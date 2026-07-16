@@ -1,0 +1,16 @@
+{
+  "name": "amazon-seller-reconciliation-platform",
+  "private": true,
+  "version": "0.3.0",
+  "workspaces": ["apps/*", "packages/*"],
+  "scripts": {
+    "dev": "concurrently \"npm --workspace @recon/api run dev\" \"npm --workspace @recon/web run dev\"",
+    "dev:api": "npm --workspace @recon/api run dev",
+    "dev:web": "npm --workspace @recon/web run dev",
+    "start": "npm --workspace @recon/api start",
+    "check": "node --check apps/api/src/server.js && node --check apps/api/src/jobs/sync.js && node --check packages/sp-api-client/src/index.js && node --check packages/db/src/index.js"
+  },
+  "devDependencies": {
+    "concurrently": "^8.2.2"
+  }
+}
