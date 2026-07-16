@@ -1,0 +1,130 @@
+import { z } from 'zod';
+
+export const SP_API_BASE_URL = 'https://sellingpartnerapi-eu.amazon.com';
+export const INDIA_MARKETPLACE_ID = 'A21TJRUUN4KGV';
+export const REPORT_TYPES = Object.freeze([
+  'GET_V2_SETTLEMENT_REPORT_DATA_FLAT_FILE_V2',
+  'GET_GST_MTR_B2B_CUSTOM',
+  'GET_GST_MTR_B2C_CUSTOM',
+  'GET_FBA_FULFILLMENT_CUSTOMER_RETURNS_DATA',
+  'GET_FBA_REIMBURSEMENTS_DATA',
+  'GET_SALES_AND_TRAFFIC_REPORT',
+  'GET_FBA_MYI_UNSUPPRESSED_INVENTORY_DATA'
+]);
+
+const GST_REPORTS = new Set(['GET_GST_MTR_B2B_CUSTOM', 'GET_GST_MTR_B2C_CUSTOM']);
+const DateRangeSchema = z.object({ start: z.string().datetime(), end: z.string().datetime() });
+
+export class SpApiClient {
+  /** @param {string} refreshToken @param {{ clientId?: string, clientSecret?: string }} [cfg] */
+  constructor(refreshToken, cfg = {}) {
+    this.refreshToken = z.string().min(1).parse(refreshToken);
+    this.cfg = { clientId: cfg.clientId ?? process.env.LWA_CLIENT_ID, clientSecret: cfg.clientSecret ?? process.env.LWA_CLIENT_SECRET };
+  }
+
+  async getAccessToken() {
+    const res = await fetch('https://api.amazon.com/auth/o2/token', {
+      method: 'POST',
+      headers: { 'content-type': 'application/x-www-form-urlencoded' },
+      body: new URLSearchParams({ grant_type: 'refresh_token', refresh_token: this.refreshToken, client_id: this.cfg.clientId ?? '', client_secret: this.cfg.clientSecret ?? '' })
+    });
+    if (!res.ok) throw new Error(`LWA token exchange failed: ${res.status}`);
+    const body = await res.json();
+    return z.object({ access_token: z.string().min(1) }).parse(body).access_token;
+  }
+
+  /** @param {string} path @param {RequestInit} [init] @param {string} [token] */
+  async request(path, init = {}, token) {
+    let accessToken = token ?? await this.getAccessToken();
+    for (let attempt = 0; attempt < 4; attempt += 1) {
+      const res = await fetch(`${SP_API_BASE_URL}${path}`, {
+        ...init,
+        headers: { 'content-type': 'application/json', 'x-amz-access-token': accessToken, ...(init.headers ?? {}) }
+      });
+      const rateLimit = Number(res.headers.get('x-amzn-RateLimit-Limit') ?? '1');
+      if (![429, 503].includes(res.status)) return res;
+      await new Promise(resolve => setTimeout(resolve, Math.min(30_000, (1000 / Math.max(rateLimit, 0.1)) * 2 ** attempt)));
+      accessToken = token ?? await this.getAccessToken();
+    }
+    throw new Error(`SP-API request failed after retries: ${path}`);
+  }
+
+  /** @param {string} documentId */
+  async restrictedDataToken(documentId) {
+    const id = z.string().min(1).parse(documentId);
+    const path = `/reports/2021-06-30/documents/${id}`;
+    const res = await this.request('/tokens/2021-03-01/restrictedDataToken', {
+      method: 'POST',
+      body: JSON.stringify({ restrictedResources: [{ method: 'GET', path, dataElements: ['taxInvoiceDataAccess'] }] })
+    });
+    if (!res.ok) throw new Error(`RDT request failed: ${res.status}`);
+    return z.object({ restrictedDataToken: z.string().min(1) }).parse(await res.json()).restrictedDataToken;
+  }
+
+  /** @param {string} reportType @param {string} tenantId @param {{ start: string, end: string }} range @param {string} [marketplaceId] */
+  async fetchReport(reportType, tenantId, range, marketplaceId = INDIA_MARKETPLACE_ID) {
+    const parsedReportType = z.enum(REPORT_TYPES).parse(reportType);
+    const parsedRange = DateRangeSchema.parse(range);
+    const parsedTenant = z.string().uuid().parse(tenantId);
+    const create = await this.request('/reports/2021-06-30/reports', {
+      method: 'POST',
+      body: JSON.stringify({ reportType: parsedReportType, marketplaceIds: [marketplaceId], dataStartTime: parsedRange.start, dataEndTime: parsedRange.end })
+    });
+    if (!create.ok) throw new Error(`Create report failed: ${create.status}`);
+    const { reportId } = z.object({ reportId: z.string().min(1) }).parse(await create.json());
+
+    let reportDocumentId = '';
+    for (let attempt = 0; attempt < 30; attempt += 1) {
+      const poll = await this.request(`/reports/2021-06-30/reports/${reportId}`);
+      if (!poll.ok) throw new Error(`Poll report failed: ${poll.status}`);
+      const body = z.object({ processingStatus: z.string(), reportDocumentId: z.string().optional() }).parse(await poll.json());
+      if (body.processingStatus === 'DONE' && body.reportDocumentId) {
+        reportDocumentId = body.reportDocumentId;
+        break;
+      }
+      if (['CANCELLED', 'FATAL'].includes(body.processingStatus)) throw new Error(`Report ${reportId} ${body.processingStatus}`);
+      await new Promise(resolve => setTimeout(resolve, 30_000));
+    }
+    if (!reportDocumentId) throw new Error(`Report ${reportId} timed out for tenant ${parsedTenant}`);
+
+    const documentToken = GST_REPORTS.has(parsedReportType) ? await this.restrictedDataToken(reportDocumentId) : undefined;
+    const document = await this.request(`/reports/2021-06-30/documents/${reportDocumentId}`, {}, documentToken);
+    if (!document.ok) throw new Error(`Document lookup failed: ${document.status}`);
+    const { url } = z.object({ url: z.string().url() }).parse(await document.json());
+    const download = await fetch(url);
+    if (!download.ok) throw new Error(`Document download failed: ${download.status}`);
+    return { reportId, reportDocumentId, content: await download.text() };
+  }
+
+  /** @param {string} sellerSku @param {unknown} body */
+  async estimateListingFees(sellerSku, body) {
+    const sku = z.string().min(1).parse(sellerSku);
+    const res = await this.request(`/products/fees/v0/listings/${encodeURIComponent(sku)}/feesEstimate`, { method: 'POST', body: JSON.stringify(body) });
+    if (!res.ok) throw new Error(`Fees estimate failed: ${res.status}`);
+    return res.json();
+  }
+
+  /** @param {string} createdAfter @param {string} [marketplaceId] */
+  async listOrders(createdAfter, marketplaceId = INDIA_MARKETPLACE_ID) {
+    const date = z.string().datetime().parse(createdAfter);
+    const res = await this.request(`/orders/v0/orders?MarketplaceIds=${marketplaceId}&CreatedAfter=${encodeURIComponent(date)}`);
+    if (!res.ok) throw new Error(`List orders failed: ${res.status}`);
+    return res.json();
+  }
+
+  /** @param {string} orderId */
+  async listOrderItems(orderId) {
+    const id = z.string().min(1).parse(orderId);
+    const res = await this.request(`/orders/v0/orders/${encodeURIComponent(id)}/orderItems`);
+    if (!res.ok) throw new Error(`List order items failed: ${res.status}`);
+    return res.json();
+  }
+
+  /** @param {string} postedAfter */
+  async listFinanceTransactions(postedAfter) {
+    const date = z.string().datetime().parse(postedAfter);
+    const res = await this.request(`/finances/2024-06-19/transactions?postedAfter=${encodeURIComponent(date)}`);
+    if (!res.ok) throw new Error(`Finance transactions failed: ${res.status}`);
+    return res.json();
+  }
+}

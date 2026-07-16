@@ -1,0 +1,1 @@
+{"name":"@recon/sp-api-client","version":"0.3.0","type":"module","main":"src/index.js","exports":"./src/index.js","scripts":{"check":"node --check src/index.js"}}
