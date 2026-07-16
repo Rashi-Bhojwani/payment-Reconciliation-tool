@@ -55,7 +55,7 @@ function SellerDashboard() {
 
     <div className="rounded-2xl bg-white p-6 shadow">
       <h2 className="text-xl font-semibold">Quarterly Report Data Preview</h2>
-      <p className="text-sm text-slate-500">Charts/tables only. Narrative fields remain manually editable until AI is added later.</p>
+      <p className="text-sm text-slate-500">Charts/tables only. Narrative fields remain manually editable for now.</p>
       <ResponsiveContainer width="100%" height={240}>
         <LineChart data={[{ month: 'M1', sales: 10 }, { month: 'M2', sales: 18 }, { month: 'M3', sales: 24 }]}><XAxis dataKey="month" /><YAxis /><Tooltip /><Line dataKey="sales" stroke="#2563eb" /></LineChart>
       </ResponsiveContainer>

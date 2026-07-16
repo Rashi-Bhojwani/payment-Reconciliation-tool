@@ -120,7 +120,6 @@ app.get('/api/tenants/:tenantId/reports/quarterly', async request => {
   await assertActiveTenant(tenantId);
   return withTenant(tenantId, async client => ({
     businessPerformance: (await client.query('select date, asin, sessions, page_views, units_ordered, units_refunded, ordered_product_sales, shipped_product_sales, featured_offer_percentage from sales_traffic_daily order by date desc limit 100')).rows,
-    advertisingPerformance: (await client.query('select c.campaign_name, d.date, d.impressions, d.clicks, d.spend, d.sales, d.orders from ad_campaign_daily d join ad_campaigns c on c.id=d.campaign_id order by d.date desc limit 100')).rows,
     manualNarrative: (await client.query("select narrative_json from generated_reports where report_type='quarterly' order by generated_at desc limit 1")).rows[0]?.narrative_json ?? {}
   }));
 });
