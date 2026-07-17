@@ -9,6 +9,24 @@ const REPORTS = ['GET_V2_SETTLEMENT_REPORT_DATA_FLAT_FILE_V2', 'GET_SALES_AND_TR
 
 function authHeaders() { const token = localStorage.getItem('token'); return token ? { authorization: `Bearer ${token}` } : {}; }
 async function api(path, options = {}) { const res = await fetch(`${API}${path}`, { ...options, headers: { 'content-type': 'application/json', ...authHeaders(), ...(options.headers ?? {}) } }); if (!res.ok) throw new Error((await res.json().catch(() => ({}))).error ?? 'Request failed'); return res.json(); }
+const ACCESS_TOKEN_CACHE_PREFIX = 'amazon_spapi_access_token:';
+function readAmazonTokenCache(tenantId) {
+  const cached = JSON.parse(localStorage.getItem(`${ACCESS_TOKEN_CACHE_PREFIX}${tenantId}`) ?? 'null');
+  if (cached?.accessToken && cached?.expiresAt && Date.now() < cached.expiresAt - 60_000) return cached;
+  return null;
+}
+async function getAmazonAccessToken(tenantId) {
+  const cached = readAmazonTokenCache(tenantId);
+  if (cached) return cached;
+  const fresh = await api(`/api/tenants/${tenantId}/amazon/access-token`);
+  localStorage.setItem(`${ACCESS_TOKEN_CACHE_PREFIX}${tenantId}`, JSON.stringify(fresh));
+  return fresh;
+}
+async function beginAmazonAuthorization(tenantId) {
+  const { url } = await api(`/api/auth/amazon/start?tenantId=${tenantId}&json=1`);
+  window.location.assign(url);
+}
+
 function Button(props) { return <button {...props} className={`rounded-xl bg-blue-600 px-4 py-2 text-sm font-semibold text-white shadow-sm transition hover:bg-blue-700 disabled:opacity-50 ${props.className ?? ''}`} />; }
 function Input(props) { return <input {...props} className="w-full rounded-xl border border-slate-300 px-3 py-2 outline-none focus:border-blue-500" />; }
 function Card({ children, className = '' }) { return <section className={`rounded-3xl border border-slate-200 bg-white p-6 shadow-sm ${className}`}>{children}</section>; }
@@ -36,10 +54,10 @@ function Login({ setSession }) {
 function SellerDashboard() {
   const [params] = useSearchParams();
   const tenantId = params.get('tenantId') ?? '';
-  const [data, setData] = useState(null); const [error, setError] = useState('');
+  const [data, setData] = useState(null); const [error, setError] = useState(''); const [tokenStatus, setTokenStatus] = useState('');
   async function load() { setError(''); try { setData(await api(`/api/tenants/${tenantId}/dashboard`)); } catch (e) { setError(e.message); } }
   useEffect(() => { if (tenantId) void load(); }, [tenantId]);
-  return <div className="space-y-6"><Card><h1 className="text-3xl font-black">Seller command center</h1><p className="mt-2 text-slate-600">End-to-end performance once an admin activates this tenant. Amazon authorization connects SP-API data ingestion.</p><div className="mt-4 flex flex-wrap gap-3"><Button disabled={!tenantId} onClick={() => { location.href = `${API}/api/auth/amazon/start?tenantId=${tenantId}`; }}>Connect Amazon SP-API</Button><Button disabled={!tenantId} onClick={load}>Refresh dashboard</Button></div>{error && <p className="mt-3 rounded-xl bg-amber-50 p-3 text-amber-800">{error}</p>}</Card><div className="grid gap-4 md:grid-cols-4"><Metric title="Net settled" value={`₹${data?.kpis?.net_settled ?? '0.00'}`} /><Metric title="Earnings" value={`₹${data?.kpis?.earnings ?? '0.00'}`} /><Metric title="Deductions" value={`₹${data?.kpis?.deductions ?? '0.00'}`} /><Metric title="Orders" value={data?.orders?.orders ?? 0} hint={`₹${data?.orders?.order_value ?? '0.00'} booked`} /></div><Card><h2 className="text-xl font-bold">Sales and unit trend</h2>{data?.trend?.length ? <ResponsiveContainer width="100%" height={280}><LineChart data={data.trend}><XAxis dataKey="date" /><YAxis /><Tooltip /><Line dataKey="sales" stroke="#2563eb" strokeWidth={2} /><Line dataKey="units" stroke="#16a34a" strokeWidth={2} /></LineChart></ResponsiveContainer> : <Empty text="Sync Sales & Traffic to populate trends." />}</Card><div className="grid gap-6 lg:grid-cols-2"><TableCard title="Product performance" rows={data?.products ?? []} columns={['asin', 'units', 'sales', 'buy_box']} /><TableCard title="Payment settlements" rows={data?.payments ?? []} columns={['posted_date', 'settlement_id', 'net_amount', 'lines']} /></div><TableCard title="Recent sync jobs" rows={data?.jobs ?? []} columns={['report_type', 'status', 'completed_at', 'error_message']} /></div>;
+  return <div className="space-y-6"><Card><h1 className="text-3xl font-black">Seller command center</h1><p className="mt-2 text-slate-600">End-to-end performance once an admin activates this tenant. Amazon authorization connects SP-API data ingestion.</p><div className="mt-4 flex flex-wrap gap-3"><Button disabled={!tenantId} onClick={() => beginAmazonAuthorization(tenantId).catch(e => setError(e.message))}>Connect Amazon SP-API</Button><Button disabled={!tenantId} onClick={load}>Refresh dashboard</Button><Button disabled={!tenantId} className="bg-emerald-600" onClick={() => getAmazonAccessToken(tenantId).then(t => setTokenStatus(`Access token cached locally until ${new Date(t.expiresAt).toLocaleTimeString()}`)).catch(e => setError(e.message))}>Warm token cache</Button></div>{error && <p className="mt-3 rounded-xl bg-amber-50 p-3 text-amber-800">{error}</p>}{tokenStatus && <p className="mt-3 rounded-xl bg-emerald-50 p-3 text-emerald-800">{tokenStatus}</p>}</Card><div className="grid gap-4 md:grid-cols-4"><Metric title="Net settled" value={`₹${data?.kpis?.net_settled ?? '0.00'}`} /><Metric title="Earnings" value={`₹${data?.kpis?.earnings ?? '0.00'}`} /><Metric title="Deductions" value={`₹${data?.kpis?.deductions ?? '0.00'}`} /><Metric title="Orders" value={data?.orders?.orders ?? 0} hint={`₹${data?.orders?.order_value ?? '0.00'} booked`} /></div><Card><h2 className="text-xl font-bold">Sales and unit trend</h2>{data?.trend?.length ? <ResponsiveContainer width="100%" height={280}><LineChart data={data.trend}><XAxis dataKey="date" /><YAxis /><Tooltip /><Line dataKey="sales" stroke="#2563eb" strokeWidth={2} /><Line dataKey="units" stroke="#16a34a" strokeWidth={2} /></LineChart></ResponsiveContainer> : <Empty text="Sync Sales & Traffic to populate trends." />}</Card><div className="grid gap-6 lg:grid-cols-2"><TableCard title="Product performance" rows={data?.products ?? []} columns={['asin', 'units', 'sales', 'buy_box']} /><TableCard title="Payment settlements" rows={data?.payments ?? []} columns={['posted_date', 'settlement_id', 'net_amount', 'lines']} /></div><TableCard title="Recent sync jobs" rows={data?.jobs ?? []} columns={['report_type', 'status', 'completed_at', 'error_message']} /></div>;
 }
 
 function TableCard({ title, rows, columns }) { return <Card><h2 className="text-xl font-bold">{title}</h2>{rows.length ? <div className="mt-4 overflow-auto"><table className="w-full text-left text-sm"><thead><tr className="border-b">{columns.map(c => <th className="py-2 pr-4" key={c}>{c.replaceAll('_', ' ')}</th>)}</tr></thead><tbody>{rows.map((row, i) => <tr className="border-b" key={i}>{columns.map(c => <td className="py-2 pr-4" key={c}>{row[c] ?? '—'}</td>)}</tr>)}</tbody></table></div> : <Empty text="No data imported yet." />}</Card>; }
