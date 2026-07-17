@@ -9,31 +9,186 @@ import { runJob } from './runner.js';
 
 const NIGHTLY_REPORTS = [...REPORT_TYPES];
 const SyncParamsSchema = z.object({ tenantId: z.string().uuid(), reportType: z.enum(REPORT_TYPES), range: z.object({ start: z.string().datetime(), end: z.string().datetime() }).optional() });
-const SettlementRowSchema = z.record(z.string(), z.string().optional());
+const ReportRowSchema = z.record(z.string(), z.unknown());
 
-/** @param {string} text @returns {Array<Record<string,string|undefined>>} */
-function parseTsv(text) {
-  const trimmed = z.string().parse(text).trim();
+/** @param {unknown} value */
+function text(value) { return value == null ? undefined : String(value).trim() || undefined; }
+/** @param {unknown} value */
+function number(value) { const parsed = Number(String(value ?? '').replace(/[,₹$]/g, '')); return Number.isFinite(parsed) ? parsed : 0; }
+/** @param {unknown} value */
+function integer(value) { return Math.trunc(number(value)); }
+/** @param {Record<string, unknown>} row @param {string[]} names */
+function pick(row, names) {
+  const lowerMap = new Map(Object.entries(row).map(([key, value]) => [key.toLowerCase().replace(/[^a-z0-9]/g, ''), value]));
+  for (const name of names) {
+    const value = lowerMap.get(name.toLowerCase().replace(/[^a-z0-9]/g, ''));
+    if (value != null && String(value).trim() !== '') return value;
+  }
+  return undefined;
+}
+
+/** @param {string} textContent @returns {Array<Record<string, unknown>>} */
+function parseTsv(textContent) {
+  const trimmed = z.string().parse(textContent).trim();
   if (!trimmed) return [];
   const [headerLine, ...lines] = trimmed.split(/\r?\n/);
-  const headers = headerLine.split('\t');
-  return lines.map(line => Object.fromEntries(line.split('\t').map((value, index) => [headers[index], value])));
+  const headers = headerLine.split('\t').map(header => header.trim());
+  return lines.filter(Boolean).map(line => Object.fromEntries(line.split('\t').map((value, index) => [headers[index], value])));
+}
+
+/** @param {Record<string, unknown>} object @returns {Record<string, unknown>} */
+function flattenObjectRow(object) {
+  const flat = { ...object };
+  for (const [key, value] of Object.entries(object)) {
+    if (value && typeof value === 'object' && !Array.isArray(value)) {
+      for (const [nestedKey, nestedValue] of Object.entries(value)) {
+        flat[nestedKey] = nestedValue;
+        flat[`${key}.${nestedKey}`] = nestedValue;
+      }
+    }
+  }
+  return flat;
+}
+
+/** @param {unknown} value @returns {Array<Record<string, unknown>>} */
+function collectObjectRows(value) {
+  if (Array.isArray(value)) return value.flatMap(collectObjectRows);
+  if (!value || typeof value !== 'object') return [];
+  const object = value;
+  const arrays = Object.values(object).filter(Array.isArray);
+  if (arrays.length) return arrays.flatMap(collectObjectRows);
+  return [flattenObjectRow(object)];
+}
+
+/** @param {string} reportType @param {string} content */
+function parseReportRows(reportType, content) {
+  const parsedType = z.enum(REPORT_TYPES).parse(reportType);
+  const trimmed = z.string().parse(content).trim();
+  if (!trimmed) return [];
+  if (trimmed.startsWith('{') || trimmed.startsWith('[')) {
+    const json = JSON.parse(trimmed);
+    if (parsedType === 'GET_SALES_AND_TRAFFIC_REPORT') {
+      return collectObjectRows(json).filter(row => pick(row, ['date', 'parentAsin', 'childAsin', 'asin']));
+    }
+    return collectObjectRows(json);
+  }
+  return parseTsv(trimmed);
 }
 
 /** @param {string} tenantId @param {string} content */
 async function saveSettlementRows(tenantId, content) {
-  const rows = z.array(SettlementRowSchema).parse(parseTsv(content));
+  const rows = z.array(ReportRowSchema).parse(parseReportRows('GET_V2_SETTLEMENT_REPORT_DATA_FLAT_FILE_V2', content));
   await withTenant(tenantId, async client => {
     for (const row of rows) {
-      const amount = z.coerce.number().default(0).parse(row.amount);
+      const amount = number(pick(row, ['amount']));
       await client.query(
         `insert into settlement_rows(tenant_id, settlement_id, order_id, amount_type, amount_description, amount, posted_date, raw)
          values($1,$2,$3,$4,$5,$6,$7,$8) on conflict do nothing`,
-        [tenantId, row['settlement-id'], row['order-id'], row['amount-type'], row['amount-description'], amount, row['posted-date'] || null, row]
+        [tenantId, text(pick(row, ['settlement-id', 'settlement id', 'settlementId'])), text(pick(row, ['order-id', 'order id', 'amazon-order-id', 'amazonOrderId'])), text(pick(row, ['amount-type', 'amount type', 'amountType'])), text(pick(row, ['amount-description', 'amount description', 'amountDescription'])), amount, text(pick(row, ['posted-date', 'posted date', 'postedDate'])) ?? null, row]
       );
     }
   });
   return rows.length;
+}
+
+/** @param {string} tenantId @param {string} content @param {'b2b'|'b2c'} invoiceType */
+async function saveGstInvoices(tenantId, content, invoiceType) {
+  const rows = z.array(ReportRowSchema).parse(parseReportRows(invoiceType === 'b2b' ? 'GET_GST_MTR_B2B_CUSTOM' : 'GET_GST_MTR_B2C_CUSTOM', content));
+  await withTenant(tenantId, async client => {
+    for (const row of rows) {
+      await client.query(
+        `insert into gst_invoices(tenant_id, invoice_type, order_id, cgst, sgst, igst, taxable_value, invoice_date)
+         values($1,$2,$3,$4,$5,$6,$7,$8)
+         on conflict (tenant_id, invoice_type, order_id, invoice_date) do update set cgst=excluded.cgst, sgst=excluded.sgst, igst=excluded.igst, taxable_value=excluded.taxable_value`,
+        [tenantId, invoiceType, text(pick(row, ['order-id', 'order id', 'amazon-order-id', 'amazonOrderId'])), number(pick(row, ['cgst', 'cgst tax', 'cgst amount'])), number(pick(row, ['sgst', 'sgst tax', 'sgst amount'])), number(pick(row, ['igst', 'igst tax', 'igst amount'])), number(pick(row, ['taxable-value', 'taxable value', 'taxableValue', 'taxable amount'])), text(pick(row, ['invoice-date', 'invoice date', 'invoiceDate', 'transaction-date', 'transaction date'])) ?? null]
+      );
+    }
+  });
+  return rows.length;
+}
+
+/** @param {string} tenantId @param {string} content */
+async function saveReturns(tenantId, content) {
+  const rows = z.array(ReportRowSchema).parse(parseReportRows('GET_FBA_FULFILLMENT_CUSTOMER_RETURNS_DATA', content));
+  await withTenant(tenantId, async client => {
+    for (const row of rows) {
+      await client.query(
+        `insert into returns(tenant_id, order_id, return_reason, disposition, status, return_date)
+         values($1,$2,$3,$4,$5,$6)
+         on conflict (tenant_id, order_id, return_date, return_reason, disposition) do update set status=excluded.status`,
+        [tenantId, text(pick(row, ['order-id', 'order id', 'amazon-order-id', 'amazonOrderId'])), text(pick(row, ['reason', 'return-reason', 'return reason', 'returnReason'])), text(pick(row, ['disposition', 'detailed-disposition', 'detailed disposition'])), 'yet_to_receive', text(pick(row, ['return-date', 'return date', 'returnDate', 'date'])) ?? null]
+      );
+    }
+  });
+  return rows.length;
+}
+
+/** @param {string} tenantId @param {string} content */
+async function saveReimbursements(tenantId, content) {
+  const rows = z.array(ReportRowSchema).parse(parseReportRows('GET_FBA_REIMBURSEMENTS_DATA', content));
+  await withTenant(tenantId, async client => {
+    for (const row of rows) {
+      await client.query(
+        `insert into reimbursements(tenant_id, amount, reason, sku, reimbursement_date)
+         values($1,$2,$3,$4,$5)
+         on conflict (tenant_id, sku, reimbursement_date, amount, reason) do nothing`,
+        [tenantId, number(pick(row, ['amount', 'total-amount', 'total amount', 'reimbursement amount'])), text(pick(row, ['reason', 'reason-code', 'reason code', 'approval-reason'])), text(pick(row, ['sku', 'seller-sku', 'seller sku'])), text(pick(row, ['reimbursement-date', 'reimbursement date', 'approval-date', 'approval date'])) ?? null]
+      );
+    }
+  });
+  return rows.length;
+}
+
+/** @param {string} tenantId @param {string} content */
+async function saveInventorySnapshots(tenantId, content) {
+  const rows = z.array(ReportRowSchema).parse(parseReportRows('GET_FBA_MYI_UNSUPPRESSED_INVENTORY_DATA', content));
+  const snapshotDate = new Date().toISOString().slice(0, 10);
+  await withTenant(tenantId, async client => {
+    for (const row of rows) {
+      const sku = text(pick(row, ['sku', 'seller-sku', 'seller sku']));
+      if (!sku) continue;
+      await client.query(
+        `insert into inventory_snapshots(tenant_id, sku, fulfillable_quantity, snapshot_date)
+         values($1,$2,$3,$4)
+         on conflict (tenant_id, sku, snapshot_date) do update set fulfillable_quantity=excluded.fulfillable_quantity`,
+        [tenantId, sku, integer(pick(row, ['fulfillable-quantity', 'fulfillable quantity', 'afn-fulfillable-quantity', 'afn fulfillable quantity', 'quantity'])), snapshotDate]
+      );
+    }
+  });
+  return rows.length;
+}
+
+/** @param {string} tenantId @param {string} content */
+async function saveSalesTrafficDaily(tenantId, content) {
+  const rows = z.array(ReportRowSchema).parse(parseReportRows('GET_SALES_AND_TRAFFIC_REPORT', content));
+  await withTenant(tenantId, async client => {
+    for (const row of rows) {
+      const date = text(pick(row, ['date', 'startDate', 'start-date']));
+      if (!date) continue;
+      const asin = text(pick(row, ['asin', 'parentAsin', 'parent-asin', 'childAsin', 'child-asin'])) ?? 'ALL';
+      await client.query(
+        `insert into sales_traffic_daily(tenant_id, date, asin, sessions, page_views, units_ordered, ordered_product_sales, featured_offer_percentage, units_refunded, shipped_product_sales)
+         values($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
+         on conflict (tenant_id, date, asin) do update set sessions=excluded.sessions, page_views=excluded.page_views, units_ordered=excluded.units_ordered, ordered_product_sales=excluded.ordered_product_sales, featured_offer_percentage=excluded.featured_offer_percentage, units_refunded=excluded.units_refunded, shipped_product_sales=excluded.shipped_product_sales`,
+        [tenantId, date, asin, integer(pick(row, ['sessions', 'sessionsTotal'])), integer(pick(row, ['pageViews', 'page-views', 'page views', 'pageViewsTotal'])), integer(pick(row, ['unitsOrdered', 'units-ordered', 'units ordered'])), number(pick(row, ['orderedProductSales', 'ordered-product-sales', 'ordered product sales', 'orderedProductSalesAmount', 'amount'])), number(pick(row, ['featuredOfferPercentage', 'featured-offer-percentage', 'featured offer percentage', 'buyBoxPercentage'])), integer(pick(row, ['unitsRefunded', 'units-refunded', 'units refunded'])), number(pick(row, ['shippedProductSales', 'shipped-product-sales', 'shipped product sales', 'shippedProductSalesAmount']))]
+      );
+    }
+  });
+  return rows.length;
+}
+
+/** @param {string} tenantId @param {string} reportType @param {string} content */
+async function saveStructuredRows(tenantId, reportType, content) {
+  switch (reportType) {
+    case 'GET_V2_SETTLEMENT_REPORT_DATA_FLAT_FILE_V2': return saveSettlementRows(tenantId, content);
+    case 'GET_GST_MTR_B2B_CUSTOM': return saveGstInvoices(tenantId, content, 'b2b');
+    case 'GET_GST_MTR_B2C_CUSTOM': return saveGstInvoices(tenantId, content, 'b2c');
+    case 'GET_FBA_FULFILLMENT_CUSTOMER_RETURNS_DATA': return saveReturns(tenantId, content);
+    case 'GET_FBA_REIMBURSEMENTS_DATA': return saveReimbursements(tenantId, content);
+    case 'GET_SALES_AND_TRAFFIC_REPORT': return saveSalesTrafficDaily(tenantId, content);
+    case 'GET_FBA_MYI_UNSUPPRESSED_INVENTORY_DATA': return saveInventorySnapshots(tenantId, content);
+    default: return 0;
+  }
 }
 
 /** @param {{ tenantId: string, reportType: string, range?: { start: string, end: string } }} params */
@@ -49,7 +204,7 @@ export async function syncReportForTenant(params) {
       const client = new SpApiClient(decryptSecret(seller.rows[0].refresh_token_encrypted));
       const report = await client.fetchReport(parsed.reportType, parsed.tenantId, range, seller.rows[0].marketplace_id);
       const s3Key = await putRawReport({ tenantId: parsed.tenantId, reportType: parsed.reportType, reportId: report.reportId, content: report.content });
-      const rowsImported = parsed.reportType === 'GET_V2_SETTLEMENT_REPORT_DATA_FLAT_FILE_V2' ? await saveSettlementRows(parsed.tenantId, report.content) : 0;
+      const rowsImported = await saveStructuredRows(parsed.tenantId, parsed.reportType, report.content);
       await pool.query('update sync_jobs set status=$1, completed_at=now(), s3_key=$2 where id=$3', ['completed', s3Key, sync.rows[0].id]);
       return { rowsImported, s3Key };
     } catch (error) {
@@ -69,5 +224,4 @@ async function syncActiveTenants(reportType) {
 
 export function startScheduler() {
   cron.schedule('0 2 * * *', () => { void Promise.all(NIGHTLY_REPORTS.map(reportType => syncActiveTenants(reportType))); });
-  cron.schedule('0 * * * *', () => { void runJob('hourly-finances-placeholder', async () => undefined); });
 }

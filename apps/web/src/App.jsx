@@ -14,6 +14,8 @@ function Button(props) {
 function SellerDashboard() {
   const [tenantId, setTenantId] = useState('');
   const [summary, setSummary] = useState(null);
+  const [quarterly, setQuarterly] = useState({ businessPerformance: [] });
+  const [payments, setPayments] = useState({ totals: {}, rows: [] });
   const [error, setError] = useState('');
 
   async function bootstrap() {
@@ -32,6 +34,10 @@ function SellerDashboard() {
       return;
     }
     setSummary(await response.json());
+    const quarterlyResponse = await fetch(`${API}/api/tenants/${tenantId}/reports/quarterly`);
+    if (quarterlyResponse.ok) setQuarterly(await quarterlyResponse.json());
+    const paymentsResponse = await fetch(`${API}/api/tenants/${tenantId}/reports/payments`);
+    if (paymentsResponse.ok) setPayments(await paymentsResponse.json());
   }
 
   return <section className="space-y-6">
@@ -56,9 +62,20 @@ function SellerDashboard() {
     <div className="rounded-2xl bg-white p-6 shadow">
       <h2 className="text-xl font-semibold">Quarterly Report Data Preview</h2>
       <p className="text-sm text-slate-500">Charts/tables only. Narrative fields remain manually editable for now.</p>
-      <ResponsiveContainer width="100%" height={240}>
-        <LineChart data={[{ month: 'M1', sales: 10 }, { month: 'M2', sales: 18 }, { month: 'M3', sales: 24 }]}><XAxis dataKey="month" /><YAxis /><Tooltip /><Line dataKey="sales" stroke="#2563eb" /></LineChart>
-      </ResponsiveContainer>
+      {quarterly.businessPerformance?.length ? <ResponsiveContainer width="100%" height={240}>
+        <LineChart data={quarterly.businessPerformance.map(row => ({ date: row.date, sales: Number(row.ordered_product_sales ?? 0), units: Number(row.units_ordered ?? 0) }))}><XAxis dataKey="date" /><YAxis /><Tooltip /><Line dataKey="sales" stroke="#2563eb" /><Line dataKey="units" stroke="#16a34a" /></LineChart>
+      </ResponsiveContainer> : <p className="mt-4 rounded-lg bg-slate-50 p-4 text-sm text-slate-600">No Sales & Traffic data imported yet. Trigger the Sales & Traffic sync to populate this chart.</p>}
+    </div>
+
+    <div className="rounded-2xl bg-white p-6 shadow">
+      <h2 className="text-xl font-semibold">Payment Report</h2>
+      <p className="text-sm text-slate-500">Built from Amazon Settlement Report rows imported through SP-API.</p>
+      <div className="mt-4 grid gap-3 md:grid-cols-3">
+        <Metric title="Net Paid" value={`₹${payments.totals?.net_amount ?? '0.00'}`} />
+        <Metric title="Credits" value={`₹${payments.totals?.credits ?? '0.00'}`} />
+        <Metric title="Deductions" value={`₹${payments.totals?.debits ?? '0.00'}`} />
+      </div>
+      <table className="mt-4 w-full text-left text-sm"><thead><tr className="border-b"><th className="py-2">Posted Date</th><th>Settlement</th><th>Order</th><th>Net</th><th>Credits</th><th>Deductions</th></tr></thead><tbody>{payments.rows?.map((row, index) => <tr className="border-t" key={index}><td className="py-2">{row.posted_date ?? '—'}</td><td>{row.settlement_id ?? '—'}</td><td>{row.order_id ?? '—'}</td><td>₹{row.net_amount}</td><td>₹{row.credits}</td><td>₹{row.debits}</td></tr>)}</tbody></table>
     </div>
 
     <div className="rounded-2xl bg-white p-6 shadow">

@@ -31,7 +31,7 @@ npm run dev
 
 ## Dashboard flow
 
-The Seller Dashboard lets you connect Amazon, bootstrap a test seller, enter a tenant ID, and refresh tenant metrics. The Admin Dashboard lists tenants, grants/rejects/revokes access, and triggers settlement sync for active tenants. Seller data APIs are denied until the tenant is `active`, so the dashboard remains gated behind admin approval.
+The Seller Dashboard lets you connect Amazon, bootstrap a test seller, enter a tenant ID, refresh tenant metrics, view a Payment Report built from Settlement Report rows, and view Sales & Traffic chart data when imported. The Admin Dashboard lists tenants, grants/rejects/revokes access, and triggers settlement sync for active tenants. Seller data APIs are denied until the tenant is `active`, so the dashboard remains gated behind admin approval.
 
 ## Runtime validation
 

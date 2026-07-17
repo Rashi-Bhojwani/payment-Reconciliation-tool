@@ -115,6 +115,31 @@ app.get('/api/tenants/:tenantId/summary', async request => {
   }));
 });
 
+app.get('/api/tenants/:tenantId/reports/payments', async request => {
+  const { tenantId } = TenantParamsSchema.parse(request.params);
+  await assertActiveTenant(tenantId);
+  return withTenant(tenantId, async client => {
+    const rows = (await client.query(`
+      select settlement_id, order_id, date(posted_date) as posted_date,
+        coalesce(sum(amount), 0) as net_amount,
+        coalesce(sum(case when amount > 0 then amount else 0 end), 0) as credits,
+        coalesce(sum(case when amount < 0 then amount else 0 end), 0) as debits,
+        count(*) as line_count
+      from settlement_rows
+      group by settlement_id, order_id, date(posted_date)
+      order by date(posted_date) desc nulls last, settlement_id desc nulls last
+      limit 200
+    `)).rows;
+    const totals = (await client.query(`
+      select coalesce(sum(amount), 0) as net_amount,
+        coalesce(sum(case when amount > 0 then amount else 0 end), 0) as credits,
+        coalesce(sum(case when amount < 0 then amount else 0 end), 0) as debits
+      from settlement_rows
+    `)).rows[0];
+    return { totals, rows };
+  });
+});
+
 app.get('/api/tenants/:tenantId/reports/quarterly', async request => {
   const { tenantId } = TenantParamsSchema.parse(request.params);
   await assertActiveTenant(tenantId);
