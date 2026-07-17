@@ -50,3 +50,65 @@ BEGIN
     EXECUTE format('CREATE POLICY tenant_isolation ON %I USING (tenant_id::text = current_setting(''app.current_tenant_id'', true)) WITH CHECK (tenant_id::text = current_setting(''app.current_tenant_id'', true))', t);
   END LOOP;
 END $$;
+CREATE EXTENSION IF NOT EXISTS pgcrypto;
+
+CREATE TABLE IF NOT EXISTS users (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  tenant_id uuid REFERENCES tenants(id) ON DELETE CASCADE,
+  email text NOT NULL UNIQUE,
+  password_hash text NOT NULL,
+  role text NOT NULL CHECK (role IN ('admin','user')),
+  status text NOT NULL DEFAULT 'active' CHECK (status IN ('active','invited','disabled')),
+  created_at timestamptz NOT NULL DEFAULT now(),
+  last_login_at timestamptz,
+  CHECK ((role = 'admin' AND tenant_id IS NULL) OR (role = 'user' AND tenant_id IS NOT NULL))
+);
+
+ALTER TABLE tenants ADD COLUMN IF NOT EXISTS legal_name text;
+ALTER TABLE tenants ADD COLUMN IF NOT EXISTS owner_email text;
+ALTER TABLE tenants ADD COLUMN IF NOT EXISTS login_email text;
+ALTER TABLE tenants ADD COLUMN IF NOT EXISTS default_marketplace_id text NOT NULL DEFAULT 'A21TJRUUN4KGV';
+ALTER TABLE tenants ADD COLUMN IF NOT EXISTS onboarding_notes text;
+
+ALTER TABLE sellers ADD COLUMN IF NOT EXISTS seller_central_region text NOT NULL DEFAULT 'IN';
+ALTER TABLE sellers ADD COLUMN IF NOT EXISTS auth_status text NOT NULL DEFAULT 'authorized' CHECK (auth_status IN ('authorized','revoked','expired'));
+ALTER TABLE sellers ADD COLUMN IF NOT EXISTS last_token_refresh_at timestamptz;
+
+CREATE TABLE IF NOT EXISTS order_items (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  tenant_id uuid NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
+  amazon_order_id text NOT NULL,
+  asin text,
+  sku text,
+  title text,
+  quantity_ordered int DEFAULT 0,
+  item_price numeric(12,2) DEFAULT 0,
+  item_tax numeric(12,2) DEFAULT 0,
+  promotion_discount numeric(12,2) DEFAULT 0,
+  raw jsonb NOT NULL DEFAULT '{}'::jsonb,
+  UNIQUE(tenant_id, amazon_order_id, sku, asin)
+);
+
+CREATE TABLE IF NOT EXISTS finance_transactions (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  tenant_id uuid NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
+  transaction_id text,
+  transaction_type text,
+  posted_date timestamptz,
+  total_amount numeric(12,2) DEFAULT 0,
+  currency text DEFAULT 'INR',
+  related_order_id text,
+  raw jsonb NOT NULL DEFAULT '{}'::jsonb,
+  UNIQUE(tenant_id, transaction_id)
+);
+
+DO $$
+DECLARE t text;
+BEGIN
+  FOREACH t IN ARRAY ARRAY['users','order_items','finance_transactions'] LOOP
+    EXECUTE format('ALTER TABLE %I ENABLE ROW LEVEL SECURITY', t);
+    EXECUTE format('DROP POLICY IF EXISTS tenant_isolation ON %I', t);
+  END LOOP;
+  CREATE POLICY tenant_isolation ON order_items USING (tenant_id::text = current_setting('app.current_tenant_id', true)) WITH CHECK (tenant_id::text = current_setting('app.current_tenant_id', true));
+  CREATE POLICY tenant_isolation ON finance_transactions USING (tenant_id::text = current_setting('app.current_tenant_id', true)) WITH CHECK (tenant_id::text = current_setting('app.current_tenant_id', true));
+END $$;
