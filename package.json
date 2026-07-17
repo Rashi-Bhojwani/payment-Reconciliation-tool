@@ -2,7 +2,10 @@
   "name": "amazon-seller-reconciliation-platform",
   "private": true,
   "version": "0.3.0",
-  "workspaces": ["apps/*", "packages/*"],
+  "workspaces": [
+    "apps/*",
+    "packages/*"
+  ],
   "scripts": {
     "dev": "concurrently \"npm --workspace @recon/api run dev\" \"npm --workspace @recon/web run dev\"",
     "dev:api": "npm --workspace @recon/api run dev",
@@ -12,5 +15,8 @@
   },
   "devDependencies": {
     "concurrently": "^8.2.2"
+  },
+  "dependencies": {
+    "dotenv": "^17.4.2"
   }
 }
