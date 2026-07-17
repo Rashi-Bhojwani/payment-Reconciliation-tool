@@ -4,7 +4,7 @@ import cors from '@fastify/cors';
 import rateLimit from '@fastify/rate-limit';
 import jwt from '@fastify/jwt';
 import { z } from 'zod';
-import { assertActiveTenant, pool, withTenant } from '@recon/db';
+import { assertActiveTenant, databaseUrlConfigured, pool, withTenant } from '@recon/db';
 import { REPORT_TYPES } from '@recon/sp-api-client';
 import { secrets } from './config/secrets.js';
 import { encryptSecret } from './config/crypto.js';
@@ -32,8 +32,26 @@ function hashPassword(password, salt = crypto.randomBytes(16).toString('hex')) {
 
 function verifyPassword(password, stored) {
   const [, iterations, salt, expected] = String(stored).split('$');
+  if (!iterations || !salt || !expected || !Number.isInteger(Number(iterations))) return false;
   const hash = crypto.pbkdf2Sync(password, salt, Number(iterations), 32, 'sha256');
-  return crypto.timingSafeEqual(Buffer.from(expected, 'hex'), hash);
+  const expectedBuffer = Buffer.from(expected, 'hex');
+  return expectedBuffer.length === hash.length && crypto.timingSafeEqual(expectedBuffer, hash);
+}
+
+function normalizeDatabaseError(error) {
+  if (error?.code === '42P01' || error?.code === '42703') {
+    return Object.assign(new Error('Database schema is not migrated. Run all packages/db/migrations/*.sql files before using this endpoint.'), { statusCode: 503 });
+  }
+  if (error?.code === '23505') {
+    return Object.assign(new Error('An account with this email already exists.'), { statusCode: 409 });
+  }
+  if (error?.code === '42501') {
+    return Object.assign(new Error('Database row-level security blocked this operation. Verify the app user owns the schema and migrations were applied.'), { statusCode: 503 });
+  }
+  if (['ECONNREFUSED', 'ENOTFOUND', 'ETIMEDOUT'].includes(error?.code)) {
+    return Object.assign(new Error('Database is unavailable. Check DATABASE_URL and network access before using this endpoint.'), { statusCode: 503 });
+  }
+  return error;
 }
 
 async function requireAuth(request) {
@@ -42,26 +60,42 @@ async function requireAuth(request) {
 async function requireAdmin(request) { const user = await requireAuth(request); if (user.role !== 'admin') throw Object.assign(new Error('Admin access required'), { statusCode: 403 }); return user; }
 async function requireTenantUser(request, tenantId) { const user = await requireAuth(request); if (user.role === 'admin') return user; if (user.tenantId !== tenantId) throw Object.assign(new Error('Tenant access denied'), { statusCode: 403 }); return user; }
 
+function requestLog(request, error) {
+  request.log.error({ error }, 'Unhandled API error');
+}
+
 app.setErrorHandler((error, _request, reply) => {
-  const statusCode = error.statusCode ?? (error.name === 'ZodError' ? 400 : 500);
-  reply.code(statusCode).send({ error: statusCode === 500 ? 'Internal server error' : error.message });
+  const normalized = normalizeDatabaseError(error);
+  const statusCode = normalized.statusCode ?? (normalized.name === 'ZodError' ? 400 : 500);
+  if (statusCode === 500) requestLog(_request, normalized);
+  reply.code(statusCode).send({ error: statusCode === 500 ? 'Internal server error' : normalized.message });
 });
 
 app.get('/health', async () => ({ ok: true }));
 
 app.post('/api/auth/register-seller', async request => {
   const body = RegisterSchema.parse(request.body);
-  const tenant = await pool.query(
-    "insert into tenants(company_name, legal_name, owner_email, login_email, default_marketplace_id, status) values($1,$1,$2,$2,$3,'pending') returning id, company_name, status, plan",
-    [body.companyName, body.ownerEmail, body.marketplaceId]
-  );
-  const tenantId = tenant.rows[0].id;
-  const user = await pool.query(
-    "insert into users(tenant_id, email, password_hash, role, status) values($1,$2,$3,'user','active') returning id,email,role,tenant_id",
-    [tenantId, body.ownerEmail, hashPassword(body.password)]
-  );
-  const token = app.jwt.sign({ sub: user.rows[0].id, email: user.rows[0].email, role: 'user', tenantId }, { expiresIn: '12h' });
-  return { token, user: { ...user.rows[0], tenantId }, tenant: tenant.rows[0] };
+  const client = await pool.connect();
+  try {
+    await client.query('begin');
+    const tenant = await client.query(
+      "insert into tenants(company_name, legal_name, owner_email, login_email, default_marketplace_id, status) values($1,$1,$2,$2,$3,'pending') returning id, company_name, status, plan",
+      [body.companyName, body.ownerEmail, body.marketplaceId]
+    );
+    const tenantId = tenant.rows[0].id;
+    const user = await client.query(
+      "insert into users(tenant_id, email, password_hash, role, status) values($1,$2,$3,'user','active') returning id,email,role,tenant_id",
+      [tenantId, body.ownerEmail, hashPassword(body.password)]
+    );
+    await client.query('commit');
+    const token = app.jwt.sign({ sub: user.rows[0].id, email: user.rows[0].email, role: 'user', tenantId }, { expiresIn: '12h' });
+    return { token, user: { id: user.rows[0].id, email: user.rows[0].email, role: user.rows[0].role, tenantId }, tenant: tenant.rows[0] };
+  } catch (error) {
+    await client.query('rollback').catch(() => undefined);
+    throw normalizeDatabaseError(error);
+  } finally {
+    client.release();
+  }
 });
 
 app.post('/api/auth/login', async request => {
@@ -140,9 +174,25 @@ app.get('/api/tenants/:tenantId/dashboard', async request => {
 });
 
 // Backward-compatible report endpoints for existing clients.
-app.get('/api/tenants/:tenantId/summary', async request => { const { tenantId } = TenantParamsSchema.parse(request.params); await requireTenantUser(request, tenantId); const dashboard = await app.inject({ method: 'GET', url: `/api/tenants/${tenantId}/dashboard`, headers: request.headers }); return JSON.parse(dashboard.body); });
+app.get('/api/tenants/:tenantId/summary', async request => {
+  const { tenantId } = TenantParamsSchema.parse(request.params);
+  await requireTenantUser(request, tenantId);
+  await assertActiveTenant(tenantId);
+  return withTenant(tenantId, async client => ({
+    settlementTotal: (await client.query('select coalesce(sum(amount),0) total from settlement_rows')).rows[0].total,
+    grossSales: (await client.query("select coalesce(sum(amount),0) total from settlement_rows where amount_type ilike '%principal%' or amount_description ilike '%principal%'")).rows[0].total,
+    fees: (await client.query("select coalesce(sum(amount),0) total from settlement_rows where amount < 0 and (amount_type ilike '%fee%' or amount_description ilike '%fee%')")).rows[0].total,
+    feeLeaks: (await client.query('select count(*) count from fee_leak_flags')).rows[0].count,
+    recentJobs: (await client.query('select report_type,status,started_at,completed_at,error_message,s3_key from sync_jobs order by started_at desc nulls last limit 10')).rows
+  }));
+});
 
-await pool.query("insert into users(id,email,password_hash,role,status) values($1,$2,$3,'admin','active') on conflict(email) do nothing", [adminId, defaultAdminEmail, hashPassword(defaultAdminPassword)]).catch(error => app.log.warn({ error }, 'Admin seed skipped; run migrations before first login'));
+if (!databaseUrlConfigured) {
+  app.log.warn('DATABASE_URL is not configured. Create .env from .env.example or export DATABASE_URL before running npm run dev.');
+} else {
+  await pool.query("insert into users(id,email,password_hash,role,status) values($1,$2,$3,'admin','active') on conflict(email) do nothing", [adminId, defaultAdminEmail, hashPassword(defaultAdminPassword)])
+    .catch(error => app.log.warn({ err: normalizeDatabaseError(error) }, 'Admin seed skipped; run migrations before first login'));
+}
 
 startScheduler();
 await app.listen({ port: 4000, host: '0.0.0.0' });

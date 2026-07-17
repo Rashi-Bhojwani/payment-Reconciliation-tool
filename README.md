@@ -11,11 +11,12 @@ Working local/dev **plain JavaScript** monorepo for Amazon India seller reconcil
 
 ## Quick start
 
-1. Copy `.env.example` to `.env` and replace `HEHE` values with real RDS, S3, and Amazon credentials.
+1. Copy `.env.example` to `.env` and replace `HEHE` values with real RDS, S3, and Amazon credentials. The API now loads `.env` automatically, but `DATABASE_URL` must be present there (or exported in your shell) for `npm run dev`.
 2. Run database migrations against your RDS database:
 
 ```bash
-psql "$DATABASE_URL" -f packages/db/migrations/001_init.sql
+export DATABASE_URL="postgresql://reconciliation:YOUR_PASSWORD@YOUR_RDS_HOST:5432/postgres"
+for file in packages/db/migrations/*.sql; do psql "$DATABASE_URL" -f "$file"; done
 ```
 
 3. Install dependencies and start API + web directly:

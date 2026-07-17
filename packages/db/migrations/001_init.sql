@@ -105,10 +105,11 @@ CREATE TABLE IF NOT EXISTS finance_transactions (
 DO $$
 DECLARE t text;
 BEGIN
-  FOREACH t IN ARRAY ARRAY['users','order_items','finance_transactions'] LOOP
+  FOREACH t IN ARRAY ARRAY['order_items','finance_transactions'] LOOP
     EXECUTE format('ALTER TABLE %I ENABLE ROW LEVEL SECURITY', t);
     EXECUTE format('DROP POLICY IF EXISTS tenant_isolation ON %I', t);
   END LOOP;
   CREATE POLICY tenant_isolation ON order_items USING (tenant_id::text = current_setting('app.current_tenant_id', true)) WITH CHECK (tenant_id::text = current_setting('app.current_tenant_id', true));
   CREATE POLICY tenant_isolation ON finance_transactions USING (tenant_id::text = current_setting('app.current_tenant_id', true)) WITH CHECK (tenant_id::text = current_setting('app.current_tenant_id', true));
+  ALTER TABLE users DISABLE ROW LEVEL SECURITY;
 END $$;

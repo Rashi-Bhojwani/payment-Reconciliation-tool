@@ -1,10 +1,14 @@
 import pg from 'pg';
+import { loadDotEnv } from './env.js';
+
+loadDotEnv();
 
 const { Pool } = pg;
 const databaseUrl = process.env.DATABASE_URL;
+export const databaseUrlConfigured = Boolean(databaseUrl && databaseUrl !== 'HEHE');
 export const pool = new Pool({
-  connectionString: databaseUrl,
-  ssl: databaseUrl && databaseUrl !== 'HEHE' ? { rejectUnauthorized: false } : false
+  connectionString: databaseUrlConfigured ? databaseUrl : undefined,
+  ssl: databaseUrlConfigured ? { rejectUnauthorized: false } : false
 });
 
 /**
