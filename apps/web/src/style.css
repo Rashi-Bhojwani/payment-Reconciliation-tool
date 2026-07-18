@@ -1,6 +1,4 @@
-@tailwind base;
-@tailwind components;
-@tailwind utilities;
+@import url('https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;600;700&family=Inter:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500;600&display=swap');
 
 :root { --ink:#0d1726; --muted:#667085; --line:#e2e8f0; --gold:#f7b500; --blue:#2f8fce; --green:#14a36d; --nav:#172332; }
 * { box-sizing: border-box; }
