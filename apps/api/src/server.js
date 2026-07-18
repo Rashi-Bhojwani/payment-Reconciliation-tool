@@ -77,6 +77,8 @@ async function exchangeAmazonCode(code) {
 }
 
 
+const TENANT_DATA_TABLES = ['orders', 'settlement_rows', 'gst_invoices', 'returns', 'reimbursements', 'inventory_snapshots', 'sales_traffic_daily', 'fee_leak_flags', 'generated_reports', 'order_items', 'finance_transactions'];
+
 async function ensureSellerAuthSchema() {
   await pool.query(`
     alter table sellers add column if not exists seller_name text;
@@ -86,6 +88,13 @@ async function ensureSellerAuthSchema() {
     alter table sellers add column if not exists disconnected_at timestamptz;
     create index if not exists idx_sellers_tenant_auth_status on sellers(tenant_id, auth_status, connected_at desc);
   `);
+}
+
+async function ensureTenantDataIsolationSchema() {
+  for (const table of TENANT_DATA_TABLES) {
+    await pool.query(`alter table ${table} enable row level security`);
+    await pool.query(`alter table ${table} force row level security`);
+  }
 }
 
 function normalizeDatabaseError(error) {
@@ -297,18 +306,18 @@ app.get('/api/tenants/:tenantId/dashboard', async request => {
     : { connected: false };
   return withTenant(tenantId, async client => {
     const amazonAuth = (await pool.query("select amazon_seller_id, marketplace_id, auth_status, connected_at, last_token_refresh_at from sellers where tenant_id=$1 and auth_status='authorized' order by connected_at desc limit 1", [tenantId])).rows[0] ?? null;
-    const kpis = (await client.query(`select coalesce(sum(amount),0) net_settled, coalesce(sum(case when amount > 0 then amount else 0 end),0) earnings, coalesce(sum(case when amount < 0 then amount else 0 end),0) deductions from settlement_rows`)).rows[0];
-    const orders = (await client.query(`select count(*) orders, coalesce(sum(total_amount),0) order_value from orders`)).rows[0];
-    const products = (await client.query(`select asin, sum(units_ordered) units, sum(ordered_product_sales) sales, avg(featured_offer_percentage) buy_box from sales_traffic_daily group by asin order by sales desc nulls last limit 20`)).rows;
-    const trend = (await client.query(`select date, sum(ordered_product_sales) sales, sum(units_ordered) units, sum(sessions) sessions from sales_traffic_daily group by date order by date desc limit 90`)).rows.reverse();
-    const payments = (await client.query(`select settlement_id, date(posted_date) posted_date, sum(amount) net_amount, count(*) lines from settlement_rows group by settlement_id,date(posted_date) order by date(posted_date) desc nulls last limit 50`)).rows;
-    const jobs = (await client.query('select report_type,status,started_at,completed_at,error_message,s3_key from sync_jobs order by started_at desc nulls last limit 10')).rows;
-    const inventory = (await client.query('select sku, fulfillable_quantity, snapshot_date from inventory_snapshots order by snapshot_date desc, fulfillable_quantity desc nulls last limit 50')).rows;
-    const returns = (await client.query('select order_id, return_reason, disposition, status, return_date from returns order by return_date desc nulls last limit 50')).rows;
-    const reimbursements = (await client.query('select sku, amount, reason, reimbursement_date from reimbursements order by reimbursement_date desc nulls last limit 50')).rows;
-    const invoices = (await client.query('select invoice_type, order_id, taxable_value, cgst, sgst, igst, invoice_date from gst_invoices order by invoice_date desc nulls last limit 50')).rows;
-    const orderItems = (await client.query('select amazon_order_id, asin, sku, title, quantity_ordered, item_price, item_tax from order_items order by quantity_ordered desc nulls last limit 50')).rows;
-    const financeTransactions = (await client.query('select transaction_id, transaction_type, posted_date, total_amount, currency, related_order_id from finance_transactions order by posted_date desc nulls last limit 50')).rows;
+    const kpis = (await client.query(`select coalesce(sum(amount),0) net_settled, coalesce(sum(case when amount > 0 then amount else 0 end),0) earnings, coalesce(sum(case when amount < 0 then amount else 0 end),0) deductions from settlement_rows where tenant_id=$1`, [tenantId])).rows[0];
+    const orders = (await client.query(`select count(*) orders, coalesce(sum(total_amount),0) order_value from orders where tenant_id=$1`, [tenantId])).rows[0];
+    const products = (await client.query(`select asin, sum(units_ordered) units, sum(ordered_product_sales) sales, avg(featured_offer_percentage) buy_box from sales_traffic_daily where tenant_id=$1 group by asin order by sales desc nulls last limit 20`, [tenantId])).rows;
+    const trend = (await client.query(`select date, sum(ordered_product_sales) sales, sum(units_ordered) units, sum(sessions) sessions from sales_traffic_daily where tenant_id=$1 group by date order by date desc limit 90`, [tenantId])).rows.reverse();
+    const payments = (await client.query(`select settlement_id, date(posted_date) posted_date, sum(amount) net_amount, count(*) lines from settlement_rows where tenant_id=$1 group by settlement_id,date(posted_date) order by date(posted_date) desc nulls last limit 50`, [tenantId])).rows;
+    const jobs = (await client.query('select report_type,status,started_at,completed_at,error_message,s3_key from sync_jobs where tenant_id=$1 order by started_at desc nulls last limit 10', [tenantId])).rows;
+    const inventory = (await client.query('select sku, fulfillable_quantity, snapshot_date from inventory_snapshots where tenant_id=$1 order by snapshot_date desc, fulfillable_quantity desc nulls last limit 50', [tenantId])).rows;
+    const returns = (await client.query('select order_id, return_reason, disposition, status, return_date from returns where tenant_id=$1 order by return_date desc nulls last limit 50', [tenantId])).rows;
+    const reimbursements = (await client.query('select sku, amount, reason, reimbursement_date from reimbursements where tenant_id=$1 order by reimbursement_date desc nulls last limit 50', [tenantId])).rows;
+    const invoices = (await client.query('select invoice_type, order_id, taxable_value, cgst, sgst, igst, invoice_date from gst_invoices where tenant_id=$1 order by invoice_date desc nulls last limit 50', [tenantId])).rows;
+    const orderItems = (await client.query('select amazon_order_id, asin, sku, title, quantity_ordered, item_price, item_tax from order_items where tenant_id=$1 order by quantity_ordered desc nulls last limit 50', [tenantId])).rows;
+    const financeTransactions = (await client.query('select transaction_id, transaction_type, posted_date, total_amount, currency, related_order_id from finance_transactions where tenant_id=$1 order by posted_date desc nulls last limit 50', [tenantId])).rows;
     const hasImportedData = Number(orders.orders ?? 0) > 0 || Number(kpis.net_settled ?? 0) !== 0 || products.length > 0 || payments.length > 0 || inventory.length > 0;
     return { seller, amazonAuth, hasImportedData, kpis, orders, products, trend, payments, jobs, inventory, returns, reimbursements, invoices, orderItems, financeTransactions };
   });
@@ -320,11 +329,11 @@ app.get('/api/tenants/:tenantId/summary', async request => {
   await requireTenantUser(request, tenantId);
   await assertActiveTenant(tenantId);
   return withTenant(tenantId, async client => ({
-    settlementTotal: (await client.query('select coalesce(sum(amount),0) total from settlement_rows')).rows[0].total,
-    grossSales: (await client.query("select coalesce(sum(amount),0) total from settlement_rows where amount_type ilike '%principal%' or amount_description ilike '%principal%'")).rows[0].total,
-    fees: (await client.query("select coalesce(sum(amount),0) total from settlement_rows where amount < 0 and (amount_type ilike '%fee%' or amount_description ilike '%fee%')")).rows[0].total,
-    feeLeaks: (await client.query('select count(*) count from fee_leak_flags')).rows[0].count,
-    recentJobs: (await client.query('select report_type,status,started_at,completed_at,error_message,s3_key from sync_jobs order by started_at desc nulls last limit 10')).rows
+    settlementTotal: (await client.query('select coalesce(sum(amount),0) total from settlement_rows where tenant_id=$1', [tenantId])).rows[0].total,
+    grossSales: (await client.query("select coalesce(sum(amount),0) total from settlement_rows where tenant_id=$1 and (amount_type ilike '%principal%' or amount_description ilike '%principal%')", [tenantId])).rows[0].total,
+    fees: (await client.query("select coalesce(sum(amount),0) total from settlement_rows where tenant_id=$1 and amount < 0 and (amount_type ilike '%fee%' or amount_description ilike '%fee%')", [tenantId])).rows[0].total,
+    feeLeaks: (await client.query('select count(*) count from fee_leak_flags where tenant_id=$1', [tenantId])).rows[0].count,
+    recentJobs: (await client.query('select report_type,status,started_at,completed_at,error_message,s3_key from sync_jobs where tenant_id=$1 order by started_at desc nulls last limit 10', [tenantId])).rows
   }));
 });
 
@@ -342,6 +351,8 @@ if (!databaseUrlConfigured) {
 } else {
   await ensureSellerAuthSchema()
     .catch(error => app.log.warn({ err: normalizeDatabaseError(error) }, 'Seller auth schema self-check skipped; run migrations before Amazon authorization'));
+  await ensureTenantDataIsolationSchema()
+    .catch(error => app.log.warn({ err: normalizeDatabaseError(error) }, 'Tenant data isolation self-check skipped; run migrations before serving tenant dashboards'));
   await pool.query("insert into users(id,email,password_hash,role,status) values($1,$2,$3,'admin','active') on conflict(email) do nothing", [adminId, defaultAdminEmail, hashPassword(defaultAdminPassword)])
     .catch(error => app.log.warn({ err: normalizeDatabaseError(error) }, 'Admin seed skipped; run migrations before first login'));
 }
