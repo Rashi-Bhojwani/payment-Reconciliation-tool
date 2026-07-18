@@ -75,6 +75,18 @@ async function exchangeAmazonCode(code) {
   return z.object({ refresh_token: z.string().min(1), access_token: z.string().optional(), expires_in: z.number().optional() }).parse(await token.json());
 }
 
+
+async function ensureSellerAuthSchema() {
+  await pool.query(`
+    alter table sellers add column if not exists seller_name text;
+    alter table sellers add column if not exists seller_central_region text not null default 'IN';
+    alter table sellers add column if not exists auth_status text not null default 'authorized';
+    alter table sellers add column if not exists last_token_refresh_at timestamptz;
+    alter table sellers add column if not exists disconnected_at timestamptz;
+    create index if not exists idx_sellers_tenant_auth_status on sellers(tenant_id, auth_status, connected_at desc);
+  `);
+}
+
 function normalizeDatabaseError(error) {
   if (error?.code === '42P01' || error?.code === '42703') {
     return Object.assign(new Error('Database schema is not migrated. Run all packages/db/migrations/*.sql files before using this endpoint.'), { statusCode: 503 });
@@ -275,6 +287,8 @@ app.setNotFoundHandler(async (request, reply) => {
 if (!databaseUrlConfigured) {
   app.log.warn('DATABASE_URL is not configured. Create .env from .env.example or export DATABASE_URL before running npm run dev.');
 } else {
+  await ensureSellerAuthSchema()
+    .catch(error => app.log.warn({ err: normalizeDatabaseError(error) }, 'Seller auth schema self-check skipped; run migrations before Amazon authorization'));
   await pool.query("insert into users(id,email,password_hash,role,status) values($1,$2,$3,'admin','active') on conflict(email) do nothing", [adminId, defaultAdminEmail, hashPassword(defaultAdminPassword)])
     .catch(error => app.log.warn({ err: normalizeDatabaseError(error) }, 'Admin seed skipped; run migrations before first login'));
 }
