@@ -192,8 +192,9 @@ async function handleAmazonCallback(request, reply) {
   return reply.redirect(`${secrets.frontendOrigin}/seller?tenantId=${state.tenantId}&connected=1`);
 }
 
-app.get('/api/auth/amazon/callback', handleAmazonCallback);
-app.get('/oauth/callback', handleAmazonCallback);
+for (const callbackPath of ['/api/auth/amazon/callback', '/oauth/callback']) {
+  app.route({ method: ['GET', 'POST'], url: callbackPath, handler: handleAmazonCallback });
+}
 
 app.get('/api/tenants/:tenantId/amazon/access-token', async request => {
   const { tenantId } = TenantParamsSchema.parse(request.params);
@@ -249,6 +250,15 @@ app.get('/api/tenants/:tenantId/summary', async request => {
     feeLeaks: (await client.query('select count(*) count from fee_leak_flags')).rows[0].count,
     recentJobs: (await client.query('select report_type,status,started_at,completed_at,error_message,s3_key from sync_jobs order by started_at desc nulls last limit 10')).rows
   }));
+});
+
+
+app.setNotFoundHandler(async (request, reply) => {
+  const pathname = new URL(request.url, 'http://localhost').pathname;
+  if (pathname === '/oauth/callback' || pathname === '/api/auth/amazon/callback') {
+    return handleAmazonCallback(request, reply);
+  }
+  return reply.code(404).send({ message: `Route ${request.method}:${request.url} not found`, error: 'Not Found', statusCode: 404 });
 });
 
 if (!databaseUrlConfigured) {
