@@ -173,7 +173,7 @@ app.get('/api/auth/amazon/start', async (request, reply) => {
   return reply.redirect(url.toString());
 });
 
-app.get('/oauth/callback', async (request, reply) => {
+app.get('/api/auth/amazon/callback', async (request, reply) => {
   const query = AmazonCallbackSchema.parse(request.query);
   const code = query.spapi_oauth_code ?? query.code;
   if (!code) return reply.code(400).send({ error: 'Missing authorization code' });
@@ -183,18 +183,13 @@ app.get('/oauth/callback', async (request, reply) => {
   const body = await exchangeAmazonCode(code);
   const marketplace = tenant.default_marketplace_id ?? 'A21TJRUUN4KGV';
   const sellerId = query.selling_partner_id ?? `SELLER-${state.tenantId}`;
-  const sellerName = tenant.company_name;
-  await pool.query(`insert into sellers(tenant_id, amazon_seller_id, seller_name, marketplace_id, seller_central_region, refresh_token_encrypted, auth_status, connected_at, last_token_refresh_at)
-    values($1,$2,$3,$4,$5,$6,'authorized',now(),now())
-    on conflict(tenant_id, amazon_seller_id) do update set seller_name=excluded.seller_name, marketplace_id=excluded.marketplace_id, seller_central_region=excluded.seller_central_region,
-      refresh_token_encrypted=excluded.refresh_token_encrypted, auth_status='authorized', connected_at=now(), last_token_refresh_at=now(), disconnected_at=null`,
-    [state.tenantId, sellerId, sellerName, marketplace, MARKETPLACES[marketplace]?.region ?? 'IN', encryptSecret(body.refresh_token)]);
+  await pool.query(`insert into sellers(tenant_id, amazon_seller_id, marketplace_id, seller_central_region, refresh_token_encrypted, auth_status, connected_at, last_token_refresh_at)
+    values($1,$2,$3,$4,$5,'authorized',now(),now())
+    on conflict(tenant_id, amazon_seller_id) do update set marketplace_id=excluded.marketplace_id, seller_central_region=excluded.seller_central_region,
+      refresh_token_encrypted=excluded.refresh_token_encrypted, auth_status='authorized', connected_at=now(), last_token_refresh_at=now()`,
+    [state.tenantId, sellerId, marketplace, MARKETPLACES[marketplace]?.region ?? 'IN', encryptSecret(body.refresh_token)]);
   return reply.redirect(`${secrets.frontendOrigin}/seller?tenantId=${state.tenantId}&connected=1`);
-}
-
-for (const callbackPath of ['/api/auth/amazon/callback', '/oauth/callback']) {
-  app.route({ method: ['GET', 'POST'], url: callbackPath, handler: handleAmazonCallback });
-}
+});
 
 app.get('/api/tenants/:tenantId/amazon/access-token', async request => {
   const { tenantId } = TenantParamsSchema.parse(request.params);
@@ -213,7 +208,7 @@ app.get('/api/tenants/:tenantId/amazon/access-token', async request => {
 app.get('/api/admin/tenants', async request => {
   await requireAdmin(request);
   const result = await pool.query(`select t.id, t.company_name, t.owner_email, t.login_email, t.status, t.plan, t.created_at, t.approved_at,
-      s.seller_name, s.amazon_seller_id, s.marketplace_id, s.auth_status, s.connected_at as amazon_connected_at, s.last_token_refresh_at, exists(select 1 from sellers s2 where s2.tenant_id = t.id) as amazon_connected,
+      s.amazon_seller_id, s.marketplace_id, s.auth_status, exists(select 1 from sellers s2 where s2.tenant_id = t.id) as amazon_connected,
       (select max(completed_at) from sync_jobs sj where sj.tenant_id = t.id and sj.status = 'completed') as last_successful_sync,
       (select count(*) from users u where u.tenant_id = t.id and u.status='active') as user_count
     from tenants t left join lateral (select * from sellers s where s.tenant_id=t.id order by connected_at desc limit 1) s on true order by t.created_at desc`);
@@ -250,15 +245,6 @@ app.get('/api/tenants/:tenantId/summary', async request => {
     feeLeaks: (await client.query('select count(*) count from fee_leak_flags')).rows[0].count,
     recentJobs: (await client.query('select report_type,status,started_at,completed_at,error_message,s3_key from sync_jobs order by started_at desc nulls last limit 10')).rows
   }));
-});
-
-
-app.setNotFoundHandler(async (request, reply) => {
-  const pathname = new URL(request.url, 'http://localhost').pathname;
-  if (pathname === '/oauth/callback' || pathname === '/api/auth/amazon/callback') {
-    return handleAmazonCallback(request, reply);
-  }
-  return reply.code(404).send({ message: `Route ${request.method}:${request.url} not found`, error: 'Not Found', statusCode: 404 });
 });
 
 if (!databaseUrlConfigured) {
