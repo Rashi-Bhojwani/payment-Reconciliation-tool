@@ -291,7 +291,12 @@ app.get('/api/tenants/:tenantId/dashboard', async request => {
     const trend = (await client.query(`select date, sum(ordered_product_sales) sales, sum(units_ordered) units, sum(sessions) sessions from sales_traffic_daily group by date order by date desc limit 90`)).rows.reverse();
     const payments = (await client.query(`select settlement_id, date(posted_date) posted_date, sum(amount) net_amount, count(*) lines from settlement_rows group by settlement_id,date(posted_date) order by date(posted_date) desc nulls last limit 50`)).rows;
     const jobs = (await client.query('select report_type,status,started_at,completed_at,error_message,s3_key from sync_jobs order by started_at desc nulls last limit 10')).rows;
-    return { kpis, orders, products, trend, payments, jobs };
+    const inventory = (await client.query('select sku, fulfillable_quantity, snapshot_date from inventory_snapshots order by snapshot_date desc, fulfillable_quantity desc nulls last limit 50')).rows;
+    const returns = (await client.query('select order_id, return_reason, disposition, status, return_date from returns order by return_date desc nulls last limit 50')).rows;
+    const reimbursements = (await client.query('select sku, amount, reason, reimbursement_date from reimbursements order by reimbursement_date desc nulls last limit 50')).rows;
+    const invoices = (await client.query('select invoice_type, order_id, taxable_value, cgst, sgst, igst, invoice_date from gst_invoices order by invoice_date desc nulls last limit 50')).rows;
+    const orderItems = (await client.query('select amazon_order_id, asin, sku, title, quantity_ordered, item_price, item_tax from order_items order by quantity_ordered desc nulls last limit 50')).rows;
+    return { kpis, orders, products, trend, payments, jobs, inventory, returns, reimbursements, invoices, orderItems };
   });
 });
 
