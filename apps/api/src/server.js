@@ -5,10 +5,10 @@ import rateLimit from '@fastify/rate-limit';
 import jwt from '@fastify/jwt';
 import { z } from 'zod';
 import { assertActiveTenant, databaseUrlConfigured, pool, withTenant } from '@recon/db';
-import { REPORT_TYPES } from '@recon/sp-api-client';
+import { getSpApiEndpoint, MARKETPLACES, REPORT_TYPES, SpApiClient } from '@recon/sp-api-client';
 import { secrets } from './config/secrets.js';
-import { encryptSecret } from './config/crypto.js';
-import { startScheduler, syncReportForTenant } from './jobs/sync.js';
+import { decryptSecret, encryptSecret } from './config/crypto.js';
+import { startScheduler, syncRecentApiDataForTenant, syncReportForTenant } from './jobs/sync.js';
 
 const app = Fastify({ logger: { redact: ['req.headers.authorization', 'refresh_token', 'access_token', 'password', 'passwordHash'] } });
 
@@ -19,6 +19,8 @@ await app.register(jwt, { secret: secrets.jwtSecret });
 const TenantParamsSchema = z.object({ tenantId: z.string().uuid() });
 const SyncParamsSchema = z.object({ tenantId: z.string().uuid(), reportType: z.enum(REPORT_TYPES) });
 const AmazonCallbackSchema = z.object({ spapi_oauth_code: z.string().optional(), code: z.string().optional(), selling_partner_id: z.string().optional(), state: z.string().optional() });
+const AmazonAccessTokenSchema = z.object({ sellerId: z.string().optional() });
+const SellerSyncSchema = z.object({ reportTypes: z.array(z.enum(REPORT_TYPES)).default(['GET_SALES_AND_TRAFFIC_REPORT', 'GET_V2_SETTLEMENT_REPORT_DATA_FLAT_FILE_V2']) });
 const RegisterSchema = z.object({ companyName: z.string().min(2), ownerEmail: z.string().email(), password: z.string().min(8), marketplaceId: z.string().default('A21TJRUUN4KGV') });
 const LoginSchema = z.object({ email: z.string().email(), password: z.string().min(1) });
 const adminId = '00000000-0000-0000-0000-000000000001';
@@ -36,6 +38,54 @@ function verifyPassword(password, stored) {
   const hash = crypto.pbkdf2Sync(password, salt, Number(iterations), 32, 'sha256');
   const expectedBuffer = Buffer.from(expected, 'hex');
   return expectedBuffer.length === hash.length && crypto.timingSafeEqual(expectedBuffer, hash);
+}
+
+
+function signAmazonState(payload) {
+  const body = Buffer.from(JSON.stringify(payload)).toString('base64url');
+  const sig = crypto.createHmac('sha256', secrets.jwtSecret).update(body).digest('base64url');
+  return `${body}.${sig}`;
+}
+
+function verifyAmazonState(state) {
+  const [body, sig] = String(state ?? '').split('.');
+  if (!body || !sig) throw Object.assign(new Error('Invalid Amazon authorization state'), { statusCode: 403 });
+  const expected = crypto.createHmac('sha256', secrets.jwtSecret).update(body).digest('base64url');
+  const sigBuffer = Buffer.from(sig);
+  const expectedBuffer = Buffer.from(expected);
+  if (sigBuffer.length !== expectedBuffer.length || !crypto.timingSafeEqual(sigBuffer, expectedBuffer)) throw Object.assign(new Error('Invalid Amazon authorization state'), { statusCode: 403 });
+  const payload = JSON.parse(Buffer.from(body, 'base64url').toString());
+  if (!payload.nonce || !payload.tenantId || Date.now() - Number(payload.createdAt) > 15 * 60 * 1000) throw Object.assign(new Error('Expired Amazon authorization state'), { statusCode: 403 });
+  return z.object({ tenantId: z.string().uuid(), userId: z.string().uuid(), nonce: z.string(), createdAt: z.number() }).parse(payload);
+}
+
+function amazonConsentHost(marketplaceId) {
+  return MARKETPLACES[marketplaceId]?.sellerCentralHost ?? 'sellercentral.amazon.in';
+}
+
+async function exchangeAmazonCode(code) {
+  const token = await fetch('https://api.amazon.com/auth/o2/token', {
+    method: 'POST',
+    headers: { 'content-type': 'application/x-www-form-urlencoded' },
+    body: new URLSearchParams({ grant_type: 'authorization_code', code, client_id: secrets.lwaClientId, client_secret: secrets.lwaClientSecret, redirect_uri: secrets.redirectUri })
+  });
+  if (!token.ok) {
+    const detail = await token.text().catch(() => '');
+    throw Object.assign(new Error(`Amazon token exchange failed: ${token.status} ${detail}`), { statusCode: 502 });
+  }
+  return z.object({ refresh_token: z.string().min(1), access_token: z.string().optional(), expires_in: z.number().optional() }).parse(await token.json());
+}
+
+
+async function ensureSellerAuthSchema() {
+  await pool.query(`
+    alter table sellers add column if not exists seller_name text;
+    alter table sellers add column if not exists seller_central_region text not null default 'IN';
+    alter table sellers add column if not exists auth_status text not null default 'authorized';
+    alter table sellers add column if not exists last_token_refresh_at timestamptz;
+    alter table sellers add column if not exists disconnected_at timestamptz;
+    create index if not exists idx_sellers_tenant_auth_status on sellers(tenant_id, auth_status, connected_at desc);
+  `);
 }
 
 function normalizeDatabaseError(error) {
@@ -59,6 +109,14 @@ async function requireAuth(request) {
 }
 async function requireAdmin(request) { const user = await requireAuth(request); if (user.role !== 'admin') throw Object.assign(new Error('Admin access required'), { statusCode: 403 }); return user; }
 async function requireTenantUser(request, tenantId) { const user = await requireAuth(request); if (user.role === 'admin') return user; if (user.tenantId !== tenantId) throw Object.assign(new Error('Tenant access denied'), { statusCode: 403 }); return user; }
+
+
+function queueInitialSellerSync(tenantId) {
+  syncRecentApiDataForTenant(tenantId).catch(error => app.log.warn({ err: error, tenantId }, 'Initial Amazon direct API sync failed'));
+  for (const reportType of ['GET_SALES_AND_TRAFFIC_REPORT', 'GET_V2_SETTLEMENT_REPORT_DATA_FLAT_FILE_V2']) {
+    syncReportForTenant({ tenantId, reportType }).catch(error => app.log.warn({ err: error, tenantId, reportType }, 'Initial Amazon report sync failed'));
+  }
+}
 
 function requestLog(request, error) {
   request.log.error({ error }, 'Unhandled API error');
@@ -121,34 +179,74 @@ app.post('/api/dev/bootstrap', async () => {
 });
 
 app.get('/api/auth/amazon/start', async (request, reply) => {
-  const query = z.object({ tenantId: z.string().uuid().optional() }).parse(request.query);
-  const state = query.tenantId ? Buffer.from(JSON.stringify({ tenantId: query.tenantId })).toString('base64url') : crypto.randomUUID();
-  const url = new URL('https://sellercentral.amazon.in/apps/authorize/consent');
+  const user = await requireAuth(request);
+  const query = z.object({ tenantId: z.string().uuid(), json: z.coerce.boolean().default(false) }).parse(request.query);
+  await requireTenantUser(request, query.tenantId);
+  const tenant = (await pool.query('select default_marketplace_id from tenants where id=$1', [query.tenantId])).rows[0];
+  if (!tenant) throw Object.assign(new Error('Tenant not found'), { statusCode: 404 });
+  if (!secrets.spApiAppId || !secrets.lwaClientId || !secrets.lwaClientSecret) throw Object.assign(new Error('Amazon SP-API credentials are not configured'), { statusCode: 503 });
+  const state = signAmazonState({ tenantId: query.tenantId, userId: user.sub, nonce: crypto.randomUUID(), createdAt: Date.now() });
+  const url = new URL(`https://${amazonConsentHost(tenant.default_marketplace_id)}/apps/authorize/consent`);
   url.searchParams.set('application_id', secrets.spApiAppId);
   url.searchParams.set('state', state);
-  url.searchParams.set('redirect_uri', secrets.redirectUri);
+  url.searchParams.set('version', 'beta');
+  if (query.json) return { url: url.toString(), expiresInMinutes: 15 };
   return reply.redirect(url.toString());
 });
 
-app.get('/api/auth/amazon/callback', async (request, reply) => {
+async function handleAmazonCallback(request, reply) {
   const query = AmazonCallbackSchema.parse(request.query);
   const code = query.spapi_oauth_code ?? query.code;
   if (!code) return reply.code(400).send({ error: 'Missing authorization code' });
-  const token = await fetch('https://api.amazon.com/auth/o2/token', { method: 'POST', headers: { 'content-type': 'application/x-www-form-urlencoded' }, body: new URLSearchParams({ grant_type: 'authorization_code', code, client_id: secrets.lwaClientId, client_secret: secrets.lwaClientSecret, redirect_uri: secrets.redirectUri }) });
-  if (!token.ok) return reply.code(502).send({ error: 'Amazon token exchange failed' });
-  const body = z.object({ refresh_token: z.string().min(1) }).parse(await token.json());
-  let tenantId;
-  try { tenantId = JSON.parse(Buffer.from(query.state ?? '', 'base64url').toString()).tenantId; } catch { tenantId = undefined; }
-  if (!tenantId) tenantId = (await pool.query("insert into tenants(company_name, status) values($1, 'pending') returning id", [`Amazon Seller ${query.selling_partner_id ?? ''}`])).rows[0].id;
-  const marketplace = 'A21TJRUUN4KGV';
-  await pool.query('insert into sellers(tenant_id, amazon_seller_id, marketplace_id, refresh_token_encrypted) values($1,$2,$3,$4) on conflict(tenant_id, amazon_seller_id) do update set refresh_token_encrypted=excluded.refresh_token_encrypted, auth_status=\'authorized\', connected_at=now()', [tenantId, query.selling_partner_id ?? 'UNKNOWN', marketplace, encryptSecret(body.refresh_token)]);
-  return reply.redirect(`${secrets.frontendOrigin}/seller?tenantId=${tenantId}&connected=1`);
+  const state = verifyAmazonState(query.state);
+  const tenant = (await pool.query('select id, company_name, default_marketplace_id from tenants where id=$1', [state.tenantId])).rows[0];
+  if (!tenant) throw Object.assign(new Error('Tenant not found'), { statusCode: 404 });
+  const body = await exchangeAmazonCode(code);
+  const marketplace = tenant.default_marketplace_id ?? 'A21TJRUUN4KGV';
+  const sellerId = query.selling_partner_id ?? `SELLER-${state.tenantId}`;
+  const sellerName = tenant.company_name;
+  const client = await pool.connect();
+  try {
+    await client.query('begin');
+    await client.query(`insert into sellers(tenant_id, amazon_seller_id, seller_name, marketplace_id, seller_central_region, refresh_token_encrypted, auth_status, connected_at, last_token_refresh_at)
+      values($1,$2,$3,$4,$5,$6,'authorized',now(),now())
+      on conflict(tenant_id, amazon_seller_id) do update set seller_name=excluded.seller_name, marketplace_id=excluded.marketplace_id, seller_central_region=excluded.seller_central_region,
+        refresh_token_encrypted=excluded.refresh_token_encrypted, auth_status='authorized', connected_at=now(), last_token_refresh_at=now(), disconnected_at=null`,
+      [state.tenantId, sellerId, sellerName, marketplace, MARKETPLACES[marketplace]?.region ?? 'IN', encryptSecret(body.refresh_token)]);
+    await client.query("update tenants set status='active', approved_at=coalesce(approved_at, now()) where id=$1 and status='pending'", [state.tenantId]);
+    await client.query('commit');
+  } catch (error) {
+    await client.query('rollback').catch(() => undefined);
+    throw error;
+  } finally {
+    client.release();
+  }
+  queueInitialSellerSync(state.tenantId);
+  return reply.redirect(`${secrets.frontendOrigin}/seller?tenantId=${state.tenantId}&connected=1&auth=complete`);
+}
+
+for (const callbackPath of ['/api/auth/amazon/callback', '/oauth/callback']) {
+  app.route({ method: ['GET', 'POST'], url: callbackPath, handler: handleAmazonCallback });
+}
+
+app.get('/api/tenants/:tenantId/amazon/access-token', async request => {
+  const { tenantId } = TenantParamsSchema.parse(request.params);
+  const query = AmazonAccessTokenSchema.parse(request.query);
+  await requireTenantUser(request, tenantId);
+  await assertActiveTenant(tenantId);
+  const seller = (await pool.query(`select id, amazon_seller_id, marketplace_id, refresh_token_encrypted from sellers
+    where tenant_id=$1 and auth_status='authorized' and ($2::text is null or amazon_seller_id=$2) order by connected_at desc limit 1`, [tenantId, query.sellerId ?? null])).rows[0];
+  if (!seller) throw Object.assign(new Error('Amazon seller is not connected'), { statusCode: 404 });
+  const client = new SpApiClient(decryptSecret(seller.refresh_token_encrypted), { clientId: secrets.lwaClientId, clientSecret: secrets.lwaClientSecret, baseUrl: getSpApiEndpoint(seller.marketplace_id) });
+  const token = await client.getAccessToken();
+  await pool.query('update sellers set last_token_refresh_at=now() where id=$1', [seller.id]);
+  return { accessToken: token.accessToken, expiresAt: token.expiresAt, expiresIn: token.expiresIn, sellerId: seller.amazon_seller_id, marketplaceId: seller.marketplace_id };
 });
 
 app.get('/api/admin/tenants', async request => {
   await requireAdmin(request);
   const result = await pool.query(`select t.id, t.company_name, t.owner_email, t.login_email, t.status, t.plan, t.created_at, t.approved_at,
-      s.amazon_seller_id, s.marketplace_id, s.auth_status, exists(select 1 from sellers s2 where s2.tenant_id = t.id) as amazon_connected,
+      s.seller_name, s.amazon_seller_id, s.marketplace_id, s.auth_status, s.connected_at as amazon_connected_at, s.last_token_refresh_at, exists(select 1 from sellers s2 where s2.tenant_id = t.id) as amazon_connected,
       (select max(completed_at) from sync_jobs sj where sj.tenant_id = t.id and sj.status = 'completed') as last_successful_sync,
       (select count(*) from users u where u.tenant_id = t.id and u.status='active') as user_count
     from tenants t left join lateral (select * from sellers s where s.tenant_id=t.id order by connected_at desc limit 1) s on true order by t.created_at desc`);
@@ -160,6 +258,30 @@ app.post('/api/admin/tenants/:tenantId/reject', async request => { await require
 app.post('/api/admin/tenants/:tenantId/revoke-access', async request => { await requireAdmin(request); const { tenantId } = TenantParamsSchema.parse(request.params); return (await pool.query("update tenants set status='suspended' where id=$1 returning id,status", [tenantId])).rows[0]; });
 app.post('/api/admin/tenants/:tenantId/sync/:reportType', async request => { await requireAdmin(request); return syncReportForTenant(SyncParamsSchema.parse(request.params)); });
 
+
+app.post('/api/tenants/:tenantId/sync', async request => {
+  const { tenantId } = TenantParamsSchema.parse(request.params);
+  await requireTenantUser(request, tenantId);
+  await assertActiveTenant(tenantId);
+  const body = SellerSyncSchema.parse(request.body ?? {});
+  const results = [];
+  try {
+    const result = await syncRecentApiDataForTenant(tenantId);
+    results.push({ reportType: 'DIRECT_SP_API_SYNC', status: 'completed', ...result });
+  } catch (error) {
+    results.push({ reportType: 'DIRECT_SP_API_SYNC', status: 'failed', error: error instanceof Error ? error.message : 'unknown error' });
+  }
+  for (const reportType of body.reportTypes) {
+    try {
+      const result = await syncReportForTenant({ tenantId, reportType });
+      results.push({ reportType, status: 'completed', ...result });
+    } catch (error) {
+      results.push({ reportType, status: 'failed', error: error instanceof Error ? error.message : 'unknown error' });
+    }
+  }
+  return { results };
+});
+
 app.get('/api/tenants/:tenantId/dashboard', async request => {
   const { tenantId } = TenantParamsSchema.parse(request.params); await requireTenantUser(request, tenantId); await assertActiveTenant(tenantId);
   return withTenant(tenantId, async client => {
@@ -169,7 +291,12 @@ app.get('/api/tenants/:tenantId/dashboard', async request => {
     const trend = (await client.query(`select date, sum(ordered_product_sales) sales, sum(units_ordered) units, sum(sessions) sessions from sales_traffic_daily group by date order by date desc limit 90`)).rows.reverse();
     const payments = (await client.query(`select settlement_id, date(posted_date) posted_date, sum(amount) net_amount, count(*) lines from settlement_rows group by settlement_id,date(posted_date) order by date(posted_date) desc nulls last limit 50`)).rows;
     const jobs = (await client.query('select report_type,status,started_at,completed_at,error_message,s3_key from sync_jobs order by started_at desc nulls last limit 10')).rows;
-    return { kpis, orders, products, trend, payments, jobs };
+    const inventory = (await client.query('select sku, fulfillable_quantity, snapshot_date from inventory_snapshots order by snapshot_date desc, fulfillable_quantity desc nulls last limit 50')).rows;
+    const returns = (await client.query('select order_id, return_reason, disposition, status, return_date from returns order by return_date desc nulls last limit 50')).rows;
+    const reimbursements = (await client.query('select sku, amount, reason, reimbursement_date from reimbursements order by reimbursement_date desc nulls last limit 50')).rows;
+    const invoices = (await client.query('select invoice_type, order_id, taxable_value, cgst, sgst, igst, invoice_date from gst_invoices order by invoice_date desc nulls last limit 50')).rows;
+    const orderItems = (await client.query('select amazon_order_id, asin, sku, title, quantity_ordered, item_price, item_tax from order_items order by quantity_ordered desc nulls last limit 50')).rows;
+    return { kpis, orders, products, trend, payments, jobs, inventory, returns, reimbursements, invoices, orderItems };
   });
 });
 
@@ -187,9 +314,20 @@ app.get('/api/tenants/:tenantId/summary', async request => {
   }));
 });
 
+
+app.setNotFoundHandler(async (request, reply) => {
+  const pathname = new URL(request.url, 'http://localhost').pathname;
+  if (pathname === '/oauth/callback' || pathname === '/api/auth/amazon/callback') {
+    return handleAmazonCallback(request, reply);
+  }
+  return reply.code(404).send({ message: `Route ${request.method}:${request.url} not found`, error: 'Not Found', statusCode: 404 });
+});
+
 if (!databaseUrlConfigured) {
   app.log.warn('DATABASE_URL is not configured. Create .env from .env.example or export DATABASE_URL before running npm run dev.');
 } else {
+  await ensureSellerAuthSchema()
+    .catch(error => app.log.warn({ err: normalizeDatabaseError(error) }, 'Seller auth schema self-check skipped; run migrations before Amazon authorization'));
   await pool.query("insert into users(id,email,password_hash,role,status) values($1,$2,$3,'admin','active') on conflict(email) do nothing", [adminId, defaultAdminEmail, hashPassword(defaultAdminPassword)])
     .catch(error => app.log.warn({ err: normalizeDatabaseError(error) }, 'Admin seed skipped; run migrations before first login'));
 }
