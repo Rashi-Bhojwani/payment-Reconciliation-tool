@@ -273,6 +273,12 @@ app.post('/api/admin/tenants/:tenantId/reject', async request => { await require
 app.post('/api/admin/tenants/:tenantId/revoke-access', async request => { await requireAdmin(request); const { tenantId } = TenantParamsSchema.parse(request.params); return (await pool.query("update tenants set status='suspended' where id=$1 returning id,status", [tenantId])).rows[0]; });
 app.post('/api/admin/tenants/:tenantId/sync/:reportType', async request => { await requireAdmin(request); return syncReportForTenant(SyncParamsSchema.parse(request.params)); });
 
+app.post('/api/tenants/:tenantId/sync/:reportType', async request => {
+  const params = SyncParamsSchema.parse(request.params);
+  await requireTenantUser(request, params.tenantId);
+  await assertActiveTenant(params.tenantId);
+  return syncReportForTenant(params);
+});
 
 app.post('/api/tenants/:tenantId/sync', async request => {
   const { tenantId } = TenantParamsSchema.parse(request.params);
