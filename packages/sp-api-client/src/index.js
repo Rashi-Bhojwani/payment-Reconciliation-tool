@@ -1,3 +1,4 @@
+import { gunzipSync } from 'node:zlib';
 import { z } from 'zod';
 
 export const SP_API_BASE_URL = 'https://sellingpartnerapi-eu.amazon.com';
@@ -99,10 +100,15 @@ export class SpApiClient {
     const documentToken = GST_REPORTS.has(parsedReportType) ? await this.restrictedDataToken(reportDocumentId) : undefined;
     const document = await this.request(`/reports/2021-06-30/documents/${reportDocumentId}`, {}, documentToken);
     if (!document.ok) throw new Error(`Document lookup failed: ${document.status}`);
-    const { url } = z.object({ url: z.string().url() }).parse(await document.json());
+    const { url, compressionAlgorithm } = z.object({ url: z.string().url(), compressionAlgorithm: z.string().optional() }).parse(await document.json());
     const download = await fetch(url);
     if (!download.ok) throw new Error(`Document download failed: ${download.status}`);
-    return { reportId, reportDocumentId, content: await download.text() };
+    const buffer = Buffer.from(await download.arrayBuffer());
+    let content = buffer.toString('utf8');
+    if (compressionAlgorithm === 'GZIP') {
+      try { content = gunzipSync(buffer).toString('utf8'); } catch { content = buffer.toString('utf8'); }
+    }
+    return { reportId, reportDocumentId, content, compressionAlgorithm };
   }
 
   /** @param {string} sellerSku @param {unknown} body */
@@ -118,6 +124,14 @@ export class SpApiClient {
     const date = z.string().datetime().parse(createdAfter);
     const res = await this.request(`/orders/v0/orders?MarketplaceIds=${marketplaceId}&CreatedAfter=${encodeURIComponent(date)}`);
     if (!res.ok) throw new Error(`List orders failed: ${res.status}`);
+    return res.json();
+  }
+
+  /** @param {string} nextToken */
+  async listOrdersByNextToken(nextToken) {
+    const token = z.string().min(1).parse(nextToken);
+    const res = await this.request(`/orders/v0/orders?NextToken=${encodeURIComponent(token)}`);
+    if (!res.ok) throw new Error(`List orders page failed: ${res.status}`);
     return res.json();
   }
 

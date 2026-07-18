@@ -227,9 +227,20 @@ export async function syncRecentApiDataForTenant(tenantId, options = {}) {
       if (!seller.rowCount) throw new Error('No connected Amazon seller account');
       const marketplaceId = seller.rows[0].marketplace_id;
       const client = new SpApiClient(decryptSecret(seller.rows[0].refresh_token_encrypted), { baseUrl: getSpApiEndpoint(marketplaceId) });
-      const ordersResponse = await client.listOrders(createdAfter, marketplaceId);
-      const orders = ordersResponse?.payload?.Orders ?? ordersResponse?.Orders ?? [];
+      const orderPages = [];
+      let ordersResponse = await client.listOrders(createdAfter, marketplaceId);
+      orderPages.push(ordersResponse);
+      for (let page = 0; page < 20; page += 1) {
+        const nextToken = ordersResponse?.payload?.NextToken ?? ordersResponse?.NextToken;
+        if (!nextToken) break;
+        ordersResponse = await client.listOrdersByNextToken(nextToken);
+        orderPages.push(ordersResponse);
+      }
+      const orders = orderPages.flatMap(page => page?.payload?.Orders ?? page?.Orders ?? []);
+      const financeResponse = await client.listFinanceTransactions(createdAfter).catch(error => ({ syncError: error instanceof Error ? error.message : 'Finance sync failed' }));
+      const transactions = financeResponse?.payload?.transactions ?? financeResponse?.transactions ?? financeResponse?.payload?.Transactions ?? financeResponse?.Transactions ?? [];
       let ordersImported = 0;
+      let transactionsImported = 0;
       await withTenant(parsedTenantId, async db => {
         for (const order of orders) {
           const orderId = order.AmazonOrderId ?? order.amazonOrderId;
@@ -252,9 +263,20 @@ export async function syncRecentApiDataForTenant(tenantId, options = {}) {
             );
           }
         }
+        for (const transaction of transactions) {
+          const transactionId = transaction.transactionId ?? transaction.TransactionId ?? transaction.financialEventGroupId ?? transaction.FinancialEventGroupId;
+          if (!transactionId) continue;
+          await db.query(
+            `insert into finance_transactions(tenant_id, transaction_id, transaction_type, posted_date, total_amount, currency, related_order_id, raw)
+             values($1,$2,$3,$4,$5,$6,$7,$8)
+             on conflict (tenant_id, transaction_id) do update set transaction_type=excluded.transaction_type, posted_date=excluded.posted_date, total_amount=excluded.total_amount, currency=excluded.currency, related_order_id=excluded.related_order_id, raw=excluded.raw`,
+            [parsedTenantId, transactionId, transaction.transactionType ?? transaction.TransactionType ?? null, transaction.postedDate ?? transaction.PostedDate ?? null, number(transaction.totalAmount?.currencyAmount ?? transaction.TotalAmount?.CurrencyAmount ?? transaction.totalAmount?.Amount ?? transaction.TotalAmount?.Amount), transaction.totalAmount?.currencyCode ?? transaction.TotalAmount?.CurrencyCode ?? 'INR', transaction.relatedIdentifiers?.orderId ?? transaction.RelatedIdentifiers?.OrderId ?? null, transaction]
+          );
+          transactionsImported += 1;
+        }
       });
       await pool.query('update sync_jobs set status=$1, completed_at=now() where id=$2', ['completed', sync.rows[0].id]);
-      return { ordersImported };
+      return { ordersImported, transactionsImported, financeWarning: financeResponse?.syncError };
     } catch (error) {
       await pool.query('update sync_jobs set status=$1, completed_at=now(), error_message=$2 where id=$3', ['failed', error instanceof Error ? error.message : 'unknown error', sync.rows[0].id]);
       throw error;

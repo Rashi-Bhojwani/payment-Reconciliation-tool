@@ -249,24 +249,6 @@ app.get('/api/tenants/:tenantId/amazon/access-token', async request => {
   return { accessToken: token.accessToken, expiresAt: token.expiresAt, expiresIn: token.expiresIn, sellerId: seller.amazon_seller_id, marketplaceId: seller.marketplace_id };
 });
 
-// Disconnect the Amazon seller account linked to a tenant. Revokes the stored
-// refresh token locally (auth_status='revoked', token wiped, disconnected_at
-// stamped) so no further SP-API calls can be made on its behalf. The seller
-// can reconnect at any time via /api/auth/amazon/start, which upserts the
-// same row back to auth_status='authorized'.
-app.post('/api/tenants/:tenantId/amazon/disconnect', async request => {
-  const { tenantId } = TenantParamsSchema.parse(request.params);
-  await requireTenantUser(request, tenantId);
-  const result = await pool.query(
-    `update sellers set auth_status='revoked', refresh_token_encrypted=null, disconnected_at=now()
-       where tenant_id=$1 and auth_status='authorized'
-       returning id, amazon_seller_id, marketplace_id`,
-    [tenantId]
-  );
-  if (!result.rowCount) throw Object.assign(new Error('No connected Amazon account found for this tenant'), { statusCode: 404 });
-  return { disconnected: true, sellerId: result.rows[0].amazon_seller_id };
-});
-
 app.get('/api/admin/tenants', async request => {
   await requireAdmin(request);
   const result = await pool.query(`select t.id, t.company_name, t.owner_email, t.login_email, t.status, t.plan, t.created_at, t.approved_at,
@@ -306,18 +288,6 @@ app.post('/api/tenants/:tenantId/sync', async request => {
   return { results };
 });
 
-// Sync a single report type for a tenant. Lets a seller re-pull just one
-// report (e.g. only settlements) from the UI instead of the whole bundle
-// that /api/tenants/:tenantId/sync triggers. This is also what powers each
-// sidebar page's scoped sync ledger on the frontend.
-app.post('/api/tenants/:tenantId/sync/:reportType', async request => {
-  const params = SyncParamsSchema.parse(request.params);
-  await requireTenantUser(request, params.tenantId);
-  await assertActiveTenant(params.tenantId);
-  const result = await syncReportForTenant(params);
-  return { reportType: params.reportType, status: 'completed', ...result };
-});
-
 app.get('/api/tenants/:tenantId/dashboard', async request => {
   const { tenantId } = TenantParamsSchema.parse(request.params); await requireTenantUser(request, tenantId); await assertActiveTenant(tenantId);
   const sellerRow = (await pool.query(`select seller_name, amazon_seller_id, marketplace_id, auth_status, connected_at, last_token_refresh_at from sellers
@@ -326,6 +296,7 @@ app.get('/api/tenants/:tenantId/dashboard', async request => {
     ? { connected: true, sellerName: sellerRow.seller_name, sellerId: sellerRow.amazon_seller_id, marketplaceId: sellerRow.marketplace_id, authStatus: sellerRow.auth_status, connectedAt: sellerRow.connected_at, lastTokenRefreshAt: sellerRow.last_token_refresh_at }
     : { connected: false };
   return withTenant(tenantId, async client => {
+    const amazonAuth = (await pool.query("select amazon_seller_id, marketplace_id, auth_status, connected_at, last_token_refresh_at from sellers where tenant_id=$1 and auth_status='authorized' order by connected_at desc limit 1", [tenantId])).rows[0] ?? null;
     const kpis = (await client.query(`select coalesce(sum(amount),0) net_settled, coalesce(sum(case when amount > 0 then amount else 0 end),0) earnings, coalesce(sum(case when amount < 0 then amount else 0 end),0) deductions from settlement_rows`)).rows[0];
     const orders = (await client.query(`select count(*) orders, coalesce(sum(total_amount),0) order_value from orders`)).rows[0];
     const products = (await client.query(`select asin, sum(units_ordered) units, sum(ordered_product_sales) sales, avg(featured_offer_percentage) buy_box from sales_traffic_daily group by asin order by sales desc nulls last limit 20`)).rows;
@@ -337,7 +308,9 @@ app.get('/api/tenants/:tenantId/dashboard', async request => {
     const reimbursements = (await client.query('select sku, amount, reason, reimbursement_date from reimbursements order by reimbursement_date desc nulls last limit 50')).rows;
     const invoices = (await client.query('select invoice_type, order_id, taxable_value, cgst, sgst, igst, invoice_date from gst_invoices order by invoice_date desc nulls last limit 50')).rows;
     const orderItems = (await client.query('select amazon_order_id, asin, sku, title, quantity_ordered, item_price, item_tax from order_items order by quantity_ordered desc nulls last limit 50')).rows;
-    return { kpis, orders, products, trend, payments, jobs, inventory, returns, reimbursements, invoices, orderItems, seller };
+    const financeTransactions = (await client.query('select transaction_id, transaction_type, posted_date, total_amount, currency, related_order_id from finance_transactions order by posted_date desc nulls last limit 50')).rows;
+    const hasImportedData = Number(orders.orders ?? 0) > 0 || Number(kpis.net_settled ?? 0) !== 0 || products.length > 0 || payments.length > 0 || inventory.length > 0;
+    return { amazonAuth, hasImportedData, kpis, orders, products, trend, payments, jobs, inventory, returns, reimbursements, invoices, orderItems, financeTransactions };
   });
 });
 
