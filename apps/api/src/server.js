@@ -8,7 +8,7 @@ import { assertActiveTenant, databaseUrlConfigured, pool, withTenant } from '@re
 import { getSpApiEndpoint, MARKETPLACES, REPORT_TYPES, SpApiClient } from '@recon/sp-api-client';
 import { secrets } from './config/secrets.js';
 import { decryptSecret, encryptSecret } from './config/crypto.js';
-import { startScheduler, syncReportForTenant } from './jobs/sync.js';
+import { startScheduler, syncRecentApiDataForTenant, syncReportForTenant } from './jobs/sync.js';
 
 const app = Fastify({ logger: { redact: ['req.headers.authorization', 'refresh_token', 'access_token', 'password', 'passwordHash'] } });
 
@@ -20,6 +20,7 @@ const TenantParamsSchema = z.object({ tenantId: z.string().uuid() });
 const SyncParamsSchema = z.object({ tenantId: z.string().uuid(), reportType: z.enum(REPORT_TYPES) });
 const AmazonCallbackSchema = z.object({ spapi_oauth_code: z.string().optional(), code: z.string().optional(), selling_partner_id: z.string().optional(), state: z.string().optional() });
 const AmazonAccessTokenSchema = z.object({ sellerId: z.string().optional() });
+const SellerSyncSchema = z.object({ reportTypes: z.array(z.enum(REPORT_TYPES)).default(['GET_SALES_AND_TRAFFIC_REPORT', 'GET_V2_SETTLEMENT_REPORT_DATA_FLAT_FILE_V2']) });
 const RegisterSchema = z.object({ companyName: z.string().min(2), ownerEmail: z.string().email(), password: z.string().min(8), marketplaceId: z.string().default('A21TJRUUN4KGV') });
 const LoginSchema = z.object({ email: z.string().email(), password: z.string().min(1) });
 const adminId = '00000000-0000-0000-0000-000000000001';
@@ -108,6 +109,14 @@ async function requireAuth(request) {
 }
 async function requireAdmin(request) { const user = await requireAuth(request); if (user.role !== 'admin') throw Object.assign(new Error('Admin access required'), { statusCode: 403 }); return user; }
 async function requireTenantUser(request, tenantId) { const user = await requireAuth(request); if (user.role === 'admin') return user; if (user.tenantId !== tenantId) throw Object.assign(new Error('Tenant access denied'), { statusCode: 403 }); return user; }
+
+
+function queueInitialSellerSync(tenantId) {
+  syncRecentApiDataForTenant(tenantId).catch(error => app.log.warn({ err: error, tenantId }, 'Initial Amazon direct API sync failed'));
+  for (const reportType of ['GET_SALES_AND_TRAFFIC_REPORT', 'GET_V2_SETTLEMENT_REPORT_DATA_FLAT_FILE_V2']) {
+    syncReportForTenant({ tenantId, reportType }).catch(error => app.log.warn({ err: error, tenantId, reportType }, 'Initial Amazon report sync failed'));
+  }
+}
 
 function requestLog(request, error) {
   request.log.error({ error }, 'Unhandled API error');
@@ -212,6 +221,7 @@ async function handleAmazonCallback(request, reply) {
   } finally {
     client.release();
   }
+  queueInitialSellerSync(state.tenantId);
   return reply.redirect(`${secrets.frontendOrigin}/seller?tenantId=${state.tenantId}&connected=1&auth=complete`);
 }
 
@@ -247,6 +257,30 @@ app.post('/api/admin/tenants/:tenantId/grant-access', async request => { await r
 app.post('/api/admin/tenants/:tenantId/reject', async request => { await requireAdmin(request); const { tenantId } = TenantParamsSchema.parse(request.params); return (await pool.query("update tenants set status='suspended' where id=$1 returning id,status", [tenantId])).rows[0]; });
 app.post('/api/admin/tenants/:tenantId/revoke-access', async request => { await requireAdmin(request); const { tenantId } = TenantParamsSchema.parse(request.params); return (await pool.query("update tenants set status='suspended' where id=$1 returning id,status", [tenantId])).rows[0]; });
 app.post('/api/admin/tenants/:tenantId/sync/:reportType', async request => { await requireAdmin(request); return syncReportForTenant(SyncParamsSchema.parse(request.params)); });
+
+
+app.post('/api/tenants/:tenantId/sync', async request => {
+  const { tenantId } = TenantParamsSchema.parse(request.params);
+  await requireTenantUser(request, tenantId);
+  await assertActiveTenant(tenantId);
+  const body = SellerSyncSchema.parse(request.body ?? {});
+  const results = [];
+  try {
+    const result = await syncRecentApiDataForTenant(tenantId);
+    results.push({ reportType: 'DIRECT_SP_API_SYNC', status: 'completed', ...result });
+  } catch (error) {
+    results.push({ reportType: 'DIRECT_SP_API_SYNC', status: 'failed', error: error instanceof Error ? error.message : 'unknown error' });
+  }
+  for (const reportType of body.reportTypes) {
+    try {
+      const result = await syncReportForTenant({ tenantId, reportType });
+      results.push({ reportType, status: 'completed', ...result });
+    } catch (error) {
+      results.push({ reportType, status: 'failed', error: error instanceof Error ? error.message : 'unknown error' });
+    }
+  }
+  return { results };
+});
 
 app.get('/api/tenants/:tenantId/dashboard', async request => {
   const { tenantId } = TenantParamsSchema.parse(request.params); await requireTenantUser(request, tenantId); await assertActiveTenant(tenantId);
