@@ -173,7 +173,7 @@ app.get('/api/auth/amazon/start', async (request, reply) => {
   return reply.redirect(url.toString());
 });
 
-app.get('/api/auth/amazon/callback', async (request, reply) => {
+app.get('/oauth/callback', async (request, reply) => {
   const query = AmazonCallbackSchema.parse(request.query);
   const code = query.spapi_oauth_code ?? query.code;
   if (!code) return reply.code(400).send({ error: 'Missing authorization code' });
