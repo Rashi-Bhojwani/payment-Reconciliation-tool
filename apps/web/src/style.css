@@ -339,6 +339,15 @@ select, input { font-family: inherit; }
 .pill.status-pending { background: var(--warn-bg); color: #8a5a12; }
 .pill.status-suspended { background: var(--danger-bg); color: var(--danger); }
 .pill.status-idle { background: var(--paper); color: var(--muted); }
+.pill.status-locked { background: var(--paper); color: var(--muted); opacity: 0.7; }
+.ledger-locked-note {
+  background: var(--danger-bg);
+  color: var(--danger);
+  font-size: 12.5px;
+  padding: 10px 14px;
+  border-radius: var(--radius-sm);
+  margin-bottom: 4px;
+}
 
 /* ---------- Metrics & stats ---------- */
 .metrics-strip, .stat-grid {

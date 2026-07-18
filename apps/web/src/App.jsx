@@ -214,11 +214,12 @@ function StatCard({ title, value, hint }) { return <Card className="stat-card"><
 // independently, with its own status and last-synced timestamp. `reportTypes`
 // scopes which rows show up — each sidebar page passes only the report(s) it
 // actually depends on, instead of every page showing the full bundle.
-function SyncLedger({ tenantId, jobs = [], onSynced, reportTypes, title, subtitle }) {
+function SyncLedger({ tenantId, jobs = [], onSynced, reportTypes, title, subtitle, disabled }) {
   const [rowState, setRowState] = useState({});
   const reports = reportTypes ? REPORTS.filter(r => reportTypes.includes(r.type)) : REPORTS;
 
   async function syncOne(reportType) {
+    if (disabled) return;
     setRowState(s => ({ ...s, [reportType]: { loading: true } }));
     try {
       await api(`/api/tenants/${tenantId}/sync/${reportType}`, { method: 'POST' });
@@ -240,14 +241,15 @@ function SyncLedger({ tenantId, jobs = [], onSynced, reportTypes, title, subtitl
 
   return (
     <Card className="ledger-card">
-      <PanelHeader title={title ?? 'Sync ledger'} subtitle={subtitle ?? 'Pull one report at a time'} />
+      <PanelHeader title={title ?? 'Sync ledger'} subtitle={disabled ? 'Connect Amazon to enable sync' : (subtitle ?? 'Pull one report at a time')} />
+      {disabled && <div className="ledger-locked-note">Connect your Amazon account above to pull this data — sync is disabled until then.</div>}
       <div className="ledger">
         {reports.map((report, i) => {
           const job = jobs.find(j => j.report_type === report.type);
           const local = rowState[report.type];
           const busy = local?.loading;
           const failed = local?.error || job?.status === 'failed';
-          const statusLabel = busy ? 'syncing' : failed ? 'failed' : job?.status ?? 'idle';
+          const statusLabel = disabled ? 'locked' : busy ? 'syncing' : failed ? 'failed' : job?.status ?? 'idle';
           return (
             <div className="ledger-row" key={report.type}>
               <span className="ledger-index">{String(i + 1).padStart(2, '0')}</span>
@@ -257,7 +259,7 @@ function SyncLedger({ tenantId, jobs = [], onSynced, reportTypes, title, subtitl
                 <small>{local?.error ?? (job?.completed_at ? `Last synced ${timeAgo(job.completed_at)}` : report.hint)}</small>
               </div>
               <span className={`pill status-${statusLabel}`}>{statusLabel}</span>
-              <Button variant="secondary" disabled={busy} onClick={() => syncOne(report.type)}>{busy ? 'Syncing…' : 'Sync'}</Button>
+              <Button variant="secondary" disabled={disabled || busy} onClick={() => syncOne(report.type)}>{busy ? 'Syncing…' : 'Sync'}</Button>
             </div>
           );
         })}
@@ -312,8 +314,30 @@ function SellerDashboard() {
   const view = params.get('view') ?? 'dashboard';
   const [data, setData] = useState(null);
   const [error, setError] = useState('');
+  const [autoSyncing, setAutoSyncing] = useState(false);
+  const autoSyncedRef = useRef(false);
   async function load() { setError(''); try { setData(await api(`/api/tenants/${tenantId}/dashboard`)); } catch (e) { setError(e.message); } }
   useEffect(() => { if (tenantId) void load(); }, [tenantId]);
+
+  // Dashboard-only, once per session: as soon as we know the seller is
+  // Amazon-authenticated, automatically pull the default last-30-days data
+  // so the dashboard is populated without the user pressing anything. Every
+  // other page stays manual — its Sync button is the only thing that syncs it.
+  useEffect(() => {
+    if (view !== 'dashboard') return;
+    if (!data?.seller?.connected) return;
+    if (autoSyncedRef.current) return;
+    autoSyncedRef.current = true;
+    (async () => {
+      setAutoSyncing(true);
+      for (const report of REPORTS) {
+        try { await api(`/api/tenants/${tenantId}/sync/${report.type}`, { method: 'POST' }); } catch { /* one failed report shouldn't block the rest */ }
+      }
+      await load();
+      setAutoSyncing(false);
+    })();
+  }, [view, data?.seller?.connected, tenantId]);
+
   const channelData = useMemo(() => [
     { name: 'Order value', value: Number(data?.orders?.order_value ?? 0) },
     { name: 'Settlement earnings', value: Number(data?.kpis?.earnings ?? 0) },
@@ -321,6 +345,7 @@ function SellerDashboard() {
   ].filter(item => item.value > 0), [data]);
   const reportTypes = VIEW_REPORT_TYPES[view];
   const ledgerCopy = VIEW_LEDGER_COPY[view];
+  const connected = !!data?.seller?.connected;
 
   return <div className="page-stack">
     <div className="section-title">
@@ -331,7 +356,9 @@ function SellerDashboard() {
       </div>
     </div>
     {error && <p className="alert warning">{error}</p>}
-    {view !== 'dashboard' && <SyncLedger tenantId={tenantId} jobs={data?.jobs ?? []} onSynced={load} reportTypes={reportTypes} title={ledgerCopy?.title} subtitle={ledgerCopy?.subtitle} />}
+    {view === 'dashboard' && autoSyncing && <p className="alert success">Auto-syncing your last 30 days of data…</p>}
+    {view === 'dashboard' && !connected && data && <p className="alert warning">Connect your Amazon account to start pulling data — nothing syncs until then.</p>}
+    {view !== 'dashboard' && <SyncLedger tenantId={tenantId} jobs={data?.jobs ?? []} onSynced={load} reportTypes={reportTypes} title={ledgerCopy?.title} subtitle={ledgerCopy?.subtitle} disabled={!connected} />}
 
     {view === 'dashboard' && <DashboardOverview data={data} channelData={channelData} />}
     {view === 'sales' && <SalesAnalytics data={data} channelData={channelData} />}
