@@ -50,6 +50,14 @@ BEGIN
     EXECUTE format('CREATE POLICY tenant_isolation ON %I USING (tenant_id::text = current_setting(''app.current_tenant_id'', true)) WITH CHECK (tenant_id::text = current_setting(''app.current_tenant_id'', true))', t);
   END LOOP;
 END $$;
+
+DO $$
+DECLARE t text;
+BEGIN
+  FOREACH t IN ARRAY ARRAY['orders','settlement_rows','gst_invoices','returns','reimbursements','inventory_snapshots','sales_traffic_daily','fee_leak_flags','generated_reports'] LOOP
+    EXECUTE format('ALTER TABLE %I FORCE ROW LEVEL SECURITY', t);
+  END LOOP;
+END $$;
 CREATE EXTENSION IF NOT EXISTS pgcrypto;
 
 CREATE TABLE IF NOT EXISTS users (
@@ -107,6 +115,7 @@ DECLARE t text;
 BEGIN
   FOREACH t IN ARRAY ARRAY['order_items','finance_transactions'] LOOP
     EXECUTE format('ALTER TABLE %I ENABLE ROW LEVEL SECURITY', t);
+    EXECUTE format('ALTER TABLE %I FORCE ROW LEVEL SECURITY', t);
     EXECUTE format('DROP POLICY IF EXISTS tenant_isolation ON %I', t);
   END LOOP;
   CREATE POLICY tenant_isolation ON order_items USING (tenant_id::text = current_setting('app.current_tenant_id', true)) WITH CHECK (tenant_id::text = current_setting('app.current_tenant_id', true));

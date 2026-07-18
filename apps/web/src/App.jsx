@@ -39,7 +39,18 @@ const VIEW_LEDGER_COPY = {
 };
 
 function authHeaders() { const token = localStorage.getItem('token'); return token ? { authorization: `Bearer ${token}` } : {}; }
-async function api(path, options = {}) { const res = await fetch(`${API}${path}`, { ...options, headers: { 'content-type': 'application/json', ...authHeaders(), ...(options.headers ?? {}) } }); if (!res.ok) throw new Error((await res.json().catch(() => ({}))).error ?? 'Request failed'); return res.json(); }
+function jsonHeaders(options = {}) {
+  return {
+    ...(options.body === undefined ? {} : { 'content-type': 'application/json' }),
+    ...authHeaders(),
+    ...(options.headers ?? {})
+  };
+}
+async function api(path, options = {}) {
+  const res = await fetch(`${API}${path}`, { ...options, headers: jsonHeaders(options) });
+  if (!res.ok) throw new Error((await res.json().catch(() => ({}))).error ?? 'Request failed');
+  return res.json();
+}
 const ACCESS_TOKEN_CACHE_PREFIX = 'amazon_spapi_access_token:';
 function readAmazonTokenCache(tenantId) { const cached = JSON.parse(localStorage.getItem(`${ACCESS_TOKEN_CACHE_PREFIX}${tenantId}`) ?? 'null'); return cached?.accessToken && cached?.expiresAt && Date.now() < cached.expiresAt - 60_000 ? cached : null; }
 async function getAmazonAccessToken(tenantId) { const cached = readAmazonTokenCache(tenantId); if (cached) return cached; const fresh = await api(`/api/tenants/${tenantId}/amazon/access-token`); localStorage.setItem(`${ACCESS_TOKEN_CACHE_PREFIX}${tenantId}`, JSON.stringify(fresh)); return fresh; }
@@ -222,7 +233,8 @@ function SyncLedger({ tenantId, jobs = [], onSynced, reportTypes, title, subtitl
     if (disabled) return;
     setRowState(s => ({ ...s, [reportType]: { loading: true } }));
     try {
-      await api(`/api/tenants/${tenantId}/sync/${reportType}`, { method: 'POST' });
+      const result = await api(`/api/tenants/${tenantId}/sync/${reportType}`, { method: 'POST' });
+      if (result?.status === 'failed') throw new Error(result.error ?? 'Sync failed');
       setRowState(s => ({ ...s, [reportType]: { loading: false, justSynced: true } }));
       await onSynced?.();
     } catch (e) {
