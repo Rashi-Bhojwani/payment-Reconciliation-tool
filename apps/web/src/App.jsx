@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useState } from 'react';
+import React, { createContext, useContext, useEffect, useMemo, useRef, useState } from 'react';
 import { createRoot } from 'react-dom/client';
 import { BrowserRouter, NavLink, Route, Routes, useLocation, useNavigate, useSearchParams } from 'react-router-dom';
 import { Area, AreaChart, Cell, Pie, PieChart, ResponsiveContainer, Tooltip, XAxis, YAxis } from 'recharts';
@@ -25,17 +25,27 @@ function formatNumber(value) { return Number(value ?? 0).toLocaleString('en-IN')
 function reportLabel(value) { return REPORT_LABELS[value] ?? String(value ?? '—').replaceAll('_', ' ').toLowerCase().replace(/(^|\s)\S/g, letter => letter.toUpperCase()); }
 function trendHint(value) { return value ? <span className={`trend ${String(value).startsWith('-') ? 'down' : ''}`}>{value}</span> : null; }
 
+function Button({ className = '', variant = 'primary', ...props }) { return <button {...props} className={`btn btn-${variant} ${className}`} />; }
+function Input(props) { return <input {...props} className="input" />; }
+function Card({ children, className = '' }) { return <section className={`card ${className}`}>{children}</section>; }
+function Empty({ text }) { return <div className="empty-state">{text}</div>; }
+function formatCurrency(value) { return `₹${Number(value ?? 0).toLocaleString('en-IN', { maximumFractionDigits: 0 })}`; }
+function formatNumber(value) { return Number(value ?? 0).toLocaleString('en-IN'); }
+function reportLabel(value) { return REPORT_LABELS[value] ?? String(value ?? '—').replaceAll('_', ' ').toLowerCase().replace(/(^|\s)\S/g, letter => letter.toUpperCase()); }
+function trendHint(value) { return value ? <span className={`trend ${String(value).startsWith('-') ? 'down' : ''}`}>{value}</span> : null; }
+
+// Login only — account creation is admin-only now (see AdminDashboard's
+// "Create seller account" card), so there is no self-serve signup here.
 function Login({ setSession }) {
-  const [mode, setMode] = useState('login');
-  const [form, setForm] = useState({ email: 'admin@reconcile.local', password: 'Admin12345!', companyName: 'Demo Amazon Seller', ownerEmail: 'seller@example.com' });
+  const [form, setForm] = useState({ email: 'admin@reconcile.local', password: 'Admin12345!' });
   const [error, setError] = useState('');
   const navigate = useNavigate();
   async function submit(event) {
     event.preventDefault(); setError('');
     try {
-      const payload = mode === 'seller' ? { companyName: form.companyName, ownerEmail: form.ownerEmail, password: form.password, marketplaceId: 'A21TJRUUN4KGV' } : { email: form.email, password: form.password };
-      const data = await api(mode === 'seller' ? '/api/auth/register-seller' : '/api/auth/login', { method: 'POST', body: JSON.stringify(payload) });
-      localStorage.setItem('token', data.token); setSession(data.user); navigate(data.user.role === 'admin' ? '/admin' : `/seller?tenantId=${data.user.tenantId}`);
+      const data = await api('/api/auth/login', { method: 'POST', body: JSON.stringify(form) });
+      localStorage.setItem('token', data.token); setSession(data.user);
+      navigate(data.user.role === 'admin' ? '/admin' : `/seller?tenantId=${data.user.tenantId}`);
     } catch (e) { setError(e.message); }
   }
   return <main className="login-shell">
@@ -81,8 +91,13 @@ function DashboardPanelHeader({ title }) { return <div className="panel-header">
 function DashboardLegend({ items }) { return <div className="legend-list">{items.map((item, i) => <div key={item.name}><span style={{ background: COLORS[i % COLORS.length] }} />{item.name}<b>{formatCurrency(item.value)}</b></div>)}</div>; }
 function DataTableCard({ title, rows = [], columns }) { return <Card className="table-card"><DashboardPanelHeader title={title} />{rows.length ? <div className="table-wrap"><table><thead><tr>{columns.map(c => <th key={c}>{c.replaceAll('_', ' ')}</th>)}</tr></thead><tbody>{rows.map((row, i) => <tr key={i}>{columns.map(c => <td key={c}>{row[c] ?? '—'}</td>)}</tr>)}</tbody></table></div> : <Empty text="No data imported yet." />}</Card>; }
 
+// Admin-only screen. Admins never see the seller sidebar/navigation — this is
+// the whole of their UI: tenant table + the one place accounts get created.
 function AdminDashboard() {
   const [tenants, setTenants] = useState([]); const [error, setError] = useState('');
+  const [newSeller, setNewSeller] = useState({ companyName: '', ownerEmail: '', password: '' });
+  const [creating, setCreating] = useState(false);
+  const [createMsg, setCreateMsg] = useState('');
   async function load() { try { setTenants((await api('/api/admin/tenants')).tenants); } catch (e) { setError(e.message); } }
   async function action(path) { await api(path, { method: 'POST' }); await load(); }
   useEffect(() => { void load(); }, []);
