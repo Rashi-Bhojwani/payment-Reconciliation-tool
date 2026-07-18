@@ -277,7 +277,12 @@ app.post('/api/tenants/:tenantId/sync/:reportType', async request => {
   const params = SyncParamsSchema.parse(request.params);
   await requireTenantUser(request, params.tenantId);
   await assertActiveTenant(params.tenantId);
-  return syncReportForTenant(params);
+  try {
+    const result = await syncReportForTenant(params);
+    return { reportType: params.reportType, status: 'completed', ...result };
+  } catch (error) {
+    return { reportType: params.reportType, status: 'failed', error: error instanceof Error ? error.message : 'Report sync failed' };
+  }
 });
 
 app.post('/api/tenants/:tenantId/sync', async request => {
