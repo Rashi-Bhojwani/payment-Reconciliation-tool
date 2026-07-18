@@ -1,6 +1,5 @@
-import { loadDotEnv } from '@recon/db/env.js';
-
-loadDotEnv();
+import dotenv from 'dotenv';
+dotenv.config();
 
 export const secrets = {
   lwaClientId: process.env.LWA_CLIENT_ID ?? '',

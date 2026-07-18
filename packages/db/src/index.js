@@ -1,7 +1,4 @@
 import pg from 'pg';
-import { loadDotEnv } from './env.js';
-
-loadDotEnv();
 
 const { Pool } = pg;
 const databaseUrl = "postgresql://reconciliation:Rashib123@reconciliation-db.cvi6iwyo0o2r.ap-south-1.rds.amazonaws.com:5432/postgres";
