@@ -2,7 +2,7 @@ import cron from 'node-cron';
 import pLimit from 'p-limit';
 import { z } from 'zod';
 import { assertActiveTenant, pool, withTenant } from '@recon/db';
-import { REPORT_TYPES, SpApiClient } from '@recon/sp-api-client';
+import { getSpApiEndpoint, REPORT_TYPES, SpApiClient } from '@recon/sp-api-client';
 import { decryptSecret } from '../config/crypto.js';
 import { putRawReport } from '../storage/s3.js';
 import { runJob } from './runner.js';
@@ -199,14 +199,62 @@ export async function syncReportForTenant(params) {
   return runJob(`sync:${parsed.reportType}:${parsed.tenantId}`, async () => {
     const sync = await pool.query('insert into sync_jobs(tenant_id, report_type, status, started_at) values($1,$2,$3,now()) returning id', [parsed.tenantId, parsed.reportType, 'running']);
     try {
-      const seller = await pool.query('select refresh_token_encrypted, marketplace_id from sellers where tenant_id = $1 limit 1', [parsed.tenantId]);
+      const seller = await pool.query("select refresh_token_encrypted, marketplace_id from sellers where tenant_id = $1 and auth_status = 'authorized' order by connected_at desc limit 1", [parsed.tenantId]);
       if (!seller.rowCount) throw new Error('No connected Amazon seller account');
-      const client = new SpApiClient(decryptSecret(seller.rows[0].refresh_token_encrypted));
+      const client = new SpApiClient(decryptSecret(seller.rows[0].refresh_token_encrypted), { baseUrl: getSpApiEndpoint(seller.rows[0].marketplace_id) });
       const report = await client.fetchReport(parsed.reportType, parsed.tenantId, range, seller.rows[0].marketplace_id);
       const s3Key = await putRawReport({ tenantId: parsed.tenantId, reportType: parsed.reportType, reportId: report.reportId, content: report.content });
       const rowsImported = await saveStructuredRows(parsed.tenantId, parsed.reportType, report.content);
       await pool.query('update sync_jobs set status=$1, completed_at=now(), s3_key=$2 where id=$3', ['completed', s3Key, sync.rows[0].id]);
       return { rowsImported, s3Key };
+    } catch (error) {
+      await pool.query('update sync_jobs set status=$1, completed_at=now(), error_message=$2 where id=$3', ['failed', error instanceof Error ? error.message : 'unknown error', sync.rows[0].id]);
+      throw error;
+    }
+  });
+}
+
+
+/** @param {string} tenantId @param {{ days?: number }} [options] */
+export async function syncRecentApiDataForTenant(tenantId, options = {}) {
+  const parsedTenantId = z.string().uuid().parse(tenantId);
+  const createdAfter = new Date(Date.now() - (options.days ?? 30) * 864e5).toISOString();
+  await assertActiveTenant(parsedTenantId);
+  return runJob(`sync:direct-api:${parsedTenantId}`, async () => {
+    const sync = await pool.query('insert into sync_jobs(tenant_id, report_type, status, started_at) values($1,$2,$3,now()) returning id', [parsedTenantId, 'DIRECT_SP_API_SYNC', 'running']);
+    try {
+      const seller = await pool.query("select refresh_token_encrypted, marketplace_id from sellers where tenant_id = $1 and auth_status = 'authorized' order by connected_at desc limit 1", [parsedTenantId]);
+      if (!seller.rowCount) throw new Error('No connected Amazon seller account');
+      const marketplaceId = seller.rows[0].marketplace_id;
+      const client = new SpApiClient(decryptSecret(seller.rows[0].refresh_token_encrypted), { baseUrl: getSpApiEndpoint(marketplaceId) });
+      const ordersResponse = await client.listOrders(createdAfter, marketplaceId);
+      const orders = ordersResponse?.payload?.Orders ?? ordersResponse?.Orders ?? [];
+      let ordersImported = 0;
+      await withTenant(parsedTenantId, async db => {
+        for (const order of orders) {
+          const orderId = order.AmazonOrderId ?? order.amazonOrderId;
+          if (!orderId) continue;
+          await db.query(
+            `insert into orders(tenant_id, amazon_order_id, order_date, total_amount, status)
+             values($1,$2,$3,$4,$5)
+             on conflict (tenant_id, amazon_order_id) do update set order_date=excluded.order_date, total_amount=excluded.total_amount, status=excluded.status`,
+            [parsedTenantId, orderId, order.PurchaseDate ?? order.purchaseDate ?? null, number(order.OrderTotal?.Amount ?? order.orderTotal?.amount), order.OrderStatus ?? order.orderStatus ?? null]
+          );
+          ordersImported += 1;
+          const itemsResponse = await client.listOrderItems(orderId).catch(() => undefined);
+          const items = itemsResponse?.payload?.OrderItems ?? itemsResponse?.OrderItems ?? [];
+          for (const item of items) {
+            await db.query(
+              `insert into order_items(tenant_id, amazon_order_id, asin, sku, title, quantity_ordered, item_price, item_tax, promotion_discount, raw)
+               values($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
+               on conflict (tenant_id, amazon_order_id, sku, asin) do update set title=excluded.title, quantity_ordered=excluded.quantity_ordered, item_price=excluded.item_price, item_tax=excluded.item_tax, promotion_discount=excluded.promotion_discount, raw=excluded.raw`,
+              [parsedTenantId, orderId, item.ASIN ?? item.asin ?? null, item.SellerSKU ?? item.sellerSku ?? null, item.Title ?? item.title ?? null, integer(item.QuantityOrdered ?? item.quantityOrdered), number(item.ItemPrice?.Amount ?? item.itemPrice?.amount), number(item.ItemTax?.Amount ?? item.itemTax?.amount), number(item.PromotionDiscount?.Amount ?? item.promotionDiscount?.amount), item]
+            );
+          }
+        }
+      });
+      await pool.query('update sync_jobs set status=$1, completed_at=now() where id=$2', ['completed', sync.rows[0].id]);
+      return { ordersImported };
     } catch (error) {
       await pool.query('update sync_jobs set status=$1, completed_at=now(), error_message=$2 where id=$3', ['failed', error instanceof Error ? error.message : 'unknown error', sync.rows[0].id]);
       throw error;
