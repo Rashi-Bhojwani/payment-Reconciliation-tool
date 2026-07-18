@@ -243,6 +243,55 @@ select, input { font-family: inherit; }
 .amazon-chip .chip-copy small { color: var(--muted); font-size: 11px; }
 .amazon-chip.is-disconnected { border-color: rgba(192, 67, 46, 0.3); background: var(--danger-bg); }
 
+/* ---------- Date range picker ---------- */
+.date-range-picker { position: relative; }
+.date-range-trigger {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  padding: 8px 14px;
+  background: var(--surface);
+  color: var(--text);
+  font-size: 13px;
+  font-weight: 600;
+}
+.date-range-trigger:hover { border-color: var(--ink); }
+.date-range-icon { font-size: 13px; }
+.date-range-panel {
+  position: absolute;
+  top: calc(100% + 8px);
+  right: 0;
+  z-index: 40;
+  display: flex;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  box-shadow: 0 12px 32px rgba(18, 33, 58, 0.16);
+  overflow: hidden;
+}
+.date-range-presets { display: flex; flex-direction: column; padding: 10px; gap: 2px; border-right: 1px solid var(--border); min-width: 140px; }
+.date-range-presets button { text-align: left; border: none; background: transparent; padding: 9px 10px; border-radius: var(--radius-sm); font-size: 13px; color: var(--text); font-weight: 500; }
+.date-range-presets button:hover { background: var(--paper); }
+.date-range-presets button.active { background: var(--brass); color: #fff; font-weight: 600; }
+.date-range-calendar { padding: 16px; width: 300px; }
+.calendar-nav { display: flex; align-items: center; justify-content: space-between; margin-bottom: 10px; }
+.calendar-nav button { border: 1px solid var(--border); background: var(--surface); border-radius: 6px; width: 26px; height: 26px; font-size: 15px; line-height: 1; color: var(--ink); }
+.calendar-nav button:hover { border-color: var(--ink); }
+.calendar-nav b { font-size: 13.5px; }
+.calendar-weekdays { display: grid; grid-template-columns: repeat(7, 1fr); margin-bottom: 4px; }
+.calendar-weekdays span { text-align: center; font-size: 11px; color: var(--muted); font-weight: 600; }
+.calendar-grid { display: grid; grid-template-columns: repeat(7, 1fr); gap: 2px; }
+.calendar-cell { aspect-ratio: 1; border: none; background: transparent; border-radius: 8px; font-size: 12.5px; color: var(--text); font-family: 'IBM Plex Mono', monospace; }
+.calendar-cell:hover:not(:disabled):not(.empty) { background: var(--paper); }
+.calendar-cell.empty { visibility: hidden; }
+.calendar-cell:disabled { color: var(--border); cursor: not-allowed; }
+.calendar-cell.in-range { background: rgba(201, 138, 44, 0.14); border-radius: 0; }
+.calendar-cell.endpoint { background: var(--brass); color: #fff; border-radius: 8px; font-weight: 600; }
+.calendar-footer { display: flex; align-items: center; justify-content: space-between; margin-top: 12px; gap: 10px; }
+.calendar-actions { display: flex; gap: 8px; }
+
 /* ---------- Sync ledger (signature element) ---------- */
 .ledger-card { padding: 22px 22px 8px; }
 .ledger { display: flex; flex-direction: column; }
@@ -362,6 +411,8 @@ tr:last-child td { border-bottom: none; }
 .row-actions { display: flex; gap: 6px; flex-wrap: wrap; }
 
 @media (max-width: 980px) {
+  .date-range-panel { right: auto; left: 0; flex-direction: column; }
+  .date-range-presets { flex-direction: row; overflow-x: auto; border-right: none; border-bottom: 1px solid var(--border); }
   .login-shell { grid-template-columns: 1fr; }
   .login-card { margin: 0; border-radius: 0; }
   .app-shell { grid-template-columns: 1fr; }

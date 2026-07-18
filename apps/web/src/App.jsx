@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useState } from 'react';
+import React, { createContext, useContext, useEffect, useMemo, useRef, useState } from 'react';
 import { createRoot } from 'react-dom/client';
 import { BrowserRouter, Navigate, NavLink, Route, Routes, useLocation, useNavigate, useSearchParams } from 'react-router-dom';
 import { Area, AreaChart, Cell, Pie, PieChart, ResponsiveContainer, Tooltip, XAxis, YAxis } from 'recharts';
@@ -18,8 +18,10 @@ const COLORS = ['#c98a2c', '#1f8a85', '#12213a', '#7fb6b2'];
 
 // Which report(s) power each sidebar page. Each page now syncs only what it
 // needs instead of showing every report side-by-side everywhere.
+// Dashboard is deliberately absent here — it's an overview page and no
+// longer shows any sync controls at all. Every other sidebar page gets only
+// the report(s) it actually depends on.
 const VIEW_REPORT_TYPES = {
-  dashboard: REPORTS.map(r => r.type),
   sales: ['GET_SALES_AND_TRAFFIC_REPORT'],
   inventory: [],
   payouts: ['GET_V2_SETTLEMENT_REPORT_DATA_FLAT_FILE_V2'],
@@ -28,7 +30,6 @@ const VIEW_REPORT_TYPES = {
   reports: REPORTS.map(r => r.type)
 };
 const VIEW_LEDGER_COPY = {
-  dashboard: { title: 'Sync ledger', subtitle: 'Pull one report at a time' },
   sales: { title: 'Sales & traffic sync', subtitle: 'Powers this page only' },
   inventory: { title: 'Inventory sync', subtitle: 'This page only' },
   payouts: { title: 'Settlement sync', subtitle: 'Powers this page only' },
@@ -101,6 +102,109 @@ function Login({ setSession }) {
       </form>
     </Card>
   </main>;
+}
+
+// ---------- Date range picker ----------
+// Replaces the static "Last 30 Days" label with an actual calendar: presets
+// on the left, click-to-select custom range on the right. The chosen range
+// is shared via context so panel subtitles that used to hardcode
+// "Last 30 Days" now reflect whatever the user picked.
+function startOfDay(d) { const x = new Date(d); x.setHours(0, 0, 0, 0); return x; }
+function addDays(d, n) { const x = new Date(d); x.setDate(x.getDate() + n); return x; }
+function formatShort(d) { return d.toLocaleDateString('en-IN', { month: 'short', day: 'numeric' }); }
+function formatRangeLabel(start, end) {
+  const startStr = formatShort(start);
+  const endStr = start.getFullYear() === end.getFullYear() ? formatShort(end) : end.toLocaleDateString('en-IN', { month: 'short', day: 'numeric', year: 'numeric' });
+  return `${startStr} – ${endStr}, ${end.getFullYear()}`;
+}
+function buildMonthGrid(viewDate) {
+  const year = viewDate.getFullYear(), month = viewDate.getMonth();
+  const startWeekday = new Date(year, month, 1).getDay();
+  const daysInMonth = new Date(year, month + 1, 0).getDate();
+  const cells = Array(startWeekday).fill(null);
+  for (let d = 1; d <= daysInMonth; d++) cells.push(new Date(year, month, d));
+  return cells;
+}
+const DATE_PRESETS = [
+  { label: 'Today', range: () => { const t = startOfDay(new Date()); return [t, t]; } },
+  { label: 'Last 7 Days', range: () => { const t = startOfDay(new Date()); return [addDays(t, -6), t]; } },
+  { label: 'Last 30 Days', range: () => { const t = startOfDay(new Date()); return [addDays(t, -29), t]; } },
+  { label: 'Last 90 Days', range: () => { const t = startOfDay(new Date()); return [addDays(t, -89), t]; } },
+  { label: 'This Month', range: () => { const t = new Date(); return [new Date(t.getFullYear(), t.getMonth(), 1), startOfDay(t)]; } },
+  { label: 'Last Month', range: () => { const t = new Date(); return [new Date(t.getFullYear(), t.getMonth() - 1, 1), new Date(t.getFullYear(), t.getMonth(), 0)]; } }
+];
+function defaultDateRange() { const end = startOfDay(new Date()); return { label: 'Last 30 Days', start: addDays(end, -29), end }; }
+const DateRangeContext = createContext({ range: defaultDateRange(), setRange: () => {} });
+
+function DateRangePicker({ value, onChange }) {
+  const [open, setOpen] = useState(false);
+  const [viewMonth, setViewMonth] = useState(() => new Date(value.end.getFullYear(), value.end.getMonth(), 1));
+  const [pending, setPending] = useState({ start: value.start, end: value.end });
+  const [selecting, setSelecting] = useState(false);
+  const rootRef = useRef(null);
+
+  useEffect(() => {
+    if (!open) return;
+    function onClickOutside(e) { if (rootRef.current && !rootRef.current.contains(e.target)) setOpen(false); }
+    document.addEventListener('mousedown', onClickOutside);
+    return () => document.removeEventListener('mousedown', onClickOutside);
+  }, [open]);
+
+  function togglePicker() {
+    setPending({ start: value.start, end: value.end });
+    setViewMonth(new Date(value.end.getFullYear(), value.end.getMonth(), 1));
+    setSelecting(false);
+    setOpen(o => !o);
+  }
+  function pickDay(day) {
+    if (!day) return;
+    if (!selecting) { setPending({ start: day, end: day }); setSelecting(true); }
+    else { setPending(day < pending.start ? { start: day, end: pending.start } : { start: pending.start, end: day }); setSelecting(false); }
+  }
+  function applyPreset(preset) { const [start, end] = preset.range(); onChange({ label: preset.label, start, end }); setOpen(false); }
+  function applyCustom() { onChange({ label: formatRangeLabel(pending.start, pending.end), start: pending.start, end: pending.end }); setOpen(false); }
+
+  const cells = useMemo(() => buildMonthGrid(viewMonth), [viewMonth]);
+  const today = startOfDay(new Date()).getTime();
+
+  return (
+    <div className="date-range-picker" ref={rootRef}>
+      <button type="button" className="date-range-trigger" onClick={togglePicker}>
+        <span className="date-range-icon">📅</span>{value.label}
+      </button>
+      {open && (
+        <div className="date-range-panel">
+          <div className="date-range-presets">
+            {DATE_PRESETS.map(p => <button type="button" key={p.label} className={p.label === value.label ? 'active' : ''} onClick={() => applyPreset(p)}>{p.label}</button>)}
+          </div>
+          <div className="date-range-calendar">
+            <div className="calendar-nav">
+              <button type="button" onClick={() => setViewMonth(m => new Date(m.getFullYear(), m.getMonth() - 1, 1))}>‹</button>
+              <b>{viewMonth.toLocaleDateString('en-IN', { month: 'long', year: 'numeric' })}</b>
+              <button type="button" onClick={() => setViewMonth(m => new Date(m.getFullYear(), m.getMonth() + 1, 1))}>›</button>
+            </div>
+            <div className="calendar-weekdays">{['S', 'M', 'T', 'W', 'T', 'F', 'S'].map((w, i) => <span key={i}>{w}</span>)}</div>
+            <div className="calendar-grid">
+              {cells.map((day, i) => {
+                if (!day) return <span key={i} className="calendar-cell empty" />;
+                const t = day.getTime();
+                const inRange = t >= pending.start.getTime() && t <= pending.end.getTime();
+                const isEndpoint = t === pending.start.getTime() || t === pending.end.getTime();
+                return <button type="button" key={i} disabled={t > today} className={`calendar-cell ${inRange ? 'in-range' : ''} ${isEndpoint ? 'endpoint' : ''}`} onClick={() => pickDay(day)}>{day.getDate()}</button>;
+              })}
+            </div>
+            <div className="calendar-footer">
+              <span className="muted small">{formatRangeLabel(pending.start, pending.end)}</span>
+              <div className="calendar-actions">
+                <Button variant="ghost" onClick={() => setOpen(false)}>Cancel</Button>
+                <Button onClick={applyCustom}>Apply</Button>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
+  );
 }
 
 function MiniMetric({ title, value, hint }) { return <div className="mini-metric"><span>{title}</span><strong>{value}</strong>{trendHint(hint)}</div>; }
@@ -215,8 +319,8 @@ function SellerDashboard() {
     { name: 'Settlement earnings', value: Number(data?.kpis?.earnings ?? 0) },
     { name: 'Settlement deductions', value: Math.abs(Number(data?.kpis?.deductions ?? 0)) }
   ].filter(item => item.value > 0), [data]);
-  const reportTypes = VIEW_REPORT_TYPES[view] ?? REPORTS.map(r => r.type);
-  const ledgerCopy = VIEW_LEDGER_COPY[view] ?? { title: 'Sync ledger', subtitle: 'Pull one report at a time' };
+  const reportTypes = VIEW_REPORT_TYPES[view];
+  const ledgerCopy = VIEW_LEDGER_COPY[view];
 
   return <div className="page-stack">
     <div className="section-title">
@@ -227,7 +331,7 @@ function SellerDashboard() {
       </div>
     </div>
     {error && <p className="alert warning">{error}</p>}
-    <SyncLedger tenantId={tenantId} jobs={data?.jobs ?? []} onSynced={load} reportTypes={reportTypes} title={ledgerCopy.title} subtitle={ledgerCopy.subtitle} />
+    {view !== 'dashboard' && <SyncLedger tenantId={tenantId} jobs={data?.jobs ?? []} onSynced={load} reportTypes={reportTypes} title={ledgerCopy?.title} subtitle={ledgerCopy?.subtitle} />}
 
     {view === 'dashboard' && <DashboardOverview data={data} channelData={channelData} />}
     {view === 'sales' && <SalesAnalytics data={data} channelData={channelData} />}
@@ -242,9 +346,9 @@ function SellerDashboard() {
 function viewTitle(view) { return ({ dashboard: 'Dashboard', sales: 'Sales Analytics', inventory: 'Inventory', payouts: 'Payout Reconciliation', brand: 'Brand Analytics', health: 'Account Health', reports: 'Reports' })[view] ?? 'Dashboard'; }
 function viewDescription(view) { return ({ dashboard: 'Live seller KPIs populated from synced SP-API orders and reports.', sales: 'Revenue, order value, units and product sales trends from Amazon reports.', inventory: 'FBA inventory snapshots imported from SP-API inventory reports.', payouts: 'Settlement rows and payout reconciliation from Amazon settlement reports.', brand: 'ASIN-level product performance from Sales & Traffic reports.', health: 'Returns and reimbursement signals imported from Amazon reports.', reports: 'GST/report imports and recent sync job status.' })[view] ?? 'Live seller KPIs populated from synced SP-API orders and reports.'; }
 function DashboardOverview({ data, channelData }) { return <><div className="metrics-strip"><MiniMetric title="Total Revenue" value={formatCurrency(data?.orders?.order_value)} /><MiniMetric title="Units Sold" value={formatNumber(data?.products?.reduce((a, p) => a + Number(p.units ?? 0), 0))} /><MiniMetric title="Avg Order Value" value={formatCurrency(Number(data?.orders?.order_value ?? 0) / Math.max(Number(data?.orders?.orders ?? 0), 1))} /><MiniMetric title="Orders" value={formatNumber(data?.orders?.orders)} /></div><SalesAnalytics data={data} channelData={channelData} /><div className="dashboard-grid two"><TableCard title="Payment Settlements" rows={data?.payments ?? []} columns={['posted_date', 'settlement_id', 'net_amount', 'lines']} /><TableCard title="Recent Sync Jobs" rows={data?.jobs ?? []} columns={['report_type', 'status', 'completed_at', 'error_message']} /></div></>; }
-function SalesAnalytics({ data, channelData }) { return <><div className="dashboard-grid"><Card className="panel"><PanelHeader title="Sales Source Distribution" />{channelData.length ? <><ResponsiveContainer width="100%" height={220}><PieChart><Pie data={channelData} innerRadius={62} outerRadius={92} dataKey="value">{channelData.map((_, i) => <Cell key={i} fill={COLORS[i % COLORS.length]} />)}</Pie><Tooltip /></PieChart></ResponsiveContainer><Legend items={channelData} /></> : <Empty text="No synced sales or settlement totals yet." />}</Card><Card className="panel wide"><PanelHeader title="Sales Trend (Last 30 Days)" />{data?.trend?.length ? <ResponsiveContainer width="100%" height={250}><AreaChart data={data.trend}><defs><linearGradient id="sales" x1="0" y1="0" x2="0" y2="1"><stop offset="5%" stopColor="#1f8a85" stopOpacity={0.35}/><stop offset="95%" stopColor="#1f8a85" stopOpacity={0}/></linearGradient></defs><XAxis dataKey="date" /><YAxis /><Tooltip /><Area dataKey="sales" stroke="#1f8a85" fill="url(#sales)" strokeWidth={3} /></AreaChart></ResponsiveContainer> : <Empty text="No imported sales trend yet. Use the Sync above to pull SP-API reports." />}</Card></div><div className="dashboard-grid two"><TableCard title="Product Performance" rows={data?.products ?? []} columns={['asin', 'units', 'sales', 'buy_box']} /><TableCard title="Order Items" rows={data?.orderItems ?? []} columns={['amazon_order_id', 'asin', 'sku', 'title', 'quantity_ordered', 'item_price']} /></div></>; }
+function SalesAnalytics({ data, channelData }) { const { range } = useContext(DateRangeContext); return <><div className="dashboard-grid"><Card className="panel"><PanelHeader title="Sales Source Distribution" />{channelData.length ? <><ResponsiveContainer width="100%" height={220}><PieChart><Pie data={channelData} innerRadius={62} outerRadius={92} dataKey="value">{channelData.map((_, i) => <Cell key={i} fill={COLORS[i % COLORS.length]} />)}</Pie><Tooltip /></PieChart></ResponsiveContainer><Legend items={channelData} /></> : <Empty text="No synced sales or settlement totals yet." />}</Card><Card className="panel wide"><PanelHeader title={`Sales Trend (${range.label})`} />{data?.trend?.length ? <ResponsiveContainer width="100%" height={250}><AreaChart data={data.trend}><defs><linearGradient id="sales" x1="0" y1="0" x2="0" y2="1"><stop offset="5%" stopColor="#1f8a85" stopOpacity={0.35}/><stop offset="95%" stopColor="#1f8a85" stopOpacity={0}/></linearGradient></defs><XAxis dataKey="date" /><YAxis /><Tooltip /><Area dataKey="sales" stroke="#1f8a85" fill="url(#sales)" strokeWidth={3} /></AreaChart></ResponsiveContainer> : <Empty text="No imported sales trend yet. Use the Sync above to pull SP-API reports." />}</Card></div><div className="dashboard-grid two"><TableCard title="Product Performance" rows={data?.products ?? []} columns={['asin', 'units', 'sales', 'buy_box']} /><TableCard title="Order Items" rows={data?.orderItems ?? []} columns={['amazon_order_id', 'asin', 'sku', 'title', 'quantity_ordered', 'item_price']} /></div></>; }
 
-function PanelHeader({ title, subtitle }) { return <div className="panel-header"><h2>{title}</h2><span>{subtitle ?? 'Last 30 Days'}</span></div>; }
+function PanelHeader({ title, subtitle }) { const { range } = useContext(DateRangeContext); return <div className="panel-header"><h2>{title}</h2><span>{subtitle ?? range.label}</span></div>; }
 function Legend({ items }) { return <div className="legend-list">{items.map((item, i) => <div key={item.name}><span style={{ background: COLORS[i % COLORS.length] }} />{item.name}<b>{formatCurrency(item.value)}</b></div>)}</div>; }
 function TableCard({ title, rows = [], columns }) { return <Card className="table-card"><PanelHeader title={title} />{rows.length ? <div className="table-wrap"><table><thead><tr>{columns.map(c => <th key={c}>{c.replaceAll('_', ' ')}</th>)}</tr></thead><tbody>{rows.map((row, i) => <tr key={i}>{columns.map(c => <td key={c}>{row[c] ?? '—'}</td>)}</tr>)}</tbody></table></div> : <Empty text="No data imported yet." />}</Card>; }
 
@@ -300,6 +404,7 @@ function SidebarLink({ to, children }) {
 // Seller-facing shell: sidebar + topbar. Admins never render this component.
 function SellerShell({ session, setSession }) {
   function logout() { localStorage.removeItem('token'); setSession(null); }
+  const [range, setRange] = useState(defaultDateRange);
   return <div className="app-shell">
     <aside className="sidebar">
       <div className="logo"><span>W</span><div><b>WELLSURE</b><small>Seller Intelligence</small></div></div>
@@ -317,14 +422,16 @@ function SellerShell({ session, setSession }) {
       <header className="topbar">
         <div className="search">⌕ Search</div>
         <select><option>Amazon.in</option></select>
-        <select><option>Last 30 Days</option></select>
+        <DateRangePicker value={range} onChange={setRange} />
         <div className="avatar">{session?.email?.[0]?.toUpperCase()}</div>
         <Button variant="dark" onClick={logout}>Logout {session?.email}</Button>
       </header>
-      <Routes>
-        <Route path="/seller" element={<SellerDashboard />} />
-        <Route path="*" element={<Navigate to={`/seller?tenantId=${session?.tenantId ?? ''}&view=dashboard`} replace />} />
-      </Routes>
+      <DateRangeContext.Provider value={{ range, setRange }}>
+        <Routes>
+          <Route path="/seller" element={<SellerDashboard />} />
+          <Route path="*" element={<Navigate to={`/seller?tenantId=${session?.tenantId ?? ''}&view=dashboard`} replace />} />
+        </Routes>
+      </DateRangeContext.Provider>
     </main>
   </div>;
 }
