@@ -310,7 +310,7 @@ app.get('/api/tenants/:tenantId/dashboard', async request => {
     const orderItems = (await client.query('select amazon_order_id, asin, sku, title, quantity_ordered, item_price, item_tax from order_items order by quantity_ordered desc nulls last limit 50')).rows;
     const financeTransactions = (await client.query('select transaction_id, transaction_type, posted_date, total_amount, currency, related_order_id from finance_transactions order by posted_date desc nulls last limit 50')).rows;
     const hasImportedData = Number(orders.orders ?? 0) > 0 || Number(kpis.net_settled ?? 0) !== 0 || products.length > 0 || payments.length > 0 || inventory.length > 0;
-    return { amazonAuth, hasImportedData, kpis, orders, products, trend, payments, jobs, inventory, returns, reimbursements, invoices, orderItems, financeTransactions };
+    return { seller, amazonAuth, hasImportedData, kpis, orders, products, trend, payments, jobs, inventory, returns, reimbursements, invoices, orderItems, financeTransactions };
   });
 });
 
