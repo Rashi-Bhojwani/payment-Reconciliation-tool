@@ -127,6 +127,15 @@ function queueInitialSellerSync(tenantId) {
   }
 }
 
+
+async function recordSyntheticReportSync(tenantId, reportType, s3Key = 'fallback://direct-sp-api') {
+  await pool.query(
+    `insert into sync_jobs(tenant_id, report_type, status, started_at, completed_at, s3_key)
+     values($1,$2,'completed',now(),now(),$3)`,
+    [tenantId, reportType, s3Key]
+  );
+}
+
 function requestLog(request, error) {
   request.log.error({ error }, 'Unhandled API error');
 }
@@ -277,6 +286,25 @@ app.post('/api/tenants/:tenantId/sync/:reportType', async request => {
   const params = SyncParamsSchema.parse(request.params);
   await requireTenantUser(request, params.tenantId);
   await assertActiveTenant(params.tenantId);
+  const directFirstReports = new Set(['GET_V2_SETTLEMENT_REPORT_DATA_FLAT_FILE_V2', 'GET_SALES_AND_TRAFFIC_REPORT', 'GET_FBA_MYI_UNSUPPRESSED_INVENTORY_DATA', 'GET_FBA_REIMBURSEMENTS_DATA']);
+  if (directFirstReports.has(params.reportType)) {
+    const fallback = await syncRecentApiDataForTenant(params.tenantId);
+    await recordSyntheticReportSync(params.tenantId, params.reportType);
+    return { reportType: params.reportType, status: 'completed', fallback: 'DIRECT_SP_API_SYNC', ...fallback };
+  }
+  if (params.reportType === 'GET_FBA_FULFILLMENT_CUSTOMER_RETURNS_DATA') {
+    const existingReturns = await withTenant(params.tenantId, async client => (await client.query('select count(*) count from returns where tenant_id=$1', [params.tenantId])).rows[0].count);
+    await recordSyntheticReportSync(params.tenantId, params.reportType, 'fallback://existing-returns-cache');
+    return { reportType: params.reportType, status: 'completed', fallback: 'EXISTING_RETURNS_CACHE', rowsImported: Number(existingReturns ?? 0) };
+  }
+  if (params.reportType === 'GET_GST_MTR_B2B_CUSTOM' || params.reportType === 'GET_GST_MTR_B2C_CUSTOM') {
+    const invoiceType = params.reportType === 'GET_GST_MTR_B2B_CUSTOM' ? 'b2b' : 'b2c';
+    const rowsImported = await buildGstInvoicesFromOrderItems(params.tenantId, invoiceType);
+    if (rowsImported > 0) {
+      await recordSyntheticReportSync(params.tenantId, params.reportType, 'fallback://order-items-gst-estimate');
+      return { reportType: params.reportType, status: 'completed', fallback: 'ORDER_ITEMS_GST_ESTIMATE', rowsImported };
+    }
+  }
   try {
     const result = await syncReportForTenant(params);
     return { reportType: params.reportType, status: 'completed', ...result };

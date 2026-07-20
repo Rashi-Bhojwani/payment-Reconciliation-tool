@@ -978,10 +978,10 @@ Tenant-triggered report sync.
 
 Important fallback behavior:
 
-- First tries report sync.
-- If report sync fails for settlement, sales/traffic, inventory, or reimbursement reports, it tries direct SP-API sync.
-- If direct fallback succeeds, returns `status: completed`, `fallback: DIRECT_SP_API_SYNC`, and the original report error as `warning`.
-- If fallback also fails, returns the original report failure.
+- For settlement, sales/traffic, inventory, and reimbursement report rows, it now runs direct SP-API sync first and records a completed synthetic report job. This avoids slow/failing Reports API calls when the same screen can be powered by direct data.
+- For GST report rows, it builds GST invoice rows from order items first when available and records a completed synthetic report job.
+- For customer returns, it records a fast completed cache-backed row using existing imported returns so the Reports ledger does not get stuck on a slow unavailable report.
+- For any remaining report path, it can still fall back after failure where a fallback exists.
 
 #### `POST /api/tenants/:tenantId/sync`
 
