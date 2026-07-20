@@ -360,7 +360,26 @@ app.get('/api/tenants/:tenantId/dashboard', async request => {
         from traffic_trend t full outer join order_trend o on o.date = t.date
       )
       select date, sales, units, sessions from merged order by date desc limit 90`, [tenantId])).rows.reverse();
-    const payments = (await client.query(`select settlement_id, date(posted_date) posted_date, sum(amount) net_amount, count(*) lines from settlement_rows where tenant_id=$1 group by settlement_id,date(posted_date) order by date(posted_date) desc nulls last limit 50`, [tenantId])).rows;
+    const payments = (await client.query(`
+      with settlement_payments as (
+        select settlement_id, date(posted_date) posted_date, sum(amount) net_amount, count(*) lines
+        from settlement_rows
+        where tenant_id=$1
+        group by settlement_id,date(posted_date)
+      ), finance_payments as (
+        select coalesce(transaction_id, related_order_id, 'finance-' || date(posted_date)::text) settlement_id,
+          date(posted_date) posted_date,
+          sum(total_amount) net_amount,
+          count(*) lines
+        from finance_transactions
+        where tenant_id=$1 and posted_date is not null
+        group by coalesce(transaction_id, related_order_id, 'finance-' || date(posted_date)::text), date(posted_date)
+      ), merged as (
+        select * from settlement_payments
+        union all
+        select * from finance_payments where not exists (select 1 from settlement_payments)
+      )
+      select settlement_id, posted_date, net_amount, lines from merged order by posted_date desc nulls last limit 50`, [tenantId])).rows;
     const jobs = (await client.query('select report_type,status,started_at,completed_at,error_message,s3_key from sync_jobs where tenant_id=$1 order by started_at desc nulls last limit 10', [tenantId])).rows;
     const inventory = (await client.query('select sku, fulfillable_quantity, snapshot_date from inventory_snapshots where tenant_id=$1 order by snapshot_date desc, fulfillable_quantity desc nulls last limit 50', [tenantId])).rows;
     const returns = (await client.query('select order_id, return_reason, disposition, status, return_date from returns where tenant_id=$1 order by return_date desc nulls last limit 50', [tenantId])).rows;
