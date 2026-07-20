@@ -218,7 +218,16 @@ export async function syncReportForTenant(params) {
 /** @param {string} tenantId @param {{ days?: number }} [options] */
 export async function syncRecentApiDataForTenant(tenantId, options = {}) {
   const parsedTenantId = z.string().uuid().parse(tenantId);
-  const createdAfter = new Date(Date.now() - (options.days ?? 30) * 864e5).toISOString();
+  const defaultCreatedAfter = new Date(Date.now() - (options.days ?? 30) * 864e5);
+  const lastCompletedSync = (await pool.query(
+    `select completed_at from sync_jobs
+     where tenant_id=$1 and report_type='DIRECT_SP_API_SYNC' and status='completed' and completed_at is not null
+     order by completed_at desc limit 1`,
+    [parsedTenantId]
+  )).rows[0]?.completed_at;
+  const incrementalCreatedAfter = lastCompletedSync ? new Date(new Date(lastCompletedSync).getTime() - 5 * 60 * 1000) : defaultCreatedAfter;
+  const createdAfterDate = options.full ? defaultCreatedAfter : new Date(Math.max(defaultCreatedAfter.getTime(), incrementalCreatedAfter.getTime()));
+  const createdAfter = createdAfterDate.toISOString();
   await assertActiveTenant(parsedTenantId);
   return runJob(`sync:direct-api:${parsedTenantId}`, async () => {
     const sync = await pool.query('insert into sync_jobs(tenant_id, report_type, status, started_at) values($1,$2,$3,now()) returning id', [parsedTenantId, 'DIRECT_SP_API_SYNC', 'running']);
@@ -239,8 +248,14 @@ export async function syncRecentApiDataForTenant(tenantId, options = {}) {
       const orders = orderPages.flatMap(page => page?.payload?.Orders ?? page?.Orders ?? []);
       const financeResponse = await client.listFinanceTransactions(createdAfter).catch(error => ({ syncError: error instanceof Error ? error.message : 'Finance sync failed' }));
       const transactions = financeResponse?.payload?.transactions ?? financeResponse?.transactions ?? financeResponse?.payload?.Transactions ?? financeResponse?.Transactions ?? [];
+      const inventoryResponse = await client.listInventorySummaries(marketplaceId).catch(error => ({ syncError: error instanceof Error ? error.message : 'Inventory sync failed' }));
+      const inventorySummaries = inventoryResponse?.payload?.inventorySummaries ?? inventoryResponse?.inventorySummaries ?? [];
+      const snapshotDate = new Date().toISOString().slice(0, 10);
       let ordersImported = 0;
       let transactionsImported = 0;
+      let inventoryImported = 0;
+      let reimbursementsImported = 0;
+      let orderItemsSkipped = 0;
       await withTenant(parsedTenantId, async db => {
         for (const order of orders) {
           const orderId = order.AmazonOrderId ?? order.amazonOrderId;
@@ -252,6 +267,11 @@ export async function syncRecentApiDataForTenant(tenantId, options = {}) {
             [parsedTenantId, orderId, order.PurchaseDate ?? order.purchaseDate ?? null, number(order.OrderTotal?.Amount ?? order.orderTotal?.amount), order.OrderStatus ?? order.orderStatus ?? null]
           );
           ordersImported += 1;
+          const existingItems = await db.query('select 1 from order_items where tenant_id=$1 and amazon_order_id=$2 limit 1', [parsedTenantId, orderId]);
+          if (existingItems.rowCount) {
+            orderItemsSkipped += 1;
+            continue;
+          }
           const itemsResponse = await client.listOrderItems(orderId).catch(() => undefined);
           const items = itemsResponse?.payload?.OrderItems ?? itemsResponse?.OrderItems ?? [];
           for (const item of items) {
@@ -263,6 +283,18 @@ export async function syncRecentApiDataForTenant(tenantId, options = {}) {
             );
           }
         }
+        for (const summary of inventorySummaries) {
+          const sku = summary.sellerSku ?? summary.SellerSKU ?? summary.sellerSKU;
+          if (!sku) continue;
+          const fulfillableQuantity = summary.inventoryDetails?.fulfillableQuantity ?? summary.InventoryDetails?.FulfillableQuantity ?? summary.fulfillableQuantity ?? summary.FulfillableQuantity;
+          await db.query(
+            `insert into inventory_snapshots(tenant_id, sku, fulfillable_quantity, snapshot_date)
+             values($1,$2,$3,$4)
+             on conflict (tenant_id, sku, snapshot_date) do update set fulfillable_quantity=excluded.fulfillable_quantity`,
+            [parsedTenantId, sku, integer(fulfillableQuantity), snapshotDate]
+          );
+          inventoryImported += 1;
+        }
         for (const transaction of transactions) {
           const transactionId = transaction.transactionId ?? transaction.TransactionId ?? transaction.financialEventGroupId ?? transaction.FinancialEventGroupId;
           if (!transactionId) continue;
@@ -273,14 +305,56 @@ export async function syncRecentApiDataForTenant(tenantId, options = {}) {
             [parsedTenantId, transactionId, transaction.transactionType ?? transaction.TransactionType ?? null, transaction.postedDate ?? transaction.PostedDate ?? null, number(transaction.totalAmount?.currencyAmount ?? transaction.TotalAmount?.CurrencyAmount ?? transaction.totalAmount?.Amount ?? transaction.TotalAmount?.Amount), transaction.totalAmount?.currencyCode ?? transaction.TotalAmount?.CurrencyCode ?? 'INR', transaction.relatedIdentifiers?.orderId ?? transaction.RelatedIdentifiers?.OrderId ?? null, transaction]
           );
           transactionsImported += 1;
+          const transactionType = String(transaction.transactionType ?? transaction.TransactionType ?? '').toLowerCase();
+          if (transactionType.includes('reimbursement')) {
+            await db.query(
+              `insert into reimbursements(tenant_id, amount, reason, sku, reimbursement_date)
+               values($1,$2,$3,$4,$5)
+               on conflict (tenant_id, sku, reimbursement_date, amount, reason) do nothing`,
+              [parsedTenantId, number(transaction.totalAmount?.currencyAmount ?? transaction.TotalAmount?.CurrencyAmount ?? transaction.totalAmount?.Amount ?? transaction.TotalAmount?.Amount), transaction.transactionType ?? transaction.TransactionType ?? 'Finance reimbursement', transaction.relatedIdentifiers?.sku ?? transaction.RelatedIdentifiers?.Sku ?? transactionId, transaction.postedDate ?? transaction.PostedDate ?? null]
+            );
+            reimbursementsImported += 1;
+          }
         }
       });
       await pool.query('update sync_jobs set status=$1, completed_at=now() where id=$2', ['completed', sync.rows[0].id]);
-      return { ordersImported, transactionsImported, financeWarning: financeResponse?.syncError };
+      return { ordersImported, transactionsImported, inventoryImported, reimbursementsImported, orderItemsSkipped, incrementalSince: createdAfter, financeWarning: financeResponse?.syncError, inventoryWarning: inventoryResponse?.syncError };
     } catch (error) {
       await pool.query('update sync_jobs set status=$1, completed_at=now(), error_message=$2 where id=$3', ['failed', error instanceof Error ? error.message : 'unknown error', sync.rows[0].id]);
       throw error;
     }
+  });
+}
+
+
+/** @param {string} tenantId @param {'b2b'|'b2c'} invoiceType */
+export async function buildGstInvoicesFromOrderItems(tenantId, invoiceType) {
+  const parsedTenantId = z.string().uuid().parse(tenantId);
+  const parsedInvoiceType = z.enum(['b2b', 'b2c']).parse(invoiceType);
+  await assertActiveTenant(parsedTenantId);
+  return withTenant(parsedTenantId, async db => {
+    const result = await db.query(
+      `insert into gst_invoices(tenant_id, invoice_type, order_id, taxable_value, cgst, sgst, igst, invoice_date)
+       select oi.tenant_id,
+         $2,
+         oi.amazon_order_id,
+         sum(greatest(coalesce(oi.item_price,0) - coalesce(oi.item_tax,0), 0)) taxable_value,
+         sum(coalesce(oi.item_tax,0) / 2) cgst,
+         sum(coalesce(oi.item_tax,0) / 2) sgst,
+         0 igst,
+         date(coalesce(o.order_date, now())) invoice_date
+       from order_items oi
+       left join orders o on o.tenant_id=oi.tenant_id and o.amazon_order_id=oi.amazon_order_id
+       where oi.tenant_id=$1
+       group by oi.tenant_id, oi.amazon_order_id, date(coalesce(o.order_date, now()))
+       on conflict (tenant_id, invoice_type, order_id, invoice_date) do update set
+         taxable_value=excluded.taxable_value,
+         cgst=excluded.cgst,
+         sgst=excluded.sgst,
+         igst=excluded.igst`,
+      [parsedTenantId, parsedInvoiceType]
+    );
+    return result.rowCount ?? 0;
   });
 }
 
