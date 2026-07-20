@@ -1096,6 +1096,8 @@ Current rows:
 - `GET_SALES_AND_TRAFFIC_REPORT`: Sales & traffic.
 - `GET_FBA_MYI_UNSUPPRESSED_INVENTORY_DATA`: Inventory.
 - `GET_FBA_REIMBURSEMENTS_DATA`: Reimbursements.
+- `GET_GST_MTR_B2B_CUSTOM`: GST B2B invoices.
+- `GET_GST_MTR_B2C_CUSTOM`: GST B2C invoices.
 - `GET_FBA_FULFILLMENT_CUSTOMER_RETURNS_DATA`: Customer returns.
 
 #### `VIEW_REPORT_TYPES`
@@ -1372,7 +1374,7 @@ Uses:
 
 - `gst_invoices`.
 - `sync_jobs`.
-- Sync ledger rows.
+- Sync ledger rows, including GST B2B and GST B2C report pulls.
 
 ## 15. SP-API request limiting
 
