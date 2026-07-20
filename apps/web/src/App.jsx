@@ -9,8 +9,12 @@ const API = import.meta.env.VITE_API_URL ?? 'http://localhost:4000';
 // Each report a tenant can pull from SP-API, with a short ledger code and a
 // human label. Order here is the order they render in the Sync Ledger.
 const REPORTS = [
+  { type: 'DIRECT_SP_API_SYNC', code: 'API', label: 'Orders & finance', hint: 'Orders, items and finance events' },
   { type: 'GET_V2_SETTLEMENT_REPORT_DATA_FLAT_FILE_V2', code: 'STL', label: 'Settlements', hint: 'Payout batches & fee lines' },
   { type: 'GET_SALES_AND_TRAFFIC_REPORT', code: 'S&T', label: 'Sales & traffic', hint: 'Sessions, units, buy box' },
+  { type: 'GET_GST_MTR_B2B_CUSTOM', code: 'B2B', label: 'GST B2B invoices', hint: 'Business GST invoice rows' },
+  { type: 'GET_GST_MTR_B2C_CUSTOM', code: 'B2C', label: 'GST B2C invoices', hint: 'Consumer GST invoice rows' },
+  { type: 'GET_FBA_MYI_UNSUPPRESSED_INVENTORY_DATA', code: 'INV', label: 'Inventory', hint: 'FBA fulfillable stock' },
   { type: 'GET_FBA_REIMBURSEMENTS_DATA', code: 'RMB', label: 'Reimbursements', hint: 'FBA loss & damage credits' },
   { type: 'GET_FBA_FULFILLMENT_CUSTOMER_RETURNS_DATA', code: 'RTN', label: 'Customer returns', hint: 'Return reasons & disposition' }
 ];
@@ -23,17 +27,17 @@ const COLORS = ['#c98a2c', '#1f8a85', '#12213a', '#7fb6b2'];
 // the report(s) it actually depends on.
 const VIEW_REPORT_TYPES = {
   sales: ['GET_SALES_AND_TRAFFIC_REPORT'],
-  inventory: [],
-  payouts: ['GET_V2_SETTLEMENT_REPORT_DATA_FLAT_FILE_V2'],
-  brand: ['GET_SALES_AND_TRAFFIC_REPORT'],
+  inventory: ['GET_FBA_MYI_UNSUPPRESSED_INVENTORY_DATA'],
+  payouts: ['DIRECT_SP_API_SYNC', 'GET_V2_SETTLEMENT_REPORT_DATA_FLAT_FILE_V2'],
+  brand: ['DIRECT_SP_API_SYNC'],
   health: ['GET_FBA_REIMBURSEMENTS_DATA', 'GET_FBA_FULFILLMENT_CUSTOMER_RETURNS_DATA'],
   reports: REPORTS.map(r => r.type)
 };
 const VIEW_LEDGER_COPY = {
   sales: { title: 'Sales & traffic sync', subtitle: 'Powers this page only' },
   inventory: { title: 'Inventory sync', subtitle: 'This page only' },
-  payouts: { title: 'Settlement sync', subtitle: 'Powers this page only' },
-  brand: { title: 'Sales & traffic sync', subtitle: 'Powers this page only' },
+  payouts: { title: 'Payout sync', subtitle: 'Orders, finance and settlements' },
+  brand: { title: 'Brand analytics sync', subtitle: 'Orders and item performance' },
   health: { title: 'Returns & reimbursements sync', subtitle: 'Powers this page only' },
   reports: { title: 'Sync ledger', subtitle: 'Pull one report at a time' }
 };
@@ -233,8 +237,12 @@ function SyncLedger({ tenantId, jobs = [], onSynced, reportTypes, title, subtitl
     if (disabled) return;
     setRowState(s => ({ ...s, [reportType]: { loading: true } }));
     try {
-      const result = await api(`/api/tenants/${tenantId}/sync/${reportType}`, { method: 'POST' });
+      const result = reportType === 'DIRECT_SP_API_SYNC'
+        ? await api(`/api/tenants/${tenantId}/sync`, { method: 'POST', body: JSON.stringify({ reportTypes: [] }) })
+        : await api(`/api/tenants/${tenantId}/sync/${reportType}`, { method: 'POST' });
       if (result?.status === 'failed') throw new Error(result.error ?? 'Sync failed');
+      const failedDirectSync = result?.results?.find?.(row => row.status === 'failed');
+      if (failedDirectSync) throw new Error(failedDirectSync.error ?? 'Sync failed');
       setRowState(s => ({ ...s, [reportType]: { loading: false, justSynced: true } }));
       await onSynced?.();
     } catch (e) {
@@ -343,7 +351,10 @@ function SellerDashboard() {
     (async () => {
       setAutoSyncing(true);
       for (const report of REPORTS) {
-        try { await api(`/api/tenants/${tenantId}/sync/${report.type}`, { method: 'POST' }); } catch { /* one failed report shouldn't block the rest */ }
+        try {
+          if (report.type === 'DIRECT_SP_API_SYNC') await api(`/api/tenants/${tenantId}/sync`, { method: 'POST', body: JSON.stringify({ reportTypes: [] }) });
+          else await api(`/api/tenants/${tenantId}/sync/${report.type}`, { method: 'POST' });
+        } catch { /* one failed report shouldn't block the rest */ }
       }
       await load();
       setAutoSyncing(false);
@@ -375,7 +386,7 @@ function SellerDashboard() {
     {view === 'dashboard' && <DashboardOverview data={data} channelData={channelData} />}
     {view === 'sales' && <SalesAnalytics data={data} channelData={channelData} />}
     {view === 'inventory' && <TableCard title="Inventory" rows={data?.inventory ?? []} columns={['sku', 'fulfillable_quantity', 'snapshot_date']} />}
-    {view === 'payouts' && <TableCard title="Payment Settlements" rows={data?.payments ?? []} columns={['posted_date', 'settlement_id', 'net_amount', 'lines']} />}
+    {view === 'payouts' && <TableCard title="Payout Activity" rows={data?.payments ?? []} columns={['posted_date', 'settlement_id', 'net_amount', 'lines']} />}
     {view === 'brand' && <TableCard title="Product Performance" rows={data?.products ?? []} columns={['asin', 'units', 'sales', 'buy_box']} />}
     {view === 'health' && <div className="dashboard-grid two"><TableCard title="Returns" rows={data?.returns ?? []} columns={['order_id', 'return_reason', 'disposition', 'status', 'return_date']} /><TableCard title="Reimbursements" rows={data?.reimbursements ?? []} columns={['sku', 'amount', 'reason', 'reimbursement_date']} /></div>}
     {view === 'reports' && <div className="dashboard-grid two"><TableCard title="GST Invoices" rows={data?.invoices ?? []} columns={['invoice_type', 'order_id', 'taxable_value', 'cgst', 'sgst', 'igst', 'invoice_date']} /><TableCard title="Recent Sync Jobs" rows={data?.jobs ?? []} columns={['report_type', 'status', 'completed_at', 'error_message']} /></div>}
@@ -383,8 +394,110 @@ function SellerDashboard() {
 }
 
 function viewTitle(view) { return ({ dashboard: 'Dashboard', sales: 'Sales Analytics', inventory: 'Inventory', payouts: 'Payout Reconciliation', brand: 'Brand Analytics', health: 'Account Health', reports: 'Reports' })[view] ?? 'Dashboard'; }
-function viewDescription(view) { return ({ dashboard: 'Live seller KPIs populated from synced SP-API orders and reports.', sales: 'Revenue, order value, units and product sales trends from Amazon reports.', inventory: 'FBA inventory snapshots imported from SP-API inventory reports.', payouts: 'Settlement rows and payout reconciliation from Amazon settlement reports.', brand: 'ASIN-level product performance from Sales & Traffic reports.', health: 'Returns and reimbursement signals imported from Amazon reports.', reports: 'GST/report imports and recent sync job status.' })[view] ?? 'Live seller KPIs populated from synced SP-API orders and reports.'; }
-function DashboardOverview({ data, channelData }) { return <><div className="metrics-strip"><MiniMetric title="Total Revenue" value={formatCurrency(data?.orders?.order_value)} /><MiniMetric title="Units Sold" value={formatNumber(data?.products?.reduce((a, p) => a + Number(p.units ?? 0), 0))} /><MiniMetric title="Avg Order Value" value={formatCurrency(Number(data?.orders?.order_value ?? 0) / Math.max(Number(data?.orders?.orders ?? 0), 1))} /><MiniMetric title="Orders" value={formatNumber(data?.orders?.orders)} /></div><SalesAnalytics data={data} channelData={channelData} /><div className="dashboard-grid two"><TableCard title="Payment Settlements" rows={data?.payments ?? []} columns={['posted_date', 'settlement_id', 'net_amount', 'lines']} /><TableCard title="Recent Sync Jobs" rows={data?.jobs ?? []} columns={['report_type', 'status', 'completed_at', 'error_message']} /></div></>; }
+function viewDescription(view) { return ({ dashboard: 'Live seller KPIs populated from synced SP-API orders and reports.', sales: 'Revenue, order value, units and product sales trends from Amazon reports.', inventory: 'FBA inventory snapshots imported from SP-API inventory reports.', payouts: 'Settlement rows and payout reconciliation from Amazon settlement reports.', brand: 'ASIN-level product performance from synced Amazon order items, with Sales & Traffic metrics when available.', health: 'Returns and reimbursement signals imported from Amazon reports.', reports: 'GST/report imports and recent sync job status.' })[view] ?? 'Live seller KPIs populated from synced SP-API orders and reports.'; }
+function DashboardOverview({ data, channelData }) {
+  const summary = useMemo(() => buildDashboardSummary(data), [data]);
+  return <>
+    <div className="metrics-strip">
+      <MiniMetric title="Net Sales" value={formatCurrency(summary.netSales)} hint="Order value" />
+      <MiniMetric title="Net Qty" value={formatNumber(summary.netQty)} hint="Units after sync" />
+      <MiniMetric title="Estimated Profit" value={formatCurrency(summary.estimatedProfit)} hint={`${summary.profitRate}% margin`} />
+      <MiniMetric title="Returns" value={formatNumber(summary.returnQty)} hint="Open return lines" />
+    </div>
+
+    <Card className="profit-control-card">
+      <PanelHeader title="Profit Analysis" subtitle="Clean overview" />
+      <div className="filter-toolbar">
+        {['Channel', 'Parent ID', 'SKU', 'Inventory Master SKU', 'Account', 'Category', 'Color', 'Year of launch'].map(filter => <button key={filter} className="filter-chip">{filter}<span>⌄</span></button>)}
+        <button className="filter-chip active">Amazon-India</button>
+        <button className="filter-chip active">With GST</button>
+        <button className="filter-chip active">Without Expenses</button>
+      </div>
+      <div className="profit-kpi-grid">
+        <StatCard title="Settled Amount" value={formatCurrency(summary.settledAmount)} hint="From settlements / finance" />
+        <StatCard title="Deductions" value={formatCurrency(summary.deductions)} hint="Fees, refunds, charges" />
+        <StatCard title="Reimbursements" value={formatCurrency(summary.reimbursements)} hint="Credits imported" />
+        <StatCard title="DRR" value={formatCurrency(summary.drr)} hint="Daily run rate" />
+      </div>
+    </Card>
+
+    <div className="dashboard-grid two detailed-dashboard-grid">
+      <TableCard title="Profit Tracker" rows={summary.profitRows} columns={['view', 'net_qty', 'return_qty', 'net_asp', 'net_sales', 'ad_spend', 'profit', 'settled_amount', 'profit_percent', 'drr']} />
+      <TableCard title="Returns Summary" rows={summary.returnRows} columns={['channel', 'yet_to_receive', 'received_not_in_hand', 'received', 'total']} />
+    </div>
+
+    <SalesAnalytics data={data} channelData={channelData} />
+
+    <div className="dashboard-grid two">
+      <TableCard title="Reconciliation Snapshot" rows={summary.reconcileRows} columns={['area', 'count', 'amount', 'status']} />
+      <TableCard title="Recent Sync Jobs" rows={data?.jobs ?? []} columns={['report_type', 'status', 'completed_at', 'error_message']} />
+    </div>
+  </>;
+}
+
+function buildDashboardSummary(data) {
+  const products = data?.products ?? [];
+  const returns = data?.returns ?? [];
+  const payments = data?.payments ?? [];
+  const reimbursements = data?.reimbursements ?? [];
+  const invoices = data?.invoices ?? [];
+  const orderItems = data?.orderItems ?? [];
+  const ordersCount = Number(data?.orders?.orders ?? 0);
+  const netSales = Number(data?.orders?.order_value ?? 0);
+  const netQty = products.reduce((sum, product) => sum + Number(product.units ?? 0), 0) || orderItems.reduce((sum, item) => sum + Number(item.quantity_ordered ?? 0), 0);
+  const returnQty = returns.length;
+  const settledAmount = payments.reduce((sum, payment) => sum + Number(payment.net_amount ?? 0), 0) || Number(data?.kpis?.net_settled ?? 0);
+  const deductions = Math.abs(Number(data?.kpis?.deductions ?? 0));
+  const reimbursementAmount = reimbursements.reduce((sum, row) => sum + Number(row.amount ?? 0), 0);
+  const estimatedProfit = settledAmount || Math.max(0, netSales - deductions + reimbursementAmount);
+  const profitRate = netSales ? Math.round((estimatedProfit / netSales) * 100) : 0;
+  const drr = netSales / Math.max(30, 1);
+  const netAsp = netQty ? netSales / netQty : 0;
+  const baseRow = {
+    view: 'Amazon-India',
+    net_qty: formatNumber(netQty),
+    return_qty: formatNumber(returnQty),
+    net_asp: formatCurrency(netAsp),
+    net_sales: formatCurrency(netSales),
+    ad_spend: formatCurrency(0),
+    profit: formatCurrency(estimatedProfit),
+    settled_amount: formatCurrency(settledAmount),
+    profit_percent: `${profitRate}%`,
+    drr: formatCurrency(drr)
+  };
+  const totalRow = { ...baseRow, view: 'Total' };
+  const returnBuckets = returns.reduce((acc, row) => {
+    const status = row.status ?? 'yet_to_receive';
+    acc[status] = (acc[status] ?? 0) + 1;
+    return acc;
+  }, {});
+  const returnSummary = {
+    channel: 'Amazon-India',
+    yet_to_receive: formatNumber(returnBuckets.yet_to_receive ?? 0),
+    received_not_in_hand: formatNumber(returnBuckets.received_not_in_hand ?? 0),
+    received: formatNumber(returnBuckets.received ?? 0),
+    total: formatNumber(returnQty)
+  };
+  return {
+    netSales,
+    netQty,
+    returnQty,
+    settledAmount,
+    deductions,
+    reimbursements: reimbursementAmount,
+    estimatedProfit,
+    profitRate,
+    drr,
+    profitRows: [baseRow, totalRow],
+    returnRows: [returnSummary, { ...returnSummary, channel: 'Total' }],
+    reconcileRows: [
+      { area: 'Orders', count: formatNumber(ordersCount), amount: formatCurrency(netSales), status: ordersCount ? 'Synced' : 'Waiting' },
+      { area: 'Payouts', count: formatNumber(payments.length), amount: formatCurrency(settledAmount), status: payments.length ? 'Matched' : 'Needs sync' },
+      { area: 'GST invoices', count: formatNumber(invoices.length), amount: formatCurrency(invoices.reduce((sum, row) => sum + Number(row.taxable_value ?? 0), 0)), status: invoices.length ? 'Imported' : 'No GST rows' },
+      { area: 'Returns', count: formatNumber(returnQty), amount: formatCurrency(0), status: returnQty ? 'Action needed' : 'Clean' }
+    ]
+  };
+}
 function SalesAnalytics({ data, channelData }) { const { range } = useContext(DateRangeContext); return <><div className="dashboard-grid"><Card className="panel"><PanelHeader title="Sales Source Distribution" />{channelData.length ? <><ResponsiveContainer width="100%" height={220}><PieChart><Pie data={channelData} innerRadius={62} outerRadius={92} dataKey="value">{channelData.map((_, i) => <Cell key={i} fill={COLORS[i % COLORS.length]} />)}</Pie><Tooltip /></PieChart></ResponsiveContainer><Legend items={channelData} /></> : <Empty text="No synced sales or settlement totals yet." />}</Card><Card className="panel wide"><PanelHeader title={`Sales Trend (${range.label})`} />{data?.trend?.length ? <ResponsiveContainer width="100%" height={250}><AreaChart data={data.trend}><defs><linearGradient id="sales" x1="0" y1="0" x2="0" y2="1"><stop offset="5%" stopColor="#1f8a85" stopOpacity={0.35}/><stop offset="95%" stopColor="#1f8a85" stopOpacity={0}/></linearGradient></defs><XAxis dataKey="date" /><YAxis /><Tooltip /><Area dataKey="sales" stroke="#1f8a85" fill="url(#sales)" strokeWidth={3} /></AreaChart></ResponsiveContainer> : <Empty text="No imported sales trend yet. Use the Sync above to pull SP-API reports." />}</Card></div><div className="dashboard-grid two"><TableCard title="Product Performance" rows={data?.products ?? []} columns={['asin', 'units', 'sales', 'buy_box']} /><TableCard title="Order Items" rows={data?.orderItems ?? []} columns={['amazon_order_id', 'asin', 'sku', 'title', 'quantity_ordered', 'item_price']} /></div></>; }
 
 function PanelHeader({ title, subtitle }) { const { range } = useContext(DateRangeContext); return <div className="panel-header"><h2>{title}</h2><span>{subtitle ?? range.label}</span></div>; }
