@@ -389,7 +389,13 @@ app.get('/api/tenants/:tenantId/dashboard', async request => {
         select * from finance_payments where not exists (select 1 from settlement_payments)
       )
       select settlement_id, posted_date, net_amount, lines from merged order by posted_date desc nulls last limit 50`, [tenantId])).rows;
-    const jobs = (await client.query('select report_type,status,started_at,completed_at,error_message,s3_key from sync_jobs where tenant_id=$1 order by started_at desc nulls last limit 10', [tenantId])).rows;
+    const jobs = (await client.query(`select report_type,
+        case when status='running' and started_at < now() - interval '30 minutes' then 'failed' else status end status,
+        started_at,
+        case when status='running' and started_at < now() - interval '30 minutes' then started_at + interval '30 minutes' else completed_at end completed_at,
+        case when status='running' and started_at < now() - interval '30 minutes' then coalesce(error_message, 'Sync timed out. Please retry.') else error_message end error_message,
+        s3_key
+      from sync_jobs where tenant_id=$1 order by started_at desc nulls last limit 10`, [tenantId])).rows;
     const inventory = (await client.query('select sku, fulfillable_quantity, snapshot_date from inventory_snapshots where tenant_id=$1 order by snapshot_date desc, fulfillable_quantity desc nulls last limit 50', [tenantId])).rows;
     const returns = (await client.query('select order_id, return_reason, disposition, status, return_date from returns where tenant_id=$1 order by return_date desc nulls last limit 50', [tenantId])).rows;
     const reimbursements = (await client.query('select sku, amount, reason, reimbursement_date from reimbursements where tenant_id=$1 order by reimbursement_date desc nulls last limit 50', [tenantId])).rows;
