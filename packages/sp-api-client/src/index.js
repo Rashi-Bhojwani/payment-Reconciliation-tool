@@ -22,6 +22,34 @@ export const REPORT_TYPES = Object.freeze([
 const GST_REPORTS = new Set(['GET_GST_MTR_B2B_CUSTOM', 'GET_GST_MTR_B2C_CUSTOM']);
 const DateRangeSchema = z.object({ start: z.string().datetime(), end: z.string().datetime() });
 
+const SP_API_RATE_LIMITS = Object.freeze([
+  { pattern: /^\/orders\//, intervalMs: 1200 },
+  { pattern: /^\/reports\//, intervalMs: 2500 },
+  { pattern: /^\/finances\//, intervalMs: 2500 },
+  { pattern: /^\/fba\/inventory\//, intervalMs: 2500 },
+  { pattern: /^\/tokens\//, intervalMs: 2500 },
+  { pattern: /^\/products\/fees\//, intervalMs: 1200 }
+]);
+const DEFAULT_SP_API_INTERVAL_MS = 1500;
+const rateLimitState = new Map();
+
+/** @param {string} path */
+function rateLimitBucket(path) {
+  const limit = SP_API_RATE_LIMITS.find(item => item.pattern.test(path));
+  const family = path.split('/').filter(Boolean)[0] ?? 'default';
+  return { key: family, intervalMs: limit?.intervalMs ?? DEFAULT_SP_API_INTERVAL_MS };
+}
+
+/** @param {string} path */
+async function waitForSpApiSlot(path) {
+  const { key, intervalMs } = rateLimitBucket(path);
+  const now = Date.now();
+  const nextAvailableAt = rateLimitState.get(key) ?? now;
+  const waitMs = Math.max(0, nextAvailableAt - now);
+  rateLimitState.set(key, now + waitMs + intervalMs);
+  if (waitMs > 0) await new Promise(resolve => setTimeout(resolve, waitMs));
+}
+
 export class SpApiClient {
   /** @param {string} refreshToken @param {{ clientId?: string, clientSecret?: string }} [cfg] */
   constructor(refreshToken, cfg = {}) {
@@ -47,6 +75,7 @@ export class SpApiClient {
   async request(path, init = {}, token) {
     let accessToken = token ?? (await this.getAccessToken()).accessToken;
     for (let attempt = 0; attempt < 4; attempt += 1) {
+      await waitForSpApiSlot(path);
       const res = await fetch(`${this.cfg.baseUrl}${path}`, {
         ...init,
         headers: { 'content-type': 'application/json', 'x-amz-access-token': accessToken, ...(init.headers ?? {}) }
@@ -76,10 +105,17 @@ export class SpApiClient {
     const parsedReportType = z.enum(REPORT_TYPES).parse(reportType);
     const parsedRange = DateRangeSchema.parse(range);
     const parsedTenant = z.string().uuid().parse(tenantId);
-    const create = await this.request('/reports/2021-06-30/reports', {
+    const createReportBody = { reportType: parsedReportType, marketplaceIds: [marketplaceId], dataStartTime: parsedRange.start, dataEndTime: parsedRange.end };
+    let create = await this.request('/reports/2021-06-30/reports', {
       method: 'POST',
-      body: JSON.stringify({ reportType: parsedReportType, marketplaceIds: [marketplaceId], dataStartTime: parsedRange.start, dataEndTime: parsedRange.end })
+      body: JSON.stringify(createReportBody)
     });
+    if (!create.ok && create.status === 400) {
+      create = await this.request('/reports/2021-06-30/reports', {
+        method: 'POST',
+        body: JSON.stringify({ reportType: parsedReportType, marketplaceIds: [marketplaceId] })
+      });
+    }
     if (!create.ok) throw new Error(`Create report failed: ${create.status}`);
     const { reportId } = z.object({ reportId: z.string().min(1) }).parse(await create.json());
 
@@ -140,6 +176,14 @@ export class SpApiClient {
     const id = z.string().min(1).parse(orderId);
     const res = await this.request(`/orders/v0/orders/${encodeURIComponent(id)}/orderItems`);
     if (!res.ok) throw new Error(`List order items failed: ${res.status}`);
+    return res.json();
+  }
+
+
+  /** @param {string} [marketplaceId] */
+  async listInventorySummaries(marketplaceId = INDIA_MARKETPLACE_ID) {
+    const res = await this.request(`/fba/inventory/v1/summaries?details=true&granularityType=Marketplace&granularityId=${encodeURIComponent(marketplaceId)}&marketplaceIds=${encodeURIComponent(marketplaceId)}`);
+    if (!res.ok) throw new Error(`Inventory summaries failed: ${res.status}`);
     return res.json();
   }
 

@@ -9,8 +9,10 @@ const API = import.meta.env.VITE_API_URL ?? 'http://localhost:4000';
 // Each report a tenant can pull from SP-API, with a short ledger code and a
 // human label. Order here is the order they render in the Sync Ledger.
 const REPORTS = [
+  { type: 'DIRECT_SP_API_SYNC', code: 'API', label: 'Orders & finance', hint: 'Orders, items and finance events' },
   { type: 'GET_V2_SETTLEMENT_REPORT_DATA_FLAT_FILE_V2', code: 'STL', label: 'Settlements', hint: 'Payout batches & fee lines' },
   { type: 'GET_SALES_AND_TRAFFIC_REPORT', code: 'S&T', label: 'Sales & traffic', hint: 'Sessions, units, buy box' },
+  { type: 'GET_FBA_MYI_UNSUPPRESSED_INVENTORY_DATA', code: 'INV', label: 'Inventory', hint: 'FBA fulfillable stock' },
   { type: 'GET_FBA_REIMBURSEMENTS_DATA', code: 'RMB', label: 'Reimbursements', hint: 'FBA loss & damage credits' },
   { type: 'GET_FBA_FULFILLMENT_CUSTOMER_RETURNS_DATA', code: 'RTN', label: 'Customer returns', hint: 'Return reasons & disposition' }
 ];
@@ -23,17 +25,17 @@ const COLORS = ['#c98a2c', '#1f8a85', '#12213a', '#7fb6b2'];
 // the report(s) it actually depends on.
 const VIEW_REPORT_TYPES = {
   sales: ['GET_SALES_AND_TRAFFIC_REPORT'],
-  inventory: [],
-  payouts: ['GET_V2_SETTLEMENT_REPORT_DATA_FLAT_FILE_V2'],
-  brand: ['GET_SALES_AND_TRAFFIC_REPORT'],
+  inventory: ['GET_FBA_MYI_UNSUPPRESSED_INVENTORY_DATA'],
+  payouts: ['DIRECT_SP_API_SYNC', 'GET_V2_SETTLEMENT_REPORT_DATA_FLAT_FILE_V2'],
+  brand: ['DIRECT_SP_API_SYNC'],
   health: ['GET_FBA_REIMBURSEMENTS_DATA', 'GET_FBA_FULFILLMENT_CUSTOMER_RETURNS_DATA'],
   reports: REPORTS.map(r => r.type)
 };
 const VIEW_LEDGER_COPY = {
   sales: { title: 'Sales & traffic sync', subtitle: 'Powers this page only' },
   inventory: { title: 'Inventory sync', subtitle: 'This page only' },
-  payouts: { title: 'Settlement sync', subtitle: 'Powers this page only' },
-  brand: { title: 'Sales & traffic sync', subtitle: 'Powers this page only' },
+  payouts: { title: 'Payout sync', subtitle: 'Orders, finance and settlements' },
+  brand: { title: 'Brand analytics sync', subtitle: 'Orders and item performance' },
   health: { title: 'Returns & reimbursements sync', subtitle: 'Powers this page only' },
   reports: { title: 'Sync ledger', subtitle: 'Pull one report at a time' }
 };
@@ -233,8 +235,12 @@ function SyncLedger({ tenantId, jobs = [], onSynced, reportTypes, title, subtitl
     if (disabled) return;
     setRowState(s => ({ ...s, [reportType]: { loading: true } }));
     try {
-      const result = await api(`/api/tenants/${tenantId}/sync/${reportType}`, { method: 'POST' });
+      const result = reportType === 'DIRECT_SP_API_SYNC'
+        ? await api(`/api/tenants/${tenantId}/sync`, { method: 'POST', body: JSON.stringify({ reportTypes: [] }) })
+        : await api(`/api/tenants/${tenantId}/sync/${reportType}`, { method: 'POST' });
       if (result?.status === 'failed') throw new Error(result.error ?? 'Sync failed');
+      const failedDirectSync = result?.results?.find?.(row => row.status === 'failed');
+      if (failedDirectSync) throw new Error(failedDirectSync.error ?? 'Sync failed');
       setRowState(s => ({ ...s, [reportType]: { loading: false, justSynced: true } }));
       await onSynced?.();
     } catch (e) {
@@ -343,7 +349,10 @@ function SellerDashboard() {
     (async () => {
       setAutoSyncing(true);
       for (const report of REPORTS) {
-        try { await api(`/api/tenants/${tenantId}/sync/${report.type}`, { method: 'POST' }); } catch { /* one failed report shouldn't block the rest */ }
+        try {
+          if (report.type === 'DIRECT_SP_API_SYNC') await api(`/api/tenants/${tenantId}/sync`, { method: 'POST', body: JSON.stringify({ reportTypes: [] }) });
+          else await api(`/api/tenants/${tenantId}/sync/${report.type}`, { method: 'POST' });
+        } catch { /* one failed report shouldn't block the rest */ }
       }
       await load();
       setAutoSyncing(false);
@@ -375,7 +384,7 @@ function SellerDashboard() {
     {view === 'dashboard' && <DashboardOverview data={data} channelData={channelData} />}
     {view === 'sales' && <SalesAnalytics data={data} channelData={channelData} />}
     {view === 'inventory' && <TableCard title="Inventory" rows={data?.inventory ?? []} columns={['sku', 'fulfillable_quantity', 'snapshot_date']} />}
-    {view === 'payouts' && <TableCard title="Payment Settlements" rows={data?.payments ?? []} columns={['posted_date', 'settlement_id', 'net_amount', 'lines']} />}
+    {view === 'payouts' && <TableCard title="Payout Activity" rows={data?.payments ?? []} columns={['posted_date', 'settlement_id', 'net_amount', 'lines']} />}
     {view === 'brand' && <TableCard title="Product Performance" rows={data?.products ?? []} columns={['asin', 'units', 'sales', 'buy_box']} />}
     {view === 'health' && <div className="dashboard-grid two"><TableCard title="Returns" rows={data?.returns ?? []} columns={['order_id', 'return_reason', 'disposition', 'status', 'return_date']} /><TableCard title="Reimbursements" rows={data?.reimbursements ?? []} columns={['sku', 'amount', 'reason', 'reimbursement_date']} /></div>}
     {view === 'reports' && <div className="dashboard-grid two"><TableCard title="GST Invoices" rows={data?.invoices ?? []} columns={['invoice_type', 'order_id', 'taxable_value', 'cgst', 'sgst', 'igst', 'invoice_date']} /><TableCard title="Recent Sync Jobs" rows={data?.jobs ?? []} columns={['report_type', 'status', 'completed_at', 'error_message']} /></div>}
@@ -383,7 +392,7 @@ function SellerDashboard() {
 }
 
 function viewTitle(view) { return ({ dashboard: 'Dashboard', sales: 'Sales Analytics', inventory: 'Inventory', payouts: 'Payout Reconciliation', brand: 'Brand Analytics', health: 'Account Health', reports: 'Reports' })[view] ?? 'Dashboard'; }
-function viewDescription(view) { return ({ dashboard: 'Live seller KPIs populated from synced SP-API orders and reports.', sales: 'Revenue, order value, units and product sales trends from Amazon reports.', inventory: 'FBA inventory snapshots imported from SP-API inventory reports.', payouts: 'Settlement rows and payout reconciliation from Amazon settlement reports.', brand: 'ASIN-level product performance from Sales & Traffic reports.', health: 'Returns and reimbursement signals imported from Amazon reports.', reports: 'GST/report imports and recent sync job status.' })[view] ?? 'Live seller KPIs populated from synced SP-API orders and reports.'; }
+function viewDescription(view) { return ({ dashboard: 'Live seller KPIs populated from synced SP-API orders and reports.', sales: 'Revenue, order value, units and product sales trends from Amazon reports.', inventory: 'FBA inventory snapshots imported from SP-API inventory reports.', payouts: 'Settlement rows and payout reconciliation from Amazon settlement reports.', brand: 'ASIN-level product performance from synced Amazon order items, with Sales & Traffic metrics when available.', health: 'Returns and reimbursement signals imported from Amazon reports.', reports: 'GST/report imports and recent sync job status.' })[view] ?? 'Live seller KPIs populated from synced SP-API orders and reports.'; }
 function DashboardOverview({ data, channelData }) { return <><div className="metrics-strip"><MiniMetric title="Total Revenue" value={formatCurrency(data?.orders?.order_value)} /><MiniMetric title="Units Sold" value={formatNumber(data?.products?.reduce((a, p) => a + Number(p.units ?? 0), 0))} /><MiniMetric title="Avg Order Value" value={formatCurrency(Number(data?.orders?.order_value ?? 0) / Math.max(Number(data?.orders?.orders ?? 0), 1))} /><MiniMetric title="Orders" value={formatNumber(data?.orders?.orders)} /></div><SalesAnalytics data={data} channelData={channelData} /><div className="dashboard-grid two"><TableCard title="Payment Settlements" rows={data?.payments ?? []} columns={['posted_date', 'settlement_id', 'net_amount', 'lines']} /><TableCard title="Recent Sync Jobs" rows={data?.jobs ?? []} columns={['report_type', 'status', 'completed_at', 'error_message']} /></div></>; }
 function SalesAnalytics({ data, channelData }) { const { range } = useContext(DateRangeContext); return <><div className="dashboard-grid"><Card className="panel"><PanelHeader title="Sales Source Distribution" />{channelData.length ? <><ResponsiveContainer width="100%" height={220}><PieChart><Pie data={channelData} innerRadius={62} outerRadius={92} dataKey="value">{channelData.map((_, i) => <Cell key={i} fill={COLORS[i % COLORS.length]} />)}</Pie><Tooltip /></PieChart></ResponsiveContainer><Legend items={channelData} /></> : <Empty text="No synced sales or settlement totals yet." />}</Card><Card className="panel wide"><PanelHeader title={`Sales Trend (${range.label})`} />{data?.trend?.length ? <ResponsiveContainer width="100%" height={250}><AreaChart data={data.trend}><defs><linearGradient id="sales" x1="0" y1="0" x2="0" y2="1"><stop offset="5%" stopColor="#1f8a85" stopOpacity={0.35}/><stop offset="95%" stopColor="#1f8a85" stopOpacity={0}/></linearGradient></defs><XAxis dataKey="date" /><YAxis /><Tooltip /><Area dataKey="sales" stroke="#1f8a85" fill="url(#sales)" strokeWidth={3} /></AreaChart></ResponsiveContainer> : <Empty text="No imported sales trend yet. Use the Sync above to pull SP-API reports." />}</Card></div><div className="dashboard-grid two"><TableCard title="Product Performance" rows={data?.products ?? []} columns={['asin', 'units', 'sales', 'buy_box']} /><TableCard title="Order Items" rows={data?.orderItems ?? []} columns={['amazon_order_id', 'asin', 'sku', 'title', 'quantity_ordered', 'item_price']} /></div></>; }
 
