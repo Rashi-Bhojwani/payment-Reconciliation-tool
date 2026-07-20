@@ -239,8 +239,13 @@ export async function syncRecentApiDataForTenant(tenantId, options = {}) {
       const orders = orderPages.flatMap(page => page?.payload?.Orders ?? page?.Orders ?? []);
       const financeResponse = await client.listFinanceTransactions(createdAfter).catch(error => ({ syncError: error instanceof Error ? error.message : 'Finance sync failed' }));
       const transactions = financeResponse?.payload?.transactions ?? financeResponse?.transactions ?? financeResponse?.payload?.Transactions ?? financeResponse?.Transactions ?? [];
+      const inventoryResponse = await client.listInventorySummaries(marketplaceId).catch(error => ({ syncError: error instanceof Error ? error.message : 'Inventory sync failed' }));
+      const inventorySummaries = inventoryResponse?.payload?.inventorySummaries ?? inventoryResponse?.inventorySummaries ?? [];
+      const snapshotDate = new Date().toISOString().slice(0, 10);
       let ordersImported = 0;
       let transactionsImported = 0;
+      let inventoryImported = 0;
+      let reimbursementsImported = 0;
       await withTenant(parsedTenantId, async db => {
         for (const order of orders) {
           const orderId = order.AmazonOrderId ?? order.amazonOrderId;
@@ -263,6 +268,18 @@ export async function syncRecentApiDataForTenant(tenantId, options = {}) {
             );
           }
         }
+        for (const summary of inventorySummaries) {
+          const sku = summary.sellerSku ?? summary.SellerSKU ?? summary.sellerSKU;
+          if (!sku) continue;
+          const fulfillableQuantity = summary.inventoryDetails?.fulfillableQuantity ?? summary.InventoryDetails?.FulfillableQuantity ?? summary.fulfillableQuantity ?? summary.FulfillableQuantity;
+          await db.query(
+            `insert into inventory_snapshots(tenant_id, sku, fulfillable_quantity, snapshot_date)
+             values($1,$2,$3,$4)
+             on conflict (tenant_id, sku, snapshot_date) do update set fulfillable_quantity=excluded.fulfillable_quantity`,
+            [parsedTenantId, sku, integer(fulfillableQuantity), snapshotDate]
+          );
+          inventoryImported += 1;
+        }
         for (const transaction of transactions) {
           const transactionId = transaction.transactionId ?? transaction.TransactionId ?? transaction.financialEventGroupId ?? transaction.FinancialEventGroupId;
           if (!transactionId) continue;
@@ -273,10 +290,20 @@ export async function syncRecentApiDataForTenant(tenantId, options = {}) {
             [parsedTenantId, transactionId, transaction.transactionType ?? transaction.TransactionType ?? null, transaction.postedDate ?? transaction.PostedDate ?? null, number(transaction.totalAmount?.currencyAmount ?? transaction.TotalAmount?.CurrencyAmount ?? transaction.totalAmount?.Amount ?? transaction.TotalAmount?.Amount), transaction.totalAmount?.currencyCode ?? transaction.TotalAmount?.CurrencyCode ?? 'INR', transaction.relatedIdentifiers?.orderId ?? transaction.RelatedIdentifiers?.OrderId ?? null, transaction]
           );
           transactionsImported += 1;
+          const transactionType = String(transaction.transactionType ?? transaction.TransactionType ?? '').toLowerCase();
+          if (transactionType.includes('reimbursement')) {
+            await db.query(
+              `insert into reimbursements(tenant_id, amount, reason, sku, reimbursement_date)
+               values($1,$2,$3,$4,$5)
+               on conflict (tenant_id, sku, reimbursement_date, amount, reason) do nothing`,
+              [parsedTenantId, number(transaction.totalAmount?.currencyAmount ?? transaction.TotalAmount?.CurrencyAmount ?? transaction.totalAmount?.Amount ?? transaction.TotalAmount?.Amount), transaction.transactionType ?? transaction.TransactionType ?? 'Finance reimbursement', transaction.relatedIdentifiers?.sku ?? transaction.RelatedIdentifiers?.Sku ?? transactionId, transaction.postedDate ?? transaction.PostedDate ?? null]
+            );
+            reimbursementsImported += 1;
+          }
         }
       });
       await pool.query('update sync_jobs set status=$1, completed_at=now() where id=$2', ['completed', sync.rows[0].id]);
-      return { ordersImported, transactionsImported, financeWarning: financeResponse?.syncError };
+      return { ordersImported, transactionsImported, inventoryImported, reimbursementsImported, financeWarning: financeResponse?.syncError, inventoryWarning: inventoryResponse?.syncError };
     } catch (error) {
       await pool.query('update sync_jobs set status=$1, completed_at=now(), error_message=$2 where id=$3', ['failed', error instanceof Error ? error.message : 'unknown error', sync.rows[0].id]);
       throw error;

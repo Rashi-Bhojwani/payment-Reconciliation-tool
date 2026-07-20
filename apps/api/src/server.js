@@ -281,6 +281,15 @@ app.post('/api/tenants/:tenantId/sync/:reportType', async request => {
     const result = await syncReportForTenant(params);
     return { reportType: params.reportType, status: 'completed', ...result };
   } catch (error) {
+    const directFallbackReports = new Set(['GET_V2_SETTLEMENT_REPORT_DATA_FLAT_FILE_V2', 'GET_SALES_AND_TRAFFIC_REPORT', 'GET_FBA_MYI_UNSUPPRESSED_INVENTORY_DATA', 'GET_FBA_REIMBURSEMENTS_DATA']);
+    if (directFallbackReports.has(params.reportType)) {
+      try {
+        const fallback = await syncRecentApiDataForTenant(params.tenantId);
+        return { reportType: params.reportType, status: 'completed', fallback: 'DIRECT_SP_API_SYNC', warning: error instanceof Error ? error.message : 'Report sync failed', ...fallback };
+      } catch {
+        // Return the original report error below; it is usually more actionable than a secondary fallback failure.
+      }
+    }
     return { reportType: params.reportType, status: 'failed', error: error instanceof Error ? error.message : 'Report sync failed' };
   }
 });

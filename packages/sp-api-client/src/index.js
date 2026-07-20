@@ -150,6 +150,14 @@ export class SpApiClient {
     return res.json();
   }
 
+
+  /** @param {string} [marketplaceId] */
+  async listInventorySummaries(marketplaceId = INDIA_MARKETPLACE_ID) {
+    const res = await this.request(`/fba/inventory/v1/summaries?details=true&granularityType=Marketplace&granularityId=${encodeURIComponent(marketplaceId)}&marketplaceIds=${encodeURIComponent(marketplaceId)}`);
+    if (!res.ok) throw new Error(`Inventory summaries failed: ${res.status}`);
+    return res.json();
+  }
+
   /** @param {string} postedAfter */
   async listFinanceTransactions(postedAfter) {
     const date = z.string().datetime().parse(postedAfter);
