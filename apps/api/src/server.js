@@ -319,9 +319,67 @@ app.get('/api/tenants/:tenantId/dashboard', async request => {
     const amazonAuth = (await pool.query("select amazon_seller_id, marketplace_id, auth_status, connected_at, last_token_refresh_at from sellers where tenant_id=$1 and auth_status='authorized' order by connected_at desc limit 1", [tenantId])).rows[0] ?? null;
     const kpis = (await client.query(`select coalesce(sum(amount),0) net_settled, coalesce(sum(case when amount > 0 then amount else 0 end),0) earnings, coalesce(sum(case when amount < 0 then amount else 0 end),0) deductions from settlement_rows where tenant_id=$1`, [tenantId])).rows[0];
     const orders = (await client.query(`select count(*) orders, coalesce(sum(total_amount),0) order_value from orders where tenant_id=$1`, [tenantId])).rows[0];
-    const products = (await client.query(`select asin, sum(units_ordered) units, sum(ordered_product_sales) sales, avg(featured_offer_percentage) buy_box from sales_traffic_daily where tenant_id=$1 group by asin order by sales desc nulls last limit 20`, [tenantId])).rows;
-    const trend = (await client.query(`select date, sum(ordered_product_sales) sales, sum(units_ordered) units, sum(sessions) sessions from sales_traffic_daily where tenant_id=$1 group by date order by date desc limit 90`, [tenantId])).rows.reverse();
-    const payments = (await client.query(`select settlement_id, date(posted_date) posted_date, sum(amount) net_amount, count(*) lines from settlement_rows where tenant_id=$1 group by settlement_id,date(posted_date) order by date(posted_date) desc nulls last limit 50`, [tenantId])).rows;
+    const products = (await client.query(`
+      with traffic_products as (
+        select asin, sum(units_ordered) units, sum(ordered_product_sales) sales, avg(featured_offer_percentage) buy_box
+        from sales_traffic_daily
+        where tenant_id=$1 and asin is not null and asin <> 'ALL'
+        group by asin
+      ), item_products as (
+        select asin, sum(quantity_ordered) units, sum(item_price) sales, null::numeric buy_box
+        from order_items
+        where tenant_id=$1 and asin is not null
+        group by asin
+      ), merged as (
+        select coalesce(t.asin, i.asin) asin,
+          greatest(coalesce(t.units, 0), coalesce(i.units, 0)) units,
+          greatest(coalesce(t.sales, 0), coalesce(i.sales, 0)) sales,
+          t.buy_box
+        from traffic_products t full outer join item_products i on i.asin = t.asin
+      )
+      select asin, units, sales, buy_box from merged order by sales desc nulls last, units desc nulls last limit 20`, [tenantId])).rows;
+    const trend = (await client.query(`
+      with traffic_trend as (
+        select date, sum(ordered_product_sales) sales, sum(units_ordered) units, sum(sessions) sessions
+        from sales_traffic_daily
+        where tenant_id=$1
+        group by date
+      ), order_trend as (
+        select date(order_date) date, sum(total_amount) sales, coalesce(sum(items.quantity), 0) units, 0::bigint sessions
+        from orders o
+        left join lateral (
+          select sum(quantity_ordered) quantity from order_items oi where oi.tenant_id=o.tenant_id and oi.amazon_order_id=o.amazon_order_id
+        ) items on true
+        where o.tenant_id=$1 and o.order_date is not null
+        group by date(o.order_date)
+      ), merged as (
+        select coalesce(t.date, o.date) date,
+          greatest(coalesce(t.sales, 0), coalesce(o.sales, 0)) sales,
+          greatest(coalesce(t.units, 0), coalesce(o.units, 0)) units,
+          coalesce(t.sessions, o.sessions, 0) sessions
+        from traffic_trend t full outer join order_trend o on o.date = t.date
+      )
+      select date, sales, units, sessions from merged order by date desc limit 90`, [tenantId])).rows.reverse();
+    const payments = (await client.query(`
+      with settlement_payments as (
+        select settlement_id, date(posted_date) posted_date, sum(amount) net_amount, count(*) lines
+        from settlement_rows
+        where tenant_id=$1
+        group by settlement_id,date(posted_date)
+      ), finance_payments as (
+        select coalesce(transaction_id, related_order_id, 'finance-' || date(posted_date)::text) settlement_id,
+          date(posted_date) posted_date,
+          sum(total_amount) net_amount,
+          count(*) lines
+        from finance_transactions
+        where tenant_id=$1 and posted_date is not null
+        group by coalesce(transaction_id, related_order_id, 'finance-' || date(posted_date)::text), date(posted_date)
+      ), merged as (
+        select * from settlement_payments
+        union all
+        select * from finance_payments where not exists (select 1 from settlement_payments)
+      )
+      select settlement_id, posted_date, net_amount, lines from merged order by posted_date desc nulls last limit 50`, [tenantId])).rows;
     const jobs = (await client.query('select report_type,status,started_at,completed_at,error_message,s3_key from sync_jobs where tenant_id=$1 order by started_at desc nulls last limit 10', [tenantId])).rows;
     const inventory = (await client.query('select sku, fulfillable_quantity, snapshot_date from inventory_snapshots where tenant_id=$1 order by snapshot_date desc, fulfillable_quantity desc nulls last limit 50', [tenantId])).rows;
     const returns = (await client.query('select order_id, return_reason, disposition, status, return_date from returns where tenant_id=$1 order by return_date desc nulls last limit 50', [tenantId])).rows;
