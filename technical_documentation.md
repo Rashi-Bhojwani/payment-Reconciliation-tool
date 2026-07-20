@@ -140,6 +140,7 @@ The SP-API client package is `packages/sp-api-client`. It owns:
 
 - LWA token refresh.
 - Generic SP-API requests.
+- Conservative per-family SP-API request limiting to avoid hammering seller/account quotas.
 - Reports API create/poll/download flow.
 - Orders API calls.
 - Order Items API calls.
@@ -424,6 +425,8 @@ Important behavior:
 
 - Adds `x-amz-access-token`.
 - Uses JSON content type by default.
+- Waits for a conservative per-API-family rate-limit slot before each SP-API request.
+- Uses slower default spacing for Reports, Finance, Inventory, Tokens, Orders, and Fees calls so sync jobs do not aggressively hit Amazon quotas.
 - Retries `429` and `503` responses with backoff.
 - Refreshes the access token between retry attempts when needed.
 
@@ -1371,7 +1374,13 @@ Uses:
 - `sync_jobs`.
 - Sync ledger rows.
 
-## 15. Common errors and what they mean
+## 15. SP-API request limiting
+
+The SP-API client includes a lightweight in-process limiter before every Amazon request. It groups paths by API family, such as Orders, Reports, Finances, FBA Inventory, Tokens, and Fees. Each group has a conservative minimum spacing between calls. This is designed to reduce `429` throttling, avoid bursty sync behavior, and lower the chance that a seller account experiences quota-related issues during manual or automatic syncs.
+
+The limiter is intentionally simple and in-process. If the app is later scaled to multiple API instances, the same idea should move to shared infrastructure such as Redis, SQS, or a database-backed queue so all instances share the same throttle state.
+
+## 16. Common errors and what they mean
 
 ### 15.1 `Create report failed: 400`
 
@@ -1409,51 +1418,51 @@ Possible causes:
 - Amazon account lacks permission for that report.
 - Direct sync completed but Amazon returned no data for the date window.
 
-## 16. How to run locally
+## 17. How to run locally
 
-### 16.1 Install dependencies
+### 17.1 Install dependencies
 
 ```bash
 npm install
 ```
 
-### 16.2 Run migrations
+### 17.2 Run migrations
 
 ```bash
 for file in packages/db/migrations/*.sql; do psql "$DATABASE_URL" -f "$file"; done
 ```
 
-### 16.3 Start development servers
+### 17.3 Start development servers
 
 ```bash
 npm run dev
 ```
 
-### 16.4 API only
+### 17.4 API only
 
 ```bash
 npm run dev:api
 ```
 
-### 16.5 Web only
+### 17.5 Web only
 
 ```bash
 npm run dev:web
 ```
 
-### 16.6 Syntax check
+### 17.6 Syntax check
 
 ```bash
 npm run check
 ```
 
-## 17. Suggested future improvements
+## 18. Suggested future improvements
 
-### 17.1 Move hardcoded database URL to environment variable
+### 18.1 Move hardcoded database URL to environment variable
 
 `packages/db/src/index.js` currently contains a hardcoded database URL. This should be changed to use `process.env.DATABASE_URL`.
 
-### 17.2 Add automated tests
+### 18.2 Add automated tests
 
 The repository currently has syntax checks but no comprehensive test suite. Useful tests would include:
 
@@ -1463,7 +1472,7 @@ The repository currently has syntax checks but no comprehensive test suite. Usef
 - Sync fallback tests.
 - Dashboard query tests.
 
-### 17.3 Split `App.jsx`
+### 18.3 Split `App.jsx`
 
 `App.jsx` contains most of the frontend. It could be split into:
 
@@ -1473,23 +1482,23 @@ The repository currently has syntax checks but no comprehensive test suite. Usef
 - `layouts/`.
 - `constants/reports.js`.
 
-### 17.4 Add structured logging for fallback sync
+### 18.4 Add structured logging for fallback sync
 
 The API returns fallback warnings, but structured logs would help debug Amazon report failures.
 
-### 17.5 Add user-facing warning details
+### 18.5 Add user-facing warning details
 
 The frontend could display fallback warnings separately from hard failures.
 
-### 17.6 Add pagination
+### 18.6 Add pagination
 
 Tables currently return limited rows. Larger sellers will need pagination/filtering.
 
-### 17.7 Harden secret management
+### 18.7 Harden secret management
 
 Use environment variables and managed secrets for production. Avoid committing credentials or real connection strings.
 
-## 18. Quick mental model for new developers
+## 19. Quick mental model for new developers
 
 If you want to understand the whole app quickly, follow this path:
 
@@ -1501,7 +1510,7 @@ If you want to understand the whole app quickly, follow this path:
 6. For database context/RLS, inspect `packages/db/src/index.js` and migrations.
 7. For raw report storage, inspect `apps/api/src/storage/s3.js`.
 
-## 19. Glossary
+## 20. Glossary
 
 - **SP-API**: Amazon Selling Partner API.
 - **LWA**: Login With Amazon, Amazon's OAuth system.
