@@ -311,6 +311,38 @@ export async function syncRecentApiDataForTenant(tenantId, options = {}) {
   });
 }
 
+
+/** @param {string} tenantId @param {'b2b'|'b2c'} invoiceType */
+export async function buildGstInvoicesFromOrderItems(tenantId, invoiceType) {
+  const parsedTenantId = z.string().uuid().parse(tenantId);
+  const parsedInvoiceType = z.enum(['b2b', 'b2c']).parse(invoiceType);
+  await assertActiveTenant(parsedTenantId);
+  return withTenant(parsedTenantId, async db => {
+    const result = await db.query(
+      `insert into gst_invoices(tenant_id, invoice_type, order_id, taxable_value, cgst, sgst, igst, invoice_date)
+       select oi.tenant_id,
+         $2,
+         oi.amazon_order_id,
+         sum(greatest(coalesce(oi.item_price,0) - coalesce(oi.item_tax,0), 0)) taxable_value,
+         sum(coalesce(oi.item_tax,0) / 2) cgst,
+         sum(coalesce(oi.item_tax,0) / 2) sgst,
+         0 igst,
+         date(coalesce(o.order_date, now())) invoice_date
+       from order_items oi
+       left join orders o on o.tenant_id=oi.tenant_id and o.amazon_order_id=oi.amazon_order_id
+       where oi.tenant_id=$1
+       group by oi.tenant_id, oi.amazon_order_id, date(coalesce(o.order_date, now()))
+       on conflict (tenant_id, invoice_type, order_id, invoice_date) do update set
+         taxable_value=excluded.taxable_value,
+         cgst=excluded.cgst,
+         sgst=excluded.sgst,
+         igst=excluded.igst`,
+      [parsedTenantId, parsedInvoiceType]
+    );
+    return result.rowCount ?? 0;
+  });
+}
+
 /** @param {string} reportType */
 async function syncActiveTenants(reportType) {
   const parsedReportType = z.enum(REPORT_TYPES).parse(reportType);

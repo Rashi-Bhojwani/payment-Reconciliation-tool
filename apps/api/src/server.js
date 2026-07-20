@@ -8,7 +8,7 @@ import { assertActiveTenant, databaseUrlConfigured, pool, withTenant } from '@re
 import { getSpApiEndpoint, MARKETPLACES, REPORT_TYPES, SpApiClient } from '@recon/sp-api-client';
 import { secrets } from './config/secrets.js';
 import { decryptSecret, encryptSecret } from './config/crypto.js';
-import { startScheduler, syncRecentApiDataForTenant, syncReportForTenant } from './jobs/sync.js';
+import { buildGstInvoicesFromOrderItems, startScheduler, syncRecentApiDataForTenant, syncReportForTenant } from './jobs/sync.js';
 
 const app = Fastify({ logger: { redact: ['req.headers.authorization', 'refresh_token', 'access_token', 'password', 'passwordHash'] } });
 
@@ -281,6 +281,11 @@ app.post('/api/tenants/:tenantId/sync/:reportType', async request => {
     const result = await syncReportForTenant(params);
     return { reportType: params.reportType, status: 'completed', ...result };
   } catch (error) {
+    if (params.reportType === 'GET_GST_MTR_B2B_CUSTOM' || params.reportType === 'GET_GST_MTR_B2C_CUSTOM') {
+      const invoiceType = params.reportType === 'GET_GST_MTR_B2B_CUSTOM' ? 'b2b' : 'b2c';
+      const rowsImported = await buildGstInvoicesFromOrderItems(params.tenantId, invoiceType);
+      if (rowsImported > 0) return { reportType: params.reportType, status: 'completed', fallback: 'ORDER_ITEMS_GST_ESTIMATE', rowsImported, warning: error instanceof Error ? error.message : 'GST report sync failed' };
+    }
     const directFallbackReports = new Set(['GET_V2_SETTLEMENT_REPORT_DATA_FLAT_FILE_V2', 'GET_SALES_AND_TRAFFIC_REPORT', 'GET_FBA_MYI_UNSUPPRESSED_INVENTORY_DATA', 'GET_FBA_REIMBURSEMENTS_DATA']);
     if (directFallbackReports.has(params.reportType)) {
       try {
