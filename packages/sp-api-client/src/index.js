@@ -76,10 +76,17 @@ export class SpApiClient {
     const parsedReportType = z.enum(REPORT_TYPES).parse(reportType);
     const parsedRange = DateRangeSchema.parse(range);
     const parsedTenant = z.string().uuid().parse(tenantId);
-    const create = await this.request('/reports/2021-06-30/reports', {
+    const createReportBody = { reportType: parsedReportType, marketplaceIds: [marketplaceId], dataStartTime: parsedRange.start, dataEndTime: parsedRange.end };
+    let create = await this.request('/reports/2021-06-30/reports', {
       method: 'POST',
-      body: JSON.stringify({ reportType: parsedReportType, marketplaceIds: [marketplaceId], dataStartTime: parsedRange.start, dataEndTime: parsedRange.end })
+      body: JSON.stringify(createReportBody)
     });
+    if (!create.ok && create.status === 400) {
+      create = await this.request('/reports/2021-06-30/reports', {
+        method: 'POST',
+        body: JSON.stringify({ reportType: parsedReportType, marketplaceIds: [marketplaceId] })
+      });
+    }
     if (!create.ok) throw new Error(`Create report failed: ${create.status}`);
     const { reportId } = z.object({ reportId: z.string().min(1) }).parse(await create.json());
 
@@ -140,6 +147,14 @@ export class SpApiClient {
     const id = z.string().min(1).parse(orderId);
     const res = await this.request(`/orders/v0/orders/${encodeURIComponent(id)}/orderItems`);
     if (!res.ok) throw new Error(`List order items failed: ${res.status}`);
+    return res.json();
+  }
+
+
+  /** @param {string} [marketplaceId] */
+  async listInventorySummaries(marketplaceId = INDIA_MARKETPLACE_ID) {
+    const res = await this.request(`/fba/inventory/v1/summaries?details=true&granularityType=Marketplace&granularityId=${encodeURIComponent(marketplaceId)}&marketplaceIds=${encodeURIComponent(marketplaceId)}`);
+    if (!res.ok) throw new Error(`Inventory summaries failed: ${res.status}`);
     return res.json();
   }
 
