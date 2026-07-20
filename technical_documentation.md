@@ -775,7 +775,7 @@ Direct SP-API sync function.
 Flow:
 
 1. Validate tenant ID.
-2. Calculate `createdAfter` based on requested days, defaulting to 30.
+2. Calculate `createdAfter` based on requested days, defaulting to 30. If a previous direct sync completed, use an incremental window from the last completed sync with a small 5-minute overlap so repeated syncs are much faster.
 3. Confirm tenant is active.
 4. Insert `sync_jobs` row as `DIRECT_SP_API_SYNC` and `running`.
 5. Load authorized seller.
@@ -784,7 +784,7 @@ Flow:
 8. Fetch finance transactions.
 9. Fetch inventory summaries.
 10. Import orders.
-11. Import order items.
+11. Import order items only for orders that do not already have item rows, so re-syncing does not repeatedly call the slow order-items endpoint.
 12. Import inventory snapshots.
 13. Import finance transactions.
 14. Derive reimbursement rows from finance transactions where transaction type includes reimbursement.
@@ -797,6 +797,8 @@ Returned counts include:
 - `transactionsImported`.
 - `inventoryImported`.
 - `reimbursementsImported`.
+- `orderItemsSkipped`.
+- `incrementalSince`.
 
 Returned warnings may include:
 

@@ -218,7 +218,16 @@ export async function syncReportForTenant(params) {
 /** @param {string} tenantId @param {{ days?: number }} [options] */
 export async function syncRecentApiDataForTenant(tenantId, options = {}) {
   const parsedTenantId = z.string().uuid().parse(tenantId);
-  const createdAfter = new Date(Date.now() - (options.days ?? 30) * 864e5).toISOString();
+  const defaultCreatedAfter = new Date(Date.now() - (options.days ?? 30) * 864e5);
+  const lastCompletedSync = (await pool.query(
+    `select completed_at from sync_jobs
+     where tenant_id=$1 and report_type='DIRECT_SP_API_SYNC' and status='completed' and completed_at is not null
+     order by completed_at desc limit 1`,
+    [parsedTenantId]
+  )).rows[0]?.completed_at;
+  const incrementalCreatedAfter = lastCompletedSync ? new Date(new Date(lastCompletedSync).getTime() - 5 * 60 * 1000) : defaultCreatedAfter;
+  const createdAfterDate = options.full ? defaultCreatedAfter : new Date(Math.max(defaultCreatedAfter.getTime(), incrementalCreatedAfter.getTime()));
+  const createdAfter = createdAfterDate.toISOString();
   await assertActiveTenant(parsedTenantId);
   return runJob(`sync:direct-api:${parsedTenantId}`, async () => {
     const sync = await pool.query('insert into sync_jobs(tenant_id, report_type, status, started_at) values($1,$2,$3,now()) returning id', [parsedTenantId, 'DIRECT_SP_API_SYNC', 'running']);
@@ -246,6 +255,7 @@ export async function syncRecentApiDataForTenant(tenantId, options = {}) {
       let transactionsImported = 0;
       let inventoryImported = 0;
       let reimbursementsImported = 0;
+      let orderItemsSkipped = 0;
       await withTenant(parsedTenantId, async db => {
         for (const order of orders) {
           const orderId = order.AmazonOrderId ?? order.amazonOrderId;
@@ -257,6 +267,11 @@ export async function syncRecentApiDataForTenant(tenantId, options = {}) {
             [parsedTenantId, orderId, order.PurchaseDate ?? order.purchaseDate ?? null, number(order.OrderTotal?.Amount ?? order.orderTotal?.amount), order.OrderStatus ?? order.orderStatus ?? null]
           );
           ordersImported += 1;
+          const existingItems = await db.query('select 1 from order_items where tenant_id=$1 and amazon_order_id=$2 limit 1', [parsedTenantId, orderId]);
+          if (existingItems.rowCount) {
+            orderItemsSkipped += 1;
+            continue;
+          }
           const itemsResponse = await client.listOrderItems(orderId).catch(() => undefined);
           const items = itemsResponse?.payload?.OrderItems ?? itemsResponse?.OrderItems ?? [];
           for (const item of items) {
@@ -303,7 +318,7 @@ export async function syncRecentApiDataForTenant(tenantId, options = {}) {
         }
       });
       await pool.query('update sync_jobs set status=$1, completed_at=now() where id=$2', ['completed', sync.rows[0].id]);
-      return { ordersImported, transactionsImported, inventoryImported, reimbursementsImported, financeWarning: financeResponse?.syncError, inventoryWarning: inventoryResponse?.syncError };
+      return { ordersImported, transactionsImported, inventoryImported, reimbursementsImported, orderItemsSkipped, incrementalSince: createdAfter, financeWarning: financeResponse?.syncError, inventoryWarning: inventoryResponse?.syncError };
     } catch (error) {
       await pool.query('update sync_jobs set status=$1, completed_at=now(), error_message=$2 where id=$3', ['failed', error instanceof Error ? error.message : 'unknown error', sync.rows[0].id]);
       throw error;
