@@ -11,6 +11,7 @@ const API = import.meta.env.VITE_API_URL ?? 'http://localhost:4000';
 const REPORTS = [
   { type: 'GET_V2_SETTLEMENT_REPORT_DATA_FLAT_FILE_V2', code: 'STL', label: 'Settlements', hint: 'Payout batches & fee lines' },
   { type: 'GET_SALES_AND_TRAFFIC_REPORT', code: 'S&T', label: 'Sales & traffic', hint: 'Sessions, units, buy box' },
+  { type: 'GET_FBA_MYI_UNSUPPRESSED_INVENTORY_DATA', code: 'INV', label: 'Inventory', hint: 'FBA fulfillable stock' },
   { type: 'GET_FBA_REIMBURSEMENTS_DATA', code: 'RMB', label: 'Reimbursements', hint: 'FBA loss & damage credits' },
   { type: 'GET_FBA_FULFILLMENT_CUSTOMER_RETURNS_DATA', code: 'RTN', label: 'Customer returns', hint: 'Return reasons & disposition' }
 ];
@@ -23,7 +24,7 @@ const COLORS = ['#c98a2c', '#1f8a85', '#12213a', '#7fb6b2'];
 // the report(s) it actually depends on.
 const VIEW_REPORT_TYPES = {
   sales: ['GET_SALES_AND_TRAFFIC_REPORT'],
-  inventory: [],
+  inventory: ['GET_FBA_MYI_UNSUPPRESSED_INVENTORY_DATA'],
   payouts: ['GET_V2_SETTLEMENT_REPORT_DATA_FLAT_FILE_V2'],
   brand: ['GET_SALES_AND_TRAFFIC_REPORT'],
   health: ['GET_FBA_REIMBURSEMENTS_DATA', 'GET_FBA_FULFILLMENT_CUSTOMER_RETURNS_DATA'],

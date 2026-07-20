@@ -10,5 +10,6 @@ export const secrets = {
   tokenEncryptionKey: process.env.SESSION_SECRET ?? 'dev-only-change-me',
   frontendOrigin: process.env.FRONTEND_ORIGIN ?? 'http://localhost:5173',
   s3Bucket: process.env.S3_BUCKET ?? '',
-  s3Region: process.env.S3_REGION ?? 'ap-south-1'
+  s3Region: process.env.S3_REGION ?? 'ap-south-1',
+  localReportDir: process.env.LOCAL_REPORT_DIR ?? 'storage/raw-reports'
 };
