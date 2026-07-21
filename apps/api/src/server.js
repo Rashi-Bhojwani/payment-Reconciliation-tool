@@ -15,10 +15,14 @@ const app = Fastify({ logger: { redact: ['req.headers.authorization', 'refresh_t
 await app.register(cors, { origin: secrets.frontendOrigin, credentials: true });
 await app.register(rateLimit, { max: 180, timeWindow: '1 minute' });
 await app.register(jwt, { secret: secrets.jwtSecret });
+app.addContentTypeParser(/^application\/x-www-form-urlencoded(?:;.*)?$/, { parseAs: 'string' }, (_request, body, done) => {
+  try { done(null, Object.fromEntries(new URLSearchParams(body))); }
+  catch (error) { done(error); }
+});
 
 const TenantParamsSchema = z.object({ tenantId: z.string().uuid() });
 const SyncParamsSchema = z.object({ tenantId: z.string().uuid(), reportType: z.enum(REPORT_TYPES) });
-const AmazonCallbackSchema = z.object({ spapi_oauth_code: z.string().optional(), code: z.string().optional(), selling_partner_id: z.string().optional(), state: z.string().optional() });
+const AmazonCallbackSchema = z.object({ spapi_oauth_code: z.string().optional(), code: z.string().optional(), selling_partner_id: z.string().optional(), state: z.string().optional(), error: z.string().optional(), error_description: z.string().optional() });
 const AmazonAccessTokenSchema = z.object({ sellerId: z.string().optional() });
 const DateRangeSchema = z.object({ start: z.string().datetime(), end: z.string().datetime() });
 const DashboardQuerySchema = z.object({ start: z.string().datetime().optional(), end: z.string().datetime().optional() });
@@ -68,6 +72,7 @@ function amazonConsentHost(marketplaceId) {
 async function exchangeAmazonCode(code) {
   const token = await fetch('https://api.amazon.com/auth/o2/token', {
     method: 'POST',
+    signal: AbortSignal.timeout(20_000),
     headers: { 'content-type': 'application/x-www-form-urlencoded' },
     body: new URLSearchParams({ grant_type: 'authorization_code', code, client_id: secrets.lwaClientId, client_secret: secrets.lwaClientSecret, redirect_uri: secrets.redirectUri })
   });
@@ -222,13 +227,23 @@ app.get('/api/auth/amazon/start', async (request, reply) => {
 });
 
 async function handleAmazonCallback(request, reply) {
-  const query = AmazonCallbackSchema.parse(request.query);
+  const query = AmazonCallbackSchema.parse({ ...(request.body && typeof request.body === 'object' ? request.body : {}), ...request.query });
+  let state;
+  try { state = verifyAmazonState(query.state); }
+  catch (error) {
+    return reply.redirect(`${secrets.frontendOrigin}/login?amazon=error&message=${encodeURIComponent(error instanceof Error ? error.message : 'Invalid Amazon authorization state')}`);
+  }
+  if (query.error) return reply.redirect(`${secrets.frontendOrigin}/seller?tenantId=${state.tenantId}&amazon=error&message=${encodeURIComponent(query.error_description ?? query.error)}`);
   const code = query.spapi_oauth_code ?? query.code;
-  if (!code) return reply.code(400).send({ error: 'Missing authorization code' });
-  const state = verifyAmazonState(query.state);
+  if (!code) return reply.redirect(`${secrets.frontendOrigin}/seller?tenantId=${state.tenantId}&amazon=error&message=${encodeURIComponent('Missing authorization code from Amazon')}`);
   const tenant = (await pool.query('select id, company_name, default_marketplace_id from tenants where id=$1', [state.tenantId])).rows[0];
   if (!tenant) throw Object.assign(new Error('Tenant not found'), { statusCode: 404 });
-  const body = await exchangeAmazonCode(code);
+  let body;
+  try { body = await exchangeAmazonCode(code); }
+  catch (error) {
+    const message = error instanceof Error ? error.message : 'Amazon token exchange failed';
+    return reply.redirect(`${secrets.frontendOrigin}/seller?tenantId=${state.tenantId}&amazon=error&message=${encodeURIComponent(message)}`);
+  }
   const marketplace = tenant.default_marketplace_id ?? 'A21TJRUUN4KGV';
   const sellerId = query.selling_partner_id ?? `SELLER-${state.tenantId}`;
   const sellerName = tenant.company_name;

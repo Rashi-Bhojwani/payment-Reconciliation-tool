@@ -383,6 +383,7 @@ function SellerDashboard() {
   const tenantId = params.get('tenantId') ?? '';
   const view = params.get('view') ?? 'dashboard';
   const freshAmazonAuth = params.get('auth') === 'complete';
+  const amazonError = params.get('amazon') === 'error' ? (params.get('message') ?? 'Amazon authorization failed') : '';
   const { range } = useContext(DateRangeContext);
   const [data, setData] = useState(null);
   const [error, setError] = useState('');
@@ -443,6 +444,7 @@ function SellerDashboard() {
       </div>
     </div>
     {freshAmazonAuth && connected && <p className="alert success">Amazon account connected. Select a date range or use Sync on this page to pull limited data.</p>}
+    {amazonError && <p className="alert warning">Amazon connection issue: {amazonError}</p>}
     {error && <p className="alert warning">{error}</p>}
     {autoSyncing && <p className="alert success">Syncing this page only for {range.label}…</p>}
     {view === 'dashboard' && !connected && data && <p className="alert warning">Connect your Amazon account to start pulling data — nothing syncs until then.</p>}
