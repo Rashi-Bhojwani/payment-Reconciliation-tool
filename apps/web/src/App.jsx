@@ -46,8 +46,6 @@ const VIEW_REPORT_TYPES = {
   tax: ['GET_GST_MTR_B2B_CUSTOM', 'GET_GST_MTR_B2C_CUSTOM'],
   pricing: ['GET_SALES_AND_TRAFFIC_REPORT'],
   listings: ['GET_FBA_MYI_UNSUPPRESSED_INVENTORY_DATA'],
-  customer: ['GET_FBA_FULFILLMENT_CUSTOMER_RETURNS_DATA'],
-  health: ['GET_FBA_REIMBURSEMENTS_DATA', 'GET_FBA_FULFILLMENT_CUSTOMER_RETURNS_DATA'],
   reports: REPORTS.map(r => r.type)
 };
 const VIEW_LEDGER_COPY = {
@@ -61,8 +59,6 @@ const VIEW_LEDGER_COPY = {
   tax: { title: 'GST sync', subtitle: 'B2B and B2C invoice reports' },
   pricing: { title: 'Pricing signals sync', subtitle: 'Sales and traffic metrics' },
   listings: { title: 'Listings inventory sync', subtitle: 'FBA SKU availability' },
-  customer: { title: 'Customer experience sync', subtitle: 'Returns and defects signals' },
-  health: { title: 'Returns & reimbursements sync', subtitle: 'Powers this page only' },
   reports: { title: 'Sync ledger', subtitle: 'Pull one report at a time' }
 };
 
@@ -436,16 +432,14 @@ function SellerDashboard() {
     {view === 'tax' && <TableCard title="GST Invoice Details" rows={data?.invoices ?? []} columns={['invoice_type', 'order_id', 'taxable_value', 'cgst', 'sgst', 'igst', 'invoice_date']} />}
     {view === 'pricing' && <InsightCards title="Pricing & Buy Box" cards={[['Buy Box', `${formatNumber((data?.products ?? []).filter(p => p.buy_box).length)} ASIN signals`], ['ASP', formatCurrency(buildDashboardSummary(data).netQty ? buildDashboardSummary(data).netSales / buildDashboardSummary(data).netQty : 0)], ['Source', 'Sales & Traffic report']]} />}
     {view === 'listings' && <TableCard title="Listing Availability" rows={data?.inventory ?? []} columns={['sku', 'fulfillable_quantity', 'snapshot_date']} />}
-    {view === 'customer' && <TableCard title="Customer Experience Signals" rows={data?.returns ?? []} columns={['order_id', 'return_reason', 'disposition', 'status', 'return_date']} />}
-    {view === 'health' && <div className="dashboard-grid two"><TableCard title="Returns" rows={data?.returns ?? []} columns={['order_id', 'return_reason', 'disposition', 'status', 'return_date']} /><TableCard title="Reimbursements" rows={data?.reimbursements ?? []} columns={['sku', 'amount', 'reason', 'reimbursement_date']} /></div>}
     {view === 'reports' && <ReportsExplorer tenantId={tenantId} data={data} />}
     {view === 'report-detail' && <ReportDetail data={data} reportType={params.get('reportType')} />}
     {view === 'metric-detail' && <MetricDetail data={data} metric={params.get('metric')} />}
   </div>;
 }
 
-function viewTitle(view) { return ({ dashboard: 'Dashboard', sales: 'Sales Analytics', inventory: 'Inventory', payouts: 'Payout Reconciliation', brand: 'Brand Analytics', orders: 'Orders', returns: 'Returns', reimbursements: 'Reimbursements', tax: 'GST & Tax', pricing: 'Pricing & Buy Box', listings: 'Listings', customer: 'Customer Experience', health: 'Account Health', reports: 'Reports', 'report-detail': 'Report Detail' })[view] ?? 'Dashboard'; }
-function viewDescription(view) { return ({ dashboard: 'Amazon-only reconciliation KPIs with explainable drill-downs.', sales: 'Revenue, order value, units and product sales trends from Amazon reports.', inventory: 'FBA inventory snapshots imported from SP-API inventory reports.', payouts: 'Settlement rows and payout reconciliation from Amazon settlement reports.', brand: 'ASIN-level product performance from synced Amazon order items, with Sales & Traffic metrics when available.', orders: 'Order and item-level details imported from Amazon SP-API.', returns: 'Customer return reasons, status and disposition.', reimbursements: 'Amazon reimbursement credits for lost, damaged or adjusted inventory.', tax: 'GST B2B and B2C invoice rows in readable form.', pricing: 'ASP and Buy Box signals that influence sales.', listings: 'SKU availability and listing stock visibility.', customer: 'Return-driven customer experience signals.', health: 'Returns and reimbursement signals imported from Amazon reports.', reports: 'Open each fetched report and view human-readable data.', 'report-detail': 'Human-readable rows from the selected SP-API report.' })[view] ?? 'Live seller KPIs populated from synced SP-API orders and reports.'; }
+function viewTitle(view) { return ({ dashboard: 'Dashboard', sales: 'Sales Analytics', inventory: 'Inventory', payouts: 'Payout Reconciliation', brand: 'Brand Analytics', orders: 'Orders', returns: 'Returns', reimbursements: 'Reimbursements', tax: 'GST & Tax', pricing: 'Pricing & Buy Box', listings: 'Listings', reports: 'Reports', 'report-detail': 'Report Detail' })[view] ?? 'Dashboard'; }
+function viewDescription(view) { return ({ dashboard: 'Amazon-only reconciliation KPIs with explainable drill-downs.', sales: 'Revenue, order value, units and product sales trends from Amazon reports.', inventory: 'FBA inventory snapshots imported from SP-API inventory reports.', payouts: 'Settlement rows and payout reconciliation from Amazon settlement reports.', brand: 'ASIN-level product performance from synced Amazon order items, with Sales & Traffic metrics when available.', orders: 'Order and item-level details imported from Amazon SP-API.', returns: 'Customer return reasons, status and disposition.', reimbursements: 'Amazon reimbursement credits for lost, damaged or adjusted inventory.', tax: 'GST B2B and B2C invoice rows in readable form.', pricing: 'ASP and Buy Box signals that influence sales.', listings: 'SKU availability and listing stock visibility.', reports: 'Open each fetched report and view human-readable data.', 'report-detail': 'Human-readable rows from the selected SP-API report.' })[view] ?? 'Live seller KPIs populated from synced SP-API orders and reports.'; }
 function DashboardOverview({ data, channelData, tenantId }) {
   const summary = useMemo(() => buildDashboardSummary(data), [data]);
   return <>
@@ -458,12 +452,6 @@ function DashboardOverview({ data, channelData, tenantId }) {
 
     <Card className="profit-control-card">
       <PanelHeader title="Profit Analysis" subtitle="Clean overview" />
-      <div className="filter-toolbar">
-        {['Channel', 'Parent ID', 'SKU', 'Inventory Master SKU', 'Account', 'Category', 'Color', 'Year of launch'].map(filter => <button key={filter} className="filter-chip">{filter}<span>⌄</span></button>)}
-        <button className="filter-chip active">Amazon-India</button>
-        <button className="filter-chip active">With GST</button>
-        <button className="filter-chip active">Without Expenses</button>
-      </div>
       <div className="profit-kpi-grid">
         <StatCard title="Settled Amount" value={formatCurrency(summary.settledAmount)} hint="From settlements / finance" />
         <StatCard title="Deductions" value={formatCurrency(summary.deductions)} hint="Fees, refunds, charges" />
@@ -497,10 +485,18 @@ function ExplanationGrid({ summary, tenantId }) {
   return <div className="explain-grid">{cards.map(([title, value, copy, target]) => <NavLink key={title} to={`/seller?tenantId=${tenantId}&view=${target === 'deductions' || target === 'settled' ? `metric-detail&metric=${target}` : target}`} className="explain-card"><b>{title}</b><strong>{value}</strong><p>{copy}</p><span>Open detail →</span></NavLink>)}</div>;
 }
 function InsightCards({ title, cards }) { return <Card><PanelHeader title={title} /><div className="explain-grid compact">{cards.map(([label, value]) => <div className="explain-card" key={label}><b>{label}</b><strong>{value}</strong></div>)}</div></Card>; }
+
+function getReportRows(data, reportType) {
+  const detail = REPORT_DETAIL_MAP[reportType];
+  const rows = data?.[detail.source] ?? [];
+  if (reportType === 'GET_GST_MTR_B2B_CUSTOM') return rows.filter(row => String(row.invoice_type ?? '').toUpperCase().includes('B2B'));
+  if (reportType === 'GET_GST_MTR_B2C_CUSTOM') return rows.filter(row => String(row.invoice_type ?? '').toUpperCase().includes('B2C'));
+  return rows;
+}
+
 function ReportsExplorer({ tenantId, data }) {
   return <div className="reports-grid">{REPORTS.map(report => {
     const detail = REPORT_DETAIL_MAP[report.type];
-    const rows = data?.[detail.source] ?? [];
     const job = data?.jobs?.find(j => j.report_type === report.type);
     return <NavLink className="report-tile" key={report.type} to={`/seller?tenantId=${tenantId}&view=report-detail&reportType=${report.type}`}>
       <span className="ledger-code">{report.code}</span><div><b>{report.label}</b><p>{detail.explanation}</p></div><small>{job?.completed_at ? `Last synced ${timeAgo(job.completed_at)}` : report.hint}</small>
@@ -510,7 +506,7 @@ function ReportsExplorer({ tenantId, data }) {
 function ReportDetail({ data, reportType }) {
   const report = REPORTS.find(r => r.type === reportType) ?? REPORTS[0];
   const detail = REPORT_DETAIL_MAP[report.type];
-  const rows = data?.[detail.source] ?? [];
+  const rows = getReportRows(data, report.type);
   return <>
     <Card className="detail-hero">
       <PanelHeader title={detail.title} subtitle={report.code} />
@@ -722,8 +718,6 @@ function SellerShell({ session, setSession }) {
         <SidebarLink to={`/seller?tenantId=${session?.tenantId ?? ''}&view=tax`}>GST & Tax</SidebarLink>
         <SidebarLink to={`/seller?tenantId=${session?.tenantId ?? ''}&view=pricing`}>Pricing & Buy Box</SidebarLink>
         <SidebarLink to={`/seller?tenantId=${session?.tenantId ?? ''}&view=listings`}>Listings</SidebarLink>
-        <SidebarLink to={`/seller?tenantId=${session?.tenantId ?? ''}&view=customer`}>Customer Experience</SidebarLink>
-        <SidebarLink to={`/seller?tenantId=${session?.tenantId ?? ''}&view=health`}>Account Health</SidebarLink>
         <SidebarLink to={`/seller?tenantId=${session?.tenantId ?? ''}&view=reports`}>Reports</SidebarLink>
       </nav>
     </aside>
