@@ -174,6 +174,8 @@ function Login({ setSession }) {
 function startOfDay(d) { const x = new Date(d); x.setHours(0, 0, 0, 0); return x; }
 function addDays(d, n) { const x = new Date(d); x.setDate(x.getDate() + n); return x; }
 function formatShort(d) { return d.toLocaleDateString('en-IN', { month: 'short', day: 'numeric' }); }
+function formatDateParam(date) { return startOfDay(date).toISOString(); }
+function rangeQuery(range) { return `start=${encodeURIComponent(formatDateParam(range.start))}&end=${encodeURIComponent(formatDateParam(addDays(range.end, 1)))}`; }
 function formatRangeLabel(start, end) {
   const startStr = formatShort(start);
   const endStr = start.getFullYear() === end.getFullYear() ? formatShort(end) : end.toLocaleDateString('en-IN', { month: 'short', day: 'numeric', year: 'numeric' });
@@ -277,6 +279,7 @@ function StatCard({ title, value, hint }) { return <Card className="stat-card"><
 // scopes which rows show up — each sidebar page passes only the report(s) it
 // actually depends on, instead of every page showing the full bundle.
 function SyncLedger({ tenantId, jobs = [], onSynced, reportTypes, title, subtitle, disabled }) {
+  const { range } = useContext(DateRangeContext);
   const [rowState, setRowState] = useState({});
   const reports = reportTypes ? REPORTS.filter(r => reportTypes.includes(r.type)) : REPORTS;
 
@@ -285,8 +288,8 @@ function SyncLedger({ tenantId, jobs = [], onSynced, reportTypes, title, subtitl
     setRowState(s => ({ ...s, [reportType]: { loading: true } }));
     try {
       const result = reportType === 'DIRECT_SP_API_SYNC'
-        ? await api(`/api/tenants/${tenantId}/sync`, { method: 'POST', body: JSON.stringify({ reportTypes: [] }) })
-        : await api(`/api/tenants/${tenantId}/sync/${reportType}`, { method: 'POST' });
+        ? await api(`/api/tenants/${tenantId}/sync`, { method: 'POST', body: JSON.stringify({ reportTypes: [], range: { start: formatDateParam(range.start), end: formatDateParam(addDays(range.end, 1)) } }) })
+        : await api(`/api/tenants/${tenantId}/sync/${reportType}`, { method: 'POST', body: JSON.stringify({ range: { start: formatDateParam(range.start), end: formatDateParam(addDays(range.end, 1)) } }) });
       if (result?.status === 'failed') throw new Error(result.error ?? 'Sync failed');
       const failedDirectSync = result?.results?.find?.(row => row.status === 'failed');
       if (failedDirectSync) throw new Error(failedDirectSync.error ?? 'Sync failed');
@@ -379,34 +382,35 @@ function SellerDashboard() {
   const [params] = useSearchParams();
   const tenantId = params.get('tenantId') ?? '';
   const view = params.get('view') ?? 'dashboard';
+  const { range } = useContext(DateRangeContext);
   const [data, setData] = useState(null);
   const [error, setError] = useState('');
   const [autoSyncing, setAutoSyncing] = useState(false);
-  const autoSyncedRef = useRef(false);
-  async function load() { setError(''); try { setData(await api(`/api/tenants/${tenantId}/dashboard`)); } catch (e) { setError(e.message); } }
-  useEffect(() => { if (tenantId) void load(); }, [tenantId]);
+  const lastRangeSyncRef = useRef('');
+  async function load() { setError(''); try { setData(await api(`/api/tenants/${tenantId}/dashboard?${rangeQuery(range)}`)); } catch (e) { setError(e.message); } }
+  useEffect(() => { if (tenantId) void load(); }, [tenantId, range.start, range.end]);
 
-  // Dashboard-only, once per session: as soon as we know the seller is
-  // Amazon-authenticated, automatically pull the default last-30-days data
-  // so the dashboard is populated without the user pressing anything. Every
-  // other page stays manual — its Sync button is the only thing that syncs it.
+  // When the calendar range is applied, do one safe, range-limited direct
+  // Amazon sync. We intentionally do not fan out to every report here, because
+  // repeated report creation can stress the seller account; detailed pages keep
+  // their manual, per-report Sync buttons.
   useEffect(() => {
-    if (view !== 'dashboard') return;
-    if (!data?.seller?.connected) return;
-    if (autoSyncedRef.current) return;
-    autoSyncedRef.current = true;
+    if (!data?.seller?.connected || !tenantId) return;
+    const syncKey = `${tenantId}:${formatDateParam(range.start)}:${formatDateParam(addDays(range.end, 1))}`;
+    if (lastRangeSyncRef.current === syncKey) return;
+    lastRangeSyncRef.current = syncKey;
     (async () => {
       setAutoSyncing(true);
-      for (const report of REPORTS) {
-        try {
-          if (report.type === 'DIRECT_SP_API_SYNC') await api(`/api/tenants/${tenantId}/sync`, { method: 'POST', body: JSON.stringify({ reportTypes: [] }) });
-          else await api(`/api/tenants/${tenantId}/sync/${report.type}`, { method: 'POST' });
-        } catch { /* one failed report shouldn't block the rest */ }
+      try {
+        await api(`/api/tenants/${tenantId}/sync`, { method: 'POST', body: JSON.stringify({ reportTypes: [], range: { start: formatDateParam(range.start), end: formatDateParam(addDays(range.end, 1)) } }) });
+        await load();
+      } catch (e) {
+        setError(e.message);
+      } finally {
+        setAutoSyncing(false);
       }
-      await load();
-      setAutoSyncing(false);
     })();
-  }, [view, data?.seller?.connected, tenantId]);
+  }, [data?.seller?.connected, tenantId, range.start, range.end]);
 
   const channelData = useMemo(() => [
     { name: 'Order value', value: Number(data?.orders?.order_value ?? 0) },
@@ -427,7 +431,7 @@ function SellerDashboard() {
       </div>
     </div>
     {error && <p className="alert warning">{error}</p>}
-    {view === 'dashboard' && autoSyncing && <p className="alert success">Auto-syncing your last 30 days of data…</p>}
+    {autoSyncing && <p className="alert success">Syncing Amazon data only for {range.label}…</p>}
     {view === 'dashboard' && !connected && data && <p className="alert warning">Connect your Amazon account to start pulling data — nothing syncs until then.</p>}
     {view !== 'dashboard' && !detailView && <SyncLedger tenantId={tenantId} jobs={data?.jobs ?? []} onSynced={load} reportTypes={reportTypes} title={ledgerCopy?.title} subtitle={ledgerCopy?.subtitle} disabled={!connected} />}
 
