@@ -218,7 +218,8 @@ export async function syncReportForTenant(params) {
 /** @param {string} tenantId @param {{ days?: number }} [options] */
 export async function syncRecentApiDataForTenant(tenantId, options = {}) {
   const parsedTenantId = z.string().uuid().parse(tenantId);
-  const defaultCreatedAfter = new Date(Date.now() - (options.days ?? 30) * 864e5);
+  const range = options.range ? z.object({ start: z.string().datetime(), end: z.string().datetime() }).parse(options.range) : null;
+  const defaultCreatedAfter = range ? new Date(range.start) : new Date(Date.now() - (options.days ?? 30) * 864e5);
   const lastCompletedSync = (await pool.query(
     `select completed_at from sync_jobs
      where tenant_id=$1 and report_type='DIRECT_SP_API_SYNC' and status='completed' and completed_at is not null
@@ -226,8 +227,9 @@ export async function syncRecentApiDataForTenant(tenantId, options = {}) {
     [parsedTenantId]
   )).rows[0]?.completed_at;
   const incrementalCreatedAfter = lastCompletedSync ? new Date(new Date(lastCompletedSync).getTime() - 5 * 60 * 1000) : defaultCreatedAfter;
-  const createdAfterDate = options.full ? defaultCreatedAfter : new Date(Math.max(defaultCreatedAfter.getTime(), incrementalCreatedAfter.getTime()));
+  const createdAfterDate = range || options.full ? defaultCreatedAfter : new Date(Math.max(defaultCreatedAfter.getTime(), incrementalCreatedAfter.getTime()));
   const createdAfter = createdAfterDate.toISOString();
+  const createdBefore = range ? new Date(range.end).toISOString() : undefined;
   await assertActiveTenant(parsedTenantId);
   return runJob(`sync:direct-api:${parsedTenantId}`, async () => {
     const sync = await pool.query('insert into sync_jobs(tenant_id, report_type, status, started_at) values($1,$2,$3,now()) returning id', [parsedTenantId, 'DIRECT_SP_API_SYNC', 'running']);
@@ -237,7 +239,7 @@ export async function syncRecentApiDataForTenant(tenantId, options = {}) {
       const marketplaceId = seller.rows[0].marketplace_id;
       const client = new SpApiClient(decryptSecret(seller.rows[0].refresh_token_encrypted), { baseUrl: getSpApiEndpoint(marketplaceId) });
       const orderPages = [];
-      let ordersResponse = await client.listOrders(createdAfter, marketplaceId);
+      let ordersResponse = await client.listOrders(createdAfter, marketplaceId, createdBefore);
       orderPages.push(ordersResponse);
       for (let page = 0; page < 20; page += 1) {
         const nextToken = ordersResponse?.payload?.NextToken ?? ordersResponse?.NextToken;
@@ -246,7 +248,7 @@ export async function syncRecentApiDataForTenant(tenantId, options = {}) {
         orderPages.push(ordersResponse);
       }
       const orders = orderPages.flatMap(page => page?.payload?.Orders ?? page?.Orders ?? []);
-      const financeResponse = await client.listFinanceTransactions(createdAfter).catch(error => ({ syncError: error instanceof Error ? error.message : 'Finance sync failed' }));
+      const financeResponse = await client.listFinanceTransactions(createdAfter, createdBefore).catch(error => ({ syncError: error instanceof Error ? error.message : 'Finance sync failed' }));
       const transactions = financeResponse?.payload?.transactions ?? financeResponse?.transactions ?? financeResponse?.payload?.Transactions ?? financeResponse?.Transactions ?? [];
       const inventoryResponse = await client.listInventorySummaries(marketplaceId).catch(error => ({ syncError: error instanceof Error ? error.message : 'Inventory sync failed' }));
       const inventorySummaries = inventoryResponse?.payload?.inventorySummaries ?? inventoryResponse?.inventorySummaries ?? [];
