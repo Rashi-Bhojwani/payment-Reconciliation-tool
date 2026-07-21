@@ -92,6 +92,22 @@ function Card({ children, className = '' }) { return <section className={`card $
 function Empty({ text }) { return <div className="empty-state">{text}</div>; }
 function formatCurrency(value) { return `₹${Number(value ?? 0).toLocaleString('en-IN', { maximumFractionDigits: 0 })}`; }
 function formatNumber(value) { return Number(value ?? 0).toLocaleString('en-IN'); }
+function csvEscape(value) {
+  const text = String(value ?? '');
+  return /[",\n]/.test(text) ? `"${text.replaceAll('"', '""')}"` : text;
+}
+function downloadCsv(filename, rows, columns) {
+  const csv = [columns.join(','), ...rows.map(row => columns.map(column => csvEscape(row[column])).join(','))].join('\n');
+  const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' });
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement('a');
+  link.href = url;
+  link.download = filename;
+  document.body.appendChild(link);
+  link.click();
+  link.remove();
+  URL.revokeObjectURL(url);
+}
 function trendHint(value) { return value ? <span className={`trend ${String(value).startsWith('-') ? 'down' : ''}`}>{value}</span> : null; }
 function timeAgo(iso) {
   if (!iso) return null;
@@ -394,6 +410,7 @@ function SellerDashboard() {
   ].filter(item => item.value > 0), [data]);
   const reportTypes = VIEW_REPORT_TYPES[view];
   const ledgerCopy = VIEW_LEDGER_COPY[view];
+  const detailView = view === 'report-detail' || view === 'metric-detail';
   const connected = !!data?.seller?.connected;
 
   return <div className="page-stack">
@@ -407,7 +424,7 @@ function SellerDashboard() {
     {error && <p className="alert warning">{error}</p>}
     {view === 'dashboard' && autoSyncing && <p className="alert success">Auto-syncing your last 30 days of data…</p>}
     {view === 'dashboard' && !connected && data && <p className="alert warning">Connect your Amazon account to start pulling data — nothing syncs until then.</p>}
-    {view !== 'dashboard' && <SyncLedger tenantId={tenantId} jobs={data?.jobs ?? []} onSynced={load} reportTypes={reportTypes} title={ledgerCopy?.title} subtitle={ledgerCopy?.subtitle} disabled={!connected} />}
+    {view !== 'dashboard' && !detailView && <SyncLedger tenantId={tenantId} jobs={data?.jobs ?? []} onSynced={load} reportTypes={reportTypes} title={ledgerCopy?.title} subtitle={ledgerCopy?.subtitle} disabled={!connected} />}
 
     {view === 'dashboard' && <DashboardOverview data={data} channelData={channelData} tenantId={tenantId} />}
     {view === 'sales' && <SalesAnalytics data={data} channelData={channelData} />}
@@ -494,19 +511,49 @@ function ReportDetail({ data, reportType }) {
   const report = REPORTS.find(r => r.type === reportType) ?? REPORTS[0];
   const detail = REPORT_DETAIL_MAP[report.type];
   const rows = data?.[detail.source] ?? [];
-  return <><Card className="detail-hero"><PanelHeader title={detail.title} subtitle={report.code} /><p>{detail.explanation}</p><div className="detail-formula"><b>Human explanation</b><span>This page shows exactly what was fetched for {report.label}. The dashboard totals use these readable rows for their counts and rupee amounts.</span></div></Card><TableCard title={`${report.label} rows`} rows={rows} columns={detail.columns} /></>;
+  return <>
+    <Card className="detail-hero">
+      <PanelHeader title={detail.title} subtitle={report.code} />
+      <p>{detail.explanation}</p>
+      <div className="detail-actions">
+        <div className="detail-formula"><b>Human explanation</b><span>This page shows exactly what was fetched for {report.label}. The dashboard totals use these readable rows for their counts and rupee amounts.</span></div>
+        <Button variant="accent" onClick={() => downloadCsv(`${report.code.toLowerCase()}-${detail.source}.csv`, rows, detail.columns)} disabled={!rows.length}>Download report CSV</Button>
+      </div>
+    </Card>
+    <TableCard title={`${report.label} rows`} rows={rows} columns={detail.columns} pageSize={10} />
+  </>;
+}
+function buildMetricDetails(data, metric) {
+  const summary = buildDashboardSummary(data);
+  const products = data?.products ?? [];
+  const orderItems = data?.orderItems ?? [];
+  const productRows = products.length
+    ? products.map(row => ({ asin: row.asin, sku: row.sku ?? '—', units: formatNumber(row.units), sales: formatCurrency(row.sales), share: summary.netSales ? `${Math.round((Number(row.sales ?? 0) / summary.netSales) * 100)}%` : '0%' }))
+    : orderItems.map(row => ({ asin: row.asin, sku: row.sku, units: formatNumber(row.quantity_ordered), sales: formatCurrency(row.item_price), share: summary.netSales ? `${Math.round((Number(row.item_price ?? 0) / summary.netSales) * 100)}%` : '0%' }));
+  const netSalesFormula = products.length
+    ? `Net Sales = ${productRows.map(row => row.sales).join(' + ')} = ${formatCurrency(summary.netSales)}`
+    : `Net Sales = sum of item_price across ${formatNumber(orderItems.length)} order item rows = ${formatCurrency(summary.netSales)}`;
+  const details = {
+    netSales: { title: 'Net Sales', value: formatCurrency(summary.netSales), explanation: 'Net sales is calculated by adding the Amazon sales value for every product/ASIN imported from the Sales & Traffic report. If product rows are not available, it falls back to order item value.', formula: netSalesFormula, rows: productRows, columns: ['asin', 'sku', 'units', 'sales', 'share'] },
+    netQty: { title: 'Net Qty', value: formatNumber(summary.netQty), explanation: 'Net quantity is the total units sold across all products. It uses product units first, then falls back to ordered item quantities.', formula: `Net Qty = sum of units across ${formatNumber(productRows.length || orderItems.length)} rows = ${formatNumber(summary.netQty)}`, rows: productRows, columns: ['asin', 'sku', 'units', 'sales', 'share'] },
+    settled: { title: 'Settled Amount', value: formatCurrency(summary.settledAmount), explanation: 'Settled amount is calculated by adding net_amount from each Amazon settlement/payout row.', formula: `Settled Amount = sum of net_amount across ${formatNumber((data?.payments ?? []).length)} payout rows = ${formatCurrency(summary.settledAmount)}`, rows: data?.payments ?? [], columns: ['posted_date', 'settlement_id', 'net_amount', 'lines'] },
+    deductions: { title: 'Deductions', value: formatCurrency(summary.deductions), explanation: 'Deductions are Amazon fees, refunds and charges imported from finance and settlement data.', formula: `Deductions = absolute value of imported deduction KPI = ${formatCurrency(summary.deductions)}`, rows: data?.payments ?? [], columns: ['posted_date', 'settlement_id', 'net_amount', 'lines'] },
+    drr: { title: 'Daily Run Rate', value: formatCurrency(summary.drr), explanation: 'Daily run rate makes sales easier to understand by dividing net sales by 30 days.', formula: `DRR = ${formatCurrency(summary.netSales)} ÷ 30 = ${formatCurrency(summary.drr)}`, rows: data?.trend ?? [], columns: ['date', 'sales'] }
+  };
+  return details[metric] ?? null;
 }
 function MetricDetail({ data, metric }) {
-  const summary = buildDashboardSummary(data);
-  const details = {
-    netSales: ['Net Sales', formatCurrency(summary.netSales), 'Amazon order value is summed from synced orders / sales report rows. Use Order Details to audit each item line.', data?.orderItems ?? [], ['amazon_order_id', 'sku', 'quantity_ordered', 'item_price']],
-    netQty: ['Net Qty', formatNumber(summary.netQty), 'Units come from ASIN product units, falling back to ordered item quantities when product rows are empty.', data?.orderItems ?? [], ['amazon_order_id', 'asin', 'sku', 'quantity_ordered']],
-    settled: ['Settled Amount', formatCurrency(summary.settledAmount), 'Settled amount is the total of payout net_amount rows imported from settlement reports.', data?.payments ?? [], ['posted_date', 'settlement_id', 'net_amount', 'lines']],
-    deductions: ['Deductions', formatCurrency(summary.deductions), 'Deductions are Amazon fees, refunds and charges from finance / settlement imports.', data?.payments ?? [], ['posted_date', 'settlement_id', 'net_amount', 'lines']],
-    drr: ['Daily Run Rate', formatCurrency(summary.drr), 'Daily run rate = Net Sales ÷ 30 for the default Amazon reconciliation window.', data?.trend ?? [], ['date', 'sales']]
-  }[metric] ?? null;
+  const details = buildMetricDetails(data, metric);
   if (!details) return <Empty text="Select a metric from the dashboard to see its calculation." />;
-  return <><Card className="detail-hero"><PanelHeader title={details[0]} subtitle={details[1]} /><p>{details[2]}</p></Card><TableCard title="Rows used for this calculation" rows={details[3]} columns={details[4]} /></>;
+  return <>
+    <Card className="detail-hero">
+      <PanelHeader title={details.title} subtitle={details.value} />
+      <p>{details.explanation}</p>
+      <div className="calculation-box"><b>Calculation</b><code>{details.formula}</code></div>
+      <Button variant="accent" onClick={() => downloadCsv(`${details.title.toLowerCase().replaceAll(' ', '-')}-calculation.csv`, details.rows, details.columns)} disabled={!details.rows.length}>Download calculation CSV</Button>
+    </Card>
+    <TableCard title="Rows used for this calculation" rows={details.rows} columns={details.columns} pageSize={10} />
+  </>;
 }
 
 function buildDashboardSummary(data) {
@@ -590,7 +637,20 @@ function SalesAnalytics({ data, channelData }) {
 
 function PanelHeader({ title, subtitle }) { const { range } = useContext(DateRangeContext); return <div className="panel-header"><h2>{title}</h2><span>{subtitle ?? range.label}</span></div>; }
 function Legend({ items }) { return <div className="legend-list">{items.map((item, i) => <div key={item.name}><span style={{ background: COLORS[i % COLORS.length] }} />{item.name}<b>{formatCurrency(item.value)}</b></div>)}</div>; }
-function TableCard({ title, rows = [], columns }) { return <Card className="table-card"><PanelHeader title={title} />{rows.length ? <div className="table-wrap"><table><thead><tr>{columns.map(c => <th key={c}>{c.replaceAll('_', ' ')}</th>)}</tr></thead><tbody>{rows.map((row, i) => <tr key={i}>{columns.map(c => <td key={c}>{row[c] ?? '—'}</td>)}</tr>)}</tbody></table></div> : <Empty text="No data imported yet." />}</Card>; }
+function TableCard({ title, rows = [], columns, pageSize = 10 }) {
+  const [page, setPage] = useState(0);
+  const totalPages = Math.max(1, Math.ceil(rows.length / pageSize));
+  useEffect(() => { setPage(0); }, [rows, pageSize]);
+  const safePage = Math.min(page, totalPages - 1);
+  const visibleRows = rows.slice(safePage * pageSize, safePage * pageSize + pageSize);
+  return <Card className="table-card">
+    <PanelHeader title={title} />
+    {rows.length ? <>
+      <div className="table-wrap"><table><thead><tr>{columns.map(c => <th key={c}>{c.replaceAll('_', ' ')}</th>)}</tr></thead><tbody>{visibleRows.map((row, i) => <tr key={i}>{columns.map(c => <td key={c}>{row[c] ?? '—'}</td>)}</tr>)}</tbody></table></div>
+      {rows.length > pageSize && <div className="pager"><Button variant="ghost" disabled={safePage === 0} onClick={() => setPage(p => Math.max(0, p - 1))}>← Previous</Button><span>Page {safePage + 1} of {totalPages} · {formatNumber(rows.length)} rows</span><Button variant="ghost" disabled={safePage >= totalPages - 1} onClick={() => setPage(p => Math.min(totalPages - 1, p + 1))}>Next →</Button></div>}
+    </> : <Empty text="No data imported yet." />}
+  </Card>;
+}
 
 // Admin-only screen. Admins never see the seller sidebar/navigation — this is
 // the whole of their UI: tenant table + the one place accounts get created.
