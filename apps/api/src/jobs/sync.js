@@ -218,7 +218,8 @@ export async function syncReportForTenant(params) {
 /** @param {string} tenantId @param {{ days?: number }} [options] */
 export async function syncRecentApiDataForTenant(tenantId, options = {}) {
   const parsedTenantId = z.string().uuid().parse(tenantId);
-  const defaultCreatedAfter = new Date(Date.now() - (options.days ?? 30) * 864e5);
+  const range = options.range ? z.object({ start: z.string().datetime(), end: z.string().datetime() }).parse(options.range) : null;
+  const defaultCreatedAfter = range ? new Date(range.start) : new Date(Date.now() - (options.days ?? 30) * 864e5);
   const lastCompletedSync = (await pool.query(
     `select completed_at from sync_jobs
      where tenant_id=$1 and report_type='DIRECT_SP_API_SYNC' and status='completed' and completed_at is not null
