@@ -8,3 +8,5 @@ coverage
 .minio
 
 *.tsbuildinfo
+/storage/*
+/api/storage
