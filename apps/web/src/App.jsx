@@ -382,6 +382,7 @@ function SellerDashboard() {
   const [params] = useSearchParams();
   const tenantId = params.get('tenantId') ?? '';
   const view = params.get('view') ?? 'dashboard';
+  const freshAmazonAuth = params.get('auth') === 'complete';
   const { range } = useContext(DateRangeContext);
   const [data, setData] = useState(null);
   const [error, setError] = useState('');
@@ -399,6 +400,10 @@ function SellerDashboard() {
     const selectedReports = view === 'dashboard' ? ['DIRECT_SP_API_SYNC'] : (reportTypes?.length ? reportTypes : ['DIRECT_SP_API_SYNC']);
     const syncKey = `${tenantId}:${view}:${formatDateParam(range.start)}:${formatDateParam(addDays(range.end, 1))}`;
     if (lastRangeSyncRef.current === syncKey) return;
+    if (freshAmazonAuth) {
+      lastRangeSyncRef.current = syncKey;
+      return;
+    }
     lastRangeSyncRef.current = syncKey;
     (async () => {
       setAutoSyncing(true);
@@ -417,7 +422,7 @@ function SellerDashboard() {
         setAutoSyncing(false);
       }
     })();
-  }, [data?.seller?.connected, tenantId, view, range.start, range.end]);
+  }, [data?.seller?.connected, tenantId, view, freshAmazonAuth, range.start, range.end]);
 
   const channelData = useMemo(() => [
     { name: 'Order value', value: Number(data?.orders?.order_value ?? 0) },
@@ -437,6 +442,7 @@ function SellerDashboard() {
         <AmazonConnectionPanel tenantId={tenantId} seller={data?.seller} onChange={load} setError={setError} />
       </div>
     </div>
+    {freshAmazonAuth && connected && <p className="alert success">Amazon account connected. Select a date range or use Sync on this page to pull limited data.</p>}
     {error && <p className="alert warning">{error}</p>}
     {autoSyncing && <p className="alert success">Syncing this page only for {range.label}…</p>}
     {view === 'dashboard' && !connected && data && <p className="alert warning">Connect your Amazon account to start pulling data — nothing syncs until then.</p>}

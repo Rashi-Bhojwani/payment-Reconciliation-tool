@@ -123,10 +123,11 @@ async function requireTenantUser(request, tenantId) { const user = await require
 
 
 function queueInitialSellerSync(tenantId) {
-  syncRecentApiDataForTenant(tenantId).catch(error => app.log.warn({ err: error, tenantId }, 'Initial Amazon direct API sync failed'));
-  for (const reportType of ['GET_SALES_AND_TRAFFIC_REPORT', 'GET_V2_SETTLEMENT_REPORT_DATA_FLAT_FILE_V2']) {
-    syncReportForTenant({ tenantId, reportType }).catch(error => app.log.warn({ err: error, tenantId, reportType }, 'Initial Amazon report sync failed'));
-  }
+  // Keep the authorization callback fast and safe: mark the seller connected
+  // first, then do only a small direct-API warmup in the background. Report
+  // pulls remain page/date scoped from the UI so a newly connected account is
+  // not hit with multiple report-generation requests immediately.
+  syncRecentApiDataForTenant(tenantId, { days: 7 }).catch(error => app.log.warn({ err: error, tenantId }, 'Initial Amazon direct API sync failed'));
 }
 
 
