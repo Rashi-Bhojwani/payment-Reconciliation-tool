@@ -476,3 +476,47 @@ tr:last-child td { border-bottom: none; }
 @media (max-width: 980px) {
   .filter-toolbar, .profit-kpi-grid { grid-template-columns: 1fr; }
 }
+
+/* ---------- Drill-downs and readable report cards ---------- */
+.drill-metric { text-decoration: none; color: inherit; position: relative; }
+.drill-metric em { font-style: normal; color: var(--brass-deep); font-size: 12px; font-weight: 700; margin-top: 4px; }
+.drill-metric:hover { border-color: rgba(201, 138, 44, 0.55); transform: translateY(-1px); }
+.explain-grid, .reports-grid {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 14px;
+}
+.explain-grid.compact { grid-template-columns: repeat(3, 1fr); }
+.explain-card, .report-tile {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  box-shadow: var(--shadow);
+  padding: 18px;
+  text-decoration: none;
+  color: var(--text);
+  display: flex;
+  flex-direction: column;
+  gap: 9px;
+}
+.explain-card:hover, .report-tile:hover { border-color: rgba(31, 138, 133, 0.45); }
+.explain-card b, .report-tile b { color: var(--ink); font-size: 13px; text-transform: uppercase; letter-spacing: 0.04em; }
+.explain-card strong, .report-tile strong { font-family: 'IBM Plex Mono', monospace; color: var(--ink); font-size: 22px; }
+.explain-card p, .report-tile p { color: var(--muted); font-size: 13px; line-height: 1.5; }
+.explain-card span { color: var(--brass-deep); font-weight: 700; font-size: 12.5px; }
+.report-tile { display: grid; grid-template-columns: 48px 1fr auto; align-items: start; }
+.report-tile small { grid-column: 2 / 4; color: var(--muted); font-size: 12px; }
+.detail-hero { display: flex; flex-direction: column; gap: 14px; }
+.detail-hero p { color: var(--muted); line-height: 1.6; }
+.detail-formula { background: var(--success-bg); border: 1px solid rgba(31, 138, 133, 0.18); border-radius: var(--radius-sm); padding: 14px; display: flex; flex-direction: column; gap: 5px; }
+.detail-formula span { color: var(--teal-deep); font-size: 13px; }
+.sidebar { overflow-y: auto; }
+
+@media (max-width: 1180px) {
+  .explain-grid, .reports-grid { grid-template-columns: repeat(2, 1fr); }
+}
+@media (max-width: 980px) {
+  .explain-grid, .explain-grid.compact, .reports-grid { grid-template-columns: 1fr; }
+  .report-tile { grid-template-columns: 48px 1fr; }
+  .report-tile strong, .report-tile small { grid-column: 2; }
+}
