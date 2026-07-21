@@ -528,3 +528,78 @@ tr:last-child td { border-bottom: none; }
 .pager { display: flex; align-items: center; justify-content: flex-end; gap: 12px; padding-top: 8px; border-top: 1px solid var(--border); }
 .pager span { color: var(--muted); font-size: 12.5px; font-family: 'IBM Plex Mono', monospace; }
 @media (max-width: 980px) { .detail-actions { grid-template-columns: 1fr; } .pager { justify-content: space-between; } }
+
+/* ---------- Excel-style performance reports ---------- */
+.excel-report {
+  background: #fff;
+  border: 1px solid #b9cbe7;
+  box-shadow: var(--shadow);
+  padding: 0 0 22px;
+  overflow-x: auto;
+}
+.excel-report-title,
+.excel-title {
+  background: #1f4e79;
+  color: #fff;
+  font-weight: 700;
+  text-align: center;
+  padding: 9px 12px;
+  border: 1px solid #0e2438;
+}
+.excel-kpi-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(190px, 1fr));
+  gap: 10px;
+  padding: 14px;
+}
+.excel-kpi-grid .stat-card {
+  border: 1px solid #111;
+  border-radius: 0;
+  box-shadow: none;
+  padding: 10px 12px;
+}
+.excel-block { margin: 14px; max-width: 980px; }
+.excel-table {
+  border-collapse: collapse;
+  background: #fff;
+  border: 2px solid #111;
+}
+.excel-table th {
+  background: #0070c0;
+  color: #fff;
+  border: 1px solid #111;
+  text-align: center;
+}
+.excel-table td {
+  border: 1px solid #111;
+  color: #111;
+  background: #fff;
+}
+.excel-chart-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(280px, 1fr));
+  gap: 18px;
+  padding: 0 14px;
+}
+.excel-chart {
+  border-radius: 0;
+  box-shadow: none;
+  border: 1px solid #d9d9d9;
+}
+.excel-summary {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(220px, 1fr));
+  margin: 14px;
+  max-width: 760px;
+  border: 2px solid #111;
+}
+.excel-summary div {
+  min-height: 96px;
+  padding: 14px;
+  border: 1px solid #111;
+  line-height: 1.45;
+  font-size: 13px;
+}
+@media (max-width: 980px) {
+  .excel-kpi-grid, .excel-chart-grid, .excel-summary { grid-template-columns: 1fr; }
+}
