@@ -380,31 +380,31 @@ function SellerDashboard() {
   const [data, setData] = useState(null);
   const [error, setError] = useState('');
   const [autoSyncing, setAutoSyncing] = useState(false);
-  const autoSyncedRef = useRef(false);
+  const lastRangeSyncRef = useRef('');
   async function load() { setError(''); try { setData(await api(`/api/tenants/${tenantId}/dashboard?${rangeQuery(range)}`)); } catch (e) { setError(e.message); } }
   useEffect(() => { if (tenantId) void load(); }, [tenantId, range.start, range.end]);
 
-  // Dashboard-only, once per session: as soon as we know the seller is
-  // Amazon-authenticated, automatically pull the default last-30-days data
-  // so the dashboard is populated without the user pressing anything. Every
-  // other page stays manual — its Sync button is the only thing that syncs it.
+  // When the calendar range is applied, do one safe, range-limited direct
+  // Amazon sync. We intentionally do not fan out to every report here, because
+  // repeated report creation can stress the seller account; detailed pages keep
+  // their manual, per-report Sync buttons.
   useEffect(() => {
-    if (view !== 'dashboard') return;
-    if (!data?.seller?.connected) return;
-    if (autoSyncedRef.current) return;
-    autoSyncedRef.current = true;
+    if (!data?.seller?.connected || !tenantId) return;
+    const syncKey = `${tenantId}:${formatDateParam(range.start)}:${formatDateParam(addDays(range.end, 1))}`;
+    if (lastRangeSyncRef.current === syncKey) return;
+    lastRangeSyncRef.current = syncKey;
     (async () => {
       setAutoSyncing(true);
-      for (const report of REPORTS) {
-        try {
-          if (report.type === 'DIRECT_SP_API_SYNC') await api(`/api/tenants/${tenantId}/sync`, { method: 'POST', body: JSON.stringify({ reportTypes: [], range: { start: formatDateParam(range.start), end: formatDateParam(addDays(range.end, 1)) } }) });
-          else await api(`/api/tenants/${tenantId}/sync/${report.type}`, { method: 'POST', body: JSON.stringify({ range: { start: formatDateParam(range.start), end: formatDateParam(addDays(range.end, 1)) } }) });
-        } catch { /* one failed report shouldn't block the rest */ }
+      try {
+        await api(`/api/tenants/${tenantId}/sync`, { method: 'POST', body: JSON.stringify({ reportTypes: [], range: { start: formatDateParam(range.start), end: formatDateParam(addDays(range.end, 1)) } }) });
+        await load();
+      } catch (e) {
+        setError(e.message);
+      } finally {
+        setAutoSyncing(false);
       }
-      await load();
-      setAutoSyncing(false);
     })();
-  }, [view, data?.seller?.connected, tenantId, range.start, range.end]);
+  }, [data?.seller?.connected, tenantId, range.start, range.end]);
 
   const channelData = useMemo(() => [
     { name: 'Order value', value: Number(data?.orders?.order_value ?? 0) },
@@ -425,7 +425,7 @@ function SellerDashboard() {
       </div>
     </div>
     {error && <p className="alert warning">{error}</p>}
-    {view === 'dashboard' && autoSyncing && <p className="alert success">Auto-syncing your last 30 days of data…</p>}
+    {autoSyncing && <p className="alert success">Syncing Amazon data only for {range.label}…</p>}
     {view === 'dashboard' && !connected && data && <p className="alert warning">Connect your Amazon account to start pulling data — nothing syncs until then.</p>}
     {view !== 'dashboard' && !detailView && <SyncLedger tenantId={tenantId} jobs={data?.jobs ?? []} onSynced={load} reportTypes={reportTypes} title={ledgerCopy?.title} subtitle={ledgerCopy?.subtitle} disabled={!connected} />}
 

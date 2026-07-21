@@ -155,10 +155,12 @@ export class SpApiClient {
     return res.json();
   }
 
-  /** @param {string} createdAfter @param {string} [marketplaceId] */
-  async listOrders(createdAfter, marketplaceId = INDIA_MARKETPLACE_ID) {
+  /** @param {string} createdAfter @param {string} [marketplaceId] @param {string} [createdBefore] */
+  async listOrders(createdAfter, marketplaceId = INDIA_MARKETPLACE_ID, createdBefore) {
     const date = z.string().datetime().parse(createdAfter);
-    const res = await this.request(`/orders/v0/orders?MarketplaceIds=${marketplaceId}&CreatedAfter=${encodeURIComponent(date)}`);
+    const before = createdBefore ? z.string().datetime().parse(createdBefore) : null;
+    const beforeQuery = before ? `&CreatedBefore=${encodeURIComponent(before)}` : '';
+    const res = await this.request(`/orders/v0/orders?MarketplaceIds=${marketplaceId}&CreatedAfter=${encodeURIComponent(date)}${beforeQuery}`);
     if (!res.ok) throw new Error(`List orders failed: ${res.status}`);
     return res.json();
   }
@@ -187,10 +189,12 @@ export class SpApiClient {
     return res.json();
   }
 
-  /** @param {string} postedAfter */
-  async listFinanceTransactions(postedAfter) {
+  /** @param {string} postedAfter @param {string} [postedBefore] */
+  async listFinanceTransactions(postedAfter, postedBefore) {
     const date = z.string().datetime().parse(postedAfter);
-    const res = await this.request(`/finances/2024-06-19/transactions?postedAfter=${encodeURIComponent(date)}`);
+    const before = postedBefore ? z.string().datetime().parse(postedBefore) : null;
+    const beforeQuery = before ? `&postedBefore=${encodeURIComponent(before)}` : '';
+    const res = await this.request(`/finances/2024-06-19/transactions?postedAfter=${encodeURIComponent(date)}${beforeQuery}`);
     if (!res.ok) throw new Error(`Finance transactions failed: ${res.status}`);
     return res.json();
   }
