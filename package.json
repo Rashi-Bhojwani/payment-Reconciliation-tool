@@ -14,7 +14,6 @@
     "check": "node --check apps/api/src/server.js && node --check apps/api/src/jobs/sync.js && node --check packages/sp-api-client/src/index.js && node --check packages/db/src/index.js"
   },
   "devDependencies": {
-    "@rollup/rollup-linux-x64-gnu": "^4.62.2",
     "concurrently": "^8.2.2"
   },
   "dependencies": {

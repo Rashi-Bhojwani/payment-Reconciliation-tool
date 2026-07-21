@@ -1,7 +1,7 @@
 import React, { createContext, useContext, useEffect, useMemo, useRef, useState } from 'react';
 import { createRoot } from 'react-dom/client';
 import { BrowserRouter, Navigate, NavLink, Route, Routes, useLocation, useNavigate, useSearchParams } from 'react-router-dom';
-import { CartesianGrid, Cell, Line, LineChart, Pie, PieChart, ResponsiveContainer, Tooltip, XAxis, YAxis, Area, AreaChart } from 'recharts';
+import { CartesianGrid, Cell, Line, LineChart, Pie, PieChart, ResponsiveContainer, Tooltip, XAxis, YAxis } from 'recharts';
 import './style.css';
 
 const API = import.meta.env.VITE_API_URL ?? 'http://localhost:4000';
@@ -84,7 +84,7 @@ function Button({ className = '', variant = 'primary', ...props }) { return <but
 function Input(props) { return <input {...props} className="input" />; }
 function Card({ children, className = '' }) { return <section className={`card ${className}`}>{children}</section>; }
 function Empty({ text }) { return <div className="empty-state">{text}</div>; }
-function formatCurrency(value, options = {}) { return `₹${Number(value ?? 0).toLocaleString('en-IN', { maximumFractionDigits: options.maximumFractionDigits ?? 0 })}`; }
+function formatCurrency(value) { return `₹${Number(value ?? 0).toLocaleString('en-IN', { maximumFractionDigits: 0 })}`; }
 function formatNumber(value) { return Number(value ?? 0).toLocaleString('en-IN'); }
 function csvEscape(value) {
   const text = String(value ?? '').replaceAll('₹', '').replaceAll('—', '').replaceAll('â€”', '').trim();
@@ -366,7 +366,7 @@ function AmazonConnectionPanel({ tenantId, seller, onChange, setError }) {
 }
 
 function SellerDashboard() {
-  const [params, setParams] = useSearchParams();
+  const [params] = useSearchParams();
   const tenantId = params.get('tenantId') ?? '';
   const view = params.get('view') ?? 'dashboard';
   const [data, setData] = useState(null);
@@ -408,25 +408,14 @@ function SellerDashboard() {
   const detailView = view === 'report-detail' || view === 'metric-detail';
   const connected = !!data?.seller?.connected;
 
-  function updateDashboardFilter(key, value) {
-    const next = new URLSearchParams(params);
-    next.set(key, value);
-    setParams(next);
-  }
-
   return <div className="page-stack">
-    {view === 'dashboard' ? <OrderLifecycleHeader
-      data={data}
-      tenantId={tenantId}
-      filters={{ channel: params.get('channel') ?? 'Channel', store: params.get('store') ?? 'Store Name', state: params.get('state') ?? 'State', warehouse: params.get('warehouse') ?? 'Warehouse', sku: params.get('sku') ?? 'Master SKU' }}
-      onFilterChange={updateDashboardFilter}
-    /> : <div className="section-title">
+    <div className="section-title">
       <div><h1>{viewTitle(view)}</h1><p>{viewDescription(view)}</p></div>
       <div className="actions">
         <Button variant="ghost" onClick={load}>Refresh</Button>
         <AmazonConnectionPanel tenantId={tenantId} seller={data?.seller} onChange={load} setError={setError} />
       </div>
-    </div>}
+    </div>
     {error && <p className="alert warning">{error}</p>}
     {view === 'dashboard' && autoSyncing && <p className="alert success">Auto-syncing your last 30 days of data…</p>}
     {view === 'dashboard' && !connected && data && <p className="alert warning">Connect your Amazon account to start pulling data — nothing syncs until then.</p>}
@@ -447,56 +436,6 @@ function SellerDashboard() {
     {view === 'report-detail' && <ReportDetail data={data} reportType={params.get('reportType')} />}
     {view === 'metric-detail' && <MetricDetail data={data} metric={params.get('metric')} />}
   </div>;
-}
-
-
-function FilterButton({ icon, value, options, onChange }) {
-  return <label className="lifecycle-filter"><span>{icon}</span><select value={value} onChange={e => onChange(e.target.value)}>{options.map(option => <option key={option}>{option}</option>)}</select></label>;
-}
-function Sparkline({ trend }) {
-  const rows = trend.length ? trend : Array.from({ length: 18 }, (_, i) => ({ label: i + 1, sales: 900 + Math.sin(i / 1.2) * 110 + (i % 5) * 28 }));
-  return <ResponsiveContainer width="100%" height={54}><AreaChart data={rows} margin={{ top: 8, right: 0, bottom: 0, left: 0 }}><defs><linearGradient id="revenueGlow" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stopColor="#6258f5" stopOpacity="0.24" /><stop offset="100%" stopColor="#6258f5" stopOpacity="0.02" /></linearGradient></defs><Area type="monotone" dataKey="sales" stroke="#6258f5" strokeWidth={2.5} fill="url(#revenueGlow)" dot={false} /></AreaChart></ResponsiveContainer>;
-}
-function OrderLifecycleHeader({ data, tenantId, filters, onFilterChange }) {
-  const { range, setRange } = useContext(DateRangeContext);
-  const summary = buildDashboardSummary(data);
-  const trend = readableTrend(data);
-  const returnRate = summary.netQty ? `${((summary.returnQty / summary.netQty) * 100).toFixed(1)}%` : '0.0%';
-  const avgOrder = summary.ordersCount ? summary.netSales / summary.ordersCount : 0;
-  const salesSummary = [
-    ['Gross Sales', formatCurrency(summary.netSales + summary.returnQty * avgOrder, { maximumFractionDigits: 2 }), '₹', 'mint'],
-    ['Returns', formatCurrency(summary.returnQty * avgOrder, { maximumFractionDigits: 2 }), '↩', 'rose'],
-    ['Net Sales', formatCurrency(summary.netSales, { maximumFractionDigits: 2 }), '▣', 'blue'],
-    ['Cost of Goods Sold', formatCurrency(summary.deductions, { maximumFractionDigits: 2 }), '◈', 'amber'],
-    ['Channel Fee', formatCurrency(summary.deductions * 0.55, { maximumFractionDigits: 2 }), '%', 'cyan']
-  ];
-  const marginSummary = [
-    ['Gross Margin', formatCurrency(summary.estimatedProfit, { maximumFractionDigits: 2 }), '⌁', 'cyan'],
-    ['Other Charges', formatCurrency(summary.deductions * 0.45, { maximumFractionDigits: 2 }), '▤', 'amber'],
-    ['Net Margin', formatCurrency(Math.max(0, summary.estimatedProfit - summary.deductions * 0.45), { maximumFractionDigits: 2 }), '◌', 'violet'],
-    ['Reimbursements', formatCurrency(summary.reimbursements, { maximumFractionDigits: 2 }), '↻', 'rose'],
-    ['Order Settlement', formatCurrency(summary.settledAmount, { maximumFractionDigits: 2 }), '▦', 'green']
-  ];
-  return <section className="lifecycle-board">
-    <div className="lifecycle-title-row">
-      <div className="lifecycle-brand"><span className="orbit-logo">↻</span><div><h1>Order Lifecycle</h1><p>Full order journey · Financial insights · Settlement tracking</p></div></div>
-      <div className="lifecycle-actions"><DateRangePicker value={range} onChange={setRange} />
-        <FilterButton icon="⌁" value={filters.channel} options={['Channel', 'Amazon', 'Flipkart', 'Website']} onChange={v => onFilterChange('channel', v)} />
-        <FilterButton icon="⌂" value={filters.store} options={['Store Name', 'Wellsure Store']} onChange={v => onFilterChange('store', v)} />
-        <FilterButton icon="⌖" value={filters.state} options={['State', 'Karnataka', 'Maharashtra', 'Delhi']} onChange={v => onFilterChange('state', v)} />
-        <FilterButton icon="▤" value={filters.warehouse} options={['Warehouse', 'BLR-01', 'BOM-02']} onChange={v => onFilterChange('warehouse', v)} />
-        <FilterButton icon="⌗" value={filters.sku} options={['Master SKU', 'All SKUs']} onChange={v => onFilterChange('sku', v)} />
-        <NavLink className="icon-btn" to={`/seller?tenantId=${tenantId}&view=reports`}>↧</NavLink><span className="coin-chip">$</span></div>
-    </div>
-    <div className="lifecycle-search-row"><div className="order-search"><select><option>Order ID</option><option>SKU</option></select><input placeholder="Search by Order ID..." /></div><button onClick={() => { const [start, end] = DATE_PRESETS[1].range(); setRange({ label: 'Last 7 Days', start, end }); }}>Last 7D</button><button onClick={() => setRange(defaultDateRange())}>Last 30D</button><button>Last Month</button><button>Last 6M</button><span className="record-pill">☷ {formatNumber(summary.ordersCount || (data?.orderItems ?? []).length)} records</span></div>
-    <div className="trend-strip"><div className="trend-chart-label">Revenue Trend</div><Sparkline trend={trend} /><div className="trend-stat"><span>Return Rate</span><b className="warning-text">{returnRate}</b></div><div className="trend-stat"><span>Avg. Order</span><b>{formatCurrency(avgOrder, { maximumFractionDigits: 2 })}</b></div><div className="trend-stat"><span>Orders</span><b>{formatNumber(summary.ordersCount)}</b></div><div className="trend-stat"><span>Top Channel</span><b>Amazon</b></div><div className="trend-stat"><span>COD %</span><b className="success-text">5.2%</b></div><div className="trend-stat"><span>Top City</span><b>Bengaluru</b></div></div>
-    <LifecycleBand title="Sales Summary" tone="purple" items={salesSummary} />
-    <LifecycleBand title="Margins & Settlement" tone="green" items={marginSummary} />
-    <h2 className="matching-title">Order-to-payment matching view</h2>
-  </section>;
-}
-function LifecycleBand({ title, tone, items }) {
-  return <div className={`lifecycle-band ${tone}`}><div className="band-title">⌙ {title}</div><div className="band-grid">{items.map(([label, value, icon, color]) => <div className="band-cell" key={label}><div><span>{label}</span><strong>{value}</strong></div><i className={color}>{icon}</i></div>)}</div></div>;
 }
 
 function viewTitle(view) { return ({ dashboard: 'Dashboard', sales: 'Sales Analytics', inventory: 'Inventory', payouts: 'Payout Reconciliation', brand: 'Brand Analytics', orders: 'Orders', returns: 'Returns', reimbursements: 'Reimbursements', tax: 'GST & Tax', pricing: 'Pricing & Buy Box', listings: 'Listings', reports: 'Reports', 'report-detail': 'Report Detail' })[view] ?? 'Dashboard'; }
@@ -764,10 +703,8 @@ function SidebarLink({ to, children }) {
 function SellerShell({ session, setSession }) {
   function logout() { localStorage.removeItem('token'); setSession(null); }
   const [range, setRange] = useState(defaultDateRange);
-  const [sidebarOpen, setSidebarOpen] = useState(true);
-  return <div className={`app-shell ${sidebarOpen ? '' : 'sidebar-collapsed'}`}>
+  return <div className="app-shell">
     <aside className="sidebar">
-      <button type="button" className="hamburger-btn" onClick={() => setSidebarOpen(open => !open)} aria-label={sidebarOpen ? 'Collapse sidebar menu' : 'Open sidebar menu'} aria-expanded={sidebarOpen}><span></span><span></span><span></span></button>
       <div className="logo"><span>W</span><div><b>WELLSURE</b><small>Seller Intelligence</small></div></div>
       <nav>
         <SidebarLink to={`/seller?tenantId=${session?.tenantId ?? ''}&view=dashboard`}>Dashboard</SidebarLink>
@@ -786,7 +723,7 @@ function SellerShell({ session, setSession }) {
     </aside>
     <main className="workspace">
       <header className="topbar">
-        <button type="button" className="hamburger-btn topbar-menu" onClick={() => setSidebarOpen(open => !open)} aria-label="Toggle sidebar menu"><span></span><span></span><span></span></button><div className="search">⌕ Search</div>
+        <div className="search">⌕ Search</div>
         <select><option>Amazon.in</option></select>
         <DateRangePicker value={range} onChange={setRange} />
         <div className="avatar">{session?.email?.[0]?.toUpperCase()}</div>
