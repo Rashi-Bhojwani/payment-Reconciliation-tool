@@ -28,7 +28,13 @@ const REPORT_DETAIL_MAP = {
   GET_FBA_REIMBURSEMENTS_DATA: { source: 'reimbursements', title: 'Reimbursement report detail', columns: ['sku', 'amount', 'reason', 'reimbursement_date'], explanation: 'Shows Amazon reimbursement credits with SKU, reason and amount.' },
   GET_FBA_FULFILLMENT_CUSTOMER_RETURNS_DATA: { source: 'returns', title: 'Customer returns report detail', columns: ['order_id', 'return_reason', 'disposition', 'status', 'return_date'], explanation: 'Shows return rows with reason, disposition and current status.' }
 };
-const COLORS = ['#c98a2c', '#1f8a85', '#12213a', '#7fb6b2'];
+const COLORS = ['#e8a23d', '#159a82', '#6d5bd0', '#2e86ab'];
+
+// Maps each report code to a stable CSS class so the Sync Ledger and Reports
+// grid can color-code report families (each is a genuinely distinct SP-API
+// data domain, so the color carries real information, not just decoration).
+const CODE_COLOR_KEY = { API: 'api', STL: 'stl', 'S&T': 'st', B2B: 'b2b', B2C: 'b2c', INV: 'inv', RMB: 'rmb', RTN: 'rtn' };
+function codeClass(code) { return `code-${CODE_COLOR_KEY[code] ?? code.toLowerCase().replace(/[^a-z0-9]/gi, '')}`; }
 
 // Which report(s) power each sidebar page. Each page now syncs only what it
 // needs instead of showing every report side-by-side everywhere.
@@ -315,9 +321,9 @@ function SyncLedger({ tenantId, jobs = [], onSynced, reportTypes, title, subtitl
           const failed = local?.error || job?.status === 'failed';
           const statusLabel = disabled ? 'locked' : busy ? 'syncing' : failed ? 'failed' : job?.status ?? 'idle';
           return (
-            <div className="ledger-row" key={report.type}>
+            <div className={`ledger-row ${codeClass(report.code)}`} key={report.type}>
               <span className="ledger-index">{String(i + 1).padStart(2, '0')}</span>
-              <span className="ledger-code">{report.code}</span>
+              <span className={`ledger-code ${codeClass(report.code)}`}>{report.code}</span>
               <div className="ledger-meta">
                 <b>{report.label}</b>
                 <small>{local?.error ?? (job?.completed_at ? `Last synced ${timeAgo(job.completed_at)}` : report.hint)}</small>
@@ -523,8 +529,8 @@ function ReportsExplorer({ tenantId, data }) {
   return <div className="reports-grid">{REPORTS.map(report => {
     const detail = REPORT_DETAIL_MAP[report.type];
     const job = data?.jobs?.find(j => j.report_type === report.type);
-    return <NavLink className="report-tile" key={report.type} to={`/seller?tenantId=${tenantId}&view=report-detail&reportType=${report.type}`}>
-      <span className="ledger-code">{report.code}</span><div><b>{report.label}</b><p>{detail.explanation}</p></div><small>{job?.completed_at ? `Last synced ${timeAgo(job.completed_at)}` : report.hint}</small>
+    return <NavLink className={`report-tile ${codeClass(report.code)}`} key={report.type} to={`/seller?tenantId=${tenantId}&view=report-detail&reportType=${report.type}`}>
+      <span className={`ledger-code ${codeClass(report.code)}`}>{report.code}</span><div><b>{report.label}</b><p>{detail.explanation}</p></div><small>{job?.completed_at ? `Last synced ${timeAgo(job.completed_at)}` : report.hint}</small>
     </NavLink>;
   })}</div>;
 }
@@ -651,7 +657,7 @@ function SalesAnalytics({ data, channelData }) {
   return <>
     <div className="dashboard-grid">
       <Card className="panel"><PanelHeader title="Amazon Value Distribution" />{channelData.length ? <><ResponsiveContainer width="100%" height={220}><PieChart><Pie data={channelData} innerRadius={62} outerRadius={92} dataKey="value">{channelData.map((_, i) => <Cell key={i} fill={COLORS[i % COLORS.length]} />)}</Pie><Tooltip formatter={value => formatCurrency(value)} /></PieChart></ResponsiveContainer><Legend items={channelData} /></> : <Empty text="No synced sales or settlement totals yet." />}</Card>
-      <Card className="panel wide"><PanelHeader title={`Simple Sales Trend (${range.label})`} subtitle="date wise net sales" />{trend.length ? <ResponsiveContainer width="100%" height={280}><LineChart data={trend} margin={{ top: 12, right: 20, bottom: 8, left: 0 }}><CartesianGrid strokeDasharray="3 3" vertical={false} /><XAxis dataKey="label" tick={{ fontSize: 12 }} /><YAxis tickFormatter={value => `₹${Number(value) / 1000}k`} /><Tooltip labelFormatter={label => `Date: ${label}`} formatter={value => [formatCurrency(value), 'Net sales']} /><Line type="monotone" dataKey="sales" name="Net sales" stroke="#1f8a85" strokeWidth={3} dot={{ r: 4 }} activeDot={{ r: 7 }} /></LineChart></ResponsiveContainer> : <Empty text="No imported sales trend yet. Use the Sync above to pull SP-API reports." />}</Card>
+      <Card className="panel wide"><PanelHeader title={`Simple Sales Trend (${range.label})`} subtitle="date wise net sales" />{trend.length ? <ResponsiveContainer width="100%" height={280}><LineChart data={trend} margin={{ top: 12, right: 20, bottom: 8, left: 0 }}><CartesianGrid strokeDasharray="3 3" vertical={false} /><XAxis dataKey="label" tick={{ fontSize: 12 }} /><YAxis tickFormatter={value => `₹${Number(value) / 1000}k`} /><Tooltip labelFormatter={label => `Date: ${label}`} formatter={value => [formatCurrency(value), 'Net sales']} /><Line type="monotone" dataKey="sales" name="Net sales" stroke="#159a82" strokeWidth={3} dot={{ r: 4 }} activeDot={{ r: 7 }} /></LineChart></ResponsiveContainer> : <Empty text="No imported sales trend yet. Use the Sync above to pull SP-API reports." />}</Card>
     </div>
     <div className="dashboard-grid two"><TableCard title="Product Performance" rows={data?.products ?? []} columns={['asin', 'units', 'sales', 'buy_box']} /><TableCard title="Order Items" rows={data?.orderItems ?? []} columns={['amazon_order_id', 'asin', 'sku', 'title', 'quantity_ordered', 'item_price']} /></div>
   </>;
