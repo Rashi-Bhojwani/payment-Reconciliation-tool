@@ -20,7 +20,9 @@ const TenantParamsSchema = z.object({ tenantId: z.string().uuid() });
 const SyncParamsSchema = z.object({ tenantId: z.string().uuid(), reportType: z.enum(REPORT_TYPES) });
 const AmazonCallbackSchema = z.object({ spapi_oauth_code: z.string().optional(), code: z.string().optional(), selling_partner_id: z.string().optional(), state: z.string().optional() });
 const AmazonAccessTokenSchema = z.object({ sellerId: z.string().optional() });
-const SellerSyncSchema = z.object({ reportTypes: z.array(z.enum(REPORT_TYPES)).default(['GET_SALES_AND_TRAFFIC_REPORT', 'GET_V2_SETTLEMENT_REPORT_DATA_FLAT_FILE_V2']) });
+const DateRangeSchema = z.object({ start: z.string().datetime(), end: z.string().datetime() });
+const DashboardQuerySchema = z.object({ start: z.string().datetime().optional(), end: z.string().datetime().optional() });
+const SellerSyncSchema = z.object({ reportTypes: z.array(z.enum(REPORT_TYPES)).default(['GET_SALES_AND_TRAFFIC_REPORT', 'GET_V2_SETTLEMENT_REPORT_DATA_FLAT_FILE_V2']), range: DateRangeSchema.optional() });
 const RegisterSchema = z.object({ companyName: z.string().min(2), ownerEmail: z.string().email(), password: z.string().min(8), marketplaceId: z.string().default('A21TJRUUN4KGV') });
 const LoginSchema = z.object({ email: z.string().email(), password: z.string().min(1) });
 const adminId = '00000000-0000-0000-0000-000000000001';
@@ -284,11 +286,12 @@ app.post('/api/admin/tenants/:tenantId/sync/:reportType', async request => { awa
 
 app.post('/api/tenants/:tenantId/sync/:reportType', async request => {
   const params = SyncParamsSchema.parse(request.params);
+  const body = z.object({ range: DateRangeSchema.optional() }).parse(request.body ?? {});
   await requireTenantUser(request, params.tenantId);
   await assertActiveTenant(params.tenantId);
   const directFirstReports = new Set(['GET_V2_SETTLEMENT_REPORT_DATA_FLAT_FILE_V2', 'GET_SALES_AND_TRAFFIC_REPORT', 'GET_FBA_MYI_UNSUPPRESSED_INVENTORY_DATA', 'GET_FBA_REIMBURSEMENTS_DATA']);
   if (directFirstReports.has(params.reportType)) {
-    const fallback = await syncRecentApiDataForTenant(params.tenantId);
+    const fallback = await syncRecentApiDataForTenant(params.tenantId, { range: body.range });
     await recordSyntheticReportSync(params.tenantId, params.reportType);
     return { reportType: params.reportType, status: 'completed', fallback: 'DIRECT_SP_API_SYNC', ...fallback };
   }
@@ -306,7 +309,7 @@ app.post('/api/tenants/:tenantId/sync/:reportType', async request => {
     }
   }
   try {
-    const result = await syncReportForTenant(params);
+    const result = await syncReportForTenant({ ...params, range: body.range });
     return { reportType: params.reportType, status: 'completed', ...result };
   } catch (error) {
     if (params.reportType === 'GET_GST_MTR_B2B_CUSTOM' || params.reportType === 'GET_GST_MTR_B2C_CUSTOM') {
@@ -324,7 +327,7 @@ app.post('/api/tenants/:tenantId/sync/:reportType', async request => {
     const directFallbackReports = new Set(['GET_V2_SETTLEMENT_REPORT_DATA_FLAT_FILE_V2', 'GET_SALES_AND_TRAFFIC_REPORT', 'GET_FBA_MYI_UNSUPPRESSED_INVENTORY_DATA', 'GET_FBA_REIMBURSEMENTS_DATA']);
     if (directFallbackReports.has(params.reportType)) {
       try {
-        const fallback = await syncRecentApiDataForTenant(params.tenantId);
+        const fallback = await syncRecentApiDataForTenant(params.tenantId, { range: body.range });
         return { reportType: params.reportType, status: 'completed', fallback: 'DIRECT_SP_API_SYNC', warning: error instanceof Error ? error.message : 'Report sync failed', ...fallback };
       } catch {
         // Return the original report error below; it is usually more actionable than a secondary fallback failure.
@@ -341,14 +344,14 @@ app.post('/api/tenants/:tenantId/sync', async request => {
   const body = SellerSyncSchema.parse(request.body ?? {});
   const results = [];
   try {
-    const result = await syncRecentApiDataForTenant(tenantId);
+    const result = await syncRecentApiDataForTenant(tenantId, { range: body.range });
     results.push({ reportType: 'DIRECT_SP_API_SYNC', status: 'completed', ...result });
   } catch (error) {
     results.push({ reportType: 'DIRECT_SP_API_SYNC', status: 'failed', error: error instanceof Error ? error.message : 'unknown error' });
   }
   for (const reportType of body.reportTypes) {
     try {
-      const result = await syncReportForTenant({ tenantId, reportType });
+      const result = await syncReportForTenant({ tenantId, reportType, range: body.range });
       results.push({ reportType, status: 'completed', ...result });
     } catch (error) {
       results.push({ reportType, status: 'failed', error: error instanceof Error ? error.message : 'unknown error' });
@@ -359,6 +362,9 @@ app.post('/api/tenants/:tenantId/sync', async request => {
 
 app.get('/api/tenants/:tenantId/dashboard', async request => {
   const { tenantId } = TenantParamsSchema.parse(request.params); await requireTenantUser(request, tenantId); await assertActiveTenant(tenantId);
+  const range = DashboardQuerySchema.parse(request.query);
+  const start = range.start ? new Date(range.start) : new Date(Date.now() - 30 * 864e5);
+  const end = range.end ? new Date(range.end) : new Date();
   const sellerRow = (await pool.query(`select seller_name, amazon_seller_id, marketplace_id, auth_status, connected_at, last_token_refresh_at from sellers
     where tenant_id=$1 and auth_status='authorized' order by connected_at desc limit 1`, [tenantId])).rows[0] ?? null;
   const seller = sellerRow
@@ -366,18 +372,19 @@ app.get('/api/tenants/:tenantId/dashboard', async request => {
     : { connected: false };
   return withTenant(tenantId, async client => {
     const amazonAuth = (await pool.query("select amazon_seller_id, marketplace_id, auth_status, connected_at, last_token_refresh_at from sellers where tenant_id=$1 and auth_status='authorized' order by connected_at desc limit 1", [tenantId])).rows[0] ?? null;
-    const kpis = (await client.query(`select coalesce(sum(amount),0) net_settled, coalesce(sum(case when amount > 0 then amount else 0 end),0) earnings, coalesce(sum(case when amount < 0 then amount else 0 end),0) deductions from settlement_rows where tenant_id=$1`, [tenantId])).rows[0];
-    const orders = (await client.query(`select count(*) orders, coalesce(sum(total_amount),0) order_value from orders where tenant_id=$1`, [tenantId])).rows[0];
+    const kpis = (await client.query(`select coalesce(sum(amount),0) net_settled, coalesce(sum(case when amount > 0 then amount else 0 end),0) earnings, coalesce(sum(case when amount < 0 then amount else 0 end),0) deductions from settlement_rows where tenant_id=$1 and posted_date >= $2 and posted_date < $3`, [tenantId, start, end])).rows[0];
+    const orders = (await client.query(`select count(*) orders, coalesce(sum(total_amount),0) order_value from orders where tenant_id=$1 and order_date >= $2 and order_date < $3`, [tenantId, start, end])).rows[0];
     const products = (await client.query(`
       with traffic_products as (
         select asin, sum(units_ordered) units, sum(ordered_product_sales) sales, avg(featured_offer_percentage) buy_box
         from sales_traffic_daily
-        where tenant_id=$1 and asin is not null and asin <> 'ALL'
+        where tenant_id=$1 and date >= $2::date and date < $3::date and asin is not null and asin <> 'ALL'
         group by asin
       ), item_products as (
         select asin, sum(quantity_ordered) units, sum(item_price) sales, null::numeric buy_box
-        from order_items
-        where tenant_id=$1 and asin is not null
+        from order_items oi
+        join orders o on o.tenant_id=oi.tenant_id and o.amazon_order_id=oi.amazon_order_id
+        where oi.tenant_id=$1 and o.order_date >= $2 and o.order_date < $3 and oi.asin is not null
         group by asin
       ), merged as (
         select coalesce(t.asin, i.asin) asin,
@@ -386,12 +393,12 @@ app.get('/api/tenants/:tenantId/dashboard', async request => {
           t.buy_box
         from traffic_products t full outer join item_products i on i.asin = t.asin
       )
-      select asin, units, sales, buy_box from merged order by sales desc nulls last, units desc nulls last limit 20`, [tenantId])).rows;
+      select asin, units, sales, buy_box from merged order by sales desc nulls last, units desc nulls last limit 20`, [tenantId, start, end])).rows;
     const trend = (await client.query(`
       with traffic_trend as (
         select date, sum(ordered_product_sales) sales, sum(units_ordered) units, sum(sessions) sessions
         from sales_traffic_daily
-        where tenant_id=$1
+        where tenant_id=$1 and date >= $2::date and date < $3::date
         group by date
       ), order_trend as (
         select date(order_date) date, sum(total_amount) sales, coalesce(sum(items.quantity), 0) units, 0::bigint sessions
@@ -399,7 +406,7 @@ app.get('/api/tenants/:tenantId/dashboard', async request => {
         left join lateral (
           select sum(quantity_ordered) quantity from order_items oi where oi.tenant_id=o.tenant_id and oi.amazon_order_id=o.amazon_order_id
         ) items on true
-        where o.tenant_id=$1 and o.order_date is not null
+        where o.tenant_id=$1 and o.order_date >= $2 and o.order_date < $3 and o.order_date is not null
         group by date(o.order_date)
       ), merged as (
         select coalesce(t.date, o.date) date,
@@ -408,12 +415,12 @@ app.get('/api/tenants/:tenantId/dashboard', async request => {
           coalesce(t.sessions, o.sessions, 0) sessions
         from traffic_trend t full outer join order_trend o on o.date = t.date
       )
-      select date, sales, units, sessions from merged order by date desc limit 90`, [tenantId])).rows.reverse();
+      select date, sales, units, sessions from merged order by date desc limit 90`, [tenantId, start, end])).rows.reverse();
     const payments = (await client.query(`
       with settlement_payments as (
         select settlement_id, date(posted_date) posted_date, sum(amount) net_amount, count(*) lines
         from settlement_rows
-        where tenant_id=$1
+        where tenant_id=$1 and posted_date >= $2 and posted_date < $3
         group by settlement_id,date(posted_date)
       ), finance_payments as (
         select coalesce(transaction_id, related_order_id, 'finance-' || date(posted_date)::text) settlement_id,
@@ -421,14 +428,14 @@ app.get('/api/tenants/:tenantId/dashboard', async request => {
           sum(total_amount) net_amount,
           count(*) lines
         from finance_transactions
-        where tenant_id=$1 and posted_date is not null
+        where tenant_id=$1 and posted_date >= $2 and posted_date < $3 and posted_date is not null
         group by coalesce(transaction_id, related_order_id, 'finance-' || date(posted_date)::text), date(posted_date)
       ), merged as (
         select * from settlement_payments
         union all
         select * from finance_payments where not exists (select 1 from settlement_payments)
       )
-      select settlement_id, posted_date, net_amount, lines from merged order by posted_date desc nulls last limit 50`, [tenantId])).rows;
+      select settlement_id, posted_date, net_amount, lines from merged order by posted_date desc nulls last limit 50`, [tenantId, start, end])).rows;
     const jobs = (await client.query(`select report_type,
         case when status='running' and started_at < now() - interval '30 minutes' then 'failed' else status end status,
         started_at,
@@ -436,12 +443,12 @@ app.get('/api/tenants/:tenantId/dashboard', async request => {
         case when status='running' and started_at < now() - interval '30 minutes' then coalesce(error_message, 'Sync timed out. Please retry.') else error_message end error_message,
         s3_key
       from sync_jobs where tenant_id=$1 order by started_at desc nulls last limit 10`, [tenantId])).rows;
-    const inventory = (await client.query('select sku, fulfillable_quantity, snapshot_date from inventory_snapshots where tenant_id=$1 order by snapshot_date desc, fulfillable_quantity desc nulls last limit 50', [tenantId])).rows;
-    const returns = (await client.query('select order_id, return_reason, disposition, status, return_date from returns where tenant_id=$1 order by return_date desc nulls last limit 50', [tenantId])).rows;
-    const reimbursements = (await client.query('select sku, amount, reason, reimbursement_date from reimbursements where tenant_id=$1 order by reimbursement_date desc nulls last limit 50', [tenantId])).rows;
-    const invoices = (await client.query('select invoice_type, order_id, taxable_value, cgst, sgst, igst, invoice_date from gst_invoices where tenant_id=$1 order by invoice_date desc nulls last limit 50', [tenantId])).rows;
-    const orderItems = (await client.query('select amazon_order_id, asin, sku, title, quantity_ordered, item_price, item_tax from order_items where tenant_id=$1 order by quantity_ordered desc nulls last limit 50', [tenantId])).rows;
-    const financeTransactions = (await client.query('select transaction_id, transaction_type, posted_date, total_amount, currency, related_order_id from finance_transactions where tenant_id=$1 order by posted_date desc nulls last limit 50', [tenantId])).rows;
+    const inventory = (await client.query('select sku, fulfillable_quantity, snapshot_date from inventory_snapshots where tenant_id=$1 and snapshot_date >= $2::date and snapshot_date < $3::date order by snapshot_date desc, fulfillable_quantity desc nulls last limit 50', [tenantId, start, end])).rows;
+    const returns = (await client.query('select order_id, return_reason, disposition, status, return_date from returns where tenant_id=$1 and return_date >= $2::date and return_date < $3::date order by return_date desc nulls last limit 50', [tenantId, start, end])).rows;
+    const reimbursements = (await client.query('select sku, amount, reason, reimbursement_date from reimbursements where tenant_id=$1 and reimbursement_date >= $2::date and reimbursement_date < $3::date order by reimbursement_date desc nulls last limit 50', [tenantId, start, end])).rows;
+    const invoices = (await client.query('select invoice_type, order_id, taxable_value, cgst, sgst, igst, invoice_date from gst_invoices where tenant_id=$1 and invoice_date >= $2::date and invoice_date < $3::date order by invoice_date desc nulls last limit 50', [tenantId, start, end])).rows;
+    const orderItems = (await client.query('select oi.amazon_order_id, oi.asin, oi.sku, oi.title, oi.quantity_ordered, oi.item_price, oi.item_tax from order_items oi join orders o on o.tenant_id=oi.tenant_id and o.amazon_order_id=oi.amazon_order_id where oi.tenant_id=$1 and o.order_date >= $2 and o.order_date < $3 order by oi.quantity_ordered desc nulls last limit 50', [tenantId, start, end])).rows;
+    const financeTransactions = (await client.query('select transaction_id, transaction_type, posted_date, total_amount, currency, related_order_id from finance_transactions where tenant_id=$1 and posted_date >= $2 and posted_date < $3 order by posted_date desc nulls last limit 50', [tenantId, start, end])).rows;
     const hasImportedData = Number(orders.orders ?? 0) > 0 || Number(kpis.net_settled ?? 0) !== 0 || products.length > 0 || payments.length > 0 || inventory.length > 0;
     return { seller, amazonAuth, hasImportedData, kpis, orders, products, trend, payments, jobs, inventory, returns, reimbursements, invoices, orderItems, financeTransactions };
   });
