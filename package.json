@@ -18,5 +18,8 @@
   },
   "dependencies": {
     "dotenv": "^17.4.2"
+  },
+  "optionalDependencies": {
+    "@rollup/rollup-linux-x64-gnu": "^4.62.2"
   }
 }
