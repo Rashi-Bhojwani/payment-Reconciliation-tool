@@ -44,7 +44,6 @@ const VIEW_REPORT_TYPES = {
   returns: ['GET_FBA_FULFILLMENT_CUSTOMER_RETURNS_DATA'],
   reimbursements: ['GET_FBA_REIMBURSEMENTS_DATA'],
   tax: ['GET_GST_MTR_B2B_CUSTOM', 'GET_GST_MTR_B2C_CUSTOM'],
-  advertising: ['DIRECT_SP_API_SYNC'],
   pricing: ['GET_SALES_AND_TRAFFIC_REPORT'],
   listings: ['GET_FBA_MYI_UNSUPPRESSED_INVENTORY_DATA'],
   customer: ['GET_FBA_FULFILLMENT_CUSTOMER_RETURNS_DATA'],
@@ -60,7 +59,6 @@ const VIEW_LEDGER_COPY = {
   returns: { title: 'Returns sync', subtitle: 'Customer return report' },
   reimbursements: { title: 'Reimbursements sync', subtitle: 'Amazon credits' },
   tax: { title: 'GST sync', subtitle: 'B2B and B2C invoice reports' },
-  advertising: { title: 'Advertising readiness', subtitle: 'Ads spend can reconcile with payouts when Ads API is connected' },
   pricing: { title: 'Pricing signals sync', subtitle: 'Sales and traffic metrics' },
   listings: { title: 'Listings inventory sync', subtitle: 'FBA SKU availability' },
   customer: { title: 'Customer experience sync', subtitle: 'Returns and defects signals' },
@@ -93,11 +91,12 @@ function Empty({ text }) { return <div className="empty-state">{text}</div>; }
 function formatCurrency(value) { return `₹${Number(value ?? 0).toLocaleString('en-IN', { maximumFractionDigits: 0 })}`; }
 function formatNumber(value) { return Number(value ?? 0).toLocaleString('en-IN'); }
 function csvEscape(value) {
-  const text = String(value ?? '');
+  const text = String(value ?? '').replaceAll('₹', '').replaceAll('—', '').replaceAll('â€”', '').trim();
   return /[",\n]/.test(text) ? `"${text.replaceAll('"', '""')}"` : text;
 }
 function downloadCsv(filename, rows, columns) {
-  const csv = [columns.join(','), ...rows.map(row => columns.map(column => csvEscape(row[column])).join(','))].join('\n');
+  const headings = columns.map(column => column.replaceAll('_', ' '));
+  const csv = ['\ufeff' + headings.join(','), ...rows.map(row => columns.map(column => csvEscape(row[column])).join(','))].join('\n');
   const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' });
   const url = URL.createObjectURL(blob);
   const link = document.createElement('a');
@@ -435,7 +434,6 @@ function SellerDashboard() {
     {view === 'returns' && <TableCard title="Return Details" rows={data?.returns ?? []} columns={['order_id', 'return_reason', 'disposition', 'status', 'return_date']} />}
     {view === 'reimbursements' && <TableCard title="Reimbursement Details" rows={data?.reimbursements ?? []} columns={['sku', 'amount', 'reason', 'reimbursement_date']} />}
     {view === 'tax' && <TableCard title="GST Invoice Details" rows={data?.invoices ?? []} columns={['invoice_type', 'order_id', 'taxable_value', 'cgst', 'sgst', 'igst', 'invoice_date']} />}
-    {view === 'advertising' && <InsightCards title="Advertising & fee reconciliation" cards={[['Ad spend', 'Ready for Ads API connection'], ['Impact', 'Compare campaign spend against settlement deductions'], ['Next action', 'Connect Ads API when credentials are available']]} />}
     {view === 'pricing' && <InsightCards title="Pricing & Buy Box" cards={[['Buy Box', `${formatNumber((data?.products ?? []).filter(p => p.buy_box).length)} ASIN signals`], ['ASP', formatCurrency(buildDashboardSummary(data).netQty ? buildDashboardSummary(data).netSales / buildDashboardSummary(data).netQty : 0)], ['Source', 'Sales & Traffic report']]} />}
     {view === 'listings' && <TableCard title="Listing Availability" rows={data?.inventory ?? []} columns={['sku', 'fulfillable_quantity', 'snapshot_date']} />}
     {view === 'customer' && <TableCard title="Customer Experience Signals" rows={data?.returns ?? []} columns={['order_id', 'return_reason', 'disposition', 'status', 'return_date']} />}
@@ -446,15 +444,15 @@ function SellerDashboard() {
   </div>;
 }
 
-function viewTitle(view) { return ({ dashboard: 'Dashboard', sales: 'Sales Analytics', inventory: 'Inventory', payouts: 'Payout Reconciliation', brand: 'Brand Analytics', orders: 'Orders', returns: 'Returns', reimbursements: 'Reimbursements', tax: 'GST & Tax', advertising: 'Advertising', pricing: 'Pricing & Buy Box', listings: 'Listings', customer: 'Customer Experience', health: 'Account Health', reports: 'Reports', 'report-detail': 'Report Detail' })[view] ?? 'Dashboard'; }
-function viewDescription(view) { return ({ dashboard: 'Amazon-only reconciliation KPIs with explainable drill-downs.', sales: 'Revenue, order value, units and product sales trends from Amazon reports.', inventory: 'FBA inventory snapshots imported from SP-API inventory reports.', payouts: 'Settlement rows and payout reconciliation from Amazon settlement reports.', brand: 'ASIN-level product performance from synced Amazon order items, with Sales & Traffic metrics when available.', orders: 'Order and item-level details imported from Amazon SP-API.', returns: 'Customer return reasons, status and disposition.', reimbursements: 'Amazon reimbursement credits for lost, damaged or adjusted inventory.', tax: 'GST B2B and B2C invoice rows in readable form.', advertising: 'Ad spend reconciliation workspace for seller account profitability.', pricing: 'ASP and Buy Box signals that influence sales.', listings: 'SKU availability and listing stock visibility.', customer: 'Return-driven customer experience signals.', health: 'Returns and reimbursement signals imported from Amazon reports.', reports: 'Open each fetched report and view human-readable data.', 'report-detail': 'Human-readable rows from the selected SP-API report.' })[view] ?? 'Live seller KPIs populated from synced SP-API orders and reports.'; }
+function viewTitle(view) { return ({ dashboard: 'Dashboard', sales: 'Sales Analytics', inventory: 'Inventory', payouts: 'Payout Reconciliation', brand: 'Brand Analytics', orders: 'Orders', returns: 'Returns', reimbursements: 'Reimbursements', tax: 'GST & Tax', pricing: 'Pricing & Buy Box', listings: 'Listings', customer: 'Customer Experience', health: 'Account Health', reports: 'Reports', 'report-detail': 'Report Detail' })[view] ?? 'Dashboard'; }
+function viewDescription(view) { return ({ dashboard: 'Amazon-only reconciliation KPIs with explainable drill-downs.', sales: 'Revenue, order value, units and product sales trends from Amazon reports.', inventory: 'FBA inventory snapshots imported from SP-API inventory reports.', payouts: 'Settlement rows and payout reconciliation from Amazon settlement reports.', brand: 'ASIN-level product performance from synced Amazon order items, with Sales & Traffic metrics when available.', orders: 'Order and item-level details imported from Amazon SP-API.', returns: 'Customer return reasons, status and disposition.', reimbursements: 'Amazon reimbursement credits for lost, damaged or adjusted inventory.', tax: 'GST B2B and B2C invoice rows in readable form.', pricing: 'ASP and Buy Box signals that influence sales.', listings: 'SKU availability and listing stock visibility.', customer: 'Return-driven customer experience signals.', health: 'Returns and reimbursement signals imported from Amazon reports.', reports: 'Open each fetched report and view human-readable data.', 'report-detail': 'Human-readable rows from the selected SP-API report.' })[view] ?? 'Live seller KPIs populated from synced SP-API orders and reports.'; }
 function DashboardOverview({ data, channelData, tenantId }) {
   const summary = useMemo(() => buildDashboardSummary(data), [data]);
   return <>
     <div className="metrics-strip">
       <DrillMetric to={`/seller?tenantId=${tenantId}&view=metric-detail&metric=netSales`} title="Net Sales" value={formatCurrency(summary.netSales)} hint="Click to see order-value formula" />
       <DrillMetric to={`/seller?tenantId=${tenantId}&view=metric-detail&metric=netQty`} title="Net Qty" value={formatNumber(summary.netQty)} hint="Click to see units source" />
-      <DrillMetric to={`/seller?tenantId=${tenantId}&view=metric-detail&metric=settled`} title="Settled Amount" value={formatCurrency(summary.settledAmount)} hint="Click to see payout math" />
+      <DrillMetric to={`/seller?tenantId=${tenantId}&view=orders`} title="Orders Synced" value={formatNumber(summary.ordersCount)} hint="Click to audit order rows" />
       <DrillMetric to={`/seller?tenantId=${tenantId}&view=returns`} title="Returns" value={formatNumber(summary.returnQty)} hint="Open return lines" />
     </div>
 
@@ -488,13 +486,15 @@ function DashboardOverview({ data, channelData, tenantId }) {
 
 function DrillMetric({ to, title, value, hint }) { return <NavLink to={to} className="mini-metric drill-metric"><span>{title}</span><strong>{value}</strong>{trendHint(hint)}<em>View calculation →</em></NavLink>; }
 function ExplanationGrid({ summary, tenantId }) {
+  const returnRate = summary.netQty ? `${Math.round((summary.returnQty / summary.netQty) * 100)}%` : '0%';
+  const payoutGap = summary.netSales - summary.settledAmount;
   const cards = [
-    ['Net sales', formatCurrency(summary.netSales), 'Sum of Amazon order value imported from orders / Sales & Traffic. Refund and settlement impact is checked separately.', 'netSales'],
-    ['Settled amount', formatCurrency(summary.settledAmount), 'Sum of settlement net amounts from payout reports and finance events.', 'settled'],
-    ['Deductions', formatCurrency(summary.deductions), 'Amazon fees, refunds and other charges imported from finance / settlement lines.', 'deductions'],
-    ['Daily run rate', formatCurrency(summary.drr), 'Net sales divided across the selected operating window for an easy daily pace.', 'drr']
+    ['Reconciliation gap', formatCurrency(payoutGap), 'Difference between Amazon net sales and settled amount; useful for payout follow-up.', 'settled'],
+    ['Fee impact', formatCurrency(summary.deductions), 'Amazon fees, refunds and other charges imported from finance / settlement lines.', 'deductions'],
+    ['Return rate', returnRate, 'Returns compared with total sold quantity for quick customer-experience review.', 'returns'],
+    ['GST invoice value', formatCurrency(summary.gstValue), 'Total taxable value imported from GST B2B/B2C invoice rows.', 'tax']
   ];
-  return <div className="explain-grid">{cards.map(([title, value, copy, metric]) => <NavLink key={metric} to={`/seller?tenantId=${tenantId}&view=metric-detail&metric=${metric}`} className="explain-card"><b>{title}</b><strong>{value}</strong><p>{copy}</p><span>Open detail →</span></NavLink>)}</div>;
+  return <div className="explain-grid">{cards.map(([title, value, copy, target]) => <NavLink key={title} to={`/seller?tenantId=${tenantId}&view=${target === 'deductions' || target === 'settled' ? `metric-detail&metric=${target}` : target}`} className="explain-card"><b>{title}</b><strong>{value}</strong><p>{copy}</p><span>Open detail →</span></NavLink>)}</div>;
 }
 function InsightCards({ title, cards }) { return <Card><PanelHeader title={title} /><div className="explain-grid compact">{cards.map(([label, value]) => <div className="explain-card" key={label}><b>{label}</b><strong>{value}</strong></div>)}</div></Card>; }
 function ReportsExplorer({ tenantId, data }) {
@@ -503,7 +503,7 @@ function ReportsExplorer({ tenantId, data }) {
     const rows = data?.[detail.source] ?? [];
     const job = data?.jobs?.find(j => j.report_type === report.type);
     return <NavLink className="report-tile" key={report.type} to={`/seller?tenantId=${tenantId}&view=report-detail&reportType=${report.type}`}>
-      <span className="ledger-code">{report.code}</span><div><b>{report.label}</b><p>{detail.explanation}</p></div><strong>{formatNumber(rows.length)} rows</strong><small>{job?.completed_at ? `Last synced ${timeAgo(job.completed_at)}` : report.hint}</small>
+      <span className="ledger-code">{report.code}</span><div><b>{report.label}</b><p>{detail.explanation}</p></div><small>{job?.completed_at ? `Last synced ${timeAgo(job.completed_at)}` : report.hint}</small>
     </NavLink>;
   })}</div>;
 }
@@ -516,7 +516,7 @@ function ReportDetail({ data, reportType }) {
       <PanelHeader title={detail.title} subtitle={report.code} />
       <p>{detail.explanation}</p>
       <div className="detail-actions">
-        <div className="detail-formula"><b>Human explanation</b><span>This page shows exactly what was fetched for {report.label}. The dashboard totals use these readable rows for their counts and rupee amounts.</span></div>
+        <p className="detail-note">Review the imported rows below, then download the same table as a clean CSV with readable headers.</p>
         <Button variant="accent" onClick={() => downloadCsv(`${report.code.toLowerCase()}-${detail.source}.csv`, rows, detail.columns)} disabled={!rows.length}>Download report CSV</Button>
       </div>
     </Card>
@@ -528,8 +528,8 @@ function buildMetricDetails(data, metric) {
   const products = data?.products ?? [];
   const orderItems = data?.orderItems ?? [];
   const productRows = products.length
-    ? products.map(row => ({ asin: row.asin, sku: row.sku ?? '—', units: formatNumber(row.units), sales: formatCurrency(row.sales), share: summary.netSales ? `${Math.round((Number(row.sales ?? 0) / summary.netSales) * 100)}%` : '0%' }))
-    : orderItems.map(row => ({ asin: row.asin, sku: row.sku, units: formatNumber(row.quantity_ordered), sales: formatCurrency(row.item_price), share: summary.netSales ? `${Math.round((Number(row.item_price ?? 0) / summary.netSales) * 100)}%` : '0%' }));
+    ? products.map(row => ({ asin: row.asin, sku: row.sku ?? '', units: formatNumber(row.units), sales: Number(row.sales ?? 0), share: summary.netSales ? `${Math.round((Number(row.sales ?? 0) / summary.netSales) * 100)}%` : '0%' }))
+    : orderItems.map(row => ({ asin: row.asin, sku: row.sku ?? '', units: formatNumber(row.quantity_ordered), sales: Number(row.item_price ?? 0), share: summary.netSales ? `${Math.round((Number(row.item_price ?? 0) / summary.netSales) * 100)}%` : '0%' }));
   const netSalesFormula = products.length
     ? `Net Sales = ${productRows.map(row => row.sales).join(' + ')} = ${formatCurrency(summary.netSales)}`
     : `Net Sales = sum of item_price across ${formatNumber(orderItems.length)} order item rows = ${formatCurrency(summary.netSales)}`;
@@ -609,6 +609,8 @@ function buildDashboardSummary(data) {
     estimatedProfit,
     profitRate,
     drr,
+    ordersCount,
+    gstValue: invoices.reduce((sum, row) => sum + Number(row.taxable_value ?? 0), 0),
     profitRows: [baseRow, totalRow],
     returnRows: [returnSummary, { ...returnSummary, channel: 'Total' }],
     reconcileRows: [
@@ -718,7 +720,6 @@ function SellerShell({ session, setSession }) {
         <SidebarLink to={`/seller?tenantId=${session?.tenantId ?? ''}&view=returns`}>Returns</SidebarLink>
         <SidebarLink to={`/seller?tenantId=${session?.tenantId ?? ''}&view=reimbursements`}>Reimbursements</SidebarLink>
         <SidebarLink to={`/seller?tenantId=${session?.tenantId ?? ''}&view=tax`}>GST & Tax</SidebarLink>
-        <SidebarLink to={`/seller?tenantId=${session?.tenantId ?? ''}&view=advertising`}>Advertising</SidebarLink>
         <SidebarLink to={`/seller?tenantId=${session?.tenantId ?? ''}&view=pricing`}>Pricing & Buy Box</SidebarLink>
         <SidebarLink to={`/seller?tenantId=${session?.tenantId ?? ''}&view=listings`}>Listings</SidebarLink>
         <SidebarLink to={`/seller?tenantId=${session?.tenantId ?? ''}&view=customer`}>Customer Experience</SidebarLink>
