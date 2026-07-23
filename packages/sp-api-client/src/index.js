@@ -23,15 +23,16 @@ const GST_REPORTS = new Set(['GET_GST_MTR_B2B_CUSTOM', 'GET_GST_MTR_B2C_CUSTOM']
 const DateRangeSchema = z.object({ start: z.string().datetime(), end: z.string().datetime() });
 
 const SP_API_RATE_LIMITS = Object.freeze([
-  { pattern: /^\/orders\//, intervalMs: 1200 },
-  { pattern: /^\/reports\//, intervalMs: 2500 },
-  { pattern: /^\/finances\//, intervalMs: 2500 },
-  { pattern: /^\/fba\/inventory\//, intervalMs: 2500 },
-  { pattern: /^\/tokens\//, intervalMs: 2500 },
-  { pattern: /^\/products\/fees\//, intervalMs: 1200 }
+  { pattern: /^\/orders\//, intervalMs: 2200 },
+  { pattern: /^\/reports\//, intervalMs: 5000 },
+  { pattern: /^\/finances\//, intervalMs: 5000 },
+  { pattern: /^\/fba\/inventory\//, intervalMs: 5000 },
+  { pattern: /^\/tokens\//, intervalMs: 5000 },
+  { pattern: /^\/products\/fees\//, intervalMs: 2200 }
 ]);
-const DEFAULT_SP_API_INTERVAL_MS = 1500;
+const DEFAULT_SP_API_INTERVAL_MS = 3000;
 const rateLimitState = new Map();
+let globalNextAvailableAt = Date.now();
 
 /** @param {string} path */
 function rateLimitBucket(path) {
@@ -44,9 +45,11 @@ function rateLimitBucket(path) {
 async function waitForSpApiSlot(path) {
   const { key, intervalMs } = rateLimitBucket(path);
   const now = Date.now();
-  const nextAvailableAt = rateLimitState.get(key) ?? now;
+  const nextAvailableAt = Math.max(rateLimitState.get(key) ?? now, globalNextAvailableAt);
   const waitMs = Math.max(0, nextAvailableAt - now);
-  rateLimitState.set(key, now + waitMs + intervalMs);
+  const reservedAt = now + waitMs + intervalMs;
+  rateLimitState.set(key, reservedAt);
+  globalNextAvailableAt = now + waitMs + 750;
   if (waitMs > 0) await new Promise(resolve => setTimeout(resolve, waitMs));
 }
 
@@ -74,15 +77,17 @@ export class SpApiClient {
   /** @param {string} path @param {RequestInit} [init] @param {string} [token] */
   async request(path, init = {}, token) {
     let accessToken = token ?? (await this.getAccessToken()).accessToken;
-    for (let attempt = 0; attempt < 4; attempt += 1) {
+    for (let attempt = 0; attempt < 5; attempt += 1) {
       await waitForSpApiSlot(path);
       const res = await fetch(`${this.cfg.baseUrl}${path}`, {
         ...init,
         headers: { 'content-type': 'application/json', 'x-amz-access-token': accessToken, ...(init.headers ?? {}) }
       });
-      const rateLimit = Number(res.headers.get('x-amzn-RateLimit-Limit') ?? '1');
+      const rateLimit = Number(res.headers.get('x-amzn-RateLimit-Limit') ?? '0.5');
       if (![429, 503].includes(res.status)) return res;
-      await new Promise(resolve => setTimeout(resolve, Math.min(30_000, (1000 / Math.max(rateLimit, 0.1)) * 2 ** attempt)));
+      const retryAfter = Number(res.headers.get('retry-after'));
+      const backoffMs = Number.isFinite(retryAfter) && retryAfter > 0 ? retryAfter * 1000 : (1000 / Math.max(rateLimit, 0.05)) * 2 ** attempt;
+      await new Promise(resolve => setTimeout(resolve, Math.min(120_000, backoffMs)));
       accessToken = token ?? (await this.getAccessToken()).accessToken;
     }
     throw new Error(`SP-API request failed after retries: ${path}`);

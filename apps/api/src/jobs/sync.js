@@ -229,7 +229,14 @@ export async function syncRecentApiDataForTenant(tenantId, options = {}) {
   const incrementalCreatedAfter = lastCompletedSync ? new Date(new Date(lastCompletedSync).getTime() - 5 * 60 * 1000) : defaultCreatedAfter;
   const createdAfterDate = range || options.full ? defaultCreatedAfter : new Date(Math.max(defaultCreatedAfter.getTime(), incrementalCreatedAfter.getTime()));
   const createdAfter = createdAfterDate.toISOString();
-  const createdBefore = range ? new Date(range.end).toISOString() : undefined;
+  const safeNow = new Date(Date.now() - 2 * 60 * 1000);
+  const requestedCreatedBefore = range ? new Date(range.end) : safeNow;
+  const createdBefore = new Date(Math.min(requestedCreatedBefore.getTime(), safeNow.getTime())).toISOString();
+  const includeOrders = options.includeOrders ?? true;
+  const includeFinance = options.includeFinance ?? true;
+  const includeInventory = options.includeInventory ?? true;
+  const maxOrderPages = Math.max(1, Math.min(Number(options.maxOrderPages ?? 3), 5));
+  const maxOrderItems = Math.max(0, Math.min(Number(options.maxOrderItems ?? 25), 50));
   await assertActiveTenant(parsedTenantId);
   return runJob(`sync:direct-api:${parsedTenantId}`, async () => {
     const sync = await pool.query('insert into sync_jobs(tenant_id, report_type, status, started_at) values($1,$2,$3,now()) returning id', [parsedTenantId, 'DIRECT_SP_API_SYNC', 'running']);
@@ -238,19 +245,26 @@ export async function syncRecentApiDataForTenant(tenantId, options = {}) {
       if (!seller.rowCount) throw new Error('No connected Amazon seller account');
       const marketplaceId = seller.rows[0].marketplace_id;
       const client = new SpApiClient(decryptSecret(seller.rows[0].refresh_token_encrypted), { baseUrl: getSpApiEndpoint(marketplaceId) });
+      let ordersWarning;
       const orderPages = [];
-      let ordersResponse = await client.listOrders(createdAfter, marketplaceId, createdBefore);
-      orderPages.push(ordersResponse);
-      for (let page = 0; page < 20; page += 1) {
-        const nextToken = ordersResponse?.payload?.NextToken ?? ordersResponse?.NextToken;
-        if (!nextToken) break;
-        ordersResponse = await client.listOrdersByNextToken(nextToken);
-        orderPages.push(ordersResponse);
+      if (includeOrders) {
+        try {
+          let ordersResponse = await client.listOrders(createdAfter, marketplaceId, createdBefore);
+          orderPages.push(ordersResponse);
+          for (let page = 1; page < maxOrderPages; page += 1) {
+            const nextToken = ordersResponse?.payload?.NextToken ?? ordersResponse?.NextToken;
+            if (!nextToken) break;
+            ordersResponse = await client.listOrdersByNextToken(nextToken);
+            orderPages.push(ordersResponse);
+          }
+        } catch (error) {
+          ordersWarning = error instanceof Error ? error.message : 'Orders sync failed';
+        }
       }
       const orders = orderPages.flatMap(page => page?.payload?.Orders ?? page?.Orders ?? []);
-      const financeResponse = await client.listFinanceTransactions(createdAfter, createdBefore).catch(error => ({ syncError: error instanceof Error ? error.message : 'Finance sync failed' }));
+      const financeResponse = includeFinance ? await client.listFinanceTransactions(createdAfter, createdBefore).catch(error => ({ syncError: error instanceof Error ? error.message : 'Finance sync failed' })) : null;
       const transactions = financeResponse?.payload?.transactions ?? financeResponse?.transactions ?? financeResponse?.payload?.Transactions ?? financeResponse?.Transactions ?? [];
-      const inventoryResponse = await client.listInventorySummaries(marketplaceId).catch(error => ({ syncError: error instanceof Error ? error.message : 'Inventory sync failed' }));
+      const inventoryResponse = includeInventory ? await client.listInventorySummaries(marketplaceId).catch(error => ({ syncError: error instanceof Error ? error.message : 'Inventory sync failed' })) : null;
       const inventorySummaries = inventoryResponse?.payload?.inventorySummaries ?? inventoryResponse?.inventorySummaries ?? [];
       const snapshotDate = new Date().toISOString().slice(0, 10);
       let ordersImported = 0;
@@ -259,6 +273,7 @@ export async function syncRecentApiDataForTenant(tenantId, options = {}) {
       let reimbursementsImported = 0;
       let orderItemsSkipped = 0;
       await withTenant(parsedTenantId, async db => {
+        let orderItemsFetched = 0;
         for (const order of orders) {
           const orderId = order.AmazonOrderId ?? order.amazonOrderId;
           if (!orderId) continue;
@@ -274,7 +289,12 @@ export async function syncRecentApiDataForTenant(tenantId, options = {}) {
             orderItemsSkipped += 1;
             continue;
           }
+          if (orderItemsFetched >= maxOrderItems) {
+            orderItemsSkipped += 1;
+            continue;
+          }
           const itemsResponse = await client.listOrderItems(orderId).catch(() => undefined);
+          orderItemsFetched += 1;
           const items = itemsResponse?.payload?.OrderItems ?? itemsResponse?.OrderItems ?? [];
           for (const item of items) {
             await db.query(
@@ -320,7 +340,7 @@ export async function syncRecentApiDataForTenant(tenantId, options = {}) {
         }
       });
       await pool.query('update sync_jobs set status=$1, completed_at=now() where id=$2', ['completed', sync.rows[0].id]);
-      return { ordersImported, transactionsImported, inventoryImported, reimbursementsImported, orderItemsSkipped, incrementalSince: createdAfter, financeWarning: financeResponse?.syncError, inventoryWarning: inventoryResponse?.syncError };
+      return { ordersImported, transactionsImported, inventoryImported, reimbursementsImported, orderItemsSkipped, incrementalSince: createdAfter, incrementalUntil: createdBefore, ordersWarning, financeWarning: financeResponse?.syncError, inventoryWarning: inventoryResponse?.syncError };
     } catch (error) {
       await pool.query('update sync_jobs set status=$1, completed_at=now(), error_message=$2 where id=$3', ['failed', error instanceof Error ? error.message : 'unknown error', sync.rows[0].id]);
       throw error;
