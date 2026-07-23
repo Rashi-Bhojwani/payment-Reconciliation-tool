@@ -28,7 +28,7 @@ const REPORT_DETAIL_MAP = {
   GET_FBA_REIMBURSEMENTS_DATA: { source: 'reimbursements', title: 'Reimbursement report detail', columns: ['sku', 'amount', 'reason', 'reimbursement_date'], explanation: 'Shows Amazon reimbursement credits with SKU, reason and amount.' },
   GET_FBA_FULFILLMENT_CUSTOMER_RETURNS_DATA: { source: 'returns', title: 'Customer returns report detail', columns: ['order_id', 'return_reason', 'disposition', 'status', 'return_date'], explanation: 'Shows return rows with reason, disposition and current status.' }
 };
-const COLORS = ['#e8a23d', '#159a82', '#6d5bd0', '#2e86ab'];
+const COLORS = ['#0f6bff', '#7c3aed', '#64748b', '#d8dde8'];
 
 // Maps each report code to a stable CSS class so the Sync Ledger and Reports
 // grid can color-code report families (each is a genuinely distinct SP-API
@@ -41,6 +41,25 @@ function codeClass(code) { return `code-${CODE_COLOR_KEY[code] ?? code.toLowerCa
 // Dashboard is deliberately absent here — it's an overview page and no
 // longer shows any sync controls at all. Every other sidebar page gets only
 // the report(s) it actually depends on.
+
+const NAV_ITEMS = [
+  { view: 'dashboard', label: 'Dashboard', icon: '▦' },
+  { view: 'sales', label: 'Sales Analytics', icon: '↗' },
+  { view: 'businessPerformance', label: 'Business Performance', icon: '▤' },
+  { view: 'productPerformance', label: 'Product Performance', icon: '◈' },
+  { view: 'inventory', label: 'Inventory', icon: '□' },
+  { view: 'payouts', label: 'Payouts', icon: '₹' },
+  { view: 'brand', label: 'Brand Analytics', icon: '☆' },
+  { view: 'orders', label: 'Orders', icon: '☰' },
+  { view: 'returns', label: 'Returns', icon: '↩' },
+  { view: 'reimbursements', label: 'Reimbursements', icon: '+' },
+  { view: 'tax', label: 'GST & Tax', icon: '%' },
+  { view: 'pricing', label: 'Pricing & Buy Box', icon: '◇' },
+  { view: 'listings', label: 'Listings', icon: '⌂' },
+  { view: 'reports', label: 'Reports', icon: '◎' },
+  { view: 'rawData', label: 'Raw API Data', icon: '{}' }
+];
+
 const VIEW_REPORT_TYPES = {
   sales: ['GET_SALES_AND_TRAFFIC_REPORT'],
   inventory: ['GET_FBA_MYI_UNSUPPRESSED_INVENTORY_DATA'],
@@ -54,7 +73,8 @@ const VIEW_REPORT_TYPES = {
   listings: ['GET_FBA_MYI_UNSUPPRESSED_INVENTORY_DATA'],
   reports: REPORTS.map(r => r.type),
   businessPerformance: ['GET_SALES_AND_TRAFFIC_REPORT', 'DIRECT_SP_API_SYNC', 'GET_FBA_FULFILLMENT_CUSTOMER_RETURNS_DATA'],
-  productPerformance: ['GET_SALES_AND_TRAFFIC_REPORT']
+  productPerformance: ['GET_SALES_AND_TRAFFIC_REPORT'],
+  rawData: REPORTS.map(r => r.type)
 };
 const VIEW_LEDGER_COPY = {
   sales: { title: 'Sales & traffic sync', subtitle: 'Powers this page only' },
@@ -69,7 +89,8 @@ const VIEW_LEDGER_COPY = {
   listings: { title: 'Listings inventory sync', subtitle: 'FBA SKU availability' },
   reports: { title: 'Sync ledger', subtitle: 'Pull one report at a time' },
   businessPerformance: { title: 'Business performance sync', subtitle: 'Sales, traffic and refunds' },
-  productPerformance: { title: 'Product performance sync', subtitle: 'ASIN-level sales and traffic' }
+  productPerformance: { title: 'Product performance sync', subtitle: 'ASIN-level sales and traffic' },
+  rawData: { title: 'Raw API sync', subtitle: 'Pull one source at a time to respect limits' }
 };
 
 function authHeaders() { const token = localStorage.getItem('token'); return token ? { authorization: `Bearer ${token}` } : {}; }
@@ -90,7 +111,7 @@ function readAmazonTokenCache(tenantId) { const cached = JSON.parse(localStorage
 async function getAmazonAccessToken(tenantId) { const cached = readAmazonTokenCache(tenantId); if (cached) return cached; const fresh = await api(`/api/tenants/${tenantId}/amazon/access-token`); localStorage.setItem(`${ACCESS_TOKEN_CACHE_PREFIX}${tenantId}`, JSON.stringify(fresh)); return fresh; }
 async function beginAmazonAuthorization(tenantId) { const { url } = await api(`/api/auth/amazon/start?tenantId=${tenantId}&json=1`); window.location.assign(url); }
 
-function Button({ className = '', variant = 'primary', ...props }) { return <button {...props} className={`btn btn-${variant} ${className}`} />; }
+function Button({ className = '', variant = 'primary', icon, children, ...props }) { return <button {...props} className={`btn btn-${variant} ${className}`}>{icon && <span className="btn-icon" aria-hidden="true">{icon}</span>}{children}</button>; }
 function Input(props) { return <input {...props} className="input" />; }
 function Card({ children, className = '' }) { return <section className={`card ${className}`}>{children}</section>; }
 function Empty({ text }) { return <div className="empty-state">{text}</div>; }
@@ -181,31 +202,25 @@ function formatRangeLabel(start, end) {
   const endStr = start.getFullYear() === end.getFullYear() ? formatShort(end) : end.toLocaleDateString('en-IN', { month: 'short', day: 'numeric', year: 'numeric' });
   return `${startStr} – ${endStr}, ${end.getFullYear()}`;
 }
-function buildMonthGrid(viewDate) {
-  const year = viewDate.getFullYear(), month = viewDate.getMonth();
-  const startWeekday = new Date(year, month, 1).getDay();
-  const daysInMonth = new Date(year, month + 1, 0).getDate();
-  const cells = Array(startWeekday).fill(null);
-  for (let d = 1; d <= daysInMonth; d++) cells.push(new Date(year, month, d));
-  return cells;
-}
-const DATE_PRESETS = [
-  { label: 'Today', range: () => { const t = startOfDay(new Date()); return [t, t]; } },
-  { label: 'Last 7 Days', range: () => { const t = startOfDay(new Date()); return [addDays(t, -6), t]; } },
-  { label: 'Last 30 Days', range: () => { const t = startOfDay(new Date()); return [addDays(t, -29), t]; } },
-  { label: 'Last 90 Days', range: () => { const t = startOfDay(new Date()); return [addDays(t, -89), t]; } },
-  { label: 'This Month', range: () => { const t = new Date(); return [new Date(t.getFullYear(), t.getMonth(), 1), startOfDay(t)]; } },
-  { label: 'Last Month', range: () => { const t = new Date(); return [new Date(t.getFullYear(), t.getMonth() - 1, 1), new Date(t.getFullYear(), t.getMonth(), 0)]; } }
-];
 function defaultDateRange() { const end = startOfDay(new Date()); return { label: 'Last 30 Days', start: addDays(end, -29), end }; }
 const DateRangeContext = createContext({ range: defaultDateRange(), setRange: () => {} });
 
+function toDateInputValue(date) {
+  const d = startOfDay(date);
+  const yyyy = d.getFullYear();
+  const mm = String(d.getMonth() + 1).padStart(2, '0');
+  const dd = String(d.getDate()).padStart(2, '0');
+  return `${yyyy}-${mm}-${dd}`;
+}
+function fromDateInputValue(value) { return startOfDay(new Date(`${value}T00:00:00`)); }
 function DateRangePicker({ value, onChange }) {
   const [open, setOpen] = useState(false);
-  const [viewMonth, setViewMonth] = useState(() => new Date(value.end.getFullYear(), value.end.getMonth(), 1));
-  const [pending, setPending] = useState({ start: value.start, end: value.end });
-  const [selecting, setSelecting] = useState(false);
+  const [draft, setDraft] = useState(() => ({ start: toDateInputValue(value.start), end: toDateInputValue(value.end) }));
   const rootRef = useRef(null);
+
+  useEffect(() => {
+    setDraft({ start: toDateInputValue(value.start), end: toDateInputValue(value.end) });
+  }, [value.start, value.end]);
 
   useEffect(() => {
     if (!open) return;
@@ -214,56 +229,32 @@ function DateRangePicker({ value, onChange }) {
     return () => document.removeEventListener('mousedown', onClickOutside);
   }, [open]);
 
-  function togglePicker() {
-    setPending({ start: value.start, end: value.end });
-    setViewMonth(new Date(value.end.getFullYear(), value.end.getMonth(), 1));
-    setSelecting(false);
-    setOpen(o => !o);
+  function applyRange() {
+    const start = fromDateInputValue(draft.start);
+    const end = fromDateInputValue(draft.end);
+    const ordered = start <= end ? { start, end } : { start: end, end: start };
+    onChange({ label: formatRangeLabel(ordered.start, ordered.end), ...ordered });
+    setOpen(false);
   }
-  function pickDay(day) {
-    if (!day) return;
-    if (!selecting) { setPending({ start: day, end: day }); setSelecting(true); }
-    else { setPending(day < pending.start ? { start: day, end: pending.start } : { start: pending.start, end: day }); setSelecting(false); }
-  }
-  function applyPreset(preset) { const [start, end] = preset.range(); onChange({ label: preset.label, start, end }); setOpen(false); }
-  function applyCustom() { onChange({ label: formatRangeLabel(pending.start, pending.end), start: pending.start, end: pending.end }); setOpen(false); }
-
-  const cells = useMemo(() => buildMonthGrid(viewMonth), [viewMonth]);
-  const today = startOfDay(new Date()).getTime();
 
   return (
     <div className="date-range-picker" ref={rootRef}>
-      <button type="button" className="date-range-trigger" onClick={togglePicker}>
+      <button type="button" className="date-range-trigger" onClick={() => setOpen(o => !o)}>
         <span className="date-range-icon">📅</span>{value.label}
       </button>
       {open && (
-        <div className="date-range-panel">
-          <div className="date-range-presets">
-            {DATE_PRESETS.map(p => <button type="button" key={p.label} className={p.label === value.label ? 'active' : ''} onClick={() => applyPreset(p)}>{p.label}</button>)}
+        <div className="date-range-panel date-range-panel-simple">
+          <div className="date-field-group">
+            <label>Start date</label>
+            <input className="input" type="date" value={draft.start} max={draft.end || toDateInputValue(new Date())} onChange={e => setDraft(d => ({ ...d, start: e.target.value }))} />
           </div>
-          <div className="date-range-calendar">
-            <div className="calendar-nav">
-              <button type="button" onClick={() => setViewMonth(m => new Date(m.getFullYear(), m.getMonth() - 1, 1))}>‹</button>
-              <b>{viewMonth.toLocaleDateString('en-IN', { month: 'long', year: 'numeric' })}</b>
-              <button type="button" onClick={() => setViewMonth(m => new Date(m.getFullYear(), m.getMonth() + 1, 1))}>›</button>
-            </div>
-            <div className="calendar-weekdays">{['S', 'M', 'T', 'W', 'T', 'F', 'S'].map((w, i) => <span key={i}>{w}</span>)}</div>
-            <div className="calendar-grid">
-              {cells.map((day, i) => {
-                if (!day) return <span key={i} className="calendar-cell empty" />;
-                const t = day.getTime();
-                const inRange = t >= pending.start.getTime() && t <= pending.end.getTime();
-                const isEndpoint = t === pending.start.getTime() || t === pending.end.getTime();
-                return <button type="button" key={i} disabled={t > today} className={`calendar-cell ${inRange ? 'in-range' : ''} ${isEndpoint ? 'endpoint' : ''}`} onClick={() => pickDay(day)}>{day.getDate()}</button>;
-              })}
-            </div>
-            <div className="calendar-footer">
-              <span className="muted small">{formatRangeLabel(pending.start, pending.end)}</span>
-              <div className="calendar-actions">
-                <Button variant="ghost" onClick={() => setOpen(false)}>Cancel</Button>
-                <Button onClick={applyCustom}>Apply</Button>
-              </div>
-            </div>
+          <div className="date-field-group">
+            <label>End date</label>
+            <input className="input" type="date" value={draft.end} min={draft.start} max={toDateInputValue(new Date())} onChange={e => setDraft(d => ({ ...d, end: e.target.value }))} />
+          </div>
+          <div className="calendar-footer range-apply-row">
+            <span className="muted small">Applied only after clicking Apply</span>
+            <Button type="button" onClick={applyRange}>Apply</Button>
           </div>
         </div>
       )}
@@ -439,7 +430,6 @@ function SellerDashboard() {
     <div className="section-title">
       <div><h1>{viewTitle(view)}</h1><p>{viewDescription(view)}</p></div>
       <div className="actions">
-        <Button variant="ghost" onClick={load}>Refresh</Button>
         <AmazonConnectionPanel tenantId={tenantId} seller={data?.seller} onChange={load} setError={setError} />
       </div>
     </div>
@@ -464,13 +454,14 @@ function SellerDashboard() {
     {view === 'pricing' && <InsightCards title="Pricing & Buy Box" cards={[['Buy Box', `${formatNumber((data?.products ?? []).filter(p => p.buy_box).length)} ASIN signals`], ['ASP', formatCurrency(buildDashboardSummary(data).netQty ? buildDashboardSummary(data).netSales / buildDashboardSummary(data).netQty : 0)], ['Source', 'Sales & Traffic report']]} />}
     {view === 'listings' && <TableCard title="Listing Availability" rows={data?.inventory ?? []} columns={['sku', 'fulfillable_quantity', 'snapshot_date']} />}
     {view === 'reports' && <ReportsExplorer tenantId={tenantId} data={data} />}
+    {view === 'rawData' && <RawApiDataExplorer data={data} />}
     {view === 'report-detail' && <ReportDetail data={data} reportType={params.get('reportType')} />}
     {view === 'metric-detail' && <MetricDetail data={data} metric={params.get('metric')} />}
   </div>;
 }
 
-function viewTitle(view) { return ({ dashboard: 'Dashboard', sales: 'Sales Analytics', businessPerformance: 'Business Performance', productPerformance: 'Product Performance', inventory: 'Inventory', payouts: 'Payout Reconciliation', brand: 'Brand Analytics', orders: 'Orders', returns: 'Returns', reimbursements: 'Reimbursements', tax: 'GST & Tax', pricing: 'Pricing & Buy Box', listings: 'Listings', reports: 'Reports', 'report-detail': 'Report Detail' })[view] ?? 'Dashboard'; }
-function viewDescription(view) { return ({ dashboard: 'Amazon-only reconciliation KPIs with explainable drill-downs.', sales: 'Revenue, order value, units and product sales trends from Amazon reports.', businessPerformance: 'Excel-style quarterly business performance report with analysed KPIs and matching graphs.', productPerformance: 'Excel-style product performance analysis with top products and written insights.', inventory: 'FBA inventory snapshots imported from SP-API inventory reports.', payouts: 'Settlement rows and payout reconciliation from Amazon settlement reports.', brand: 'ASIN-level product performance from synced Amazon order items, with Sales & Traffic metrics when available.', orders: 'Order and item-level details imported from Amazon SP-API.', returns: 'Customer return reasons, status and disposition.', reimbursements: 'Amazon reimbursement credits for lost, damaged or adjusted inventory.', tax: 'GST B2B and B2C invoice rows in readable form.', pricing: 'ASP and Buy Box signals that influence sales.', listings: 'SKU availability and listing stock visibility.', reports: 'Open each fetched report and view human-readable data.', 'report-detail': 'Human-readable rows from the selected SP-API report.' })[view] ?? 'Live seller KPIs populated from synced SP-API orders and reports.'; }
+function viewTitle(view) { return ({ dashboard: 'Dashboard', sales: 'Sales Analytics', businessPerformance: 'Business Performance', productPerformance: 'Product Performance', inventory: 'Inventory', payouts: 'Payout Reconciliation', brand: 'Brand Analytics', orders: 'Orders', returns: 'Returns', reimbursements: 'Reimbursements', tax: 'GST & Tax', pricing: 'Pricing & Buy Box', listings: 'Listings', reports: 'Reports', rawData: 'Raw API Data', 'report-detail': 'Report Detail' })[view] ?? 'Dashboard'; }
+function viewDescription(view) { return ({ dashboard: 'Amazon-only reconciliation KPIs with explainable drill-downs.', sales: 'Revenue, order value, units and product sales trends from Amazon reports.', businessPerformance: 'Excel-style quarterly business performance report with analysed KPIs and matching graphs.', productPerformance: 'Excel-style product performance analysis with top products and written insights.', inventory: 'FBA inventory snapshots imported from SP-API inventory reports.', payouts: 'Settlement rows and payout reconciliation from Amazon settlement reports.', brand: 'ASIN-level product performance from synced Amazon order items, with Sales & Traffic metrics when available.', orders: 'Order and item-level details imported from Amazon SP-API.', returns: 'Customer return reasons, status and disposition.', reimbursements: 'Amazon reimbursement credits for lost, damaged or adjusted inventory.', tax: 'GST B2B and B2C invoice rows in readable form.', pricing: 'ASP and Buy Box signals that influence sales.', listings: 'SKU availability and listing stock visibility.', reports: 'Open each fetched report and view human-readable data.', rawData: 'Inspect raw fields returned from each imported API/report source before finalizing calculations.', 'report-detail': 'Human-readable rows from the selected SP-API report.' })[view] ?? 'Live seller KPIs populated from synced SP-API orders and reports.'; }
 function DashboardOverview({ data, channelData, tenantId }) {
   const summary = useMemo(() => buildDashboardSummary(data), [data]);
   return <>
@@ -534,6 +525,32 @@ function ReportsExplorer({ tenantId, data }) {
     </NavLink>;
   })}</div>;
 }
+function reportFieldCount(rows) { return Array.from(new Set(rows.flatMap(row => Object.keys(row ?? {})))).length; }
+function RawApiDataExplorer({ data }) {
+  const [activeType, setActiveType] = useState(REPORTS[0].type);
+  const [page, setPage] = useState(0);
+  const activeReport = REPORTS.find(report => report.type === activeType) ?? REPORTS[0];
+  const rows = getReportRows(data, activeReport.type);
+  const fields = Array.from(new Set(rows.flatMap(row => Object.keys(row ?? {}))));
+  const pageSize = 6;
+  const totalPages = Math.max(1, Math.ceil(rows.length / pageSize));
+  const safePage = Math.min(page, totalPages - 1);
+  const previewRows = rows.slice(safePage * pageSize, safePage * pageSize + pageSize);
+  useEffect(() => { setPage(0); }, [activeType]);
+  return <Card className="raw-data-card">
+    <PanelHeader title="Raw API data explorer" subtitle="rate-limited source review" />
+    <p className="muted">Select one API/report source at a time. The sync ledger above keeps pulls source-by-source instead of fanning out all APIs together, which helps avoid rate-limit pressure.</p>
+    <div className="raw-source-tabs">{REPORTS.map(report => {
+      const reportRows = getReportRows(data, report.type);
+      return <button type="button" key={report.type} className={report.type === activeType ? 'active' : ''} onClick={() => setActiveType(report.type)}><span className={`ledger-code ${codeClass(report.code)}`}>{report.code}</span><b>{report.label}</b><small>{formatNumber(reportRows.length)} rows · {formatNumber(reportFieldCount(reportRows))} fields</small></button>;
+    })}</div>
+    {rows.length ? <>
+      <div className="raw-data-toolbar"><b>{activeReport.label}</b><span>{formatNumber(rows.length)} rows · {formatNumber(fields.length)} fields · showing {formatNumber(previewRows.length)} at a time</span></div>
+      <pre className="raw-json-preview">{JSON.stringify(previewRows, null, 2)}</pre>
+      {rows.length > pageSize && <div className="pager"><Button variant="ghost" disabled={safePage === 0} onClick={() => setPage(p => Math.max(0, p - 1))}>← Previous 6</Button><span>Page {safePage + 1} of {totalPages} · {formatNumber(rows.length)} rows</span><Button variant="ghost" disabled={safePage >= totalPages - 1} onClick={() => setPage(p => Math.min(totalPages - 1, p + 1))}>Next 6 →</Button></div>}
+    </> : <Empty text="No raw rows available for this source yet. Use the source-specific Sync button above first." />}
+  </Card>;
+}
 function ReportDetail({ data, reportType }) {
   const report = REPORTS.find(r => r.type === reportType) ?? REPORTS[0];
   const detail = REPORT_DETAIL_MAP[report.type];
@@ -547,7 +564,7 @@ function ReportDetail({ data, reportType }) {
         <Button variant="accent" onClick={() => downloadCsv(`${report.code.toLowerCase()}-${detail.source}.csv`, rows, detail.columns)} disabled={!rows.length}>Download report CSV</Button>
       </div>
     </Card>
-    <TableCard title={`${report.label} rows`} rows={rows} columns={detail.columns} pageSize={10} />
+    <TableCard title={`${report.label} rows`} rows={rows} columns={detail.columns} pageSize={6} />
   </>;
 }
 function buildMetricDetails(data, metric) {
@@ -579,7 +596,7 @@ function MetricDetail({ data, metric }) {
       <div className="calculation-box"><b>Calculation</b><code>{details.formula}</code></div>
       <Button variant="accent" onClick={() => downloadCsv(`${details.title.toLowerCase().replaceAll(' ', '-')}-calculation.csv`, details.rows, details.columns)} disabled={!details.rows.length}>Download calculation CSV</Button>
     </Card>
-    <TableCard title="Rows used for this calculation" rows={details.rows} columns={details.columns} pageSize={10} />
+    <TableCard title="Rows used for this calculation" rows={details.rows} columns={details.columns} pageSize={6} />
   </>;
 }
 
@@ -724,7 +741,7 @@ function ReportChart({ title, data, type, dataKey, keys }) {
 
 function PanelHeader({ title, subtitle }) { const { range } = useContext(DateRangeContext); return <div className="panel-header"><h2>{title}</h2><span>{subtitle ?? range.label}</span></div>; }
 function Legend({ items }) { return <div className="legend-list">{items.map((item, i) => <div key={item.name}><span style={{ background: COLORS[i % COLORS.length] }} />{item.name}<b>{formatCurrency(item.value)}</b></div>)}</div>; }
-function TableCard({ title, rows = [], columns, pageSize = 10 }) {
+function TableCard({ title, rows = [], columns, pageSize = 6 }) {
   const [page, setPage] = useState(0);
   const totalPages = Math.max(1, Math.ceil(rows.length / pageSize));
   useEffect(() => { setPage(0); }, [rows, pageSize]);
@@ -780,12 +797,12 @@ function AdminDashboard() {
   </div>;
 }
 
-function SidebarLink({ to, children }) {
+function SidebarLink({ to, icon, children }) {
   const location = useLocation();
   const target = new URL(to, 'http://local');
   const current = new URL(`${location.pathname}${location.search}`, 'http://local');
   const active = current.pathname === target.pathname && current.searchParams.get('view') === target.searchParams.get('view');
-  return <NavLink className={active ? 'active' : ''} to={to}>{children}</NavLink>;
+  return <NavLink className={active ? 'active' : ''} to={to}><span className="nav-icon" aria-hidden="true">{icon}</span><span>{children}</span></NavLink>;
 }
 
 // Seller-facing shell: sidebar + topbar. Admins never render this component.
@@ -796,29 +813,16 @@ function SellerShell({ session, setSession }) {
     <aside className="sidebar">
       <div className="logo"><span>W</span><div><b>WELLSURE</b><small>Seller Intelligence</small></div></div>
       <nav>
-        <SidebarLink to={`/seller?tenantId=${session?.tenantId ?? ''}&view=dashboard`}>Dashboard</SidebarLink>
-        <SidebarLink to={`/seller?tenantId=${session?.tenantId ?? ''}&view=sales`}>Sales Analytics</SidebarLink>
-        <SidebarLink to={`/seller?tenantId=${session?.tenantId ?? ''}&view=businessPerformance`}>Business Performance</SidebarLink>
-        <SidebarLink to={`/seller?tenantId=${session?.tenantId ?? ''}&view=productPerformance`}>Product Performance</SidebarLink>
-        <SidebarLink to={`/seller?tenantId=${session?.tenantId ?? ''}&view=inventory`}>Inventory</SidebarLink>
-        <SidebarLink to={`/seller?tenantId=${session?.tenantId ?? ''}&view=payouts`}>Payouts</SidebarLink>
-        <SidebarLink to={`/seller?tenantId=${session?.tenantId ?? ''}&view=brand`}>Brand Analytics</SidebarLink>
-        <SidebarLink to={`/seller?tenantId=${session?.tenantId ?? ''}&view=orders`}>Orders</SidebarLink>
-        <SidebarLink to={`/seller?tenantId=${session?.tenantId ?? ''}&view=returns`}>Returns</SidebarLink>
-        <SidebarLink to={`/seller?tenantId=${session?.tenantId ?? ''}&view=reimbursements`}>Reimbursements</SidebarLink>
-        <SidebarLink to={`/seller?tenantId=${session?.tenantId ?? ''}&view=tax`}>GST & Tax</SidebarLink>
-        <SidebarLink to={`/seller?tenantId=${session?.tenantId ?? ''}&view=pricing`}>Pricing & Buy Box</SidebarLink>
-        <SidebarLink to={`/seller?tenantId=${session?.tenantId ?? ''}&view=listings`}>Listings</SidebarLink>
-        <SidebarLink to={`/seller?tenantId=${session?.tenantId ?? ''}&view=reports`}>Reports</SidebarLink>
+        {NAV_ITEMS.map(item => <SidebarLink key={item.view} icon={item.icon} to={`/seller?tenantId=${session?.tenantId ?? ''}&view=${item.view}`}>{item.label}</SidebarLink>)}
       </nav>
     </aside>
     <main className="workspace">
       <header className="topbar">
-        <div className="search">⌕ Search</div>
+        <div className="search"><span>⌕</span><span>Search reports, orders, payouts…</span></div>
         <select><option>Amazon.in</option></select>
         <DateRangePicker value={range} onChange={setRange} />
         <div className="avatar">{session?.email?.[0]?.toUpperCase()}</div>
-        <Button variant="dark" onClick={logout}>Logout {session?.email}</Button>
+        <Button variant="dark" onClick={logout}>Logout</Button>
       </header>
       <DateRangeContext.Provider value={{ range, setRange }}>
         <Routes>
