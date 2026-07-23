@@ -11,6 +11,8 @@
     "dev:api": "npm --workspace @recon/api run dev",
     "dev:web": "npm --workspace @recon/web run dev",
     "start": "npm --workspace @recon/api start",
+    "build": "npm --workspace @recon/web run build",
+    "test": "npm run check",
     "check": "node --check apps/api/src/server.js && node --check apps/api/src/jobs/sync.js && node --check packages/sp-api-client/src/index.js && node --check packages/db/src/index.js"
   },
   "devDependencies": {
