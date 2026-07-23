@@ -337,7 +337,12 @@ app.post('/api/tenants/:tenantId/sync/:reportType', async request => {
   await assertActiveTenant(params.tenantId);
   const directFirstReports = new Set(['GET_V2_SETTLEMENT_REPORT_DATA_FLAT_FILE_V2', 'GET_FBA_MYI_UNSUPPRESSED_INVENTORY_DATA', 'GET_FBA_REIMBURSEMENTS_DATA']);
   if (directFirstReports.has(params.reportType)) {
-    const fallback = await syncRecentApiDataForTenant(params.tenantId, { range: body.range });
+    const familyOptions = params.reportType === 'GET_FBA_MYI_UNSUPPRESSED_INVENTORY_DATA'
+      ? { includeOrders: false, includeFinance: false, includeInventory: true }
+      : params.reportType === 'GET_FBA_REIMBURSEMENTS_DATA'
+        ? { includeOrders: false, includeFinance: true, includeInventory: false }
+        : { includeOrders: false, includeFinance: true, includeInventory: false };
+    const fallback = await syncRecentApiDataForTenant(params.tenantId, { range: body.range, ...familyOptions });
     await recordSyntheticReportSync(params.tenantId, params.reportType);
     return { reportType: params.reportType, status: 'completed', fallback: 'DIRECT_SP_API_SYNC', ...fallback };
   }
@@ -390,7 +395,7 @@ app.post('/api/tenants/:tenantId/sync', async request => {
   const body = SellerSyncSchema.parse(request.body ?? {});
   const results = [];
   try {
-    const result = await syncRecentApiDataForTenant(tenantId, { range: body.range });
+    const result = await syncRecentApiDataForTenant(tenantId, { range: body.range, maxOrderPages: 2, maxOrderItems: 20 });
     results.push({ reportType: 'DIRECT_SP_API_SYNC', status: 'completed', ...result });
   } catch (error) {
     results.push({ reportType: 'DIRECT_SP_API_SYNC', status: 'failed', error: error instanceof Error ? error.message : 'unknown error' });
