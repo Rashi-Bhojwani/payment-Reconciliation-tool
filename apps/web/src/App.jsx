@@ -528,10 +528,15 @@ function ReportsExplorer({ tenantId, data }) {
 function reportFieldCount(rows) { return Array.from(new Set(rows.flatMap(row => Object.keys(row ?? {})))).length; }
 function RawApiDataExplorer({ data }) {
   const [activeType, setActiveType] = useState(REPORTS[0].type);
+  const [page, setPage] = useState(0);
   const activeReport = REPORTS.find(report => report.type === activeType) ?? REPORTS[0];
   const rows = getReportRows(data, activeReport.type);
   const fields = Array.from(new Set(rows.flatMap(row => Object.keys(row ?? {}))));
-  const previewRows = rows.slice(0, 25);
+  const pageSize = 6;
+  const totalPages = Math.max(1, Math.ceil(rows.length / pageSize));
+  const safePage = Math.min(page, totalPages - 1);
+  const previewRows = rows.slice(safePage * pageSize, safePage * pageSize + pageSize);
+  useEffect(() => { setPage(0); }, [activeType]);
   return <Card className="raw-data-card">
     <PanelHeader title="Raw API data explorer" subtitle="rate-limited source review" />
     <p className="muted">Select one API/report source at a time. The sync ledger above keeps pulls source-by-source instead of fanning out all APIs together, which helps avoid rate-limit pressure.</p>
@@ -540,8 +545,9 @@ function RawApiDataExplorer({ data }) {
       return <button type="button" key={report.type} className={report.type === activeType ? 'active' : ''} onClick={() => setActiveType(report.type)}><span className={`ledger-code ${codeClass(report.code)}`}>{report.code}</span><b>{report.label}</b><small>{formatNumber(reportRows.length)} rows · {formatNumber(reportFieldCount(reportRows))} fields</small></button>;
     })}</div>
     {rows.length ? <>
-      <div className="raw-data-toolbar"><b>{activeReport.label}</b><span>{formatNumber(rows.length)} rows · {formatNumber(fields.length)} fields · showing first {formatNumber(previewRows.length)}</span></div>
+      <div className="raw-data-toolbar"><b>{activeReport.label}</b><span>{formatNumber(rows.length)} rows · {formatNumber(fields.length)} fields · showing {formatNumber(previewRows.length)} at a time</span></div>
       <pre className="raw-json-preview">{JSON.stringify(previewRows, null, 2)}</pre>
+      {rows.length > pageSize && <div className="pager"><Button variant="ghost" disabled={safePage === 0} onClick={() => setPage(p => Math.max(0, p - 1))}>← Previous 6</Button><span>Page {safePage + 1} of {totalPages} · {formatNumber(rows.length)} rows</span><Button variant="ghost" disabled={safePage >= totalPages - 1} onClick={() => setPage(p => Math.min(totalPages - 1, p + 1))}>Next 6 →</Button></div>}
     </> : <Empty text="No raw rows available for this source yet. Use the source-specific Sync button above first." />}
   </Card>;
 }
@@ -558,7 +564,7 @@ function ReportDetail({ data, reportType }) {
         <Button variant="accent" onClick={() => downloadCsv(`${report.code.toLowerCase()}-${detail.source}.csv`, rows, detail.columns)} disabled={!rows.length}>Download report CSV</Button>
       </div>
     </Card>
-    <TableCard title={`${report.label} rows`} rows={rows} columns={detail.columns} pageSize={10} />
+    <TableCard title={`${report.label} rows`} rows={rows} columns={detail.columns} pageSize={6} />
   </>;
 }
 function buildMetricDetails(data, metric) {
@@ -590,7 +596,7 @@ function MetricDetail({ data, metric }) {
       <div className="calculation-box"><b>Calculation</b><code>{details.formula}</code></div>
       <Button variant="accent" onClick={() => downloadCsv(`${details.title.toLowerCase().replaceAll(' ', '-')}-calculation.csv`, details.rows, details.columns)} disabled={!details.rows.length}>Download calculation CSV</Button>
     </Card>
-    <TableCard title="Rows used for this calculation" rows={details.rows} columns={details.columns} pageSize={10} />
+    <TableCard title="Rows used for this calculation" rows={details.rows} columns={details.columns} pageSize={6} />
   </>;
 }
 
@@ -735,7 +741,7 @@ function ReportChart({ title, data, type, dataKey, keys }) {
 
 function PanelHeader({ title, subtitle }) { const { range } = useContext(DateRangeContext); return <div className="panel-header"><h2>{title}</h2><span>{subtitle ?? range.label}</span></div>; }
 function Legend({ items }) { return <div className="legend-list">{items.map((item, i) => <div key={item.name}><span style={{ background: COLORS[i % COLORS.length] }} />{item.name}<b>{formatCurrency(item.value)}</b></div>)}</div>; }
-function TableCard({ title, rows = [], columns, pageSize = 10 }) {
+function TableCard({ title, rows = [], columns, pageSize = 6 }) {
   const [page, setPage] = useState(0);
   const totalPages = Math.max(1, Math.ceil(rows.length / pageSize));
   useEffect(() => { setPage(0); }, [rows, pageSize]);
