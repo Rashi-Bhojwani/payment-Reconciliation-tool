@@ -28,7 +28,7 @@ const REPORT_DETAIL_MAP = {
   GET_FBA_REIMBURSEMENTS_DATA: { source: 'reimbursements', title: 'Reimbursement report detail', columns: ['sku', 'amount', 'reason', 'reimbursement_date'], explanation: 'Shows Amazon reimbursement credits with SKU, reason and amount.' },
   GET_FBA_FULFILLMENT_CUSTOMER_RETURNS_DATA: { source: 'returns', title: 'Customer returns report detail', columns: ['order_id', 'return_reason', 'disposition', 'status', 'return_date'], explanation: 'Shows return rows with reason, disposition and current status.' }
 };
-const COLORS = ['#e8a23d', '#159a82', '#6d5bd0', '#2e86ab'];
+const COLORS = ['#0f6bff', '#7c3aed', '#64748b', '#d8dde8'];
 
 // Maps each report code to a stable CSS class so the Sync Ledger and Reports
 // grid can color-code report families (each is a genuinely distinct SP-API
@@ -41,6 +41,24 @@ function codeClass(code) { return `code-${CODE_COLOR_KEY[code] ?? code.toLowerCa
 // Dashboard is deliberately absent here — it's an overview page and no
 // longer shows any sync controls at all. Every other sidebar page gets only
 // the report(s) it actually depends on.
+
+const NAV_ITEMS = [
+  { view: 'dashboard', label: 'Dashboard', icon: '▦' },
+  { view: 'sales', label: 'Sales Analytics', icon: '↗' },
+  { view: 'businessPerformance', label: 'Business Performance', icon: '▤' },
+  { view: 'productPerformance', label: 'Product Performance', icon: '◈' },
+  { view: 'inventory', label: 'Inventory', icon: '□' },
+  { view: 'payouts', label: 'Payouts', icon: '₹' },
+  { view: 'brand', label: 'Brand Analytics', icon: '☆' },
+  { view: 'orders', label: 'Orders', icon: '☰' },
+  { view: 'returns', label: 'Returns', icon: '↩' },
+  { view: 'reimbursements', label: 'Reimbursements', icon: '+' },
+  { view: 'tax', label: 'GST & Tax', icon: '%' },
+  { view: 'pricing', label: 'Pricing & Buy Box', icon: '◇' },
+  { view: 'listings', label: 'Listings', icon: '⌂' },
+  { view: 'reports', label: 'Reports', icon: '◎' }
+];
+
 const VIEW_REPORT_TYPES = {
   sales: ['GET_SALES_AND_TRAFFIC_REPORT'],
   inventory: ['GET_FBA_MYI_UNSUPPRESSED_INVENTORY_DATA'],
@@ -90,7 +108,7 @@ function readAmazonTokenCache(tenantId) { const cached = JSON.parse(localStorage
 async function getAmazonAccessToken(tenantId) { const cached = readAmazonTokenCache(tenantId); if (cached) return cached; const fresh = await api(`/api/tenants/${tenantId}/amazon/access-token`); localStorage.setItem(`${ACCESS_TOKEN_CACHE_PREFIX}${tenantId}`, JSON.stringify(fresh)); return fresh; }
 async function beginAmazonAuthorization(tenantId) { const { url } = await api(`/api/auth/amazon/start?tenantId=${tenantId}&json=1`); window.location.assign(url); }
 
-function Button({ className = '', variant = 'primary', ...props }) { return <button {...props} className={`btn btn-${variant} ${className}`} />; }
+function Button({ className = '', variant = 'primary', icon, children, ...props }) { return <button {...props} className={`btn btn-${variant} ${className}`}>{icon && <span className="btn-icon" aria-hidden="true">{icon}</span>}{children}</button>; }
 function Input(props) { return <input {...props} className="input" />; }
 function Card({ children, className = '' }) { return <section className={`card ${className}`}>{children}</section>; }
 function Empty({ text }) { return <div className="empty-state">{text}</div>; }
@@ -439,7 +457,7 @@ function SellerDashboard() {
     <div className="section-title">
       <div><h1>{viewTitle(view)}</h1><p>{viewDescription(view)}</p></div>
       <div className="actions">
-        <Button variant="ghost" onClick={load}>Refresh</Button>
+        <Button variant="ghost" icon="↻" onClick={load}>Refresh</Button>
         <AmazonConnectionPanel tenantId={tenantId} seller={data?.seller} onChange={load} setError={setError} />
       </div>
     </div>
@@ -780,12 +798,12 @@ function AdminDashboard() {
   </div>;
 }
 
-function SidebarLink({ to, children }) {
+function SidebarLink({ to, icon, children }) {
   const location = useLocation();
   const target = new URL(to, 'http://local');
   const current = new URL(`${location.pathname}${location.search}`, 'http://local');
   const active = current.pathname === target.pathname && current.searchParams.get('view') === target.searchParams.get('view');
-  return <NavLink className={active ? 'active' : ''} to={to}>{children}</NavLink>;
+  return <NavLink className={active ? 'active' : ''} to={to}><span className="nav-icon" aria-hidden="true">{icon}</span><span>{children}</span></NavLink>;
 }
 
 // Seller-facing shell: sidebar + topbar. Admins never render this component.
@@ -796,29 +814,16 @@ function SellerShell({ session, setSession }) {
     <aside className="sidebar">
       <div className="logo"><span>W</span><div><b>WELLSURE</b><small>Seller Intelligence</small></div></div>
       <nav>
-        <SidebarLink to={`/seller?tenantId=${session?.tenantId ?? ''}&view=dashboard`}>Dashboard</SidebarLink>
-        <SidebarLink to={`/seller?tenantId=${session?.tenantId ?? ''}&view=sales`}>Sales Analytics</SidebarLink>
-        <SidebarLink to={`/seller?tenantId=${session?.tenantId ?? ''}&view=businessPerformance`}>Business Performance</SidebarLink>
-        <SidebarLink to={`/seller?tenantId=${session?.tenantId ?? ''}&view=productPerformance`}>Product Performance</SidebarLink>
-        <SidebarLink to={`/seller?tenantId=${session?.tenantId ?? ''}&view=inventory`}>Inventory</SidebarLink>
-        <SidebarLink to={`/seller?tenantId=${session?.tenantId ?? ''}&view=payouts`}>Payouts</SidebarLink>
-        <SidebarLink to={`/seller?tenantId=${session?.tenantId ?? ''}&view=brand`}>Brand Analytics</SidebarLink>
-        <SidebarLink to={`/seller?tenantId=${session?.tenantId ?? ''}&view=orders`}>Orders</SidebarLink>
-        <SidebarLink to={`/seller?tenantId=${session?.tenantId ?? ''}&view=returns`}>Returns</SidebarLink>
-        <SidebarLink to={`/seller?tenantId=${session?.tenantId ?? ''}&view=reimbursements`}>Reimbursements</SidebarLink>
-        <SidebarLink to={`/seller?tenantId=${session?.tenantId ?? ''}&view=tax`}>GST & Tax</SidebarLink>
-        <SidebarLink to={`/seller?tenantId=${session?.tenantId ?? ''}&view=pricing`}>Pricing & Buy Box</SidebarLink>
-        <SidebarLink to={`/seller?tenantId=${session?.tenantId ?? ''}&view=listings`}>Listings</SidebarLink>
-        <SidebarLink to={`/seller?tenantId=${session?.tenantId ?? ''}&view=reports`}>Reports</SidebarLink>
+        {NAV_ITEMS.map(item => <SidebarLink key={item.view} icon={item.icon} to={`/seller?tenantId=${session?.tenantId ?? ''}&view=${item.view}`}>{item.label}</SidebarLink>)}
       </nav>
     </aside>
     <main className="workspace">
       <header className="topbar">
-        <div className="search">⌕ Search</div>
+        <div className="search"><span>⌕</span><span>Search reports, orders, payouts…</span></div>
         <select><option>Amazon.in</option></select>
         <DateRangePicker value={range} onChange={setRange} />
         <div className="avatar">{session?.email?.[0]?.toUpperCase()}</div>
-        <Button variant="dark" onClick={logout}>Logout {session?.email}</Button>
+        <Button variant="dark" onClick={logout}>Logout</Button>
       </header>
       <DateRangeContext.Provider value={{ range, setRange }}>
         <Routes>
