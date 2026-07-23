@@ -270,6 +270,7 @@ async function handleAmazonCallback(request, reply) {
     const message = error instanceof Error ? error.message : 'Amazon token exchange failed';
     return reply.redirect(`${secrets.frontendOrigin}/seller?tenantId=${state.tenantId}&amazon=error&message=${encodeURIComponent(message)}`);
   }
+
   const marketplace = tenant.default_marketplace_id ?? 'A21TJRUUN4KGV';
   const sellerId = query.selling_partner_id ?? `SELLER-${state.tenantId}`;
   const sellerName = tenant.company_name;
@@ -293,9 +294,12 @@ async function handleAmazonCallback(request, reply) {
   return reply.redirect(`${secrets.frontendOrigin}/seller?tenantId=${state.tenantId}&connected=1&auth=complete`);
 }
 
-for (const callbackPath of ['/api/auth/amazon/callback', '/oauth/callback']) {
-  app.route({ method: ['GET', 'POST'], url: callbackPath, handler: handleAmazonCallback });
-}
+app.route({
+  method: 'POST',
+  url: '/oauth/callback',
+  handler: handleAmazonCallback
+});
+
 
 app.get('/api/tenants/:tenantId/amazon/access-token', async request => {
   const { tenantId } = TenantParamsSchema.parse(request.params);
