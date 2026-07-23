@@ -10,7 +10,7 @@ import { secrets } from './config/secrets.js';
 import { decryptSecret, encryptSecret } from './config/crypto.js';
 import { buildGstInvoicesFromOrderItems, startScheduler, syncRecentApiDataForTenant, syncReportForTenant } from './jobs/sync.js';
 
-const app = Fastify({ logger: { redact: ['req.headers.authorization', 'refresh_token', 'access_token', 'password', 'passwordHash'] } });
+const app = Fastify({ logger: { redact: ['req.headers.authorization', 'refresh_token', 'access_token', 'password', 'passwordHash'] }, trustProxy: true });
 
 await app.register(cors, { origin: secrets.frontendOrigin, credentials: true });
 await app.register(rateLimit, { max: 180, timeWindow: '1 minute' });
@@ -69,7 +69,31 @@ function amazonConsentHost(marketplaceId) {
   return MARKETPLACES[marketplaceId]?.sellerCentralHost ?? 'sellercentral.amazon.in';
 }
 
-async function exchangeAmazonCode(code, redirectUri = secrets.redirectUri) {
+function requestOrigin(request) {
+  const forwardedProto = request.headers['x-forwarded-proto']?.toString().split(',')[0]?.trim();
+  const forwardedHost = request.headers['x-forwarded-host']?.toString().split(',')[0]?.trim();
+  const proto = forwardedProto || request.protocol || 'http';
+  const host = forwardedHost || request.headers.host;
+  return host ? `${proto}://${host}` : '';
+}
+
+function amazonCallbackUrl(request) {
+  if (secrets.redirectUri) return secrets.redirectUri;
+  const origin = secrets.publicApiOrigin || requestOrigin(request);
+  if (!origin) throw Object.assign(new Error('Amazon OAuth redirect URL is not configured. Set SP_API_REDIRECT_URI to the exact Redirect URI registered for your SP-API application.'), { statusCode: 503 });
+  return `${origin.replace(/\/$/, '')}/oauth/callback`;
+}
+
+function validateAmazonRedirectUrl(redirectUri) {
+  let url;
+  try { url = new URL(redirectUri); }
+  catch { throw Object.assign(new Error('Amazon OAuth redirect URL is invalid. Set SP_API_REDIRECT_URI to an absolute URL registered for your SP-API application.'), { statusCode: 503 }); }
+  if (!['https:', 'http:'].includes(url.protocol)) throw Object.assign(new Error('Amazon OAuth redirect URL must use http or https.'), { statusCode: 503 });
+  if (url.protocol === 'http:' && !['localhost', '127.0.0.1'].includes(url.hostname)) throw Object.assign(new Error('Amazon OAuth redirect URL must use HTTPS outside local development.'), { statusCode: 503 });
+  return url.toString();
+}
+
+async function exchangeAmazonCode(code, redirectUri) {
   const token = await fetch('https://api.amazon.com/auth/o2/token', {
     method: 'POST',
     signal: AbortSignal.timeout(20_000),
@@ -218,9 +242,10 @@ app.get('/api/auth/amazon/start', async (request, reply) => {
   if (!tenant) throw Object.assign(new Error('Tenant not found'), { statusCode: 404 });
   if (!secrets.spApiAppId || !secrets.lwaClientId || !secrets.lwaClientSecret) throw Object.assign(new Error('Amazon SP-API credentials are not configured'), { statusCode: 503 });
   const state = signAmazonState({ tenantId: query.tenantId, userId: user.sub, nonce: crypto.randomUUID(), createdAt: Date.now() });
+  const redirectUri = validateAmazonRedirectUrl(amazonCallbackUrl(request));
   const url = new URL(`https://${amazonConsentHost(tenant.default_marketplace_id)}/apps/authorize/consent`);
   url.searchParams.set('application_id', secrets.spApiAppId);
-  url.searchParams.set('redirect_uri', secrets.redirectUri);
+  url.searchParams.set('redirect_uri', redirectUri);
   url.searchParams.set('state', state);
   url.searchParams.set('version', 'beta');
   if (query.json) return { url: url.toString(), expiresInMinutes: 15 };
@@ -240,7 +265,7 @@ async function handleAmazonCallback(request, reply) {
   const tenant = (await pool.query('select id, company_name, default_marketplace_id from tenants where id=$1', [state.tenantId])).rows[0];
   if (!tenant) throw Object.assign(new Error('Tenant not found'), { statusCode: 404 });
   let body;
-  try { body = await exchangeAmazonCode(code, query.redirect_uri ?? secrets.redirectUri); }
+  try { body = await exchangeAmazonCode(code, validateAmazonRedirectUrl(query.redirect_uri ?? amazonCallbackUrl(request))); }
   catch (error) {
     const message = error instanceof Error ? error.message : 'Amazon token exchange failed';
     return reply.redirect(`${secrets.frontendOrigin}/seller?tenantId=${state.tenantId}&amazon=error&message=${encodeURIComponent(message)}`);
