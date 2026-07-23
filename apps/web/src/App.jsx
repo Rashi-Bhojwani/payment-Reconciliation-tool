@@ -56,7 +56,8 @@ const NAV_ITEMS = [
   { view: 'tax', label: 'GST & Tax', icon: '%' },
   { view: 'pricing', label: 'Pricing & Buy Box', icon: '◇' },
   { view: 'listings', label: 'Listings', icon: '⌂' },
-  { view: 'reports', label: 'Reports', icon: '◎' }
+  { view: 'reports', label: 'Reports', icon: '◎' },
+  { view: 'rawData', label: 'Raw API Data', icon: '{}' }
 ];
 
 const VIEW_REPORT_TYPES = {
@@ -72,7 +73,8 @@ const VIEW_REPORT_TYPES = {
   listings: ['GET_FBA_MYI_UNSUPPRESSED_INVENTORY_DATA'],
   reports: REPORTS.map(r => r.type),
   businessPerformance: ['GET_SALES_AND_TRAFFIC_REPORT', 'DIRECT_SP_API_SYNC', 'GET_FBA_FULFILLMENT_CUSTOMER_RETURNS_DATA'],
-  productPerformance: ['GET_SALES_AND_TRAFFIC_REPORT']
+  productPerformance: ['GET_SALES_AND_TRAFFIC_REPORT'],
+  rawData: REPORTS.map(r => r.type)
 };
 const VIEW_LEDGER_COPY = {
   sales: { title: 'Sales & traffic sync', subtitle: 'Powers this page only' },
@@ -87,7 +89,8 @@ const VIEW_LEDGER_COPY = {
   listings: { title: 'Listings inventory sync', subtitle: 'FBA SKU availability' },
   reports: { title: 'Sync ledger', subtitle: 'Pull one report at a time' },
   businessPerformance: { title: 'Business performance sync', subtitle: 'Sales, traffic and refunds' },
-  productPerformance: { title: 'Product performance sync', subtitle: 'ASIN-level sales and traffic' }
+  productPerformance: { title: 'Product performance sync', subtitle: 'ASIN-level sales and traffic' },
+  rawData: { title: 'Raw API sync', subtitle: 'Pull one source at a time to respect limits' }
 };
 
 function authHeaders() { const token = localStorage.getItem('token'); return token ? { authorization: `Bearer ${token}` } : {}; }
@@ -199,31 +202,25 @@ function formatRangeLabel(start, end) {
   const endStr = start.getFullYear() === end.getFullYear() ? formatShort(end) : end.toLocaleDateString('en-IN', { month: 'short', day: 'numeric', year: 'numeric' });
   return `${startStr} – ${endStr}, ${end.getFullYear()}`;
 }
-function buildMonthGrid(viewDate) {
-  const year = viewDate.getFullYear(), month = viewDate.getMonth();
-  const startWeekday = new Date(year, month, 1).getDay();
-  const daysInMonth = new Date(year, month + 1, 0).getDate();
-  const cells = Array(startWeekday).fill(null);
-  for (let d = 1; d <= daysInMonth; d++) cells.push(new Date(year, month, d));
-  return cells;
-}
-const DATE_PRESETS = [
-  { label: 'Today', range: () => { const t = startOfDay(new Date()); return [t, t]; } },
-  { label: 'Last 7 Days', range: () => { const t = startOfDay(new Date()); return [addDays(t, -6), t]; } },
-  { label: 'Last 30 Days', range: () => { const t = startOfDay(new Date()); return [addDays(t, -29), t]; } },
-  { label: 'Last 90 Days', range: () => { const t = startOfDay(new Date()); return [addDays(t, -89), t]; } },
-  { label: 'This Month', range: () => { const t = new Date(); return [new Date(t.getFullYear(), t.getMonth(), 1), startOfDay(t)]; } },
-  { label: 'Last Month', range: () => { const t = new Date(); return [new Date(t.getFullYear(), t.getMonth() - 1, 1), new Date(t.getFullYear(), t.getMonth(), 0)]; } }
-];
 function defaultDateRange() { const end = startOfDay(new Date()); return { label: 'Last 30 Days', start: addDays(end, -29), end }; }
 const DateRangeContext = createContext({ range: defaultDateRange(), setRange: () => {} });
 
+function toDateInputValue(date) {
+  const d = startOfDay(date);
+  const yyyy = d.getFullYear();
+  const mm = String(d.getMonth() + 1).padStart(2, '0');
+  const dd = String(d.getDate()).padStart(2, '0');
+  return `${yyyy}-${mm}-${dd}`;
+}
+function fromDateInputValue(value) { return startOfDay(new Date(`${value}T00:00:00`)); }
 function DateRangePicker({ value, onChange }) {
   const [open, setOpen] = useState(false);
-  const [viewMonth, setViewMonth] = useState(() => new Date(value.end.getFullYear(), value.end.getMonth(), 1));
-  const [pending, setPending] = useState({ start: value.start, end: value.end });
-  const [selecting, setSelecting] = useState(false);
+  const [draft, setDraft] = useState(() => ({ start: toDateInputValue(value.start), end: toDateInputValue(value.end) }));
   const rootRef = useRef(null);
+
+  useEffect(() => {
+    setDraft({ start: toDateInputValue(value.start), end: toDateInputValue(value.end) });
+  }, [value.start, value.end]);
 
   useEffect(() => {
     if (!open) return;
@@ -232,56 +229,32 @@ function DateRangePicker({ value, onChange }) {
     return () => document.removeEventListener('mousedown', onClickOutside);
   }, [open]);
 
-  function togglePicker() {
-    setPending({ start: value.start, end: value.end });
-    setViewMonth(new Date(value.end.getFullYear(), value.end.getMonth(), 1));
-    setSelecting(false);
-    setOpen(o => !o);
+  function applyRange() {
+    const start = fromDateInputValue(draft.start);
+    const end = fromDateInputValue(draft.end);
+    const ordered = start <= end ? { start, end } : { start: end, end: start };
+    onChange({ label: formatRangeLabel(ordered.start, ordered.end), ...ordered });
+    setOpen(false);
   }
-  function pickDay(day) {
-    if (!day) return;
-    if (!selecting) { setPending({ start: day, end: day }); setSelecting(true); }
-    else { setPending(day < pending.start ? { start: day, end: pending.start } : { start: pending.start, end: day }); setSelecting(false); }
-  }
-  function applyPreset(preset) { const [start, end] = preset.range(); onChange({ label: preset.label, start, end }); setOpen(false); }
-  function applyCustom() { onChange({ label: formatRangeLabel(pending.start, pending.end), start: pending.start, end: pending.end }); setOpen(false); }
-
-  const cells = useMemo(() => buildMonthGrid(viewMonth), [viewMonth]);
-  const today = startOfDay(new Date()).getTime();
 
   return (
     <div className="date-range-picker" ref={rootRef}>
-      <button type="button" className="date-range-trigger" onClick={togglePicker}>
+      <button type="button" className="date-range-trigger" onClick={() => setOpen(o => !o)}>
         <span className="date-range-icon">📅</span>{value.label}
       </button>
       {open && (
-        <div className="date-range-panel">
-          <div className="date-range-presets">
-            {DATE_PRESETS.map(p => <button type="button" key={p.label} className={p.label === value.label ? 'active' : ''} onClick={() => applyPreset(p)}>{p.label}</button>)}
+        <div className="date-range-panel date-range-panel-simple">
+          <div className="date-field-group">
+            <label>Start date</label>
+            <input className="input" type="date" value={draft.start} max={draft.end || toDateInputValue(new Date())} onChange={e => setDraft(d => ({ ...d, start: e.target.value }))} />
           </div>
-          <div className="date-range-calendar">
-            <div className="calendar-nav">
-              <button type="button" onClick={() => setViewMonth(m => new Date(m.getFullYear(), m.getMonth() - 1, 1))}>‹</button>
-              <b>{viewMonth.toLocaleDateString('en-IN', { month: 'long', year: 'numeric' })}</b>
-              <button type="button" onClick={() => setViewMonth(m => new Date(m.getFullYear(), m.getMonth() + 1, 1))}>›</button>
-            </div>
-            <div className="calendar-weekdays">{['S', 'M', 'T', 'W', 'T', 'F', 'S'].map((w, i) => <span key={i}>{w}</span>)}</div>
-            <div className="calendar-grid">
-              {cells.map((day, i) => {
-                if (!day) return <span key={i} className="calendar-cell empty" />;
-                const t = day.getTime();
-                const inRange = t >= pending.start.getTime() && t <= pending.end.getTime();
-                const isEndpoint = t === pending.start.getTime() || t === pending.end.getTime();
-                return <button type="button" key={i} disabled={t > today} className={`calendar-cell ${inRange ? 'in-range' : ''} ${isEndpoint ? 'endpoint' : ''}`} onClick={() => pickDay(day)}>{day.getDate()}</button>;
-              })}
-            </div>
-            <div className="calendar-footer">
-              <span className="muted small">{formatRangeLabel(pending.start, pending.end)}</span>
-              <div className="calendar-actions">
-                <Button variant="ghost" onClick={() => setOpen(false)}>Cancel</Button>
-                <Button onClick={applyCustom}>Apply</Button>
-              </div>
-            </div>
+          <div className="date-field-group">
+            <label>End date</label>
+            <input className="input" type="date" value={draft.end} min={draft.start} max={toDateInputValue(new Date())} onChange={e => setDraft(d => ({ ...d, end: e.target.value }))} />
+          </div>
+          <div className="calendar-footer range-apply-row">
+            <span className="muted small">Applied only after clicking Apply</span>
+            <Button type="button" onClick={applyRange}>Apply</Button>
           </div>
         </div>
       )}
@@ -457,7 +430,6 @@ function SellerDashboard() {
     <div className="section-title">
       <div><h1>{viewTitle(view)}</h1><p>{viewDescription(view)}</p></div>
       <div className="actions">
-        <Button variant="ghost" icon="↻" onClick={load}>Refresh</Button>
         <AmazonConnectionPanel tenantId={tenantId} seller={data?.seller} onChange={load} setError={setError} />
       </div>
     </div>
@@ -482,13 +454,14 @@ function SellerDashboard() {
     {view === 'pricing' && <InsightCards title="Pricing & Buy Box" cards={[['Buy Box', `${formatNumber((data?.products ?? []).filter(p => p.buy_box).length)} ASIN signals`], ['ASP', formatCurrency(buildDashboardSummary(data).netQty ? buildDashboardSummary(data).netSales / buildDashboardSummary(data).netQty : 0)], ['Source', 'Sales & Traffic report']]} />}
     {view === 'listings' && <TableCard title="Listing Availability" rows={data?.inventory ?? []} columns={['sku', 'fulfillable_quantity', 'snapshot_date']} />}
     {view === 'reports' && <ReportsExplorer tenantId={tenantId} data={data} />}
+    {view === 'rawData' && <RawApiDataExplorer data={data} />}
     {view === 'report-detail' && <ReportDetail data={data} reportType={params.get('reportType')} />}
     {view === 'metric-detail' && <MetricDetail data={data} metric={params.get('metric')} />}
   </div>;
 }
 
-function viewTitle(view) { return ({ dashboard: 'Dashboard', sales: 'Sales Analytics', businessPerformance: 'Business Performance', productPerformance: 'Product Performance', inventory: 'Inventory', payouts: 'Payout Reconciliation', brand: 'Brand Analytics', orders: 'Orders', returns: 'Returns', reimbursements: 'Reimbursements', tax: 'GST & Tax', pricing: 'Pricing & Buy Box', listings: 'Listings', reports: 'Reports', 'report-detail': 'Report Detail' })[view] ?? 'Dashboard'; }
-function viewDescription(view) { return ({ dashboard: 'Amazon-only reconciliation KPIs with explainable drill-downs.', sales: 'Revenue, order value, units and product sales trends from Amazon reports.', businessPerformance: 'Excel-style quarterly business performance report with analysed KPIs and matching graphs.', productPerformance: 'Excel-style product performance analysis with top products and written insights.', inventory: 'FBA inventory snapshots imported from SP-API inventory reports.', payouts: 'Settlement rows and payout reconciliation from Amazon settlement reports.', brand: 'ASIN-level product performance from synced Amazon order items, with Sales & Traffic metrics when available.', orders: 'Order and item-level details imported from Amazon SP-API.', returns: 'Customer return reasons, status and disposition.', reimbursements: 'Amazon reimbursement credits for lost, damaged or adjusted inventory.', tax: 'GST B2B and B2C invoice rows in readable form.', pricing: 'ASP and Buy Box signals that influence sales.', listings: 'SKU availability and listing stock visibility.', reports: 'Open each fetched report and view human-readable data.', 'report-detail': 'Human-readable rows from the selected SP-API report.' })[view] ?? 'Live seller KPIs populated from synced SP-API orders and reports.'; }
+function viewTitle(view) { return ({ dashboard: 'Dashboard', sales: 'Sales Analytics', businessPerformance: 'Business Performance', productPerformance: 'Product Performance', inventory: 'Inventory', payouts: 'Payout Reconciliation', brand: 'Brand Analytics', orders: 'Orders', returns: 'Returns', reimbursements: 'Reimbursements', tax: 'GST & Tax', pricing: 'Pricing & Buy Box', listings: 'Listings', reports: 'Reports', rawData: 'Raw API Data', 'report-detail': 'Report Detail' })[view] ?? 'Dashboard'; }
+function viewDescription(view) { return ({ dashboard: 'Amazon-only reconciliation KPIs with explainable drill-downs.', sales: 'Revenue, order value, units and product sales trends from Amazon reports.', businessPerformance: 'Excel-style quarterly business performance report with analysed KPIs and matching graphs.', productPerformance: 'Excel-style product performance analysis with top products and written insights.', inventory: 'FBA inventory snapshots imported from SP-API inventory reports.', payouts: 'Settlement rows and payout reconciliation from Amazon settlement reports.', brand: 'ASIN-level product performance from synced Amazon order items, with Sales & Traffic metrics when available.', orders: 'Order and item-level details imported from Amazon SP-API.', returns: 'Customer return reasons, status and disposition.', reimbursements: 'Amazon reimbursement credits for lost, damaged or adjusted inventory.', tax: 'GST B2B and B2C invoice rows in readable form.', pricing: 'ASP and Buy Box signals that influence sales.', listings: 'SKU availability and listing stock visibility.', reports: 'Open each fetched report and view human-readable data.', rawData: 'Inspect raw fields returned from each imported API/report source before finalizing calculations.', 'report-detail': 'Human-readable rows from the selected SP-API report.' })[view] ?? 'Live seller KPIs populated from synced SP-API orders and reports.'; }
 function DashboardOverview({ data, channelData, tenantId }) {
   const summary = useMemo(() => buildDashboardSummary(data), [data]);
   return <>
@@ -551,6 +524,26 @@ function ReportsExplorer({ tenantId, data }) {
       <span className={`ledger-code ${codeClass(report.code)}`}>{report.code}</span><div><b>{report.label}</b><p>{detail.explanation}</p></div><small>{job?.completed_at ? `Last synced ${timeAgo(job.completed_at)}` : report.hint}</small>
     </NavLink>;
   })}</div>;
+}
+function reportFieldCount(rows) { return Array.from(new Set(rows.flatMap(row => Object.keys(row ?? {})))).length; }
+function RawApiDataExplorer({ data }) {
+  const [activeType, setActiveType] = useState(REPORTS[0].type);
+  const activeReport = REPORTS.find(report => report.type === activeType) ?? REPORTS[0];
+  const rows = getReportRows(data, activeReport.type);
+  const fields = Array.from(new Set(rows.flatMap(row => Object.keys(row ?? {}))));
+  const previewRows = rows.slice(0, 25);
+  return <Card className="raw-data-card">
+    <PanelHeader title="Raw API data explorer" subtitle="rate-limited source review" />
+    <p className="muted">Select one API/report source at a time. The sync ledger above keeps pulls source-by-source instead of fanning out all APIs together, which helps avoid rate-limit pressure.</p>
+    <div className="raw-source-tabs">{REPORTS.map(report => {
+      const reportRows = getReportRows(data, report.type);
+      return <button type="button" key={report.type} className={report.type === activeType ? 'active' : ''} onClick={() => setActiveType(report.type)}><span className={`ledger-code ${codeClass(report.code)}`}>{report.code}</span><b>{report.label}</b><small>{formatNumber(reportRows.length)} rows · {formatNumber(reportFieldCount(reportRows))} fields</small></button>;
+    })}</div>
+    {rows.length ? <>
+      <div className="raw-data-toolbar"><b>{activeReport.label}</b><span>{formatNumber(rows.length)} rows · {formatNumber(fields.length)} fields · showing first {formatNumber(previewRows.length)}</span></div>
+      <pre className="raw-json-preview">{JSON.stringify(previewRows, null, 2)}</pre>
+    </> : <Empty text="No raw rows available for this source yet. Use the source-specific Sync button above first." />}
+  </Card>;
 }
 function ReportDetail({ data, reportType }) {
   const report = REPORTS.find(r => r.type === reportType) ?? REPORTS[0];
