@@ -729,6 +729,45 @@ function buildDashboardSummary(data, range = defaultDateRange()) {
 function readableTrend(data) {
   return (data?.trend ?? []).map(row => ({ ...row, label: new Date(row.date).toLocaleDateString('en-IN', { day: '2-digit', month: 'short' }) }));
 }
+
+function readableBusinessReportRows(data) {
+  const rows = amazonBusinessReportRows(data).map(row => ({
+    date: row.date,
+    ordered_product_sales: formatCurrency(row.ordered_product_sales),
+    ordered_product_sales_b2b: formatCurrency(row.ordered_product_sales_b2b),
+    units_ordered: formatNumber(row.units_ordered),
+    units_ordered_b2b: formatNumber(row.units_ordered_b2b),
+    total_order_items: formatNumber(row.total_order_items),
+    total_order_items_b2b: formatNumber(row.total_order_items_b2b),
+    average_sales_per_order_item: formatCurrency(row.average_sales_per_order_item),
+    average_sales_per_order_item_b2b: formatCurrency(row.average_sales_per_order_item_b2b),
+    average_units_per_order_item: Number(row.average_units_per_order_item ?? 0).toLocaleString('en-IN', { maximumFractionDigits: 2 }),
+    average_units_per_order_item_b2b: Number(row.average_units_per_order_item_b2b ?? 0).toLocaleString('en-IN', { maximumFractionDigits: 2 }),
+    average_selling_price: formatCurrency(row.average_selling_price)
+  }));
+  if (!rows.length) return [];
+  const sourceRows = amazonBusinessReportRows(data);
+  const totalUnits = sumRows(sourceRows, 'units_ordered');
+  const totalItems = sumRows(sourceRows, 'total_order_items');
+  return [...rows, {
+    date: 'Total',
+    ordered_product_sales: formatCurrency(sumRows(sourceRows, 'ordered_product_sales')),
+    ordered_product_sales_b2b: formatCurrency(sumRows(sourceRows, 'ordered_product_sales_b2b')),
+    units_ordered: formatNumber(totalUnits),
+    units_ordered_b2b: formatNumber(sumRows(sourceRows, 'units_ordered_b2b')),
+    total_order_items: formatNumber(totalItems),
+    total_order_items_b2b: formatNumber(sumRows(sourceRows, 'total_order_items_b2b')),
+    average_sales_per_order_item: formatCurrency(totalItems ? sumRows(sourceRows, 'ordered_product_sales') / totalItems : 0),
+    average_sales_per_order_item_b2b: formatCurrency(sumRows(sourceRows, 'total_order_items_b2b') ? sumRows(sourceRows, 'ordered_product_sales_b2b') / sumRows(sourceRows, 'total_order_items_b2b') : 0),
+    average_units_per_order_item: totalItems ? (totalUnits / totalItems).toLocaleString('en-IN', { maximumFractionDigits: 2 }) : '0',
+    average_units_per_order_item_b2b: sumRows(sourceRows, 'total_order_items_b2b') ? (sumRows(sourceRows, 'units_ordered_b2b') / sumRows(sourceRows, 'total_order_items_b2b')).toLocaleString('en-IN', { maximumFractionDigits: 2 }) : '0',
+    average_selling_price: formatCurrency(totalUnits ? sumRows(sourceRows, 'ordered_product_sales') / totalUnits : 0)
+  }];
+}
+function BusinessReportDetailTable({ data }) {
+  return <TableCard title="Seller Central Sales & Traffic detail" rows={readableBusinessReportRows(data)} columns={['date', 'ordered_product_sales', 'ordered_product_sales_b2b', 'units_ordered', 'units_ordered_b2b', 'total_order_items', 'total_order_items_b2b', 'average_sales_per_order_item', 'average_sales_per_order_item_b2b', 'average_units_per_order_item', 'average_units_per_order_item_b2b', 'average_selling_price']} pageSize={16} />;
+}
+
 function SalesAnalytics({ data, channelData }) {
   const { range } = useContext(DateRangeContext);
   const trend = readableTrend(data);
@@ -737,6 +776,7 @@ function SalesAnalytics({ data, channelData }) {
       <Card className="panel"><PanelHeader title="Amazon Value Distribution" />{channelData.length ? <><ResponsiveContainer width="100%" height={220}><PieChart><Pie data={channelData} innerRadius={62} outerRadius={92} dataKey="value">{channelData.map((_, i) => <Cell key={i} fill={COLORS[i % COLORS.length]} />)}</Pie><Tooltip formatter={value => formatCurrency(value)} /></PieChart></ResponsiveContainer><Legend items={channelData} /></> : <Empty text="No synced sales or settlement totals yet." />}</Card>
       <Card className="panel wide"><PanelHeader title={`Simple Sales Trend (${range.label})`} subtitle="date wise net sales" />{trend.length ? <ResponsiveContainer width="100%" height={280}><LineChart data={trend} margin={{ top: 12, right: 20, bottom: 8, left: 0 }}><CartesianGrid strokeDasharray="3 3" vertical={false} /><XAxis dataKey="label" tick={{ fontSize: 12 }} /><YAxis tickFormatter={value => `₹${Number(value) / 1000}k`} /><Tooltip labelFormatter={label => `Date: ${label}`} formatter={value => [formatCurrency(value), 'Net sales']} /><Line type="monotone" dataKey="sales" name="Net sales" stroke="#159a82" strokeWidth={3} dot={{ r: 4 }} activeDot={{ r: 7 }} /></LineChart></ResponsiveContainer> : <Empty text="No imported sales trend yet. Use the Sync above to pull SP-API reports." />}</Card>
     </div>
+    <BusinessReportDetailTable data={data} />
     <div className="dashboard-grid two"><TableCard title="Product Performance" rows={data?.products ?? []} columns={['asin', 'units', 'sales', 'buy_box']} /><TableCard title="Order Items" rows={data?.orderItems ?? []} columns={['amazon_order_id', 'asin', 'sku', 'title', 'quantity_ordered', 'item_price']} /></div>
   </>;
 }

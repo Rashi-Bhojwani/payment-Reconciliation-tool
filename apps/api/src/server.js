@@ -526,22 +526,29 @@ app.get('/api/tenants/:tenantId/dashboard', async request => {
     const kpis = (await client.query(`select coalesce(sum(amount),0) net_settled, coalesce(sum(case when amount > 0 then amount else 0 end),0) earnings, coalesce(sum(case when amount < 0 then amount else 0 end),0) deductions from settlement_rows where tenant_id=$1 and posted_date >= $2 and posted_date < $3`, [tenantId, start, end])).rows[0];
     const orders = (await client.query(`select count(*) orders, coalesce(sum(total_amount),0) order_value from orders where tenant_id=$1 and order_date >= $2 and order_date < $3`, [tenantId, start, end])).rows[0];
     const businessReportRows = (await client.query(`
-      select date,
-        coalesce(sum(ordered_product_sales),0) ordered_product_sales,
-        coalesce(sum(ordered_product_sales_b2b),0) ordered_product_sales_b2b,
-        coalesce(sum(units_ordered),0) units_ordered,
-        coalesce(sum(units_ordered_b2b),0) units_ordered_b2b,
-        coalesce(sum(total_order_items),0) total_order_items,
-        coalesce(sum(total_order_items_b2b),0) total_order_items_b2b,
-        coalesce(avg(nullif(average_sales_per_order_item,0)),0) average_sales_per_order_item,
-        coalesce(avg(nullif(average_sales_per_order_item_b2b,0)),0) average_sales_per_order_item_b2b,
-        coalesce(avg(nullif(average_units_per_order_item,0)),0) average_units_per_order_item,
-        coalesce(avg(nullif(average_units_per_order_item_b2b,0)),0) average_units_per_order_item_b2b,
-        coalesce(avg(nullif(average_selling_price,0)),0) average_selling_price
-      from sales_traffic_daily
-      where tenant_id=$1 and date >= $2::date and date < $3::date
-      group by date
-      order by date desc limit 120`, [tenantId, start, end])).rows.reverse();
+      with scoped as (
+        select * from sales_traffic_daily
+        where tenant_id=$1 and date >= $2::date and date < $3::date
+      ), daily as (
+        select date,
+          coalesce(sum(ordered_product_sales),0) ordered_product_sales,
+          coalesce(sum(ordered_product_sales_b2b),0) ordered_product_sales_b2b,
+          coalesce(sum(units_ordered),0) units_ordered,
+          coalesce(sum(units_ordered_b2b),0) units_ordered_b2b,
+          coalesce(sum(total_order_items),0) total_order_items,
+          coalesce(sum(total_order_items_b2b),0) total_order_items_b2b,
+          coalesce(avg(nullif(average_sales_per_order_item,0)),0) average_sales_per_order_item,
+          coalesce(avg(nullif(average_sales_per_order_item_b2b,0)),0) average_sales_per_order_item_b2b,
+          coalesce(avg(nullif(average_units_per_order_item,0)),0) average_units_per_order_item,
+          coalesce(avg(nullif(average_units_per_order_item_b2b,0)),0) average_units_per_order_item_b2b,
+          coalesce(avg(nullif(average_selling_price,0)),0) average_selling_price
+        from scoped where not exists (select 1 from scoped all_rows where all_rows.date=scoped.date and all_rows.asin='ALL')
+        group by date
+        union all
+        select date, ordered_product_sales, ordered_product_sales_b2b, units_ordered, units_ordered_b2b, total_order_items, total_order_items_b2b, average_sales_per_order_item, average_sales_per_order_item_b2b, average_units_per_order_item, average_units_per_order_item_b2b, average_selling_price
+        from scoped where asin='ALL'
+      )
+      select * from daily order by date desc limit 120`, [tenantId, start, end])).rows.reverse();
     const products = (await client.query(`
       with traffic_products as (
         select asin, sum(units_ordered) units, sum(ordered_product_sales) sales, avg(featured_offer_percentage) buy_box
