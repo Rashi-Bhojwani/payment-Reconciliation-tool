@@ -380,8 +380,10 @@ function SellerDashboard() {
   const [error, setError] = useState('');
   const [autoSyncing, setAutoSyncing] = useState(false);
   const lastRangeSyncRef = useRef('');
+  const reportTypes = VIEW_REPORT_TYPES[view];
+  const ledgerCopy = VIEW_LEDGER_COPY[view];
   async function load() { setError(''); try { setData(await api(`/api/tenants/${tenantId}/dashboard?${rangeQuery(range)}`)); } catch (e) { setError(e.message); } }
-  useEffect(() => { if (tenantId) void load(); }, [tenantId, range.start, range.end]);
+  useEffect(() => { if (tenantId) void load(); }, [tenantId]);
 
   // When the calendar range is applied, sync only the report(s) needed by
   // the current page, and always send the selected start/end limit. This keeps
@@ -389,7 +391,7 @@ function SellerDashboard() {
   // the data the user is looking at.
   useEffect(() => {
     if (!data?.seller?.connected || !tenantId) return;
-    const selectedReports = view === 'dashboard' ? ['DIRECT_SP_API_SYNC'] : (reportTypes?.length ? reportTypes : ['DIRECT_SP_API_SYNC']);
+    const selectedReports = view === 'dashboard' ? REPORTS.map(report => report.type) : (reportTypes?.length ? reportTypes : ['DIRECT_SP_API_SYNC']);
     const syncKey = `${tenantId}:${view}:${formatDateParam(range.start)}:${formatDateParam(addDays(range.end, 1))}`;
     if (lastRangeSyncRef.current === syncKey) return;
     if (freshAmazonAuth) {
@@ -410,6 +412,7 @@ function SellerDashboard() {
         await load();
       } catch (e) {
         setError(e.message);
+        await load();
       } finally {
         setAutoSyncing(false);
       }
@@ -421,8 +424,6 @@ function SellerDashboard() {
     { name: 'Settlement earnings', value: Number(data?.kpis?.earnings ?? 0) },
     { name: 'Settlement deductions', value: Math.abs(Number(data?.kpis?.deductions ?? 0)) }
   ].filter(item => item.value > 0), [data]);
-  const reportTypes = VIEW_REPORT_TYPES[view];
-  const ledgerCopy = VIEW_LEDGER_COPY[view];
   const detailView = view === 'report-detail' || view === 'metric-detail';
   const connected = !!data?.seller?.connected;
 
@@ -576,7 +577,7 @@ function componentAmount(data, categories) {
 function hasFinancialComponents(data) { return (data?.financialComponents ?? []).length > 0; }
 function amazonBusinessReportRows(data) { return data?.businessReportRows ?? []; }
 function amazonNetSales(data) {
-  const businessSales = amazonBusinessReportRows(data).reduce((sum, row) => sum + Number(row.ordered_product_sales ?? 0) + Number(row.ordered_product_sales_b2b ?? 0), 0);
+  const businessSales = amazonBusinessReportRows(data).reduce((sum, row) => sum + Number(row.ordered_product_sales ?? 0), 0);
   if (businessSales) return businessSales;
   const productSales = (data?.products ?? []).reduce((sum, product) => sum + Number(product.sales ?? 0), 0);
   if (productSales) return productSales;
@@ -627,13 +628,13 @@ function buildMetricDetails(data, metric, range) {
     ? moneyRows(settlementLines.filter(row => Number(row.amount ?? 0) < 0), row => ({ date: row.posted_date, source: 'Settlement', id: row.settlement_id ?? row.order_id, type: row.amount_type, description: row.amount_description, amount: Number(row.amount ?? 0), absolute_amount: Math.abs(Number(row.amount ?? 0)) }))
     : moneyRows(financeRows.filter(row => Number(row.total_amount ?? 0) < 0), row => ({ date: row.posted_date, source: 'Finance', id: row.transaction_id ?? row.related_order_id, type: row.transaction_type, description: row.related_order_id, amount: Number(row.total_amount ?? 0), absolute_amount: Math.abs(Number(row.total_amount ?? 0)) }));
   const netSalesTree = businessRows.length
-    ? formulaTreeRows([['Ordered Product Sales', orderedProductSales, '+', 'Business Reports'], ['Ordered Product Sales - B2B', orderedProductSalesB2b, '+', 'Business Reports B2B']])
+    ? formulaTreeRows([['Ordered Product Sales', orderedProductSales, '+', 'Business Reports'], ['Ordered Product Sales - B2B subset', orderedProductSalesB2b, 'ⓘ', 'Shown separately, not double-counted']])
     : formulaTreeRows([['Gross Item Price', grossItemPrice, '+', 'Principal / item price'], ['Shipping / Gift Wrap Income', shippingIncome, shippingIncome < 0 ? '−' : '+', 'ShippingCharge / GiftWrap'], ['Promotions', promotions, '−', 'Promotion discounts'], ['Returns / Refunds', refundAmount, '−', 'Finance refund components']]);
   const settledTree = formulaTreeRows([['Net Sales', summary.netSales, '+', 'Net sales calculation'], ['Referral Commission', referralCommission, '−', 'Commission components'], ['FBA Fulfillment Fees', fbaFees, '−', 'FBA fee components'], ['Shipping Fees', shippingFees, '−', 'Shipping fee/tax components'], ['Reimbursements', summary.reimbursements, '+', 'Reimbursement credits'], ['Other Adjustments', otherAdjustments, otherAdjustments < 0 ? '−' : '+', 'Other finance/settlement components']]);
   const details = {
-    netSales: { title: 'Net Sales', value: formatCurrency(summary.netSales), explanation: 'Net sales is matched to Amazon Business Reports first: Ordered Product Sales plus Ordered Product Sales - B2B for the selected date range. Finance components are used for payout reconciliation, not to replace the Business Reports sales total.', formula: `Net Sales = Ordered Product Sales ${formatCurrency(orderedProductSales)} + Ordered Product Sales - B2B ${formatCurrency(orderedProductSalesB2b)} = ${formatCurrency(summary.netSales)}`, treeRows: netSalesTree, numericValue: summary.netSales, rows: businessRows.length ? moneyRows(businessRows, row => row) : productRows, columns: businessRows.length ? ['line', 'date', 'ordered_product_sales', 'ordered_product_sales_b2b', 'units_ordered', 'units_ordered_b2b', 'total_order_items', 'total_order_items_b2b', 'average_sales_per_order_item', 'average_selling_price'] : ['line', 'source', 'asin', 'sku', 'units', 'gross_sales', 'tax', 'discounts', 'net_sales', 'share'] },
+    netSales: { title: 'Net Sales', value: formatCurrency(summary.netSales), explanation: 'Net sales is matched to the Amazon Business Reports Ordered Product Sales total for the selected date range. B2B is shown as a separate subset, the same way Seller Central displays it, so it is not added a second time.', formula: `Net Sales = Ordered Product Sales ${formatCurrency(orderedProductSales)} (B2B subset shown separately: ${formatCurrency(orderedProductSalesB2b)}) = ${formatCurrency(summary.netSales)}`, treeRows: netSalesTree, numericValue: summary.netSales, rows: businessRows.length ? moneyRows(businessRows, row => row) : productRows, columns: businessRows.length ? ['line', 'date', 'ordered_product_sales', 'ordered_product_sales_b2b', 'units_ordered', 'units_ordered_b2b', 'total_order_items', 'total_order_items_b2b', 'average_sales_per_order_item', 'average_selling_price'] : ['line', 'source', 'asin', 'sku', 'units', 'gross_sales', 'tax', 'discounts', 'net_sales', 'share'] },
     netQty: { title: 'Net Qty', value: formatNumber(summary.netQty), explanation: 'Net quantity is the sum of sold units for the same rows used by Net Sales.', formula: `Net Qty = Σ units across ${formatNumber(productRows.length)} calculation rows = ${formatNumber(summary.netQty)}`, rows: productRows, columns: ['line', 'source', 'asin', 'sku', 'units', 'net_sales', 'share'] },
-    orders: { title: 'Orders Synced', value: formatNumber(summary.ordersCount), explanation: 'Orders synced counts Amazon order headers in the date range. Item-line totals are shown beside each order so the count can be audited against money rows.', formula: `Orders Synced = count(order headers) = ${formatNumber(summary.ordersCount)}`, rows: orderRows, columns: ['line', 'amazon_order_id', 'order_date', 'status', 'total_amount', 'item_lines', 'item_value', 'item_tax', 'discounts'] },
+    orders: { title: 'Orders Synced', value: formatNumber(summary.ordersCount), explanation: 'Orders synced matches Amazon Business Reports Total Order Items when available, then falls back to imported order headers. Item-line totals are shown for audit.', formula: `Orders Synced = Amazon Total Order Items (or order header count fallback) = ${formatNumber(summary.ordersCount)}`, rows: orderRows, columns: ['line', 'amazon_order_id', 'order_date', 'status', 'total_amount', 'item_lines', 'item_value', 'item_tax', 'discounts'] },
     returns: { title: 'Returns', value: formatNumber(summary.returnQty), explanation: 'Returns count customer-return report lines. The return rate uses Returns ÷ Net Qty.', formula: `Return Rate = ${formatNumber(summary.returnQty)} ÷ ${formatNumber(summary.netQty)} = ${summary.netQty ? `${Math.round((summary.returnQty / summary.netQty) * 100)}%` : '0%'}`, rows: moneyRows(returns, row => row), columns: ['line', 'order_id', 'return_reason', 'disposition', 'status', 'return_date'] },
     settled: { title: 'Settled Amount', value: formatCurrency(summary.settledAmount), explanation: 'Settled amount is reconciled from the net sales formula through Amazon commission, FBA fulfillment fees, shipping fees, reimbursements and other adjustments. Payout groups show the final settlement batches.', formula: `Settled Amount = Net Sales ${formatCurrency(summary.netSales)} − Referral Commission ${formatCurrency(Math.abs(referralCommission))} − FBA Fees ${formatCurrency(Math.abs(fbaFees))} − Shipping Fees ${formatCurrency(Math.abs(shippingFees))} + Reimbursements ${formatCurrency(summary.reimbursements)} + Other Adjustments ${formatCurrency(otherAdjustments)} = ${formatCurrency(summary.settledAmount)}`, treeRows: settledTree, numericValue: summary.settledAmount, rows: payments, columns: ['posted_date', 'settlement_id', 'net_amount', 'lines'] },
     deductions: { title: 'Deductions', value: formatCurrency(summary.deductions), explanation: 'Deductions are negative Amazon settlement/finance lines such as fees, refunds, commission, shipping clawbacks and other charges.', formula: `Deductions = Σ absolute value of negative money lines = ${formatCurrency(sumRows(deductionRows, 'absolute_amount') || summary.deductions)}`, rows: financialComponents.filter(row => Number(row.amount ?? 0) < 0), columns: ['posted_date', 'source', 'transaction_id', 'related_order_id', 'category', 'component', 'amount'] },
@@ -667,9 +668,11 @@ function buildDashboardSummary(data, range = defaultDateRange()) {
   const reimbursements = data?.reimbursements ?? [];
   const invoices = data?.invoices ?? [];
   const orderItems = data?.orderItems ?? [];
-  const ordersCount = Number(data?.orders?.orders ?? 0);
+  const businessRows = amazonBusinessReportRows(data);
+  const amazonOrderItems = businessRows.reduce((sum, row) => sum + Number(row.total_order_items ?? 0), 0);
+  const ordersCount = amazonOrderItems || Number(data?.orders?.orders ?? 0);
   const netSales = amazonNetSales(data);
-  const netQty = products.reduce((sum, product) => sum + Number(product.units ?? 0), 0) || orderItems.reduce((sum, item) => sum + Number(item.quantity_ordered ?? 0), 0);
+  const netQty = businessRows.reduce((sum, row) => sum + Number(row.units_ordered ?? 0), 0) || products.reduce((sum, product) => sum + Number(product.units ?? 0), 0) || orderItems.reduce((sum, item) => sum + Number(item.quantity_ordered ?? 0), 0);
   const returnQty = returns.length;
   const settledAmount = payments.reduce((sum, payment) => sum + Number(payment.net_amount ?? 0), 0) || Number(data?.kpis?.net_settled ?? 0);
   const deductions = amazonDeductions(data);

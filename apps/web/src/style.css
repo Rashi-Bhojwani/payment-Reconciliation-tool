@@ -325,7 +325,7 @@ select, input { font-family: inherit; }
   position: absolute;
   top: calc(100% + 8px);
   right: 0;
-  z-index: 40;
+  z-index: 120;
   display: flex;
   background: var(--surface);
   border: 1px solid var(--border);
@@ -352,6 +352,8 @@ select, input { font-family: inherit; }
 .calendar-cell.in-range { background: rgba(232, 162, 61, 0.15); border-radius: 0; }
 .calendar-cell.endpoint { background: var(--marigold); color: #fff; border-radius: 8px; font-weight: 600; }
 .calendar-footer { display: flex; align-items: center; justify-content: space-between; margin-top: 12px; gap: 10px; }
+.date-range-panel-simple .calendar-footer { margin-top: 2px; align-items: center; }
+.date-range-panel-simple .calendar-footer .btn { min-height: 42px; padding-inline: 20px; }
 .calendar-actions { display: flex; gap: 8px; }
 
 /* ---------- Sync ledger (signature element: color-coded report families) ---------- */
@@ -800,12 +802,14 @@ td { padding: 13px 14px; color:#344054; }
 }
 .mini-metric::before { width: 42px; height: 42px; border-radius: 13px; }
 .date-range-panel-simple {
-  width: 420px;
-  padding: 18px;
+  width: min(340px, calc(100vw - 32px));
+  padding: 14px;
   flex-direction: column;
-  gap: 14px;
+  gap: 12px;
+  border-radius: 18px;
 }
-.date-field-group { display: flex; flex-direction: column; gap: 7px; }
+.date-field-group { display: flex; flex-direction: column; gap: 6px; }
+.date-range-panel-simple .input { height: 44px; padding: 0 12px; font-size: 14px; }
 .date-field-group label {
   color: var(--ink);
   font-size: 12px;
