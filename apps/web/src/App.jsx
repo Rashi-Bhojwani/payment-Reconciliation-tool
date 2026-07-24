@@ -408,46 +408,14 @@ function SellerDashboard() {
   const { range } = useContext(DateRangeContext);
   const [data, setData] = useState(null);
   const [error, setError] = useState('');
-  const [autoSyncing, setAutoSyncing] = useState(false);
-  const lastRangeSyncRef = useRef('');
   const reportTypes = VIEW_REPORT_TYPES[view];
   const ledgerCopy = VIEW_LEDGER_COPY[view];
   async function load() { setError(''); try { setData(await api(`/api/tenants/${tenantId}/dashboard?${rangeQuery(range)}`)); } catch (e) { setError(e.message); } }
-  useEffect(() => { if (tenantId) void load(); }, [tenantId]);
 
-  // When the calendar range is applied, sync only the report(s) needed by
-  // the current page, and always send the selected start/end limit. This keeps
-  // the account safe by avoiding an all-report fan-out while still refreshing
-  // the data the user is looking at.
-  useEffect(() => {
-    if (!data?.seller?.connected || !tenantId) return;
-    const selectedReports = view === 'dashboard' ? REPORTS.map(report => report.type) : (reportTypes?.length ? reportTypes : ['DIRECT_SP_API_SYNC']);
-    const syncKey = `${tenantId}:${view}:${formatDateParam(range.start)}:${formatDateParam(addDays(range.end, 1))}`;
-    if (lastRangeSyncRef.current === syncKey) return;
-    if (freshAmazonAuth) {
-      lastRangeSyncRef.current = syncKey;
-      return;
-    }
-    lastRangeSyncRef.current = syncKey;
-    (async () => {
-      setAutoSyncing(true);
-      try {
-        for (const reportType of selectedReports) {
-          if (reportType === 'DIRECT_SP_API_SYNC') {
-            await api(`/api/tenants/${tenantId}/sync`, { method: 'POST', body: JSON.stringify({ reportTypes: [], range: { start: formatDateParam(range.start), end: formatDateParam(addDays(range.end, 1)) } }) });
-          } else {
-            await api(`/api/tenants/${tenantId}/sync/${reportType}`, { method: 'POST', body: JSON.stringify({ range: { start: formatDateParam(range.start), end: formatDateParam(addDays(range.end, 1)) } }) });
-          }
-        }
-        await load();
-      } catch (e) {
-        setError(e.message);
-        await load();
-      } finally {
-        setAutoSyncing(false);
-      }
-    })();
-  }, [data?.seller?.connected, tenantId, view, freshAmazonAuth, range.start, range.end]);
+  // Date selection is a filter, not an implicit sync trigger. Reload the
+  // dashboard with the selected range immediately and leave SP-API pulls to
+  // the explicit Sync buttons, which already send the active range.
+  useEffect(() => { if (tenantId) void load(); }, [tenantId, range.start, range.end]);
 
   const channelData = useMemo(() => [
     { name: 'Order value', value: Number(data?.orders?.order_value ?? 0) },
@@ -467,7 +435,6 @@ function SellerDashboard() {
     {freshAmazonAuth && connected && <p className="alert success">Amazon account connected. Select a date range or use Sync on this page to pull limited data.</p>}
     {amazonError && <p className="alert warning">Amazon connection issue: {amazonError}</p>}
     {error && <p className="alert warning">{error}</p>}
-    {autoSyncing && <p className="alert success">Syncing this page only for {range.label}…</p>}
     {view === 'dashboard' && !connected && data && <p className="alert warning">Connect your Amazon account to start pulling data — nothing syncs until then.</p>}
     {view !== 'dashboard' && !detailView && <SyncLedger tenantId={tenantId} jobs={data?.jobs ?? []} onSynced={load} reportTypes={reportTypes} title={ledgerCopy?.title} subtitle={ledgerCopy?.subtitle} disabled={!connected} />}
 
@@ -931,27 +898,30 @@ function AdminDashboard() {
   </div>;
 }
 
-function SidebarLink({ to, icon, children }) {
+function SidebarLink({ to, icon, children, onNavigate }) {
   const location = useLocation();
   const target = new URL(to, 'http://local');
   const current = new URL(`${location.pathname}${location.search}`, 'http://local');
   const active = current.pathname === target.pathname && current.searchParams.get('view') === target.searchParams.get('view');
-  return <NavLink className={active ? 'active' : ''} to={to}><span className="nav-icon" aria-hidden="true">{icon}</span><span>{children}</span></NavLink>;
+  return <NavLink className={active ? 'active' : ''} to={to} onClick={onNavigate}><span className="nav-icon" aria-hidden="true">{icon}</span><span>{children}</span></NavLink>;
 }
 
 // Seller-facing shell: sidebar + topbar. Admins never render this component.
 function SellerShell({ session, setSession }) {
   function logout() { localStorage.removeItem('token'); setSession(null); }
   const [range, setRange] = useState(defaultDateRange);
-  return <div className="app-shell">
-    <aside className="sidebar">
+  const [sidebarOpen, setSidebarOpen] = useState(false);
+  return <div className={`app-shell ${sidebarOpen ? 'sidebar-open' : ''}`}>
+    <button type="button" className="sidebar-backdrop" aria-label="Close navigation menu" onClick={() => setSidebarOpen(false)} />
+    <aside className="sidebar" aria-label="Seller navigation">
       <div className="logo"><span>W</span><div><b>WELLSURE</b><small>Seller Intelligence</small></div></div>
       <nav>
-        {NAV_ITEMS.map(item => <SidebarLink key={item.view} icon={item.icon} to={`/seller?tenantId=${session?.tenantId ?? ''}&view=${item.view}`}>{item.label}</SidebarLink>)}
+        {NAV_ITEMS.map(item => <SidebarLink key={item.view} icon={item.icon} to={`/seller?tenantId=${session?.tenantId ?? ''}&view=${item.view}`} onNavigate={() => setSidebarOpen(false)}>{item.label}</SidebarLink>)}
       </nav>
     </aside>
     <main className="workspace">
       <header className="topbar">
+        <button type="button" className="hamburger-button" aria-label="Open navigation menu" aria-expanded={sidebarOpen} onClick={() => setSidebarOpen(true)}><span></span><span></span><span></span></button>
         <div className="search"><span>⌕</span><span>Search reports, orders, payouts…</span></div>
         <select><option>Amazon.in</option></select>
         <DateRangePicker value={range} onChange={setRange} />
