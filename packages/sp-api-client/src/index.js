@@ -110,7 +110,16 @@ export class SpApiClient {
     const parsedReportType = z.enum(REPORT_TYPES).parse(reportType);
     const parsedRange = DateRangeSchema.parse(range);
     const parsedTenant = z.string().uuid().parse(tenantId);
-    const createReportBody = { reportType: parsedReportType, marketplaceIds: [marketplaceId], dataStartTime: parsedRange.start, dataEndTime: parsedRange.end };
+    const reportOptions = parsedReportType === 'GET_SALES_AND_TRAFFIC_REPORT'
+      ? { dateGranularity: 'DAY', asinGranularity: 'CHILD' }
+      : undefined;
+    const createReportBody = {
+      reportType: parsedReportType,
+      marketplaceIds: [marketplaceId],
+      dataStartTime: parsedRange.start,
+      dataEndTime: parsedRange.end,
+      ...(reportOptions ? { reportOptions } : {})
+    };
     let create = await this.request('/reports/2021-06-30/reports', {
       method: 'POST',
       body: JSON.stringify(createReportBody)

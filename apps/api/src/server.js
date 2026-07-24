@@ -379,6 +379,7 @@ app.post('/api/tenants/:tenantId/sync/:reportType', async request => {
     if (directFallbackReports.has(params.reportType)) {
       try {
         const fallback = await syncRecentApiDataForTenant(params.tenantId, { range: body.range });
+        await recordSyntheticReportSync(params.tenantId, params.reportType);
         return { reportType: params.reportType, status: 'completed', fallback: 'DIRECT_SP_API_SYNC', warning: error instanceof Error ? error.message : 'Report sync failed', ...fallback };
       } catch {
         // Return the original report error below; it is usually more actionable than a secondary fallback failure.
@@ -487,13 +488,21 @@ app.get('/api/tenants/:tenantId/dashboard', async request => {
         select * from finance_payments where not exists (select 1 from settlement_payments)
       )
       select settlement_id, posted_date, net_amount, lines from merged order by posted_date desc nulls last limit 50`, [tenantId, start, end])).rows;
-    const jobs = (await client.query(`select report_type,
-        case when status='running' and started_at < now() - interval '30 minutes' then 'failed' else status end status,
-        started_at,
-        case when status='running' and started_at < now() - interval '30 minutes' then started_at + interval '30 minutes' else completed_at end completed_at,
-        case when status='running' and started_at < now() - interval '30 minutes' then coalesce(error_message, 'Sync timed out. Please retry.') else error_message end error_message,
-        s3_key
-      from sync_jobs where tenant_id=$1 order by started_at desc nulls last limit 10`, [tenantId])).rows;
+    const jobs = (await client.query(`
+      with normalized_jobs as (
+        select report_type,
+          case when status='running' and started_at < now() - interval '30 minutes' then 'failed' else status end status,
+          started_at,
+          case when status='running' and started_at < now() - interval '30 minutes' then started_at + interval '30 minutes' else completed_at end completed_at,
+          case when status='running' and started_at < now() - interval '30 minutes' then coalesce(error_message, 'Sync timed out. Please retry.') else error_message end error_message,
+          s3_key
+        from sync_jobs
+        where tenant_id=$1
+      )
+      select distinct on (report_type) report_type, status, started_at, completed_at, error_message, s3_key
+      from normalized_jobs
+      order by report_type, started_at desc nulls last
+    `, [tenantId])).rows;
     const inventory = (await client.query('select sku, fulfillable_quantity, snapshot_date from inventory_snapshots where tenant_id=$1 and snapshot_date >= $2::date and snapshot_date < $3::date order by snapshot_date desc, fulfillable_quantity desc nulls last limit 50', [tenantId, start, end])).rows;
     const returns = (await client.query('select order_id, return_reason, disposition, status, return_date from returns where tenant_id=$1 and return_date >= $2::date and return_date < $3::date order by return_date desc nulls last limit 50', [tenantId, start, end])).rows;
     const reimbursements = (await client.query('select sku, amount, reason, reimbursement_date from reimbursements where tenant_id=$1 and reimbursement_date >= $2::date and reimbursement_date < $3::date order by reimbursement_date desc nulls last limit 50', [tenantId, start, end])).rows;
