@@ -151,6 +151,105 @@ async function requireAdmin(request) { const user = await requireAuth(request); 
 async function requireTenantUser(request, tenantId) { const user = await requireAuth(request); if (user.role === 'admin') return user; if (user.tenantId !== tenantId) throw Object.assign(new Error('Tenant access denied'), { statusCode: 403 }); return user; }
 
 
+
+function asMoney(value) {
+  const parsed = Number(String(value ?? '').replace(/[,₹$]/g, ''));
+  return Number.isFinite(parsed) ? parsed : 0;
+}
+
+function textOrNull(value) { return value == null || String(value).trim() === '' ? null : String(value).trim(); }
+
+
+function directMoneyValue(value) {
+  if (!value || typeof value !== 'object') return undefined;
+  return value.chargeAmount ?? value.ChargeAmount ?? value.feeAmount ?? value.FeeAmount ?? value.amount ?? value.Amount ?? value.currencyAmount ?? value.CurrencyAmount;
+}
+
+function hasNestedMoney(value) {
+  if (Array.isArray(value)) return value.some(hasNestedMoney);
+  if (!value || typeof value !== 'object') return false;
+  return Object.values(value).some(nested => {
+    if (!nested || typeof nested !== 'object') return false;
+    if (directMoneyValue(nested) != null) return true;
+    return hasNestedMoney(nested);
+  });
+}
+
+function isAggregateComponent(label) {
+  return /total|summary|breakdown|list|amount$/i.test(String(label ?? ''));
+}
+
+function componentCategory(label) {
+  const normalized = String(label ?? '').toLowerCase().replace(/[^a-z0-9]/g, '');
+  if (['principal', 'itemprice', 'productcharges', 'productcharge', 'itemcharge'].some(key => normalized.includes(key))) return 'principal';
+  if (normalized.includes('shipping') && normalized.includes('tax')) return 'shipping_tax';
+  if (normalized.includes('shipping')) return 'shipping';
+  if (normalized.includes('giftwrap') && normalized.includes('tax')) return 'gift_wrap_tax';
+  if (normalized.includes('giftwrap')) return 'gift_wrap';
+  if (normalized.includes('promotion') || normalized.includes('discount')) return 'promotion';
+  if (normalized.includes('commission') || normalized.includes('referral')) return normalized.includes('refund') ? 'refund_commission' : 'commission';
+  if (normalized.includes('fbaperunit') || normalized.includes('fulfillment') || normalized.includes('fbaweight') || normalized.includes('weightbased')) return 'fba_fee';
+  if (normalized.includes('tax') || normalized.includes('tcs') || normalized.includes('tds')) return 'tax';
+  if (normalized.includes('refund') || normalized.includes('return')) return 'refund';
+  if (normalized.includes('reimbursement') || normalized.includes('safet') || normalized.includes('chargebackrecovery')) return 'reimbursement';
+  if (normalized.includes('fee') || normalized.includes('charge')) return 'other_fee';
+  return 'other_adjustment';
+}
+
+function financeComponentRows(row) {
+  const raw = row.raw && typeof row.raw === 'object' ? row.raw : {};
+  const rows = [];
+  function walk(value, context = {}) {
+    if (Array.isArray(value)) return value.forEach(item => walk(item, context));
+    if (!value || typeof value !== 'object') return;
+    const label = textOrNull(value.chargeType ?? value.ChargeType ?? value.feeType ?? value.FeeType ?? value.type ?? value.Type ?? value.description ?? value.Description ?? value.name ?? value.Name ?? context.label ?? row.transaction_type);
+    const money = directMoneyValue(value);
+    const amount = typeof money === 'object' && money ? asMoney(money.currencyAmount ?? money.CurrencyAmount ?? money.amount ?? money.Amount) : asMoney(money);
+    const hasMoney = money != null && Number.isFinite(amount) && amount !== 0 && !(hasNestedMoney(value) && isAggregateComponent(label));
+    if (hasMoney) {
+      rows.push({
+        posted_date: row.posted_date,
+        transaction_id: row.transaction_id,
+        related_order_id: row.related_order_id,
+        transaction_type: row.transaction_type,
+        component: label ?? 'Transaction amount',
+        category: componentCategory(label ?? row.transaction_type),
+        amount,
+        currency: row.currency ?? value.currencyCode ?? value.CurrencyCode ?? 'INR',
+        source: 'Finances API'
+      });
+    }
+    for (const [key, nested] of Object.entries(value)) {
+      if (nested && typeof nested === 'object') walk(nested, { label: label ?? key });
+    }
+  }
+  walk(raw);
+  if (!rows.length && Number(row.total_amount ?? 0) !== 0) {
+    rows.push({ posted_date: row.posted_date, transaction_id: row.transaction_id, related_order_id: row.related_order_id, transaction_type: row.transaction_type, component: row.transaction_type ?? 'Transaction total', category: componentCategory(row.transaction_type), amount: Number(row.total_amount ?? 0), currency: row.currency ?? 'INR', source: 'Finances API total' });
+  }
+  return rows;
+}
+
+function settlementComponentRows(rows) {
+  return rows.map(row => ({
+    posted_date: row.posted_date,
+    transaction_id: row.settlement_id,
+    related_order_id: row.order_id,
+    transaction_type: row.amount_type,
+    component: row.amount_description ?? row.amount_type ?? 'Settlement amount',
+    category: componentCategory(`${row.amount_type ?? ''} ${row.amount_description ?? ''}`),
+    amount: Number(row.amount ?? 0),
+    currency: 'INR',
+    source: 'Settlement report'
+  }));
+}
+
+function summarizeComponents(rows) {
+  const byCategory = new Map();
+  for (const row of rows) byCategory.set(row.category, (byCategory.get(row.category) ?? 0) + Number(row.amount ?? 0));
+  return Object.fromEntries(byCategory.entries());
+}
+
 function queueInitialSellerSync(tenantId) {
   // Keep the authorization callback fast and safe: mark the seller connected
   // first, then do only a small direct-API warmup in the background. Report
@@ -487,7 +586,7 @@ app.get('/api/tenants/:tenantId/dashboard', async request => {
         union all
         select * from finance_payments where not exists (select 1 from settlement_payments)
       )
-      select settlement_id, posted_date, net_amount, lines from merged order by posted_date desc nulls last limit 50`, [tenantId, start, end])).rows;
+      select settlement_id, posted_date, net_amount, lines from merged order by posted_date desc nulls last limit 100`, [tenantId, start, end])).rows;
     const jobs = (await client.query(`
       with normalized_jobs as (
         select report_type,
@@ -503,14 +602,28 @@ app.get('/api/tenants/:tenantId/dashboard', async request => {
       from normalized_jobs
       order by report_type, started_at desc nulls last
     `, [tenantId])).rows;
+    const settlementLines = (await client.query('select settlement_id, order_id, amount_type, amount_description, amount, posted_date from settlement_rows where tenant_id=$1 and posted_date >= $2 and posted_date < $3 order by posted_date desc nulls last limit 250', [tenantId, start, end])).rows;
+    const orderRows = (await client.query(`
+      select o.amazon_order_id, o.order_date, o.status, o.total_amount,
+        count(oi.id) item_lines,
+        coalesce(sum(oi.item_price),0) item_value,
+        coalesce(sum(oi.item_tax),0) item_tax,
+        coalesce(sum(oi.promotion_discount),0) promotion_discount
+      from orders o
+      left join order_items oi on oi.tenant_id=o.tenant_id and oi.amazon_order_id=o.amazon_order_id
+      where o.tenant_id=$1 and o.order_date >= $2 and o.order_date < $3
+      group by o.amazon_order_id, o.order_date, o.status, o.total_amount
+      order by o.order_date desc nulls last limit 250`, [tenantId, start, end])).rows;
     const inventory = (await client.query('select sku, fulfillable_quantity, snapshot_date from inventory_snapshots where tenant_id=$1 and snapshot_date >= $2::date and snapshot_date < $3::date order by snapshot_date desc, fulfillable_quantity desc nulls last limit 50', [tenantId, start, end])).rows;
     const returns = (await client.query('select order_id, return_reason, disposition, status, return_date from returns where tenant_id=$1 and return_date >= $2::date and return_date < $3::date order by return_date desc nulls last limit 50', [tenantId, start, end])).rows;
     const reimbursements = (await client.query('select sku, amount, reason, reimbursement_date from reimbursements where tenant_id=$1 and reimbursement_date >= $2::date and reimbursement_date < $3::date order by reimbursement_date desc nulls last limit 50', [tenantId, start, end])).rows;
     const invoices = (await client.query('select invoice_type, order_id, taxable_value, cgst, sgst, igst, invoice_date from gst_invoices where tenant_id=$1 and invoice_date >= $2::date and invoice_date < $3::date order by invoice_date desc nulls last limit 50', [tenantId, start, end])).rows;
-    const orderItems = (await client.query('select oi.amazon_order_id, oi.asin, oi.sku, oi.title, oi.quantity_ordered, oi.item_price, oi.item_tax from order_items oi join orders o on o.tenant_id=oi.tenant_id and o.amazon_order_id=oi.amazon_order_id where oi.tenant_id=$1 and o.order_date >= $2 and o.order_date < $3 order by oi.quantity_ordered desc nulls last limit 50', [tenantId, start, end])).rows;
-    const financeTransactions = (await client.query('select transaction_id, transaction_type, posted_date, total_amount, currency, related_order_id from finance_transactions where tenant_id=$1 and posted_date >= $2 and posted_date < $3 order by posted_date desc nulls last limit 50', [tenantId, start, end])).rows;
+    const orderItems = (await client.query('select oi.amazon_order_id, oi.asin, oi.sku, oi.title, oi.quantity_ordered, oi.item_price, oi.item_tax, oi.promotion_discount from order_items oi join orders o on o.tenant_id=oi.tenant_id and o.amazon_order_id=oi.amazon_order_id where oi.tenant_id=$1 and o.order_date >= $2 and o.order_date < $3 order by oi.quantity_ordered desc nulls last limit 50', [tenantId, start, end])).rows;
+    const financeTransactions = (await client.query('select transaction_id, transaction_type, posted_date, total_amount, currency, related_order_id, raw from finance_transactions where tenant_id=$1 and posted_date >= $2 and posted_date < $3 order by posted_date desc nulls last limit 250', [tenantId, start, end])).rows;
+    const financialComponents = [...settlementComponentRows(settlementLines), ...financeTransactions.flatMap(financeComponentRows)];
+    const financialSummary = summarizeComponents(financialComponents);
     const hasImportedData = Number(orders.orders ?? 0) > 0 || Number(kpis.net_settled ?? 0) !== 0 || products.length > 0 || payments.length > 0 || inventory.length > 0;
-    return { seller, amazonAuth, hasImportedData, kpis, orders, products, trend, payments, jobs, inventory, returns, reimbursements, invoices, orderItems, financeTransactions };
+    return { seller, amazonAuth, hasImportedData, kpis, orders, orderRows, products, trend, payments, settlementLines, financialComponents, financialSummary, jobs, inventory, returns, reimbursements, invoices, orderItems, financeTransactions };
   });
 });
 
