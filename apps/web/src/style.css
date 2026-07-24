@@ -944,3 +944,96 @@ td { padding: 13px 14px; color:#344054; }
   .table-wrap { overflow-x: auto; }
   .raw-source-tabs { grid-template-columns: 1fr; }
 }
+
+/* ---------- Mobile drawer navigation and calendar placement ---------- */
+.hamburger-button,
+.sidebar-backdrop { display: none; }
+.hamburger-button {
+  width: 42px;
+  height: 42px;
+  border: 1px solid var(--border-cool);
+  border-radius: 12px;
+  background: var(--surface);
+  align-items: center;
+  justify-content: center;
+  flex-direction: column;
+  gap: 5px;
+  padding: 0;
+}
+.hamburger-button span {
+  width: 18px;
+  height: 2px;
+  border-radius: 999px;
+  background: var(--ink);
+}
+.date-range-picker { z-index: 120; }
+.date-range-panel {
+  position: absolute;
+  top: calc(100% + 10px);
+  right: 0;
+  width: min(560px, calc(100vw - 48px));
+  max-height: min(620px, calc(100vh - 120px));
+}
+.date-range-trigger { min-height: 44px; }
+.date-range-presets button:focus-visible,
+.calendar-nav button:focus-visible,
+.calendar-cell:focus-visible { outline: 2px solid var(--violet); outline-offset: 2px; }
+.calendar-cell.in-range:not(.endpoint) { color: var(--ink); font-weight: 700; }
+.calendar-cell.endpoint { box-shadow: 0 8px 18px rgba(37, 99, 235, 0.24); }
+
+@media (max-width: 980px) {
+  .app-shell { display: block; }
+  .hamburger-button { display: inline-flex; }
+  .sidebar-backdrop {
+    position: fixed;
+    inset: 0;
+    z-index: 100;
+    border: 0;
+    background: rgba(10, 13, 36, 0.42);
+    padding: 0;
+  }
+  .sidebar {
+    position: fixed;
+    inset: 0 auto 0 0;
+    z-index: 110;
+    width: min(82vw, 310px);
+    transform: translateX(-105%);
+    transition: transform 0.2s ease;
+    flex-direction: column;
+    align-items: stretch;
+    gap: 24px;
+    padding: 22px 16px;
+    overflow-y: auto;
+    overflow-x: hidden;
+    border-bottom: 0;
+    box-shadow: 24px 0 60px rgba(10, 13, 36, 0.28);
+  }
+  .sidebar nav { flex-direction: column; min-width: 0; gap: 3px; }
+  .sidebar nav a { white-space: normal; }
+  .sidebar .logo { padding-right: 0; }
+  .app-shell.sidebar-open .sidebar { transform: translateX(0); }
+  .app-shell.sidebar-open .sidebar-backdrop { display: block; }
+  .topbar { grid-template-columns: auto minmax(0, 1fr) auto; align-items: center; }
+  .topbar .search { grid-column: auto; order: 0; }
+  .topbar select { grid-column: 1 / 2; }
+  .date-range-picker { grid-column: 2 / -1; }
+  .date-range-panel {
+    position: fixed;
+    top: 88px;
+    left: 12px;
+    right: 12px;
+    width: auto;
+    max-height: calc(100vh - 104px);
+  }
+}
+
+@media (max-width: 560px) {
+  .topbar { grid-template-columns: auto 1fr auto; padding: 12px; margin: 0; border-radius: 0; }
+  .topbar select { grid-column: 1 / -1; }
+  .date-range-picker { grid-column: 1 / -1; }
+  .topbar .avatar, .topbar .btn-dark { justify-self: auto; }
+  .topbar .btn-dark { padding-inline: 13px; }
+  .date-range-panel { top: 154px; }
+  .date-range-presets { padding: 8px; }
+  .date-range-calendar { padding: 12px; }
+}
