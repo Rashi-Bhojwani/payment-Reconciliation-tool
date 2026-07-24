@@ -14,7 +14,11 @@
     "build": "npm --workspace @recon/web run build",
     "test": "npm run check",
     "check": "node --check apps/api/src/server.js && node --check apps/api/src/jobs/sync.js && node --check packages/sp-api-client/src/index.js && node --check packages/db/src/index.js",
+<<<<<<< HEAD
     "db:migrate": "prisma migrate deploy"
+=======
+    "db:migrate": "npm --workspace @recon/db run migrate"
+>>>>>>> aa64cc7bbe43c6c43c17ac3b9a16f1de4a908b2e
   },
   "devDependencies": {
     "concurrently": "^8.2.2"
