@@ -161,11 +161,12 @@ async function saveInventorySnapshots(tenantId, content) {
 }
 
 /** @param {string} tenantId @param {string} content */
-async function saveSalesTrafficDaily(tenantId, content) {
+async function saveSalesTrafficDaily(tenantId, content, range) {
   const rows = z.array(ReportRowSchema).parse(parseReportRows('GET_SALES_AND_TRAFFIC_REPORT', content));
+  const fallbackDate = range?.start ? new Date(range.start).toISOString().slice(0, 10) : null;
   await withTenant(tenantId, async client => {
     for (const row of rows) {
-      const date = text(pick(row, ['date', 'startDate', 'start-date']));
+      const date = text(pick(row, ['date', 'startDate', 'start-date'])) ?? fallbackDate;
       if (!date) continue;
       const asin = text(pick(row, ['asin', 'parentAsin', 'parent-asin', 'childAsin', 'child-asin'])) ?? 'ALL';
       await client.query(
@@ -180,14 +181,14 @@ async function saveSalesTrafficDaily(tenantId, content) {
 }
 
 /** @param {string} tenantId @param {string} reportType @param {string} content */
-async function saveStructuredRows(tenantId, reportType, content) {
+async function saveStructuredRows(tenantId, reportType, content, range) {
   switch (reportType) {
     case 'GET_V2_SETTLEMENT_REPORT_DATA_FLAT_FILE_V2': return saveSettlementRows(tenantId, content);
     case 'GET_GST_MTR_B2B_CUSTOM': return saveGstInvoices(tenantId, content, 'b2b');
     case 'GET_GST_MTR_B2C_CUSTOM': return saveGstInvoices(tenantId, content, 'b2c');
     case 'GET_FBA_FULFILLMENT_CUSTOMER_RETURNS_DATA': return saveReturns(tenantId, content);
     case 'GET_FBA_REIMBURSEMENTS_DATA': return saveReimbursements(tenantId, content);
-    case 'GET_SALES_AND_TRAFFIC_REPORT': return saveSalesTrafficDaily(tenantId, content);
+    case 'GET_SALES_AND_TRAFFIC_REPORT': return saveSalesTrafficDaily(tenantId, content, range);
     case 'GET_FBA_MYI_UNSUPPRESSED_INVENTORY_DATA': return saveInventorySnapshots(tenantId, content);
     default: return 0;
   }
@@ -206,7 +207,7 @@ export async function syncReportForTenant(params) {
       const client = new SpApiClient(decryptSecret(seller.rows[0].refresh_token_encrypted), { baseUrl: getSpApiEndpoint(seller.rows[0].marketplace_id) });
       const report = await client.fetchReport(parsed.reportType, parsed.tenantId, range, seller.rows[0].marketplace_id);
       const s3Key = await putRawReport({ tenantId: parsed.tenantId, reportType: parsed.reportType, reportId: report.reportId, content: report.content });
-      const rowsImported = await saveStructuredRows(parsed.tenantId, parsed.reportType, report.content);
+      const rowsImported = await saveStructuredRows(parsed.tenantId, parsed.reportType, report.content, range);
       await pool.query('update sync_jobs set status=$1, completed_at=now(), s3_key=$2 where id=$3', ['completed', s3Key, sync.rows[0].id]);
       return { rowsImported, s3Key };
     } catch (error) {
