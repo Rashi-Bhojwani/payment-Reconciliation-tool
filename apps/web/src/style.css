@@ -271,6 +271,12 @@ select, input { font-family: inherit; }
   padding: 16px 32px;
   border-bottom: 1px solid var(--border);
   background: var(--surface);
+  /* FIX: give the topbar its own explicit stacking priority so its
+     dropdown (the date-range calendar) always paints above later page
+     content, even though .card elements below it also create their own
+     stacking contexts via backdrop-filter. */
+  position: relative;
+  z-index: 60;
 }
 .topbar .search { flex: 1; color: var(--muted); font-size: 13.5px; }
 .topbar select { border: 1px solid var(--border-cool); border-radius: var(--radius-sm); padding: 7px 10px; font-size: 13px; background: var(--surface); color: var(--text); }
@@ -287,6 +293,25 @@ select, input { font-family: inherit; }
 .section-title h1 { font-size: 25px; }
 .section-title p { color: var(--muted); font-size: 13.5px; margin-top: 4px; max-width: 520px; }
 .section-title .actions { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+
+/* ---------- Hamburger (mobile nav toggle) ---------- */
+.hamburger-btn {
+  display: none;
+  border: 1px solid var(--border-cool);
+  background: var(--surface);
+  border-radius: 10px;
+  width: 38px;
+  height: 38px;
+  align-items: center;
+  justify-content: center;
+  font-size: 18px;
+  color: var(--ink);
+  flex: 0 0 auto;
+}
+.hamburger-btn:hover { border-color: var(--violet); color: var(--violet-deep); }
+.sidebar-overlay {
+  display: none;
+}
 
 /* ---------- Amazon connection chip ---------- */
 .amazon-chip {
@@ -325,7 +350,10 @@ select, input { font-family: inherit; }
   position: absolute;
   top: calc(100% + 8px);
   right: 0;
-  z-index: 120;
+  /* FIX: bumped well above page content (cards etc. can reach into the
+     dozens via their own stacking contexts); paired with .topbar's z-index
+     of 60 this guarantees the calendar is always fully visible. */
+  z-index: 200;
   display: flex;
   background: var(--surface);
   border: 1px solid var(--border);
@@ -352,8 +380,6 @@ select, input { font-family: inherit; }
 .calendar-cell.in-range { background: rgba(232, 162, 61, 0.15); border-radius: 0; }
 .calendar-cell.endpoint { background: var(--marigold); color: #fff; border-radius: 8px; font-weight: 600; }
 .calendar-footer { display: flex; align-items: center; justify-content: space-between; margin-top: 12px; gap: 10px; }
-.date-range-panel-simple .calendar-footer { margin-top: 2px; align-items: center; }
-.date-range-panel-simple .calendar-footer .btn { min-height: 42px; padding-inline: 20px; }
 .calendar-actions { display: flex; gap: 8px; }
 
 /* ---------- Sync ledger (signature element: color-coded report families) ---------- */
@@ -510,8 +536,34 @@ tbody tr:hover td { background: rgba(232, 162, 61, 0.045); }
   .login-shell { grid-template-columns: 1fr; }
   .login-card { margin: 0; border-radius: 0; }
   .app-shell { grid-template-columns: 1fr; }
-  .sidebar { flex-direction: row; overflow-x: auto; }
-  .sidebar nav { flex-direction: row; }
+
+  /* FIX: sidebar becomes a true off-canvas drawer on mobile, toggled by the
+     hamburger button, instead of a horizontally-scrolling strip. */
+  .hamburger-btn { display: inline-flex; }
+  .sidebar {
+    position: fixed;
+    top: 0;
+    left: 0;
+    bottom: 0;
+    width: 268px;
+    max-width: 82vw;
+    z-index: 250;
+    flex-direction: column;
+    overflow-x: hidden;
+    transform: translateX(-100%);
+    transition: transform 0.25s ease;
+    box-shadow: var(--shadow-lift);
+  }
+  .sidebar.open { transform: translateX(0); }
+  .sidebar nav { flex-direction: column; }
+  .sidebar-overlay {
+    display: block;
+    position: fixed;
+    inset: 0;
+    background: rgba(5, 8, 22, 0.45);
+    z-index: 220;
+  }
+
   .dashboard-grid, .dashboard-grid.two, .metrics-strip, .stat-grid { grid-template-columns: 1fr; }
   .ledger-row { grid-template-columns: 24px 40px 1fr; grid-template-areas: "idx code meta" ". . pill" ". . btn"; }
 }
@@ -775,7 +827,15 @@ td { padding: 13px 14px; color:#344054; }
 .explain-card, .report-tile { border-color: var(--border); }
 .explain-card:hover, .report-tile:hover, .drill-metric:hover { border-color:#bfdbfe; box-shadow: var(--shadow-lift); }
 .date-range-trigger:hover, .btn-secondary:hover:not(:disabled), .btn-ghost:hover:not(:disabled) { border-color:#93c5fd; color:#0f4edb; }
-@media (max-width: 980px) { .app-shell { grid-template-columns: 1fr; } .topbar { margin: 12px; flex-wrap: wrap; } .section-title h1 { font-size: 28px; } }
+@media (max-width: 980px) {
+  .app-shell { grid-template-columns: 1fr; }
+  .topbar { margin: 12px; flex-wrap: wrap; }
+  .section-title h1 { font-size: 28px; }
+  /* keep the refreshed topbar/card visuals but make sure this later,
+     more specific block doesn't re-flatten the sidebar drawer/hamburger
+     rules defined above */
+  .hamburger-btn { display: inline-flex; }
+}
 
 /* ---------- Follow-up polish: consistent card scale, calendar inputs, raw API data ---------- */
 .metrics-strip .mini-metric,
@@ -802,14 +862,12 @@ td { padding: 13px 14px; color:#344054; }
 }
 .mini-metric::before { width: 42px; height: 42px; border-radius: 13px; }
 .date-range-panel-simple {
-  width: min(340px, calc(100vw - 32px));
-  padding: 14px;
+  width: 420px;
+  padding: 18px;
   flex-direction: column;
-  gap: 12px;
-  border-radius: 18px;
+  gap: 14px;
 }
-.date-field-group { display: flex; flex-direction: column; gap: 6px; }
-.date-range-panel-simple .input { height: 44px; padding: 0 12px; font-size: 14px; }
+.date-field-group { display: flex; flex-direction: column; gap: 7px; }
 .date-field-group label {
   color: var(--ink);
   font-size: 12px;
@@ -865,175 +923,3 @@ td { padding: 13px 14px; color:#344054; }
 .tree-row span { width: 28px; height: 28px; display: inline-flex; align-items: center; justify-content: center; border-radius: 999px; background: #eef2ff; color: var(--violet); font-weight: 800; }
 .tree-row small { color: var(--muted); }
 @media (max-width: 780px) { .tree-total, .tree-row { grid-template-columns: 28px 1fr; } .tree-total { grid-template-columns: 1fr; } .tree-row strong, .tree-row small { grid-column: 2; text-align: left; } }
-
-/* ---------- Responsive calendar and mobile shell fixes ---------- */
-.topbar { position: relative; z-index: 80; }
-.date-range-panel {
-  position: fixed;
-  top: 96px;
-  right: 56px;
-  z-index: 1000;
-  width: min(560px, calc(100vw - 28px));
-  max-height: calc(100vh - 116px);
-  overflow: auto;
-}
-.date-range-calendar { width: 100%; }
-.date-field-row {
-  display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
-  gap: 8px;
-  margin-bottom: 12px;
-}
-.date-field-row div {
-  border: 1px solid var(--border-cool);
-  border-radius: 12px;
-  background: #f8fafc;
-  padding: 9px 10px;
-}
-.date-field-row span { display: block; color: var(--muted); font-size: 10px; font-weight: 800; text-transform: uppercase; letter-spacing: .08em; }
-.date-field-row b { display: block; margin-top: 2px; color: var(--ink); font-size: 13px; font-family: 'IBM Plex Mono', monospace; }
-.calendar-cell { min-height: 36px; }
-.calendar-cell.endpoint { background: linear-gradient(135deg, #2563eb, #7c3aed); }
-.calendar-footer .muted { max-width: 190px; }
-
-@media (max-width: 980px) {
-  .app-shell { display: flex; flex-direction: column; }
-  .sidebar {
-    position: sticky;
-    top: 0;
-    z-index: 90;
-    flex-direction: row;
-    align-items: center;
-    gap: 14px;
-    padding: 12px;
-    overflow-x: auto;
-    border-right: 0;
-    border-bottom: 1px solid var(--border);
-  }
-  .sidebar .logo { flex: 0 0 auto; padding-right: 10px; }
-  .sidebar nav { flex-direction: row; gap: 8px; min-width: max-content; }
-  .sidebar nav a { white-space: nowrap; padding: 10px 12px; }
-  .topbar { margin: 12px; display: grid; grid-template-columns: 1fr auto; gap: 10px; }
-  .topbar .search { grid-column: 1 / -1; order: -1; min-width: 0; }
-  .topbar select, .date-range-picker, .date-range-trigger { width: 100%; }
-  .topbar .avatar, .topbar .btn-dark { justify-self: end; }
-  .page-stack { padding: 18px 12px 40px; gap: 16px; }
-  .section-title { gap: 12px; }
-  .section-title .actions, .amazon-chip { width: 100%; }
-  .amazon-chip { justify-content: space-between; border-radius: 16px; }
-  .metrics-strip, .profit-kpi-grid, .dashboard-grid, .dashboard-grid.two, .explain-grid, .stat-grid { grid-template-columns: 1fr !important; gap: 12px; }
-  .mini-metric, .metrics-strip .mini-metric, .profit-kpi-grid .stat-card, .explain-card { min-height: auto; padding: 18px; }
-  .date-range-panel {
-    top: 92px;
-    left: 12px;
-    right: 12px;
-    width: auto;
-    max-height: calc(100vh - 104px);
-    flex-direction: column;
-  }
-  .date-range-presets { flex-direction: row; overflow-x: auto; border-right: none; border-bottom: 1px solid var(--border); min-width: 0; }
-}
-
-@media (max-width: 560px) {
-  .sidebar .logo small, .search span:last-child { display: none; }
-  .topbar { grid-template-columns: 1fr 1fr; }
-  .topbar .avatar { width: 38px; height: 38px; }
-  .date-range-panel { top: 148px; }
-  .date-field-row { grid-template-columns: 1fr; }
-  .calendar-cell { min-height: 34px; font-size: 12px; }
-  .table-wrap { overflow-x: auto; }
-  .raw-source-tabs { grid-template-columns: 1fr; }
-}
-
-/* ---------- Mobile drawer navigation and calendar placement ---------- */
-.hamburger-button,
-.sidebar-backdrop { display: none; }
-.hamburger-button {
-  width: 42px;
-  height: 42px;
-  border: 1px solid var(--border-cool);
-  border-radius: 12px;
-  background: var(--surface);
-  align-items: center;
-  justify-content: center;
-  flex-direction: column;
-  gap: 5px;
-  padding: 0;
-}
-.hamburger-button span {
-  width: 18px;
-  height: 2px;
-  border-radius: 999px;
-  background: var(--ink);
-}
-.date-range-picker { z-index: 120; }
-.date-range-panel {
-  position: absolute;
-  top: calc(100% + 10px);
-  right: 0;
-  width: min(560px, calc(100vw - 48px));
-  max-height: min(620px, calc(100vh - 120px));
-}
-.date-range-trigger { min-height: 44px; }
-.date-range-presets button:focus-visible,
-.calendar-nav button:focus-visible,
-.calendar-cell:focus-visible { outline: 2px solid var(--violet); outline-offset: 2px; }
-.calendar-cell.in-range:not(.endpoint) { color: var(--ink); font-weight: 700; }
-.calendar-cell.endpoint { box-shadow: 0 8px 18px rgba(37, 99, 235, 0.24); }
-
-@media (max-width: 980px) {
-  .app-shell { display: block; }
-  .hamburger-button { display: inline-flex; }
-  .sidebar-backdrop {
-    position: fixed;
-    inset: 0;
-    z-index: 100;
-    border: 0;
-    background: rgba(10, 13, 36, 0.42);
-    padding: 0;
-  }
-  .sidebar {
-    position: fixed;
-    inset: 0 auto 0 0;
-    z-index: 110;
-    width: min(82vw, 310px);
-    transform: translateX(-105%);
-    transition: transform 0.2s ease;
-    flex-direction: column;
-    align-items: stretch;
-    gap: 24px;
-    padding: 22px 16px;
-    overflow-y: auto;
-    overflow-x: hidden;
-    border-bottom: 0;
-    box-shadow: 24px 0 60px rgba(10, 13, 36, 0.28);
-  }
-  .sidebar nav { flex-direction: column; min-width: 0; gap: 3px; }
-  .sidebar nav a { white-space: normal; }
-  .sidebar .logo { padding-right: 0; }
-  .app-shell.sidebar-open .sidebar { transform: translateX(0); }
-  .app-shell.sidebar-open .sidebar-backdrop { display: block; }
-  .topbar { grid-template-columns: auto minmax(0, 1fr) auto; align-items: center; }
-  .topbar .search { grid-column: auto; order: 0; }
-  .topbar select { grid-column: 1 / 2; }
-  .date-range-picker { grid-column: 2 / -1; }
-  .date-range-panel {
-    position: fixed;
-    top: 88px;
-    left: 12px;
-    right: 12px;
-    width: auto;
-    max-height: calc(100vh - 104px);
-  }
-}
-
-@media (max-width: 560px) {
-  .topbar { grid-template-columns: auto 1fr auto; padding: 12px; margin: 0; border-radius: 0; }
-  .topbar select { grid-column: 1 / -1; }
-  .date-range-picker { grid-column: 1 / -1; }
-  .topbar .avatar, .topbar .btn-dark { justify-self: auto; }
-  .topbar .btn-dark { padding-inline: 13px; }
-  .date-range-panel { top: 154px; }
-  .date-range-presets { padding: 8px; }
-  .date-range-calendar { padding: 12px; }
-}
