@@ -456,29 +456,30 @@ function SellerDashboard() {
     {view === 'reports' && <ReportsExplorer tenantId={tenantId} data={data} />}
     {view === 'rawData' && <RawApiDataExplorer data={data} />}
     {view === 'report-detail' && <ReportDetail data={data} reportType={params.get('reportType')} />}
-    {view === 'metric-detail' && <MetricDetail data={data} metric={params.get('metric')} />}
+    {view === 'metric-detail' && <MetricDetail data={data} metric={params.get('metric')} tenantId={tenantId} />}
   </div>;
 }
 
-function viewTitle(view) { return ({ dashboard: 'Dashboard', sales: 'Sales Analytics', businessPerformance: 'Business Performance', productPerformance: 'Product Performance', inventory: 'Inventory', payouts: 'Payout Reconciliation', brand: 'Brand Analytics', orders: 'Orders', returns: 'Returns', reimbursements: 'Reimbursements', tax: 'GST & Tax', pricing: 'Pricing & Buy Box', listings: 'Listings', reports: 'Reports', rawData: 'Raw API Data', 'report-detail': 'Report Detail' })[view] ?? 'Dashboard'; }
+function viewTitle(view) { return ({ dashboard: 'Dashboard', sales: 'Sales Analytics', businessPerformance: 'Business Performance', productPerformance: 'Product Performance', inventory: 'Inventory', payouts: 'Payout Reconciliation', brand: 'Brand Analytics', orders: 'Orders', returns: 'Returns', reimbursements: 'Reimbursements', tax: 'GST & Tax', pricing: 'Pricing & Buy Box', listings: 'Listings', reports: 'Reports', rawData: 'Raw API Data', 'report-detail': 'Report Detail', 'metric-detail': 'Calculation Detail' })[view] ?? 'Dashboard'; }
 function viewDescription(view) { return ({ dashboard: 'Amazon-only reconciliation KPIs with explainable drill-downs.', sales: 'Revenue, order value, units and product sales trends from Amazon reports.', businessPerformance: 'Excel-style quarterly business performance report with analysed KPIs and matching graphs.', productPerformance: 'Excel-style product performance analysis with top products and written insights.', inventory: 'FBA inventory snapshots imported from SP-API inventory reports.', payouts: 'Settlement rows and payout reconciliation from Amazon settlement reports.', brand: 'ASIN-level product performance from synced Amazon order items, with Sales & Traffic metrics when available.', orders: 'Order and item-level details imported from Amazon SP-API.', returns: 'Customer return reasons, status and disposition.', reimbursements: 'Amazon reimbursement credits for lost, damaged or adjusted inventory.', tax: 'GST B2B and B2C invoice rows in readable form.', pricing: 'ASP and Buy Box signals that influence sales.', listings: 'SKU availability and listing stock visibility.', reports: 'Open each fetched report and view human-readable data.', rawData: 'Inspect raw fields returned from each imported API/report source before finalizing calculations.', 'report-detail': 'Human-readable rows from the selected SP-API report.' })[view] ?? 'Live seller KPIs populated from synced SP-API orders and reports.'; }
 function DashboardOverview({ data, channelData, tenantId }) {
-  const summary = useMemo(() => buildDashboardSummary(data), [data]);
+  const { range } = useContext(DateRangeContext);
+  const summary = useMemo(() => buildDashboardSummary(data, range), [data, range]);
   return <>
     <div className="metrics-strip">
       <DrillMetric to={`/seller?tenantId=${tenantId}&view=metric-detail&metric=netSales`} title="Net Sales" value={formatCurrency(summary.netSales)} hint="Click to see order-value formula" />
       <DrillMetric to={`/seller?tenantId=${tenantId}&view=metric-detail&metric=netQty`} title="Net Qty" value={formatNumber(summary.netQty)} hint="Click to see units source" />
-      <DrillMetric to={`/seller?tenantId=${tenantId}&view=orders`} title="Orders Synced" value={formatNumber(summary.ordersCount)} hint="Click to audit order rows" />
-      <DrillMetric to={`/seller?tenantId=${tenantId}&view=returns`} title="Returns" value={formatNumber(summary.returnQty)} hint="Open return lines" />
+      <DrillMetric to={`/seller?tenantId=${tenantId}&view=metric-detail&metric=orders`} title="Orders Synced" value={formatNumber(summary.ordersCount)} hint="Click to audit order rows" />
+      <DrillMetric to={`/seller?tenantId=${tenantId}&view=metric-detail&metric=returns`} title="Returns" value={formatNumber(summary.returnQty)} hint="Open return lines" />
     </div>
 
     <Card className="profit-control-card">
       <PanelHeader title="Profit Analysis" subtitle="Clean overview" />
       <div className="profit-kpi-grid">
-        <StatCard title="Settled Amount" value={formatCurrency(summary.settledAmount)} hint="From settlements / finance" />
-        <StatCard title="Deductions" value={formatCurrency(summary.deductions)} hint="Fees, refunds, charges" />
-        <StatCard title="Reimbursements" value={formatCurrency(summary.reimbursements)} hint="Credits imported" />
-        <StatCard title="DRR" value={formatCurrency(summary.drr)} hint="Daily run rate" />
+        <DrillMetric to={`/seller?tenantId=${tenantId}&view=metric-detail&metric=settled`} title="Settled Amount" value={formatCurrency(summary.settledAmount)} hint="From settlements / finance" />
+        <DrillMetric to={`/seller?tenantId=${tenantId}&view=metric-detail&metric=deductions`} title="Deductions" value={formatCurrency(summary.deductions)} hint="Fees, refunds, charges" />
+        <DrillMetric to={`/seller?tenantId=${tenantId}&view=metric-detail&metric=reimbursements`} title="Reimbursements" value={formatCurrency(summary.reimbursements)} hint="Credits imported" />
+        <DrillMetric to={`/seller?tenantId=${tenantId}&view=metric-detail&metric=drr`} title="DRR" value={formatCurrency(summary.drr)} hint="Daily run rate" />
       </div>
     </Card>
 
@@ -504,7 +505,7 @@ function ExplanationGrid({ summary, tenantId }) {
     ['Return rate', returnRate, 'Returns compared with total sold quantity for quick customer-experience review.', 'returns'],
     ['GST invoice value', formatCurrency(summary.gstValue), 'Total taxable value imported from GST B2B/B2C invoice rows.', 'tax']
   ];
-  return <div className="explain-grid">{cards.map(([title, value, copy, target]) => <NavLink key={title} to={`/seller?tenantId=${tenantId}&view=${target === 'deductions' || target === 'settled' ? `metric-detail&metric=${target}` : target}`} className="explain-card"><b>{title}</b><strong>{value}</strong><p>{copy}</p><span>Open detail →</span></NavLink>)}</div>;
+  return <div className="explain-grid">{cards.map(([title, value, copy, target]) => <NavLink key={title} to={`/seller?tenantId=${tenantId}&view=metric-detail&metric=${target}`} className="explain-card"><b>{title}</b><strong>{value}</strong><p>{copy}</p><span>Open calculation →</span></NavLink>)}</div>;
 }
 function InsightCards({ title, cards }) { return <Card><PanelHeader title={title} /><div className="explain-grid compact">{cards.map(([label, value]) => <div className="explain-card" key={label}><b>{label}</b><strong>{value}</strong></div>)}</div></Card>; }
 
@@ -567,40 +568,58 @@ function ReportDetail({ data, reportType }) {
     <TableCard title={`${report.label} rows`} rows={rows} columns={detail.columns} pageSize={6} />
   </>;
 }
-function buildMetricDetails(data, metric) {
+function moneyRows(rows, mapper) { return rows.map((row, index) => ({ line: index + 1, ...mapper(row) })); }
+function sumRows(rows, key) { return rows.reduce((sum, row) => sum + Number(row[key] ?? 0), 0); }
+function buildMetricDetails(data, metric, range) {
   const summary = buildDashboardSummary(data);
   const products = data?.products ?? [];
   const orderItems = data?.orderItems ?? [];
+  const orders = data?.orderRows ?? [];
+  const payments = data?.payments ?? [];
+  const settlementLines = data?.settlementLines ?? [];
+  const financeRows = data?.financeTransactions ?? [];
+  const returns = data?.returns ?? [];
+  const reimbursements = data?.reimbursements ?? [];
+  const invoices = data?.invoices ?? [];
+  const trend = data?.trend ?? [];
+  const days = Math.max(1, Math.round((startOfDay(range.end) - startOfDay(range.start)) / 864e5) + 1);
   const productRows = products.length
-    ? products.map(row => ({ asin: row.asin, sku: row.sku ?? '', units: formatNumber(row.units), sales: Number(row.sales ?? 0), share: summary.netSales ? `${Math.round((Number(row.sales ?? 0) / summary.netSales) * 100)}%` : '0%' }))
-    : orderItems.map(row => ({ asin: row.asin, sku: row.sku ?? '', units: formatNumber(row.quantity_ordered), sales: Number(row.item_price ?? 0), share: summary.netSales ? `${Math.round((Number(row.item_price ?? 0) / summary.netSales) * 100)}%` : '0%' }));
-  const netSalesFormula = products.length
-    ? `Net Sales = ${productRows.map(row => row.sales).join(' + ')} = ${formatCurrency(summary.netSales)}`
-    : `Net Sales = sum of item_price across ${formatNumber(orderItems.length)} order item rows = ${formatCurrency(summary.netSales)}`;
+    ? moneyRows(products, row => ({ source: 'Sales & Traffic', asin: row.asin, sku: row.sku ?? '', units: Number(row.units ?? 0), gross_sales: Number(row.sales ?? 0), tax: 0, discounts: 0, net_sales: Number(row.sales ?? 0), share: summary.netSales ? `${Math.round((Number(row.sales ?? 0) / summary.netSales) * 100)}%` : '0%' }))
+    : moneyRows(orderItems, row => ({ source: 'Order Items', asin: row.asin, sku: row.sku ?? '', units: Number(row.quantity_ordered ?? 0), gross_sales: Number(row.item_price ?? 0), tax: Number(row.item_tax ?? 0), discounts: Number(row.promotion_discount ?? 0), net_sales: Number(row.item_price ?? 0), share: summary.netSales ? `${Math.round((Number(row.item_price ?? 0) / summary.netSales) * 100)}%` : '0%' }));
+  const orderRows = orders.length ? moneyRows(orders, row => ({ amazon_order_id: row.amazon_order_id, order_date: row.order_date, status: row.status, total_amount: Number(row.total_amount ?? 0), item_lines: row.item_lines ?? 0, item_value: Number(row.item_value ?? 0), item_tax: Number(row.item_tax ?? 0), discounts: Number(row.promotion_discount ?? 0) })) : moneyRows(orderItems, row => ({ amazon_order_id: row.amazon_order_id, order_date: '', status: '', total_amount: Number(row.item_price ?? 0), item_lines: 1, item_value: Number(row.item_price ?? 0), item_tax: Number(row.item_tax ?? 0), discounts: Number(row.promotion_discount ?? 0) }));
+  const deductionRows = settlementLines.length
+    ? moneyRows(settlementLines.filter(row => Number(row.amount ?? 0) < 0), row => ({ date: row.posted_date, source: 'Settlement', id: row.settlement_id ?? row.order_id, type: row.amount_type, description: row.amount_description, amount: Number(row.amount ?? 0), absolute_amount: Math.abs(Number(row.amount ?? 0)) }))
+    : moneyRows(financeRows.filter(row => Number(row.total_amount ?? 0) < 0), row => ({ date: row.posted_date, source: 'Finance', id: row.transaction_id ?? row.related_order_id, type: row.transaction_type, description: row.related_order_id, amount: Number(row.total_amount ?? 0), absolute_amount: Math.abs(Number(row.total_amount ?? 0)) }));
   const details = {
-    netSales: { title: 'Net Sales', value: formatCurrency(summary.netSales), explanation: 'Net sales is calculated by adding the Amazon sales value for every product/ASIN imported from the Sales & Traffic report. If product rows are not available, it falls back to order item value.', formula: netSalesFormula, rows: productRows, columns: ['asin', 'sku', 'units', 'sales', 'share'] },
-    netQty: { title: 'Net Qty', value: formatNumber(summary.netQty), explanation: 'Net quantity is the total units sold across all products. It uses product units first, then falls back to ordered item quantities.', formula: `Net Qty = sum of units across ${formatNumber(productRows.length || orderItems.length)} rows = ${formatNumber(summary.netQty)}`, rows: productRows, columns: ['asin', 'sku', 'units', 'sales', 'share'] },
-    settled: { title: 'Settled Amount', value: formatCurrency(summary.settledAmount), explanation: 'Settled amount is calculated by adding net_amount from each Amazon settlement/payout row.', formula: `Settled Amount = sum of net_amount across ${formatNumber((data?.payments ?? []).length)} payout rows = ${formatCurrency(summary.settledAmount)}`, rows: data?.payments ?? [], columns: ['posted_date', 'settlement_id', 'net_amount', 'lines'] },
-    deductions: { title: 'Deductions', value: formatCurrency(summary.deductions), explanation: 'Deductions are Amazon fees, refunds and charges imported from finance and settlement data.', formula: `Deductions = absolute value of imported deduction KPI = ${formatCurrency(summary.deductions)}`, rows: data?.payments ?? [], columns: ['posted_date', 'settlement_id', 'net_amount', 'lines'] },
-    drr: { title: 'Daily Run Rate', value: formatCurrency(summary.drr), explanation: 'Daily run rate makes sales easier to understand by dividing net sales by 30 days.', formula: `DRR = ${formatCurrency(summary.netSales)} ÷ 30 = ${formatCurrency(summary.drr)}`, rows: data?.trend ?? [], columns: ['date', 'sales'] }
+    netSales: { title: 'Net Sales', value: formatCurrency(summary.netSales), explanation: 'Net sales is the auditable Amazon sales value for the selected date range. It prefers Sales & Traffic ordered_product_sales by ASIN, and falls back to order-item item_price when that report is not synced.', formula: `Net Sales = Σ net_sales from ${productRows.length ? productRows[0].source : 'Sales & Traffic / Order Items'} rows = ${formatCurrency(sumRows(productRows, 'net_sales') || summary.netSales)}`, rows: productRows, columns: ['line', 'source', 'asin', 'sku', 'units', 'gross_sales', 'tax', 'discounts', 'net_sales', 'share'] },
+    netQty: { title: 'Net Qty', value: formatNumber(summary.netQty), explanation: 'Net quantity is the sum of sold units for the same rows used by Net Sales.', formula: `Net Qty = Σ units across ${formatNumber(productRows.length)} calculation rows = ${formatNumber(summary.netQty)}`, rows: productRows, columns: ['line', 'source', 'asin', 'sku', 'units', 'net_sales', 'share'] },
+    orders: { title: 'Orders Synced', value: formatNumber(summary.ordersCount), explanation: 'Orders synced counts Amazon order headers in the date range. Item-line totals are shown beside each order so the count can be audited against money rows.', formula: `Orders Synced = count(order headers) = ${formatNumber(summary.ordersCount)}`, rows: orderRows, columns: ['line', 'amazon_order_id', 'order_date', 'status', 'total_amount', 'item_lines', 'item_value', 'item_tax', 'discounts'] },
+    returns: { title: 'Returns', value: formatNumber(summary.returnQty), explanation: 'Returns count customer-return report lines. The return rate uses Returns ÷ Net Qty.', formula: `Return Rate = ${formatNumber(summary.returnQty)} ÷ ${formatNumber(summary.netQty)} = ${summary.netQty ? `${Math.round((summary.returnQty / summary.netQty) * 100)}%` : '0%'}`, rows: moneyRows(returns, row => row), columns: ['line', 'order_id', 'return_reason', 'disposition', 'status', 'return_date'] },
+    settled: { title: 'Settled Amount', value: formatCurrency(summary.settledAmount), explanation: 'Settled amount adds payout batch net amounts. When settlement rows are unavailable, finance transaction groups are used as the fallback.', formula: `Settled Amount = Σ net_amount across ${formatNumber(payments.length)} payout groups = ${formatCurrency(sumRows(payments, 'net_amount') || summary.settledAmount)}`, rows: payments, columns: ['posted_date', 'settlement_id', 'net_amount', 'lines'] },
+    deductions: { title: 'Deductions', value: formatCurrency(summary.deductions), explanation: 'Deductions are negative Amazon settlement/finance lines such as fees, refunds, commission, shipping clawbacks and other charges.', formula: `Deductions = Σ absolute value of negative money lines = ${formatCurrency(sumRows(deductionRows, 'absolute_amount') || summary.deductions)}`, rows: deductionRows, columns: ['line', 'date', 'source', 'id', 'type', 'description', 'amount', 'absolute_amount'] },
+    reimbursements: { title: 'Reimbursements', value: formatCurrency(summary.reimbursements), explanation: 'Reimbursements are FBA credits imported from reimbursement rows.', formula: `Reimbursements = Σ amount across ${formatNumber(reimbursements.length)} rows = ${formatCurrency(summary.reimbursements)}`, rows: moneyRows(reimbursements, row => row), columns: ['line', 'sku', 'amount', 'reason', 'reimbursement_date'] },
+    drr: { title: 'Daily Run Rate', value: formatCurrency(summary.drr), explanation: 'Daily run rate divides net sales by the number of calendar days selected in the date picker.', formula: `DRR = ${formatCurrency(summary.netSales)} ÷ ${formatNumber(days)} days = ${formatCurrency(summary.netSales / days)}`, rows: trend.map(row => ({ ...row, drr_component: Number(row.sales ?? 0) / days })), columns: ['date', 'sales', 'units', 'sessions', 'drr_component'] },
+    tax: { title: 'GST Invoice Value', value: formatCurrency(summary.gstValue), explanation: 'GST invoice value is total taxable value from B2B and B2C GST invoice rows, with CGST/SGST/IGST shown separately for audit.', formula: `GST Invoice Value = Σ taxable_value across ${formatNumber(invoices.length)} invoice rows = ${formatCurrency(summary.gstValue)}`, rows: moneyRows(invoices, row => row), columns: ['line', 'invoice_type', 'order_id', 'taxable_value', 'cgst', 'sgst', 'igst', 'invoice_date'] }
   };
   return details[metric] ?? null;
 }
-function MetricDetail({ data, metric }) {
-  const details = buildMetricDetails(data, metric);
+function MetricDetail({ data, metric, tenantId }) {
+  const { range } = useContext(DateRangeContext);
+  const navigate = useNavigate();
+  const details = buildMetricDetails(data, metric, range);
   if (!details) return <Empty text="Select a metric from the dashboard to see its calculation." />;
   return <>
     <Card className="detail-hero">
       <PanelHeader title={details.title} subtitle={details.value} />
       <p>{details.explanation}</p>
       <div className="calculation-box"><b>Calculation</b><code>{details.formula}</code></div>
-      <Button variant="accent" onClick={() => downloadCsv(`${details.title.toLowerCase().replaceAll(' ', '-')}-calculation.csv`, details.rows, details.columns)} disabled={!details.rows.length}>Download calculation CSV</Button>
+      <div className="detail-actions"><Button variant="secondary" onClick={() => navigate(`/seller?tenantId=${tenantId}&view=dashboard`)}>← Back</Button><Button variant="accent" onClick={() => downloadCsv(`${details.title.toLowerCase().replaceAll(' ', '-')}-calculation.csv`, details.rows, details.columns)} disabled={!details.rows.length}>Download calculation CSV</Button><NavLink className="btn btn-secondary" to={`/seller?tenantId=${tenantId}&view=rawData`}>Review raw API data</NavLink></div>
     </Card>
     <TableCard title="Rows used for this calculation" rows={details.rows} columns={details.columns} pageSize={6} />
   </>;
 }
 
-function buildDashboardSummary(data) {
+function buildDashboardSummary(data, range = defaultDateRange()) {
   const products = data?.products ?? [];
   const returns = data?.returns ?? [];
   const payments = data?.payments ?? [];
@@ -616,7 +635,8 @@ function buildDashboardSummary(data) {
   const reimbursementAmount = reimbursements.reduce((sum, row) => sum + Number(row.amount ?? 0), 0);
   const estimatedProfit = settledAmount || Math.max(0, netSales - deductions + reimbursementAmount);
   const profitRate = netSales ? Math.round((estimatedProfit / netSales) * 100) : 0;
-  const drr = netSales / Math.max(30, 1);
+  const selectedDays = Math.max(1, Math.round((startOfDay(range.end) - startOfDay(range.start)) / 864e5) + 1);
+  const drr = netSales / selectedDays;
   const netAsp = netQty ? netSales / netQty : 0;
   const baseRow = {
     view: 'Amazon-India',
