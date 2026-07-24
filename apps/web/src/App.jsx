@@ -378,40 +378,43 @@ function SellerDashboard() {
   const { range } = useContext(DateRangeContext);
   const [data, setData] = useState(null);
   const [error, setError] = useState('');
-  const [autoSyncing, setAutoSyncing] = useState(false);
-  const lastRangeSyncRef = useRef('');
-  async function load() { setError(''); try { setData(await api(`/api/tenants/${tenantId}/dashboard?${rangeQuery(range)}`)); } catch (e) { setError(e.message); } }
-  useEffect(() => { if (tenantId) void load(); }, [tenantId, range.start, range.end]);
-
-  // When the calendar range is applied, sync only the report(s) needed by
-  // the current page, and always send the selected start/end limit. This keeps
-  // the account safe by avoiding an all-report fan-out while still refreshing
-  // the data the user is looking at.
-  useEffect(() => {
-    if (!data?.seller?.connected || !tenantId) return;
-    const selectedReports = view === 'dashboard' ? ['DIRECT_SP_API_SYNC'] : (reportTypes?.length ? reportTypes : ['DIRECT_SP_API_SYNC']);
-    const syncKey = `${tenantId}:${view}:${formatDateParam(range.start)}:${formatDateParam(addDays(range.end, 1))}`;
-    if (lastRangeSyncRef.current === syncKey) return;
-    if (freshAmazonAuth) {
-      lastRangeSyncRef.current = syncKey;
-      return;
+  const rangeSyncRef = useRef({ key: '', requestId: 0 });
+  async function load(targetRange = range, requestId = rangeSyncRef.current.requestId) {
+    setError('');
+    try {
+      const dashboard = await api(`/api/tenants/${tenantId}/dashboard?${rangeQuery(targetRange)}`);
+      if (requestId === rangeSyncRef.current.requestId) setData(dashboard);
+    } catch (e) {
+      if (requestId === rangeSyncRef.current.requestId) setError(e.message);
     }
-    lastRangeSyncRef.current = syncKey;
+  }
+  useEffect(() => {
+    if (!tenantId) return;
+    rangeSyncRef.current.requestId += 1;
+    void load(range, rangeSyncRef.current.requestId);
+  }, [tenantId, range.start, range.end]);
+
+  // On a selected dashboard range, pull the same Amazon Sales & Traffic source
+  // that Seller Central shows for ordered product sales/units. Capture the
+  // exact range and ignore stale completions, so a delayed sync cannot replace
+  // the user's current selection with another range.
+  useEffect(() => {
+    if (!data?.seller?.connected || !tenantId || freshAmazonAuth) return;
+    const selectedReportTypes = view === 'dashboard' ? ['GET_SALES_AND_TRAFFIC_REPORT'] : (VIEW_REPORT_TYPES[view] ?? []);
+    if (!selectedReportTypes.length) return;
+    const selectedRange = { label: range.label, start: range.start, end: range.end };
+    const syncKey = `${tenantId}:${view}:${selectedReportTypes.join(',')}:${formatDateParam(selectedRange.start)}:${formatDateParam(addDays(selectedRange.end, 1))}`;
+    if (rangeSyncRef.current.key === syncKey) return;
+    rangeSyncRef.current.key = syncKey;
+    const requestId = rangeSyncRef.current.requestId;
     (async () => {
-      setAutoSyncing(true);
       try {
-        for (const reportType of selectedReports) {
-          if (reportType === 'DIRECT_SP_API_SYNC') {
-            await api(`/api/tenants/${tenantId}/sync`, { method: 'POST', body: JSON.stringify({ reportTypes: [], range: { start: formatDateParam(range.start), end: formatDateParam(addDays(range.end, 1)) } }) });
-          } else {
-            await api(`/api/tenants/${tenantId}/sync/${reportType}`, { method: 'POST', body: JSON.stringify({ range: { start: formatDateParam(range.start), end: formatDateParam(addDays(range.end, 1)) } }) });
-          }
+        for (const reportType of selectedReportTypes) {
+          await api(`/api/tenants/${tenantId}/sync/${reportType}`, { method: 'POST', body: JSON.stringify({ range: { start: formatDateParam(selectedRange.start), end: formatDateParam(addDays(selectedRange.end, 1)) } }) });
         }
-        await load();
+        await load(selectedRange, requestId);
       } catch (e) {
-        setError(e.message);
-      } finally {
-        setAutoSyncing(false);
+        if (requestId === rangeSyncRef.current.requestId) setError(e.message);
       }
     })();
   }, [data?.seller?.connected, tenantId, view, freshAmazonAuth, range.start, range.end]);
@@ -436,7 +439,6 @@ function SellerDashboard() {
     {freshAmazonAuth && connected && <p className="alert success">Amazon account connected. Select a date range or use Sync on this page to pull limited data.</p>}
     {amazonError && <p className="alert warning">Amazon connection issue: {amazonError}</p>}
     {error && <p className="alert warning">{error}</p>}
-    {autoSyncing && <p className="alert success">Syncing this page only for {range.label}…</p>}
     {view === 'dashboard' && !connected && data && <p className="alert warning">Connect your Amazon account to start pulling data — nothing syncs until then.</p>}
     {view !== 'dashboard' && !detailView && <SyncLedger tenantId={tenantId} jobs={data?.jobs ?? []} onSynced={load} reportTypes={reportTypes} title={ledgerCopy?.title} subtitle={ledgerCopy?.subtitle} disabled={!connected} />}
 
@@ -576,7 +578,7 @@ function componentAmount(data, categories) {
 function hasFinancialComponents(data) { return (data?.financialComponents ?? []).length > 0; }
 function amazonBusinessReportRows(data) { return data?.businessReportRows ?? []; }
 function amazonNetSales(data) {
-  const businessSales = amazonBusinessReportRows(data).reduce((sum, row) => sum + Number(row.ordered_product_sales ?? 0) + Number(row.ordered_product_sales_b2b ?? 0), 0);
+  const businessSales = amazonBusinessReportRows(data).reduce((sum, row) => sum + Number(row.ordered_product_sales ?? 0), 0);
   if (businessSales) return businessSales;
   const productSales = (data?.products ?? []).reduce((sum, product) => sum + Number(product.sales ?? 0), 0);
   if (productSales) return productSales;
@@ -610,7 +612,7 @@ function buildMetricDetails(data, metric, range) {
   const businessRows = amazonBusinessReportRows(data);
   const orderedProductSales = sumRows(businessRows, 'ordered_product_sales') || sumRows(products, 'sales') || sumRows(orderItems, 'item_price') || summary.netSales;
   const orderedProductSalesB2b = sumRows(businessRows, 'ordered_product_sales_b2b');
-  const grossItemPrice = componentAmount(data, ['principal']) || orderedProductSales + orderedProductSalesB2b;
+  const grossItemPrice = componentAmount(data, ['principal']) || orderedProductSales;
   const shippingIncome = componentAmount(data, ['shipping', 'gift_wrap']);
   const promotions = componentAmount(data, ['promotion']) || -sumRows(orderItems, 'promotion_discount');
   const refundAmount = componentAmount(data, ['refund']);
@@ -627,11 +629,11 @@ function buildMetricDetails(data, metric, range) {
     ? moneyRows(settlementLines.filter(row => Number(row.amount ?? 0) < 0), row => ({ date: row.posted_date, source: 'Settlement', id: row.settlement_id ?? row.order_id, type: row.amount_type, description: row.amount_description, amount: Number(row.amount ?? 0), absolute_amount: Math.abs(Number(row.amount ?? 0)) }))
     : moneyRows(financeRows.filter(row => Number(row.total_amount ?? 0) < 0), row => ({ date: row.posted_date, source: 'Finance', id: row.transaction_id ?? row.related_order_id, type: row.transaction_type, description: row.related_order_id, amount: Number(row.total_amount ?? 0), absolute_amount: Math.abs(Number(row.total_amount ?? 0)) }));
   const netSalesTree = businessRows.length
-    ? formulaTreeRows([['Ordered Product Sales', orderedProductSales, '+', 'Business Reports'], ['Ordered Product Sales - B2B', orderedProductSalesB2b, '+', 'Business Reports B2B']])
+    ? formulaTreeRows([['Ordered Product Sales', orderedProductSales, '+', 'Business Reports'], ['Ordered Product Sales - B2B', orderedProductSalesB2b, 'included', 'Business Reports B2B subset']])
     : formulaTreeRows([['Gross Item Price', grossItemPrice, '+', 'Principal / item price'], ['Shipping / Gift Wrap Income', shippingIncome, shippingIncome < 0 ? '−' : '+', 'ShippingCharge / GiftWrap'], ['Promotions', promotions, '−', 'Promotion discounts'], ['Returns / Refunds', refundAmount, '−', 'Finance refund components']]);
   const settledTree = formulaTreeRows([['Net Sales', summary.netSales, '+', 'Net sales calculation'], ['Referral Commission', referralCommission, '−', 'Commission components'], ['FBA Fulfillment Fees', fbaFees, '−', 'FBA fee components'], ['Shipping Fees', shippingFees, '−', 'Shipping fee/tax components'], ['Reimbursements', summary.reimbursements, '+', 'Reimbursement credits'], ['Other Adjustments', otherAdjustments, otherAdjustments < 0 ? '−' : '+', 'Other finance/settlement components']]);
   const details = {
-    netSales: { title: 'Net Sales', value: formatCurrency(summary.netSales), explanation: 'Net sales is matched to Amazon Business Reports first: Ordered Product Sales plus Ordered Product Sales - B2B for the selected date range. Finance components are used for payout reconciliation, not to replace the Business Reports sales total.', formula: `Net Sales = Ordered Product Sales ${formatCurrency(orderedProductSales)} + Ordered Product Sales - B2B ${formatCurrency(orderedProductSalesB2b)} = ${formatCurrency(summary.netSales)}`, treeRows: netSalesTree, numericValue: summary.netSales, rows: businessRows.length ? moneyRows(businessRows, row => row) : productRows, columns: businessRows.length ? ['line', 'date', 'ordered_product_sales', 'ordered_product_sales_b2b', 'units_ordered', 'units_ordered_b2b', 'total_order_items', 'total_order_items_b2b', 'average_sales_per_order_item', 'average_selling_price'] : ['line', 'source', 'asin', 'sku', 'units', 'gross_sales', 'tax', 'discounts', 'net_sales', 'share'] },
+    netSales: { title: 'Net Sales', value: formatCurrency(summary.netSales), explanation: 'Net sales is matched to Amazon Business Reports first: Ordered Product Sales for the selected date range; Ordered Product Sales - B2B is shown separately because Amazon includes it in Ordered Product Sales. Finance components are used for payout reconciliation, not to replace the Business Reports sales total.', formula: `Net Sales = Ordered Product Sales ${formatCurrency(orderedProductSales)} (B2B subset ${formatCurrency(orderedProductSalesB2b)} already included) = ${formatCurrency(summary.netSales)}`, treeRows: netSalesTree, numericValue: summary.netSales, rows: businessRows.length ? moneyRows(businessRows, row => row) : productRows, columns: businessRows.length ? ['line', 'date', 'ordered_product_sales', 'ordered_product_sales_b2b', 'units_ordered', 'units_ordered_b2b', 'total_order_items', 'total_order_items_b2b', 'average_sales_per_order_item', 'average_selling_price'] : ['line', 'source', 'asin', 'sku', 'units', 'gross_sales', 'tax', 'discounts', 'net_sales', 'share'] },
     netQty: { title: 'Net Qty', value: formatNumber(summary.netQty), explanation: 'Net quantity is the sum of sold units for the same rows used by Net Sales.', formula: `Net Qty = Σ units across ${formatNumber(productRows.length)} calculation rows = ${formatNumber(summary.netQty)}`, rows: productRows, columns: ['line', 'source', 'asin', 'sku', 'units', 'net_sales', 'share'] },
     orders: { title: 'Orders Synced', value: formatNumber(summary.ordersCount), explanation: 'Orders synced counts Amazon order headers in the date range. Item-line totals are shown beside each order so the count can be audited against money rows.', formula: `Orders Synced = count(order headers) = ${formatNumber(summary.ordersCount)}`, rows: orderRows, columns: ['line', 'amazon_order_id', 'order_date', 'status', 'total_amount', 'item_lines', 'item_value', 'item_tax', 'discounts'] },
     returns: { title: 'Returns', value: formatNumber(summary.returnQty), explanation: 'Returns count customer-return report lines. The return rate uses Returns ÷ Net Qty.', formula: `Return Rate = ${formatNumber(summary.returnQty)} ÷ ${formatNumber(summary.netQty)} = ${summary.netQty ? `${Math.round((summary.returnQty / summary.netQty) * 100)}%` : '0%'}`, rows: moneyRows(returns, row => row), columns: ['line', 'order_id', 'return_reason', 'disposition', 'status', 'return_date'] },
