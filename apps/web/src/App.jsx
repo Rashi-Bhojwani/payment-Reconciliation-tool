@@ -931,27 +931,30 @@ function AdminDashboard() {
   </div>;
 }
 
-function SidebarLink({ to, icon, children }) {
+function SidebarLink({ to, icon, children, onNavigate }) {
   const location = useLocation();
   const target = new URL(to, 'http://local');
   const current = new URL(`${location.pathname}${location.search}`, 'http://local');
   const active = current.pathname === target.pathname && current.searchParams.get('view') === target.searchParams.get('view');
-  return <NavLink className={active ? 'active' : ''} to={to}><span className="nav-icon" aria-hidden="true">{icon}</span><span>{children}</span></NavLink>;
+  return <NavLink className={active ? 'active' : ''} to={to} onClick={onNavigate}><span className="nav-icon" aria-hidden="true">{icon}</span><span>{children}</span></NavLink>;
 }
 
 // Seller-facing shell: sidebar + topbar. Admins never render this component.
 function SellerShell({ session, setSession }) {
   function logout() { localStorage.removeItem('token'); setSession(null); }
   const [range, setRange] = useState(defaultDateRange);
-  return <div className="app-shell">
-    <aside className="sidebar">
+  const [sidebarOpen, setSidebarOpen] = useState(false);
+  return <div className={`app-shell ${sidebarOpen ? 'sidebar-open' : ''}`}>
+    <button type="button" className="sidebar-backdrop" aria-label="Close navigation menu" onClick={() => setSidebarOpen(false)} />
+    <aside className="sidebar" aria-label="Seller navigation">
       <div className="logo"><span>W</span><div><b>WELLSURE</b><small>Seller Intelligence</small></div></div>
       <nav>
-        {NAV_ITEMS.map(item => <SidebarLink key={item.view} icon={item.icon} to={`/seller?tenantId=${session?.tenantId ?? ''}&view=${item.view}`}>{item.label}</SidebarLink>)}
+        {NAV_ITEMS.map(item => <SidebarLink key={item.view} icon={item.icon} to={`/seller?tenantId=${session?.tenantId ?? ''}&view=${item.view}`} onNavigate={() => setSidebarOpen(false)}>{item.label}</SidebarLink>)}
       </nav>
     </aside>
     <main className="workspace">
       <header className="topbar">
+        <button type="button" className="hamburger-button" aria-label="Open navigation menu" aria-expanded={sidebarOpen} onClick={() => setSidebarOpen(true)}><span></span><span></span><span></span></button>
         <div className="search"><span>⌕</span><span>Search reports, orders, payouts…</span></div>
         <select><option>Amazon.in</option></select>
         <DateRangePicker value={range} onChange={setRange} />
