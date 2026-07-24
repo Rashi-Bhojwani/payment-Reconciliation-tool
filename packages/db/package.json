@@ -1,1 +1,17 @@
-{"name":"@recon/db","version":"0.3.0","type":"module","main":"src/index.js","exports":{".":"./src/index.js","./env.js":"./src/env.js"},"scripts":{"check":"node --check src/index.js"},"dependencies":{"pg":"^8.12.0"}}
+{
+  "name": "@recon/db",
+  "version": "0.3.0",
+  "type": "module",
+  "main": "src/index.js",
+  "exports": {
+    ".": "./src/index.js",
+    "./env.js": "./src/env.js"
+  },
+  "scripts": {
+    "check": "node --check src/index.js",
+    "migrate": "node src/migrate.js"
+  },
+  "dependencies": {
+    "pg": "^8.12.0"
+  }
+}

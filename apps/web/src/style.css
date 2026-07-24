@@ -854,3 +854,10 @@ td { padding: 13px 14px; color:#344054; }
 }
 @media (max-width: 1180px) { .raw-source-tabs { grid-template-columns: repeat(2, 1fr); } }
 @media (max-width: 980px) { .raw-source-tabs { grid-template-columns: 1fr; } .date-range-panel-simple { width: min(92vw, 420px); } }
+.calculation-tree { display: grid; gap: 10px; padding: 14px; border: 1px solid var(--border-cool); border-radius: var(--radius-sm); background: #fff; }
+.tree-total, .tree-row { display: grid; grid-template-columns: 32px minmax(180px, 1fr) 150px minmax(160px, .7fr); gap: 12px; align-items: center; }
+.tree-total { grid-template-columns: minmax(180px, 1fr) 150px; padding-bottom: 10px; border-bottom: 1px solid var(--border-cool); }
+.tree-total strong, .tree-row strong { font-family: 'IBM Plex Mono', monospace; text-align: right; }
+.tree-row span { width: 28px; height: 28px; display: inline-flex; align-items: center; justify-content: center; border-radius: 999px; background: #eef2ff; color: var(--violet); font-weight: 800; }
+.tree-row small { color: var(--muted); }
+@media (max-width: 780px) { .tree-total, .tree-row { grid-template-columns: 28px 1fr; } .tree-total { grid-template-columns: 1fr; } .tree-row strong, .tree-row small { grid-column: 2; text-align: left; } }

@@ -1,0 +1,10 @@
+ALTER TABLE sales_traffic_daily ADD COLUMN IF NOT EXISTS ordered_product_sales_b2b numeric(12,2) DEFAULT 0;
+ALTER TABLE sales_traffic_daily ADD COLUMN IF NOT EXISTS units_ordered_b2b int DEFAULT 0;
+ALTER TABLE sales_traffic_daily ADD COLUMN IF NOT EXISTS total_order_items int DEFAULT 0;
+ALTER TABLE sales_traffic_daily ADD COLUMN IF NOT EXISTS total_order_items_b2b int DEFAULT 0;
+ALTER TABLE sales_traffic_daily ADD COLUMN IF NOT EXISTS average_sales_per_order_item numeric(12,2) DEFAULT 0;
+ALTER TABLE sales_traffic_daily ADD COLUMN IF NOT EXISTS average_sales_per_order_item_b2b numeric(12,2) DEFAULT 0;
+ALTER TABLE sales_traffic_daily ADD COLUMN IF NOT EXISTS average_units_per_order_item numeric(12,4) DEFAULT 0;
+ALTER TABLE sales_traffic_daily ADD COLUMN IF NOT EXISTS average_units_per_order_item_b2b numeric(12,4) DEFAULT 0;
+ALTER TABLE sales_traffic_daily ADD COLUMN IF NOT EXISTS average_selling_price numeric(12,2) DEFAULT 0;
+ALTER TABLE sales_traffic_daily ADD COLUMN IF NOT EXISTS raw jsonb NOT NULL DEFAULT '{}'::jsonb;
