@@ -378,43 +378,12 @@ function SellerDashboard() {
   const { range } = useContext(DateRangeContext);
   const [data, setData] = useState(null);
   const [error, setError] = useState('');
-  const [autoSyncing, setAutoSyncing] = useState(false);
-  const lastRangeSyncRef = useRef('');
   async function load() { setError(''); try { setData(await api(`/api/tenants/${tenantId}/dashboard?${rangeQuery(range)}`)); } catch (e) { setError(e.message); } }
   useEffect(() => { if (tenantId) void load(); }, [tenantId, range.start, range.end]);
 
-  // When the calendar range is applied, sync only the report(s) needed by
-  // the current page, and always send the selected start/end limit. This keeps
-  // the account safe by avoiding an all-report fan-out while still refreshing
-  // the data the user is looking at.
-  useEffect(() => {
-    if (!data?.seller?.connected || !tenantId) return;
-    const selectedReports = view === 'dashboard' ? ['DIRECT_SP_API_SYNC'] : (reportTypes?.length ? reportTypes : ['DIRECT_SP_API_SYNC']);
-    const syncKey = `${tenantId}:${view}:${formatDateParam(range.start)}:${formatDateParam(addDays(range.end, 1))}`;
-    if (lastRangeSyncRef.current === syncKey) return;
-    if (freshAmazonAuth) {
-      lastRangeSyncRef.current = syncKey;
-      return;
-    }
-    lastRangeSyncRef.current = syncKey;
-    (async () => {
-      setAutoSyncing(true);
-      try {
-        for (const reportType of selectedReports) {
-          if (reportType === 'DIRECT_SP_API_SYNC') {
-            await api(`/api/tenants/${tenantId}/sync`, { method: 'POST', body: JSON.stringify({ reportTypes: [], range: { start: formatDateParam(range.start), end: formatDateParam(addDays(range.end, 1)) } }) });
-          } else {
-            await api(`/api/tenants/${tenantId}/sync/${reportType}`, { method: 'POST', body: JSON.stringify({ range: { start: formatDateParam(range.start), end: formatDateParam(addDays(range.end, 1)) } }) });
-          }
-        }
-        await load();
-      } catch (e) {
-        setError(e.message);
-      } finally {
-        setAutoSyncing(false);
-      }
-    })();
-  }, [data?.seller?.connected, tenantId, view, freshAmazonAuth, range.start, range.end]);
+  // Date changes should only reload the dashboard query. Syncing remains an
+  // explicit user action so the selected range is not overwritten by a delayed
+  // background pull.
 
   const channelData = useMemo(() => [
     { name: 'Order value', value: Number(data?.orders?.order_value ?? 0) },
@@ -436,7 +405,6 @@ function SellerDashboard() {
     {freshAmazonAuth && connected && <p className="alert success">Amazon account connected. Select a date range or use Sync on this page to pull limited data.</p>}
     {amazonError && <p className="alert warning">Amazon connection issue: {amazonError}</p>}
     {error && <p className="alert warning">{error}</p>}
-    {autoSyncing && <p className="alert success">Syncing this page only for {range.label}…</p>}
     {view === 'dashboard' && !connected && data && <p className="alert warning">Connect your Amazon account to start pulling data — nothing syncs until then.</p>}
     {view !== 'dashboard' && !detailView && <SyncLedger tenantId={tenantId} jobs={data?.jobs ?? []} onSynced={load} reportTypes={reportTypes} title={ledgerCopy?.title} subtitle={ledgerCopy?.subtitle} disabled={!connected} />}
 
