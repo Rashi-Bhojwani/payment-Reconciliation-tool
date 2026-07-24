@@ -378,40 +378,43 @@ function SellerDashboard() {
   const { range } = useContext(DateRangeContext);
   const [data, setData] = useState(null);
   const [error, setError] = useState('');
-  const [autoSyncing, setAutoSyncing] = useState(false);
-  const lastRangeSyncRef = useRef('');
-  async function load() { setError(''); try { setData(await api(`/api/tenants/${tenantId}/dashboard?${rangeQuery(range)}`)); } catch (e) { setError(e.message); } }
-  useEffect(() => { if (tenantId) void load(); }, [tenantId, range.start, range.end]);
-
-  // When the calendar range is applied, sync only the report(s) needed by
-  // the current page, and always send the selected start/end limit. This keeps
-  // the account safe by avoiding an all-report fan-out while still refreshing
-  // the data the user is looking at.
-  useEffect(() => {
-    if (!data?.seller?.connected || !tenantId) return;
-    const selectedReports = view === 'dashboard' ? ['DIRECT_SP_API_SYNC'] : (reportTypes?.length ? reportTypes : ['DIRECT_SP_API_SYNC']);
-    const syncKey = `${tenantId}:${view}:${formatDateParam(range.start)}:${formatDateParam(addDays(range.end, 1))}`;
-    if (lastRangeSyncRef.current === syncKey) return;
-    if (freshAmazonAuth) {
-      lastRangeSyncRef.current = syncKey;
-      return;
+  const rangeSyncRef = useRef({ key: '', requestId: 0 });
+  async function load(targetRange = range, requestId = rangeSyncRef.current.requestId) {
+    setError('');
+    try {
+      const dashboard = await api(`/api/tenants/${tenantId}/dashboard?${rangeQuery(targetRange)}`);
+      if (requestId === rangeSyncRef.current.requestId) setData(dashboard);
+    } catch (e) {
+      if (requestId === rangeSyncRef.current.requestId) setError(e.message);
     }
-    lastRangeSyncRef.current = syncKey;
+  }
+  useEffect(() => {
+    if (!tenantId) return;
+    rangeSyncRef.current.requestId += 1;
+    void load(range, rangeSyncRef.current.requestId);
+  }, [tenantId, range.start, range.end]);
+
+  // On a selected dashboard range, pull the same Amazon Sales & Traffic source
+  // that Seller Central shows for ordered product sales/units. Capture the
+  // exact range and ignore stale completions, so a delayed sync cannot replace
+  // the user's current selection with another range.
+  useEffect(() => {
+    if (!data?.seller?.connected || !tenantId || freshAmazonAuth) return;
+    const selectedReportTypes = view === 'dashboard' ? ['GET_SALES_AND_TRAFFIC_REPORT'] : (VIEW_REPORT_TYPES[view] ?? []);
+    if (!selectedReportTypes.length) return;
+    const selectedRange = { label: range.label, start: range.start, end: range.end };
+    const syncKey = `${tenantId}:${view}:${selectedReportTypes.join(',')}:${formatDateParam(selectedRange.start)}:${formatDateParam(addDays(selectedRange.end, 1))}`;
+    if (rangeSyncRef.current.key === syncKey) return;
+    rangeSyncRef.current.key = syncKey;
+    const requestId = rangeSyncRef.current.requestId;
     (async () => {
-      setAutoSyncing(true);
       try {
-        for (const reportType of selectedReports) {
-          if (reportType === 'DIRECT_SP_API_SYNC') {
-            await api(`/api/tenants/${tenantId}/sync`, { method: 'POST', body: JSON.stringify({ reportTypes: [], range: { start: formatDateParam(range.start), end: formatDateParam(addDays(range.end, 1)) } }) });
-          } else {
-            await api(`/api/tenants/${tenantId}/sync/${reportType}`, { method: 'POST', body: JSON.stringify({ range: { start: formatDateParam(range.start), end: formatDateParam(addDays(range.end, 1)) } }) });
-          }
+        for (const reportType of selectedReportTypes) {
+          await api(`/api/tenants/${tenantId}/sync/${reportType}`, { method: 'POST', body: JSON.stringify({ range: { start: formatDateParam(selectedRange.start), end: formatDateParam(addDays(selectedRange.end, 1)) } }) });
         }
-        await load();
+        await load(selectedRange, requestId);
       } catch (e) {
-        setError(e.message);
-      } finally {
-        setAutoSyncing(false);
+        if (requestId === rangeSyncRef.current.requestId) setError(e.message);
       }
     })();
   }, [data?.seller?.connected, tenantId, view, freshAmazonAuth, range.start, range.end]);
@@ -436,7 +439,6 @@ function SellerDashboard() {
     {freshAmazonAuth && connected && <p className="alert success">Amazon account connected. Select a date range or use Sync on this page to pull limited data.</p>}
     {amazonError && <p className="alert warning">Amazon connection issue: {amazonError}</p>}
     {error && <p className="alert warning">{error}</p>}
-    {autoSyncing && <p className="alert success">Syncing this page only for {range.label}…</p>}
     {view === 'dashboard' && !connected && data && <p className="alert warning">Connect your Amazon account to start pulling data — nothing syncs until then.</p>}
     {view !== 'dashboard' && !detailView && <SyncLedger tenantId={tenantId} jobs={data?.jobs ?? []} onSynced={load} reportTypes={reportTypes} title={ledgerCopy?.title} subtitle={ledgerCopy?.subtitle} disabled={!connected} />}
 
