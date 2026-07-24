@@ -159,6 +159,26 @@ function asMoney(value) {
 
 function textOrNull(value) { return value == null || String(value).trim() === '' ? null : String(value).trim(); }
 
+
+function directMoneyValue(value) {
+  if (!value || typeof value !== 'object') return undefined;
+  return value.chargeAmount ?? value.ChargeAmount ?? value.feeAmount ?? value.FeeAmount ?? value.amount ?? value.Amount ?? value.currencyAmount ?? value.CurrencyAmount;
+}
+
+function hasNestedMoney(value) {
+  if (Array.isArray(value)) return value.some(hasNestedMoney);
+  if (!value || typeof value !== 'object') return false;
+  return Object.values(value).some(nested => {
+    if (!nested || typeof nested !== 'object') return false;
+    if (directMoneyValue(nested) != null) return true;
+    return hasNestedMoney(nested);
+  });
+}
+
+function isAggregateComponent(label) {
+  return /total|summary|breakdown|list|amount$/i.test(String(label ?? ''));
+}
+
 function componentCategory(label) {
   const normalized = String(label ?? '').toLowerCase().replace(/[^a-z0-9]/g, '');
   if (['principal', 'itemprice', 'productcharges', 'productcharge', 'itemcharge'].some(key => normalized.includes(key))) return 'principal';
@@ -183,9 +203,9 @@ function financeComponentRows(row) {
     if (Array.isArray(value)) return value.forEach(item => walk(item, context));
     if (!value || typeof value !== 'object') return;
     const label = textOrNull(value.chargeType ?? value.ChargeType ?? value.feeType ?? value.FeeType ?? value.type ?? value.Type ?? value.description ?? value.Description ?? value.name ?? value.Name ?? context.label ?? row.transaction_type);
-    const money = value.chargeAmount ?? value.ChargeAmount ?? value.feeAmount ?? value.FeeAmount ?? value.amount ?? value.Amount ?? value.currencyAmount ?? value.CurrencyAmount;
+    const money = directMoneyValue(value);
     const amount = typeof money === 'object' && money ? asMoney(money.currencyAmount ?? money.CurrencyAmount ?? money.amount ?? money.Amount) : asMoney(money);
-    const hasMoney = money != null && Number.isFinite(amount) && amount !== 0;
+    const hasMoney = money != null && Number.isFinite(amount) && amount !== 0 && !(hasNestedMoney(value) && isAggregateComponent(label));
     if (hasMoney) {
       rows.push({
         posted_date: row.posted_date,

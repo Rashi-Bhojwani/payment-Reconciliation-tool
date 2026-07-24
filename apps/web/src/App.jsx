@@ -573,6 +573,20 @@ function componentAmount(data, categories) {
   const summary = data?.financialSummary ?? {};
   return categories.reduce((sum, category) => sum + Number(summary[category] ?? 0), 0);
 }
+function hasFinancialComponents(data) { return (data?.financialComponents ?? []).length > 0; }
+function amazonNetSales(data) {
+  if (hasFinancialComponents(data)) {
+    return componentAmount(data, ['principal', 'shipping', 'gift_wrap']) + componentAmount(data, ['promotion', 'refund']);
+  }
+  const productSales = (data?.products ?? []).reduce((sum, product) => sum + Number(product.sales ?? 0), 0);
+  if (productSales) return productSales;
+  const itemSales = (data?.orderItems ?? []).reduce((sum, item) => sum + Number(item.item_price ?? 0) - Number(item.promotion_discount ?? 0), 0);
+  return itemSales || Number(data?.orders?.order_value ?? 0);
+}
+function amazonDeductions(data) {
+  if (hasFinancialComponents(data)) return Math.abs(componentAmount(data, ['commission', 'fba_fee', 'other_fee', 'tax', 'shipping_tax', 'gift_wrap_tax']));
+  return Math.abs(Number(data?.kpis?.deductions ?? 0));
+}
 function formulaTreeRows(rows) { return rows.map(([label, amount, sign, source]) => ({ component: label, sign, amount, source })); }
 function FormulaTree({ rows, total }) {
   return <div className="calculation-tree"><div className="tree-total"><span>Total</span><strong>{formatCurrency(total)}</strong></div>{rows.map(row => <div className="tree-row" key={row.component}><span>{row.sign}</span><b>{row.component}</b><strong>{formatCurrency(row.amount)}</strong><small>{row.source}</small></div>)}</div>;
@@ -581,7 +595,7 @@ function FormulaTree({ rows, total }) {
 function moneyRows(rows, mapper) { return rows.map((row, index) => ({ line: index + 1, ...mapper(row) })); }
 function sumRows(rows, key) { return rows.reduce((sum, row) => sum + Number(row[key] ?? 0), 0); }
 function buildMetricDetails(data, metric, range) {
-  const summary = buildDashboardSummary(data);
+  const summary = buildDashboardSummary(data, range);
   const products = data?.products ?? [];
   const orderItems = data?.orderItems ?? [];
   const orders = data?.orderRows ?? [];
@@ -594,8 +608,9 @@ function buildMetricDetails(data, metric, range) {
   const trend = data?.trend ?? [];
   const financialComponents = data?.financialComponents ?? [];
   const grossItemPrice = componentAmount(data, ['principal']) || sumRows(orderItems, 'item_price') || summary.netSales;
-  const promotions = Math.abs(componentAmount(data, ['promotion']) || sumRows(orderItems, 'promotion_discount'));
-  const refundAmount = Math.abs(componentAmount(data, ['refund']));
+  const shippingIncome = componentAmount(data, ['shipping', 'gift_wrap']);
+  const promotions = componentAmount(data, ['promotion']) || -sumRows(orderItems, 'promotion_discount');
+  const refundAmount = componentAmount(data, ['refund']);
   const referralCommission = componentAmount(data, ['commission', 'refund_commission']);
   const fbaFees = componentAmount(data, ['fba_fee']);
   const shippingFees = componentAmount(data, ['shipping', 'shipping_tax']);
@@ -608,14 +623,14 @@ function buildMetricDetails(data, metric, range) {
   const deductionRows = settlementLines.length
     ? moneyRows(settlementLines.filter(row => Number(row.amount ?? 0) < 0), row => ({ date: row.posted_date, source: 'Settlement', id: row.settlement_id ?? row.order_id, type: row.amount_type, description: row.amount_description, amount: Number(row.amount ?? 0), absolute_amount: Math.abs(Number(row.amount ?? 0)) }))
     : moneyRows(financeRows.filter(row => Number(row.total_amount ?? 0) < 0), row => ({ date: row.posted_date, source: 'Finance', id: row.transaction_id ?? row.related_order_id, type: row.transaction_type, description: row.related_order_id, amount: Number(row.total_amount ?? 0), absolute_amount: Math.abs(Number(row.total_amount ?? 0)) }));
-  const netSalesTree = formulaTreeRows([['Gross Item Price', grossItemPrice, '+', 'Principal / item price'], ['Promotions', -promotions, '−', 'Promotion discounts'], ['Returns / Refunds', -refundAmount, '−', 'Finance refund components']]);
+  const netSalesTree = formulaTreeRows([['Gross Item Price', grossItemPrice, '+', 'Principal / item price'], ['Shipping / Gift Wrap Income', shippingIncome, shippingIncome < 0 ? '−' : '+', 'ShippingCharge / GiftWrap'], ['Promotions', promotions, '−', 'Promotion discounts'], ['Returns / Refunds', refundAmount, '−', 'Finance refund components']]);
   const settledTree = formulaTreeRows([['Net Sales', summary.netSales, '+', 'Net sales calculation'], ['Referral Commission', referralCommission, '−', 'Commission components'], ['FBA Fulfillment Fees', fbaFees, '−', 'FBA fee components'], ['Shipping Fees', shippingFees, '−', 'Shipping fee/tax components'], ['Reimbursements', summary.reimbursements, '+', 'Reimbursement credits'], ['Other Adjustments', otherAdjustments, otherAdjustments < 0 ? '−' : '+', 'Other finance/settlement components']]);
   const details = {
-    netSales: { title: 'Net Sales', value: formatCurrency(summary.netSales), explanation: 'Net sales is built as a formula tree from finance components when available: gross item principal minus promotions and refunds. Sales & Traffic or order-item rows remain visible as supporting rows.', formula: `Net Sales = Gross Item Price ${formatCurrency(grossItemPrice)} − Promotions ${formatCurrency(promotions)} − Returns/Refunds ${formatCurrency(refundAmount)} = ${formatCurrency(summary.netSales)}`, treeRows: netSalesTree, rows: productRows, columns: ['line', 'source', 'asin', 'sku', 'units', 'gross_sales', 'tax', 'discounts', 'net_sales', 'share'] },
+    netSales: { title: 'Net Sales', value: formatCurrency(summary.netSales), explanation: 'Net sales is built as a formula tree from finance components when available: gross item principal minus promotions and refunds. Sales & Traffic or order-item rows remain visible as supporting rows.', formula: `Net Sales = Principal ${formatCurrency(grossItemPrice)} + Shipping/GiftWrap ${formatCurrency(shippingIncome)} + Promotions ${formatCurrency(promotions)} + Refunds ${formatCurrency(refundAmount)} = ${formatCurrency(summary.netSales)}`, treeRows: netSalesTree, numericValue: summary.netSales, rows: productRows, columns: ['line', 'source', 'asin', 'sku', 'units', 'gross_sales', 'tax', 'discounts', 'net_sales', 'share'] },
     netQty: { title: 'Net Qty', value: formatNumber(summary.netQty), explanation: 'Net quantity is the sum of sold units for the same rows used by Net Sales.', formula: `Net Qty = Σ units across ${formatNumber(productRows.length)} calculation rows = ${formatNumber(summary.netQty)}`, rows: productRows, columns: ['line', 'source', 'asin', 'sku', 'units', 'net_sales', 'share'] },
     orders: { title: 'Orders Synced', value: formatNumber(summary.ordersCount), explanation: 'Orders synced counts Amazon order headers in the date range. Item-line totals are shown beside each order so the count can be audited against money rows.', formula: `Orders Synced = count(order headers) = ${formatNumber(summary.ordersCount)}`, rows: orderRows, columns: ['line', 'amazon_order_id', 'order_date', 'status', 'total_amount', 'item_lines', 'item_value', 'item_tax', 'discounts'] },
     returns: { title: 'Returns', value: formatNumber(summary.returnQty), explanation: 'Returns count customer-return report lines. The return rate uses Returns ÷ Net Qty.', formula: `Return Rate = ${formatNumber(summary.returnQty)} ÷ ${formatNumber(summary.netQty)} = ${summary.netQty ? `${Math.round((summary.returnQty / summary.netQty) * 100)}%` : '0%'}`, rows: moneyRows(returns, row => row), columns: ['line', 'order_id', 'return_reason', 'disposition', 'status', 'return_date'] },
-    settled: { title: 'Settled Amount', value: formatCurrency(summary.settledAmount), explanation: 'Settled amount is reconciled from the net sales formula through Amazon commission, FBA fulfillment fees, shipping fees, reimbursements and other adjustments. Payout groups show the final settlement batches.', formula: `Settled Amount = Net Sales ${formatCurrency(summary.netSales)} − Referral Commission ${formatCurrency(Math.abs(referralCommission))} − FBA Fees ${formatCurrency(Math.abs(fbaFees))} − Shipping Fees ${formatCurrency(Math.abs(shippingFees))} + Reimbursements ${formatCurrency(summary.reimbursements)} + Other Adjustments ${formatCurrency(otherAdjustments)} = ${formatCurrency(summary.settledAmount)}`, treeRows: settledTree, rows: payments, columns: ['posted_date', 'settlement_id', 'net_amount', 'lines'] },
+    settled: { title: 'Settled Amount', value: formatCurrency(summary.settledAmount), explanation: 'Settled amount is reconciled from the net sales formula through Amazon commission, FBA fulfillment fees, shipping fees, reimbursements and other adjustments. Payout groups show the final settlement batches.', formula: `Settled Amount = Net Sales ${formatCurrency(summary.netSales)} − Referral Commission ${formatCurrency(Math.abs(referralCommission))} − FBA Fees ${formatCurrency(Math.abs(fbaFees))} − Shipping Fees ${formatCurrency(Math.abs(shippingFees))} + Reimbursements ${formatCurrency(summary.reimbursements)} + Other Adjustments ${formatCurrency(otherAdjustments)} = ${formatCurrency(summary.settledAmount)}`, treeRows: settledTree, numericValue: summary.settledAmount, rows: payments, columns: ['posted_date', 'settlement_id', 'net_amount', 'lines'] },
     deductions: { title: 'Deductions', value: formatCurrency(summary.deductions), explanation: 'Deductions are negative Amazon settlement/finance lines such as fees, refunds, commission, shipping clawbacks and other charges.', formula: `Deductions = Σ absolute value of negative money lines = ${formatCurrency(sumRows(deductionRows, 'absolute_amount') || summary.deductions)}`, rows: financialComponents.filter(row => Number(row.amount ?? 0) < 0), columns: ['posted_date', 'source', 'transaction_id', 'related_order_id', 'category', 'component', 'amount'] },
     reimbursements: { title: 'Reimbursements', value: formatCurrency(summary.reimbursements), explanation: 'Reimbursements are FBA credits imported from reimbursement rows.', formula: `Reimbursements = Σ amount across ${formatNumber(reimbursements.length)} rows = ${formatCurrency(summary.reimbursements)}`, rows: moneyRows(reimbursements, row => row), columns: ['line', 'sku', 'amount', 'reason', 'reimbursement_date'] },
     drr: { title: 'Daily Run Rate', value: formatCurrency(summary.drr), explanation: 'Daily run rate divides net sales by the number of calendar days selected in the date picker.', formula: `DRR = ${formatCurrency(summary.netSales)} ÷ ${formatNumber(days)} days = ${formatCurrency(summary.netSales / days)}`, rows: trend.map(row => ({ ...row, drr_component: Number(row.sales ?? 0) / days })), columns: ['date', 'sales', 'units', 'sessions', 'drr_component'] },
@@ -633,7 +648,7 @@ function MetricDetail({ data, metric, tenantId }) {
       <PanelHeader title={details.title} subtitle={details.value} />
       <p>{details.explanation}</p>
       <div className="calculation-box"><b>Calculation</b><code>{details.formula}</code></div>
-      {details.treeRows && <FormulaTree rows={details.treeRows} total={Number(String(details.value).replace(/[^0-9.-]/g, ''))} />}
+      {details.treeRows && <FormulaTree rows={details.treeRows} total={details.numericValue ?? Number(String(details.value).replace(/[^0-9.-]/g, ''))} />}
       <div className="detail-actions"><Button variant="secondary" onClick={() => navigate(`/seller?tenantId=${tenantId}&view=dashboard`)}>← Back</Button><Button variant="accent" onClick={() => downloadCsv(`${details.title.toLowerCase().replaceAll(' ', '-')}-calculation.csv`, details.rows, details.columns)} disabled={!details.rows.length}>Download calculation CSV</Button><NavLink className="btn btn-secondary" to={`/seller?tenantId=${tenantId}&view=rawData`}>Review raw API data</NavLink></div>
     </Card>
     <TableCard title="Rows used for this calculation" rows={details.rows} columns={details.columns} pageSize={6} />
@@ -648,11 +663,11 @@ function buildDashboardSummary(data, range = defaultDateRange()) {
   const invoices = data?.invoices ?? [];
   const orderItems = data?.orderItems ?? [];
   const ordersCount = Number(data?.orders?.orders ?? 0);
-  const netSales = Number(data?.orders?.order_value ?? 0);
+  const netSales = amazonNetSales(data);
   const netQty = products.reduce((sum, product) => sum + Number(product.units ?? 0), 0) || orderItems.reduce((sum, item) => sum + Number(item.quantity_ordered ?? 0), 0);
   const returnQty = returns.length;
   const settledAmount = payments.reduce((sum, payment) => sum + Number(payment.net_amount ?? 0), 0) || Number(data?.kpis?.net_settled ?? 0);
-  const deductions = Math.abs(Number(data?.kpis?.deductions ?? 0));
+  const deductions = amazonDeductions(data);
   const reimbursementAmount = reimbursements.reduce((sum, row) => sum + Number(row.amount ?? 0), 0);
   const estimatedProfit = settledAmount || Math.max(0, netSales - deductions + reimbursementAmount);
   const profitRate = netSales ? Math.round((estimatedProfit / netSales) * 100) : 0;
