@@ -487,7 +487,7 @@ app.get('/api/tenants/:tenantId/dashboard', async request => {
         union all
         select * from finance_payments where not exists (select 1 from settlement_payments)
       )
-      select settlement_id, posted_date, net_amount, lines from merged order by posted_date desc nulls last limit 50`, [tenantId, start, end])).rows;
+      select settlement_id, posted_date, net_amount, lines from merged order by posted_date desc nulls last limit 100`, [tenantId, start, end])).rows;
     const jobs = (await client.query(`
       with normalized_jobs as (
         select report_type,
@@ -503,14 +503,26 @@ app.get('/api/tenants/:tenantId/dashboard', async request => {
       from normalized_jobs
       order by report_type, started_at desc nulls last
     `, [tenantId])).rows;
+    const settlementLines = (await client.query('select settlement_id, order_id, amount_type, amount_description, amount, posted_date from settlement_rows where tenant_id=$1 and posted_date >= $2 and posted_date < $3 order by posted_date desc nulls last limit 250', [tenantId, start, end])).rows;
+    const orderRows = (await client.query(`
+      select o.amazon_order_id, o.order_date, o.status, o.total_amount,
+        count(oi.id) item_lines,
+        coalesce(sum(oi.item_price),0) item_value,
+        coalesce(sum(oi.item_tax),0) item_tax,
+        coalesce(sum(oi.promotion_discount),0) promotion_discount
+      from orders o
+      left join order_items oi on oi.tenant_id=o.tenant_id and oi.amazon_order_id=o.amazon_order_id
+      where o.tenant_id=$1 and o.order_date >= $2 and o.order_date < $3
+      group by o.amazon_order_id, o.order_date, o.status, o.total_amount
+      order by o.order_date desc nulls last limit 250`, [tenantId, start, end])).rows;
     const inventory = (await client.query('select sku, fulfillable_quantity, snapshot_date from inventory_snapshots where tenant_id=$1 and snapshot_date >= $2::date and snapshot_date < $3::date order by snapshot_date desc, fulfillable_quantity desc nulls last limit 50', [tenantId, start, end])).rows;
     const returns = (await client.query('select order_id, return_reason, disposition, status, return_date from returns where tenant_id=$1 and return_date >= $2::date and return_date < $3::date order by return_date desc nulls last limit 50', [tenantId, start, end])).rows;
     const reimbursements = (await client.query('select sku, amount, reason, reimbursement_date from reimbursements where tenant_id=$1 and reimbursement_date >= $2::date and reimbursement_date < $3::date order by reimbursement_date desc nulls last limit 50', [tenantId, start, end])).rows;
     const invoices = (await client.query('select invoice_type, order_id, taxable_value, cgst, sgst, igst, invoice_date from gst_invoices where tenant_id=$1 and invoice_date >= $2::date and invoice_date < $3::date order by invoice_date desc nulls last limit 50', [tenantId, start, end])).rows;
-    const orderItems = (await client.query('select oi.amazon_order_id, oi.asin, oi.sku, oi.title, oi.quantity_ordered, oi.item_price, oi.item_tax from order_items oi join orders o on o.tenant_id=oi.tenant_id and o.amazon_order_id=oi.amazon_order_id where oi.tenant_id=$1 and o.order_date >= $2 and o.order_date < $3 order by oi.quantity_ordered desc nulls last limit 50', [tenantId, start, end])).rows;
+    const orderItems = (await client.query('select oi.amazon_order_id, oi.asin, oi.sku, oi.title, oi.quantity_ordered, oi.item_price, oi.item_tax, oi.promotion_discount from order_items oi join orders o on o.tenant_id=oi.tenant_id and o.amazon_order_id=oi.amazon_order_id where oi.tenant_id=$1 and o.order_date >= $2 and o.order_date < $3 order by oi.quantity_ordered desc nulls last limit 50', [tenantId, start, end])).rows;
     const financeTransactions = (await client.query('select transaction_id, transaction_type, posted_date, total_amount, currency, related_order_id from finance_transactions where tenant_id=$1 and posted_date >= $2 and posted_date < $3 order by posted_date desc nulls last limit 50', [tenantId, start, end])).rows;
     const hasImportedData = Number(orders.orders ?? 0) > 0 || Number(kpis.net_settled ?? 0) !== 0 || products.length > 0 || payments.length > 0 || inventory.length > 0;
-    return { seller, amazonAuth, hasImportedData, kpis, orders, products, trend, payments, jobs, inventory, returns, reimbursements, invoices, orderItems, financeTransactions };
+    return { seller, amazonAuth, hasImportedData, kpis, orders, orderRows, products, trend, payments, settlementLines, jobs, inventory, returns, reimbursements, invoices, orderItems, financeTransactions };
   });
 });
 
