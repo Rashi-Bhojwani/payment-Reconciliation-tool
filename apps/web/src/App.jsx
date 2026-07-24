@@ -213,13 +213,31 @@ function toDateInputValue(date) {
   return `${yyyy}-${mm}-${dd}`;
 }
 function fromDateInputValue(value) { return startOfDay(new Date(`${value}T00:00:00`)); }
+
+function monthGridDays(monthDate) {
+  const first = new Date(monthDate.getFullYear(), monthDate.getMonth(), 1);
+  const daysInMonth = new Date(monthDate.getFullYear(), monthDate.getMonth() + 1, 0).getDate();
+  const blanks = Array.from({ length: first.getDay() }, () => null);
+  return [...blanks, ...Array.from({ length: daysInMonth }, (_, i) => new Date(monthDate.getFullYear(), monthDate.getMonth(), i + 1))];
+}
+function sameDay(a, b) { return !!a && !!b && startOfDay(a).getTime() === startOfDay(b).getTime(); }
 function DateRangePicker({ value, onChange }) {
   const [open, setOpen] = useState(false);
   const [draft, setDraft] = useState(() => ({ start: toDateInputValue(value.start), end: toDateInputValue(value.end) }));
+  const [month, setMonth] = useState(() => new Date(value.end.getFullYear(), value.end.getMonth(), 1));
   const rootRef = useRef(null);
+  const today = startOfDay(new Date());
+  const draftStart = fromDateInputValue(draft.start);
+  const draftEnd = fromDateInputValue(draft.end);
+  const presets = [
+    ['Last 7 Days', addDays(today, -6), today],
+    ['Last 30 Days', addDays(today, -29), today],
+    ['This Month', new Date(today.getFullYear(), today.getMonth(), 1), today]
+  ];
 
   useEffect(() => {
     setDraft({ start: toDateInputValue(value.start), end: toDateInputValue(value.end) });
+    setMonth(new Date(value.end.getFullYear(), value.end.getMonth(), 1));
   }, [value.start, value.end]);
 
   useEffect(() => {
@@ -229,9 +247,21 @@ function DateRangePicker({ value, onChange }) {
     return () => document.removeEventListener('mousedown', onClickOutside);
   }, [open]);
 
+  function setPreset(label, start, end) {
+    setDraft({ start: toDateInputValue(start), end: toDateInputValue(end) });
+    setMonth(new Date(end.getFullYear(), end.getMonth(), 1));
+  }
+  function selectDay(day) {
+    if (!day || day > today) return;
+    const dayValue = toDateInputValue(day);
+    if (!draft.start || draft.end) return setDraft({ start: dayValue, end: dayValue });
+    const start = fromDateInputValue(draft.start);
+    const ordered = start <= day ? { start: draft.start, end: dayValue } : { start: dayValue, end: draft.start };
+    setDraft(ordered);
+  }
   function applyRange() {
     const start = fromDateInputValue(draft.start);
-    const end = fromDateInputValue(draft.end);
+    const end = fromDateInputValue(draft.end || draft.start);
     const ordered = start <= end ? { start, end } : { start: end, end: start };
     onChange({ label: formatRangeLabel(ordered.start, ordered.end), ...ordered });
     setOpen(false);
@@ -243,18 +273,18 @@ function DateRangePicker({ value, onChange }) {
         <span className="date-range-icon">📅</span>{value.label}
       </button>
       {open && (
-        <div className="date-range-panel date-range-panel-simple">
-          <div className="date-field-group">
-            <label>Start date</label>
-            <input className="input" type="date" value={draft.start} max={draft.end || toDateInputValue(new Date())} onChange={e => setDraft(d => ({ ...d, start: e.target.value }))} />
-          </div>
-          <div className="date-field-group">
-            <label>End date</label>
-            <input className="input" type="date" value={draft.end} min={draft.start} max={toDateInputValue(new Date())} onChange={e => setDraft(d => ({ ...d, end: e.target.value }))} />
-          </div>
-          <div className="calendar-footer range-apply-row">
-            <span className="muted small">Applied only after clicking Apply</span>
-            <Button type="button" onClick={applyRange}>Apply</Button>
+        <div className="date-range-panel">
+          <div className="date-range-presets">{presets.map(([label, start, end]) => <button type="button" key={label} onClick={() => setPreset(label, start, end)}>{label}</button>)}</div>
+          <div className="date-range-calendar">
+            <div className="calendar-nav"><button type="button" onClick={() => setMonth(new Date(month.getFullYear(), month.getMonth() - 1, 1))}>‹</button><b>{month.toLocaleDateString('en-IN', { month: 'long', year: 'numeric' })}</b><button type="button" disabled={month.getFullYear() === today.getFullYear() && month.getMonth() === today.getMonth()} onClick={() => setMonth(new Date(month.getFullYear(), month.getMonth() + 1, 1))}>›</button></div>
+            <div className="date-field-row"><div><span>Start</span><b>{toDateInputValue(draftStart)}</b></div><div><span>End</span><b>{toDateInputValue(draftEnd)}</b></div></div>
+            <div className="calendar-weekdays">{['S', 'M', 'T', 'W', 'T', 'F', 'S'].map((day, index) => <span key={`${day}-${index}`}>{day}</span>)}</div>
+            <div className="calendar-grid">{monthGridDays(month).map((day, index) => {
+              const inRange = day && day >= draftStart && day <= draftEnd;
+              const endpoint = sameDay(day, draftStart) || sameDay(day, draftEnd);
+              return <button type="button" key={day?.toISOString() ?? `blank-${index}`} disabled={!day || day > today} className={`calendar-cell ${!day ? 'empty' : ''} ${inRange ? 'in-range' : ''} ${endpoint ? 'endpoint' : ''}`} onClick={() => selectDay(day)}>{day?.getDate() ?? ''}</button>;
+            })}</div>
+            <div className="calendar-footer range-apply-row"><span className="muted small">Pick start and end, then Apply</span><Button type="button" onClick={applyRange}>Apply</Button></div>
           </div>
         </div>
       )}
