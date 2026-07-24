@@ -378,12 +378,46 @@ function SellerDashboard() {
   const { range } = useContext(DateRangeContext);
   const [data, setData] = useState(null);
   const [error, setError] = useState('');
-  async function load() { setError(''); try { setData(await api(`/api/tenants/${tenantId}/dashboard?${rangeQuery(range)}`)); } catch (e) { setError(e.message); } }
-  useEffect(() => { if (tenantId) void load(); }, [tenantId, range.start, range.end]);
+  const rangeSyncRef = useRef({ key: '', requestId: 0 });
+  async function load(targetRange = range, requestId = rangeSyncRef.current.requestId) {
+    setError('');
+    try {
+      const dashboard = await api(`/api/tenants/${tenantId}/dashboard?${rangeQuery(targetRange)}`);
+      if (requestId === rangeSyncRef.current.requestId) setData(dashboard);
+    } catch (e) {
+      if (requestId === rangeSyncRef.current.requestId) setError(e.message);
+    }
+  }
+  useEffect(() => {
+    if (!tenantId) return;
+    rangeSyncRef.current.requestId += 1;
+    void load(range, rangeSyncRef.current.requestId);
+  }, [tenantId, range.start, range.end]);
 
-  // Date changes should only reload the dashboard query. Syncing remains an
-  // explicit user action so the selected range is not overwritten by a delayed
-  // background pull.
+  // On a selected dashboard range, pull the same Amazon Sales & Traffic source
+  // that Seller Central shows for ordered product sales/units. Capture the
+  // exact range and ignore stale completions, so a delayed sync cannot replace
+  // the user's current selection with another range.
+  useEffect(() => {
+    if (!data?.seller?.connected || !tenantId || freshAmazonAuth) return;
+    const selectedReportTypes = view === 'dashboard' ? ['GET_SALES_AND_TRAFFIC_REPORT'] : (VIEW_REPORT_TYPES[view] ?? []);
+    if (!selectedReportTypes.length) return;
+    const selectedRange = { label: range.label, start: range.start, end: range.end };
+    const syncKey = `${tenantId}:${view}:${selectedReportTypes.join(',')}:${formatDateParam(selectedRange.start)}:${formatDateParam(addDays(selectedRange.end, 1))}`;
+    if (rangeSyncRef.current.key === syncKey) return;
+    rangeSyncRef.current.key = syncKey;
+    const requestId = rangeSyncRef.current.requestId;
+    (async () => {
+      try {
+        for (const reportType of selectedReportTypes) {
+          await api(`/api/tenants/${tenantId}/sync/${reportType}`, { method: 'POST', body: JSON.stringify({ range: { start: formatDateParam(selectedRange.start), end: formatDateParam(addDays(selectedRange.end, 1)) } }) });
+        }
+        await load(selectedRange, requestId);
+      } catch (e) {
+        if (requestId === rangeSyncRef.current.requestId) setError(e.message);
+      }
+    })();
+  }, [data?.seller?.connected, tenantId, view, freshAmazonAuth, range.start, range.end]);
 
   const channelData = useMemo(() => [
     { name: 'Order value', value: Number(data?.orders?.order_value ?? 0) },
