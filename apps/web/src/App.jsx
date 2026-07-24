@@ -380,8 +380,10 @@ function SellerDashboard() {
   const [error, setError] = useState('');
   const [autoSyncing, setAutoSyncing] = useState(false);
   const lastRangeSyncRef = useRef('');
+  const reportTypes = VIEW_REPORT_TYPES[view];
+  const ledgerCopy = VIEW_LEDGER_COPY[view];
   async function load() { setError(''); try { setData(await api(`/api/tenants/${tenantId}/dashboard?${rangeQuery(range)}`)); } catch (e) { setError(e.message); } }
-  useEffect(() => { if (tenantId) void load(); }, [tenantId, range.start, range.end]);
+  useEffect(() => { if (tenantId) void load(); }, [tenantId]);
 
   // When the calendar range is applied, sync only the report(s) needed by
   // the current page, and always send the selected start/end limit. This keeps
@@ -389,7 +391,7 @@ function SellerDashboard() {
   // the data the user is looking at.
   useEffect(() => {
     if (!data?.seller?.connected || !tenantId) return;
-    const selectedReports = view === 'dashboard' ? ['DIRECT_SP_API_SYNC'] : (reportTypes?.length ? reportTypes : ['DIRECT_SP_API_SYNC']);
+    const selectedReports = view === 'dashboard' ? REPORTS.map(report => report.type) : (reportTypes?.length ? reportTypes : ['DIRECT_SP_API_SYNC']);
     const syncKey = `${tenantId}:${view}:${formatDateParam(range.start)}:${formatDateParam(addDays(range.end, 1))}`;
     if (lastRangeSyncRef.current === syncKey) return;
     if (freshAmazonAuth) {
@@ -410,6 +412,7 @@ function SellerDashboard() {
         await load();
       } catch (e) {
         setError(e.message);
+        await load();
       } finally {
         setAutoSyncing(false);
       }
@@ -421,8 +424,6 @@ function SellerDashboard() {
     { name: 'Settlement earnings', value: Number(data?.kpis?.earnings ?? 0) },
     { name: 'Settlement deductions', value: Math.abs(Number(data?.kpis?.deductions ?? 0)) }
   ].filter(item => item.value > 0), [data]);
-  const reportTypes = VIEW_REPORT_TYPES[view];
-  const ledgerCopy = VIEW_LEDGER_COPY[view];
   const detailView = view === 'report-detail' || view === 'metric-detail';
   const connected = !!data?.seller?.connected;
 
