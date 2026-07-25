@@ -6,6 +6,9 @@ import { getSpApiEndpoint, REPORT_TYPES, SpApiClient } from '@recon/sp-api-clien
 import { decryptSecret } from '../config/crypto.js';
 import { putRawReport } from '../storage/s3.js';
 import { runJob } from './runner.js';
+import { categorizeFinanceLabel, flattenFinanceTransaction } from './finance-components.js';
+
+export { categorizeFinanceLabel } from './finance-components.js';
 
 const NIGHTLY_REPORTS = [...REPORT_TYPES];
 const SyncParamsSchema = z.object({ tenantId: z.string().uuid(), reportType: z.enum(REPORT_TYPES), range: z.object({ start: z.string().datetime(), end: z.string().datetime() }).optional() });
@@ -393,6 +396,16 @@ export async function syncRecentApiDataForTenant(tenantId, options = {}) {
              on conflict (tenant_id, transaction_id) do update set transaction_type=excluded.transaction_type, posted_date=excluded.posted_date, total_amount=excluded.total_amount, currency=excluded.currency, related_order_id=excluded.related_order_id, raw=excluded.raw`,
             [parsedTenantId, transactionId, transaction.transactionType ?? transaction.TransactionType ?? null, transaction.postedDate ?? transaction.PostedDate ?? null, number(transaction.totalAmount?.currencyAmount ?? transaction.TotalAmount?.CurrencyAmount ?? transaction.totalAmount?.Amount ?? transaction.TotalAmount?.Amount), transaction.totalAmount?.currencyCode ?? transaction.TotalAmount?.CurrencyCode ?? 'INR', financeRelatedValue(transaction, ['ORDER_ID', 'AMAZON_ORDER_ID']) ?? null, transaction]
           );
+          // Finances API field casing and nested breakdown names can vary by
+          // generation. Persist every source node in raw so classifications
+          // that land in `other` can be inspected and improved safely.
+          for (const component of flattenFinanceTransaction(transaction)) {
+            await db.query(
+              `insert into finance_transaction_items(tenant_id, transaction_id, order_id, sku, asin, category, amount_description, amount, currency, posted_date, raw)
+               values($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) on conflict do nothing`,
+              [parsedTenantId, component.transactionId, component.orderId ?? null, component.sku ?? null, component.asin ?? null, component.category, component.description ?? null, component.amount, component.currency ?? 'INR', component.postedDate, component.raw]
+            );
+          }
           transactionsImported += 1;
           const transactionType = String(transaction.transactionType ?? transaction.TransactionType ?? '').toLowerCase();
           if (transactionType.includes('reimbursement')) {

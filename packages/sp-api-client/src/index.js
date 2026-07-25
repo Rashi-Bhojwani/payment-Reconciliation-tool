@@ -225,10 +225,13 @@ export class SpApiClient {
   /** Fetches Amazon's catalog attributes used for package weight and dimensions. */
   async getCatalogItem(asin, marketplaceId = INDIA_MARKETPLACE_ID) {
     const parsedAsin = z.string().min(1).parse(asin);
-    const path = `/catalog/2022-04-01/items/${encodeURIComponent(parsedAsin)}?marketplaceIds=${encodeURIComponent(marketplaceId)}&includedData=attributes`;
+    const path = `/catalog/2022-04-01/items/${encodeURIComponent(parsedAsin)}?marketplaceIds=${encodeURIComponent(marketplaceId)}&includedData=attributes,dimensions,productTypes,summaries,classifications`;
     const res = await this.request(path);
     if (!res.ok) throw new Error(`Catalog item lookup failed: ${res.status}`);
-    return res.json();
+    const raw = await res.json();
+    const category = raw?.summaries?.[0]?.websiteDisplayGroup ?? raw?.classifications?.[0]?.classifications?.[0]?.displayName ?? raw?.productTypes?.[0]?.productType ?? null;
+    const weightNode = raw?.dimensions?.[0]?.package?.weight ?? raw?.dimensions?.[0]?.item?.weight ?? null;
+    return { ...raw, category, weightNode, raw };
   }
 
 

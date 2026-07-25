@@ -941,3 +941,15 @@ td { padding: 13px 14px; color:#344054; }
 .fulfillment-split strong { font-size: 22px; }
 .fulfillment-split small, .fulfillment-split span { color: #cbd5e1; }
 @media (max-width: 800px) { .money-flow, .fulfillment-split { grid-template-columns: 1fr; } .money-flow > b { text-align: center; } .money-flow-heading { display: block; } }
+.calculation-components { display: grid; gap: 8px; margin: 22px 0; }
+.calculation-components > div { display: grid; grid-template-columns: 1fr 120px 160px; align-items: center; padding: 12px 16px; border: 1px solid var(--border); border-radius: 10px; }
+.calculation-components .negative strong, .fee-line.negative strong { color: #c62828; }
+.calculation-components .total { background: #0f172a; color: #fff; font-size: 18px; }
+.overcharge-badge { display: inline-block; padding: 5px 8px; border-radius: 999px; background: #fee2e2; color: #b91c1c; font-weight: 800; white-space: nowrap; }
+.order-detail-row > td { background: #f8fafc; padding: 22px !important; }
+.order-detail-grid { display: grid; grid-template-columns: minmax(260px, 1fr) minmax(360px, 2fr); gap: 28px; text-align: left; }
+.fee-line { display: grid; grid-template-columns: 1fr 160px 120px; gap: 12px; padding: 9px 0; border-bottom: 1px solid var(--border); }
+.fee-line strong { text-align: right; }
+.fee-audit-hero { display: flex; justify-content: space-between; align-items: center; gap: 24px; padding: 28px; }
+.fee-audit-hero h2 { margin: 5px 0; }
+@media(max-width:800px){.order-detail-grid{grid-template-columns:1fr}.fee-audit-hero{display:block}.calculation-components>div{grid-template-columns:1fr auto}.calculation-components small{display:none}}
