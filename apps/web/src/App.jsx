@@ -43,6 +43,7 @@ function codeClass(code) { return `code-${CODE_COLOR_KEY[code] ?? code.toLowerCa
 // the report(s) it actually depends on.
 
 const NAV_ITEMS = [
+  { view: 'orderPayments', label: 'Order Payments', icon: '₹' },
   { view: 'dashboard', label: 'Dashboard', icon: '▦' },
   { view: 'sales', label: 'Sales Analytics', icon: '↗' },
   { view: 'businessPerformance', label: 'Business Performance', icon: '▤' },
@@ -61,6 +62,7 @@ const NAV_ITEMS = [
 ];
 
 const VIEW_REPORT_TYPES = {
+  orderPayments: ['DIRECT_SP_API_SYNC', 'GET_V2_SETTLEMENT_REPORT_DATA_FLAT_FILE_V2'],
   sales: ['GET_SALES_AND_TRAFFIC_REPORT'],
   inventory: ['GET_FBA_MYI_UNSUPPRESSED_INVENTORY_DATA'],
   payouts: ['DIRECT_SP_API_SYNC', 'GET_V2_SETTLEMENT_REPORT_DATA_FLAT_FILE_V2'],
@@ -77,6 +79,7 @@ const VIEW_REPORT_TYPES = {
   rawData: REPORTS.map(r => r.type)
 };
 const VIEW_LEDGER_COPY = {
+  orderPayments: { title: 'Real payment data sync', subtitle: 'Orders API + Finances API + final settlement report' },
   sales: { title: 'Sales & traffic sync', subtitle: 'Powers this page only' },
   inventory: { title: 'Inventory sync', subtitle: 'This page only' },
   payouts: { title: 'Payout sync', subtitle: 'Orders, finance and settlements' },
@@ -110,6 +113,10 @@ const ACCESS_TOKEN_CACHE_PREFIX = 'amazon_spapi_access_token:';
 function readAmazonTokenCache(tenantId) { const cached = JSON.parse(localStorage.getItem(`${ACCESS_TOKEN_CACHE_PREFIX}${tenantId}`) ?? 'null'); return cached?.accessToken && cached?.expiresAt && Date.now() < cached.expiresAt - 60_000 ? cached : null; }
 async function getAmazonAccessToken(tenantId) { const cached = readAmazonTokenCache(tenantId); if (cached) return cached; const fresh = await api(`/api/tenants/${tenantId}/amazon/access-token`); localStorage.setItem(`${ACCESS_TOKEN_CACHE_PREFIX}${tenantId}`, JSON.stringify(fresh)); return fresh; }
 async function beginAmazonAuthorization(tenantId) { const { url } = await api(`/api/auth/amazon/start?tenantId=${tenantId}&json=1`); window.location.assign(url); }
+async function syncAmazonSource(tenantId, reportType, range) {
+  const payload = { method: 'POST', body: JSON.stringify({ range: { start: formatDateParam(range.start), end: formatDateParam(addDays(range.end, 1)) } }) };
+  return api(`/api/tenants/${tenantId}/sync/${reportType}`, payload);
+}
 
 function Button({ className = '', variant = 'primary', icon, children, ...props }) { return <button {...props} className={`btn btn-${variant} ${className}`}>{icon && <span className="btn-icon" aria-hidden="true">{icon}</span>}{children}</button>; }
 function Input(props) { return <input {...props} className="input" />; }
@@ -278,9 +285,7 @@ function SyncLedger({ tenantId, jobs = [], onSynced, reportTypes, title, subtitl
     if (disabled) return;
     setRowState(s => ({ ...s, [reportType]: { loading: true } }));
     try {
-      const result = reportType === 'DIRECT_SP_API_SYNC'
-        ? await api(`/api/tenants/${tenantId}/sync`, { method: 'POST', body: JSON.stringify({ reportTypes: [], range: { start: formatDateParam(range.start), end: formatDateParam(addDays(range.end, 1)) } }) })
-        : await api(`/api/tenants/${tenantId}/sync/${reportType}`, { method: 'POST', body: JSON.stringify({ range: { start: formatDateParam(range.start), end: formatDateParam(addDays(range.end, 1)) } }) });
+      const result = await syncAmazonSource(tenantId, reportType, range);
       if (result?.status === 'failed') throw new Error(result.error ?? 'Sync failed');
       const failedDirectSync = result?.results?.find?.(row => row.status === 'failed');
       if (failedDirectSync) throw new Error(failedDirectSync.error ?? 'Sync failed');
@@ -372,7 +377,7 @@ function AmazonConnectionPanel({ tenantId, seller, onChange, setError }) {
 function SellerDashboard() {
   const [params] = useSearchParams();
   const tenantId = params.get('tenantId') ?? '';
-  const view = params.get('view') ?? 'dashboard';
+  const view = params.get('view') ?? 'orderPayments';
   const freshAmazonAuth = params.get('auth') === 'complete';
   const amazonError = params.get('amazon') === 'error' ? (params.get('message') ?? 'Amazon authorization failed') : '';
   const { range } = useContext(DateRangeContext);
@@ -410,7 +415,7 @@ function SellerDashboard() {
     (async () => {
       try {
         for (const reportType of selectedReportTypes) {
-          await api(`/api/tenants/${tenantId}/sync/${reportType}`, { method: 'POST', body: JSON.stringify({ range: { start: formatDateParam(selectedRange.start), end: formatDateParam(addDays(selectedRange.end, 1)) } }) });
+          await syncAmazonSource(tenantId, reportType, selectedRange);
         }
         await load(selectedRange, requestId);
       } catch (e) {
@@ -439,9 +444,10 @@ function SellerDashboard() {
     {freshAmazonAuth && connected && <p className="alert success">Amazon account connected. Select a date range or use Sync on this page to pull limited data.</p>}
     {amazonError && <p className="alert warning">Amazon connection issue: {amazonError}</p>}
     {error && <p className="alert warning">{error}</p>}
-    {view === 'dashboard' && !connected && data && <p className="alert warning">Connect your Amazon account to start pulling data — nothing syncs until then.</p>}
+    {(view === 'dashboard' || view === 'orderPayments') && !connected && data && <p className="alert warning">Connect your Amazon account to start pulling real payment data — nothing syncs until then.</p>}
     {view !== 'dashboard' && !detailView && <SyncLedger tenantId={tenantId} jobs={data?.jobs ?? []} onSynced={load} reportTypes={reportTypes} title={ledgerCopy?.title} subtitle={ledgerCopy?.subtitle} disabled={!connected} />}
 
+    {view === 'orderPayments' && <OrderPayments data={data} />}
     {view === 'dashboard' && <DashboardOverview data={data} channelData={channelData} tenantId={tenantId} />}
     {view === 'sales' && <SalesAnalytics data={data} channelData={channelData} />}
     {view === 'businessPerformance' && <BusinessPerformanceReport data={data} />}
@@ -462,8 +468,37 @@ function SellerDashboard() {
   </div>;
 }
 
-function viewTitle(view) { return ({ dashboard: 'Dashboard', sales: 'Sales Analytics', businessPerformance: 'Business Performance', productPerformance: 'Product Performance', inventory: 'Inventory', payouts: 'Payout Reconciliation', brand: 'Brand Analytics', orders: 'Orders', returns: 'Returns', reimbursements: 'Reimbursements', tax: 'GST & Tax', pricing: 'Pricing & Buy Box', listings: 'Listings', reports: 'Reports', rawData: 'Raw API Data', 'report-detail': 'Report Detail', 'metric-detail': 'Calculation Detail' })[view] ?? 'Dashboard'; }
-function viewDescription(view) { return ({ dashboard: 'Amazon-only reconciliation KPIs with explainable drill-downs.', sales: 'Revenue, order value, units and product sales trends from Amazon reports.', businessPerformance: 'Excel-style quarterly business performance report with analysed KPIs and matching graphs.', productPerformance: 'Excel-style product performance analysis with top products and written insights.', inventory: 'FBA inventory snapshots imported from SP-API inventory reports.', payouts: 'Settlement rows and payout reconciliation from Amazon settlement reports.', brand: 'ASIN-level product performance from synced Amazon order items, with Sales & Traffic metrics when available.', orders: 'Order and item-level details imported from Amazon SP-API.', returns: 'Customer return reasons, status and disposition.', reimbursements: 'Amazon reimbursement credits for lost, damaged or adjusted inventory.', tax: 'GST B2B and B2C invoice rows in readable form.', pricing: 'ASP and Buy Box signals that influence sales.', listings: 'SKU availability and listing stock visibility.', reports: 'Open each fetched report and view human-readable data.', rawData: 'Inspect raw fields returned from each imported API/report source before finalizing calculations.', 'report-detail': 'Human-readable rows from the selected SP-API report.' })[view] ?? 'Live seller KPIs populated from synced SP-API orders and reports.'; }
+function viewTitle(view) { return ({ orderPayments: 'Order Payment Reconciliation', dashboard: 'Dashboard', sales: 'Sales Analytics', businessPerformance: 'Business Performance', productPerformance: 'Product Performance', inventory: 'Inventory', payouts: 'Payout Reconciliation', brand: 'Brand Analytics', orders: 'Orders', returns: 'Returns', reimbursements: 'Reimbursements', tax: 'GST & Tax', pricing: 'Pricing & Buy Box', listings: 'Listings', reports: 'Reports', rawData: 'Raw API Data', 'report-detail': 'Report Detail', 'metric-detail': 'Calculation Detail' })[view] ?? 'Dashboard'; }
+function viewDescription(view) { return ({ orderPayments: 'See every rupee from customer order value, through Amazon deductions, to the final FBA or FBM seller receivable.', dashboard: 'Amazon-only reconciliation KPIs with explainable drill-downs.', sales: 'Revenue, order value, units and product sales trends from Amazon reports.', businessPerformance: 'Excel-style quarterly business performance report with analysed KPIs and matching graphs.', productPerformance: 'Excel-style product performance analysis with top products and written insights.', inventory: 'FBA inventory snapshots imported from SP-API inventory reports.', payouts: 'Settlement rows and payout reconciliation from Amazon settlement reports.', brand: 'ASIN-level product performance from synced Amazon order items, with Sales & Traffic metrics when available.', orders: 'Order and item-level details imported from Amazon SP-API.', returns: 'Customer return reasons, status and disposition.', reimbursements: 'Amazon reimbursement credits for lost, damaged or adjusted inventory.', tax: 'GST B2B and B2C invoice rows in readable form.', pricing: 'ASP and Buy Box signals that influence sales.', listings: 'SKU availability and listing stock visibility.', reports: 'Open each fetched report and view human-readable data.', rawData: 'Inspect raw fields returned from each imported API/report source before finalizing calculations.', 'report-detail': 'Human-readable rows from the selected SP-API report.' })[view] ?? 'Live seller KPIs populated from synced SP-API orders and reports.'; }
+
+function OrderPayments({ data }) {
+  const rows = data?.orderPayments ?? [];
+  const summary = data?.paymentSummary ?? {};
+  const displayed = rows.map(row => ({
+    ...row,
+    gross_sales: formatCurrency(row.gross_sales),
+    referral_fee: formatCurrency(row.referral_fee),
+    fulfillment_fee: formatCurrency(row.fulfillment_fee),
+    shipping_and_tax: formatCurrency(row.shipping_and_tax),
+    refunds: formatCurrency(row.refunds),
+    other_deductions: formatCurrency(row.other_deductions),
+    total_deductions: formatCurrency(row.total_deductions),
+    seller_receivable: formatCurrency(row.seller_receivable)
+  }));
+  return <>
+    <Card className="money-flow-card">
+      <div className="money-flow-heading"><div><span className="live-source">LIVE AMAZON SOURCES</span><h2>Where the order money goes</h2></div><p>Final settlements take priority over interim Finance events, so the same transaction is never counted twice.</p></div>
+      <div className="money-flow">
+        <div><small>Customer order value</small><strong>{formatCurrency(summary.grossSales)}</strong><span>Orders API</span></div>
+        <b>−</b><div className="deduction-step"><small>Amazon deductions</small><strong>{formatCurrency(summary.deductions)}</strong><span>Fees · tax · refunds</span></div>
+        <b>=</b><div className="receivable-step"><small>Seller receives</small><strong>{formatCurrency(summary.sellerReceivable)}</strong><span>Settlement / Finances API</span></div>
+      </div>
+      <div className="fulfillment-split"><div><span>FBA received</span><strong>{formatCurrency(summary.fbaReceivable)}</strong><small>Amazon fulfilled</small></div><div><span>FBM received</span><strong>{formatCurrency(summary.fbmReceivable)}</strong><small>Merchant fulfilled</small></div><div><span>Unclassified</span><strong>{formatCurrency(summary.otherReceivable)}</strong><small>Pending channel data</small></div></div>
+    </Card>
+    <TableCard title="Order-by-order money trail" rows={displayed} columns={['amazon_order_id', 'order_date', 'fulfillment', 'gross_sales', 'referral_fee', 'fulfillment_fee', 'shipping_and_tax', 'refunds', 'other_deductions', 'total_deductions', 'seller_receivable', 'payment_status', 'source']} pageSize={10} />
+    {!rows.length && <p className="alert warning">No order payment rows are available for this period. Connect Amazon, then run the real payment data sync above.</p>}
+  </>;
+}
 function DashboardOverview({ data, channelData, tenantId }) {
   const { range } = useContext(DateRangeContext);
   const summary = useMemo(() => buildDashboardSummary(data, range), [data, range]);
