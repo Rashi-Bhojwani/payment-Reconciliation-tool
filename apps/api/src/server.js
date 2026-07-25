@@ -612,19 +612,34 @@ app.get('/api/tenants/:tenantId/orders-reconciliation', async request => {
   const { tenantId }=TenantParamsSchema.parse(request.params); const range=requestedRange(request.query); await requireTenantUser(request,tenantId); await assertActiveTenant(tenantId);
   return withTenant(tenantId,async db=>{
     const orders=(await db.query(`with item_totals as (select amazon_order_id,sum(item_price) gross_item_price,sum(quantity_ordered) units,string_agg(distinct title,', ') product from order_items where tenant_id=$1 group by amazon_order_id), fees as (select order_id,count(*) fee_lines,
-      sum(amount) filter(where category='referral_commission') referral_commission,sum(amount) filter(where category like 'fulfillment_fee%') fulfillment_fee,sum(amount) filter(where category='shipping_fee') shipping_fee,sum(amount) filter(where category='closing_fee') closing_fee,
-      sum(amount) filter(where category in ('gift_wrap_fee','digital_services_fee','storage_fee','chargeback','adjustment','other')) other_fees,sum(amount) filter(where category='promotion') promotion,sum(amount) filter(where category='refund') refund,sum(amount) filter(where category='reimbursement') reimbursement,
+      sum(amount) filter(where category='referral_commission' and amount<0) referral_commission,sum(amount) filter(where category like 'fulfillment_fee%' and amount<0) fulfillment_fee,sum(amount) filter(where category='shipping_fee' and amount<0) shipping_fee,sum(amount) filter(where category='closing_fee' and amount<0) closing_fee,
+      sum(amount) filter(where category in ('gift_wrap_fee','digital_services_fee','storage_fee','chargeback','adjustment','other') and amount<0) other_fees,sum(amount) filter(where category='promotion') promotion,sum(amount) filter(where category='refund') refund,sum(amount) filter(where category='reimbursement') reimbursement,
       sum(amount) filter(where category='shipping_charge') shipping_charge,sum(amount) filter(where category='tax') tax,
-      sum(abs(amount)) filter(where amount<0 and category=any($4)) total_deductions from finance_transaction_items where tenant_id=$1 and posted_date >= $2 and posted_date < $3 group by order_id)
-      select o.amazon_order_id,o.order_date,o.status,o.fulfillment_channel,i.product,coalesce(i.units,0) units,coalesce(i.gross_item_price,o.total_amount,0) gross_item_price,
+      sum(amount) filter(where category in ('item_price','shipping_charge','gift_wrap') and amount>0) finance_gross,
+      sum(amount) net_total,sum(abs(amount)) filter(where amount<0 and category=any($4)) total_deductions from finance_transaction_items where tenant_id=$1 and posted_date >= $2 and posted_date < $3 group by order_id)
+      select o.amazon_order_id,o.order_date,o.status,o.fulfillment_channel,i.product,coalesce(i.units,0) units,case when coalesce(f.fee_lines,0)>0 then coalesce(f.finance_gross,i.gross_item_price,o.total_amount,0) else coalesce(i.gross_item_price,o.total_amount,0) end gross_item_price,
       abs(coalesce(f.referral_commission,0)) referral_commission,abs(coalesce(f.fulfillment_fee,0)) fulfillment_fee,abs(coalesce(f.shipping_fee,0)) shipping_fee,abs(coalesce(f.closing_fee,0)) closing_fee,abs(coalesce(f.other_fees,0)) other_fees,coalesce(f.promotion,0) promotion,coalesce(f.refund,0) refund,coalesce(f.reimbursement,0) reimbursement,coalesce(f.total_deductions,0) total_deductions,
-      coalesce(i.gross_item_price,o.total_amount,0)+coalesce(f.shipping_charge,0)+coalesce(f.tax,0)-coalesce(f.total_deductions,0)+coalesce(f.refund,0)+coalesce(f.reimbursement,0) net_payout,(coalesce(f.fee_lines,0)>0) "hasFeeData"
+      case when coalesce(f.fee_lines,0)>0 then f.net_total-coalesce(f.finance_gross,0)-coalesce(f.promotion,0)+coalesce(f.total_deductions,0) else 0 end other_amount,
+      case when coalesce(f.fee_lines,0)>0 then f.net_total else null end net_payout,(coalesce(f.fee_lines,0)>0) "hasFeeData"
       from orders o left join item_totals i on i.amazon_order_id=o.amazon_order_id left join fees f on f.order_id=o.amazon_order_id where o.tenant_id=$1 and o.order_date >= $2 and o.order_date < $3 order by "hasFeeData" desc,o.order_date desc`,[tenantId,range.start,range.end,FEE_CATEGORIES])).rows;
     const hasFinanceItems=orders.some(order=>order.hasFeeData);
     if (!hasFinanceItems) {
       const settlement=(await db.query('select order_id,amount_type,amount_description,amount from settlement_rows where tenant_id=$1 and posted_date >= $2 and posted_date < $3 and order_id is not null',[tenantId,range.start,range.end])).rows;
       const byOrder=new Map(); for(const row of settlement){const list=byOrder.get(row.order_id)??[];list.push({...row,category:categorizeFinanceLabel(`${row.amount_type} ${row.amount_description}`)});byOrder.set(row.order_id,list);}
-      for(const order of orders){const lines=byOrder.get(order.amazon_order_id)??[];if(!lines.length)continue;const sum=category=>lines.filter(line=>category(line.category)).reduce((total,line)=>total+Number(line.amount),0);order.referral_commission=Math.abs(sum(category=>category==='referral_commission'));order.fulfillment_fee=Math.abs(sum(category=>category.startsWith('fulfillment_fee')));order.shipping_fee=Math.abs(sum(category=>category==='shipping_fee'));order.closing_fee=Math.abs(sum(category=>category==='closing_fee'));order.other_fees=Math.abs(sum(category=>['gift_wrap_fee','digital_services_fee','storage_fee','chargeback','adjustment','other'].includes(category)));order.refund=sum(category=>category==='refund');order.reimbursement=sum(category=>category==='reimbursement');order.total_deductions=lines.filter(line=>FEE_CATEGORIES.includes(line.category)&&Number(line.amount)<0).reduce((total,line)=>total+Math.abs(Number(line.amount)),0);order.net_payout=lines.reduce((total,line)=>total+Number(line.amount),0);order.hasFeeData=true;order.feeSource='Settlement report';}
+      for (const order of orders) {
+        const lines=byOrder.get(order.amazon_order_id)??[]; if(!lines.length) continue;
+        const sum=predicate=>lines.filter(predicate).reduce((total,line)=>total+Number(line.amount),0);
+        order.referral_commission=Math.abs(sum(line=>line.category==='referral_commission'&&Number(line.amount)<0));
+        order.fulfillment_fee=Math.abs(sum(line=>line.category.startsWith('fulfillment_fee')&&Number(line.amount)<0));
+        order.shipping_fee=Math.abs(sum(line=>line.category==='shipping_fee'&&Number(line.amount)<0));
+        order.closing_fee=Math.abs(sum(line=>line.category==='closing_fee'&&Number(line.amount)<0));
+        order.other_fees=Math.abs(sum(line=>['gift_wrap_fee','digital_services_fee','storage_fee','chargeback','adjustment','other'].includes(line.category)&&Number(line.amount)<0));
+        order.promotion=sum(line=>line.category==='promotion'); order.refund=sum(line=>line.category==='refund'); order.reimbursement=sum(line=>line.category==='reimbursement');
+        order.total_deductions=lines.filter(line=>FEE_CATEGORIES.includes(line.category)&&Number(line.amount)<0).reduce((total,line)=>total+Math.abs(Number(line.amount)),0);
+        const settlementGross=sum(line=>['item_price','shipping_charge','gift_wrap'].includes(line.category)&&Number(line.amount)>0); if(settlementGross) order.gross_item_price=settlementGross;
+        order.net_payout=lines.reduce((total,line)=>total+Number(line.amount),0); order.other_amount=order.net_payout-Number(order.gross_item_price)-Number(order.promotion)+order.total_deductions;
+        order.hasFeeData=true; order.feeSource='Settlement report';
+      }
     }
     return {orders,source:hasFinanceItems?'Finances API':'Settlement report fallback'};
   });

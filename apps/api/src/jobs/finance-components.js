@@ -49,7 +49,11 @@ export function flattenFinanceTransaction(transaction) {
     if (!value || typeof value !== 'object') return;
     const label = value.description ?? value.Description ?? value.type ?? value.Type ?? value.breakdownType ?? value.BreakdownType ?? inheritedLabel;
     const amountNode = value.amount ?? value.Amount ?? value.breakdownAmount ?? value.BreakdownAmount ?? value.chargeAmount ?? value.ChargeAmount ?? value.feeAmount ?? value.FeeAmount;
-    if (amountNode != null && label) rows.push({ transactionId, ...context, category: categorizeFinanceLabel(label), description: String(label), amount: money(amountNode), currency: amountNode?.currencyCode ?? amountNode?.CurrencyCode ?? currency, postedDate, raw: value });
+    const childBreakdowns = value.breakdown ?? value.Breakdown ?? value.breakdowns ?? value.Breakdowns;
+    // Amazon sometimes supplies a parent total alongside its nested component
+    // amounts. Store leaf money only or the same rupees are counted twice.
+    const hasChildren = Array.isArray(childBreakdowns) ? childBreakdowns.length > 0 : Boolean(childBreakdowns && typeof childBreakdowns === 'object');
+    if (amountNode != null && label && !hasChildren) rows.push({ transactionId, ...context, category: categorizeFinanceLabel(label), description: String(label), amount: money(amountNode), currency: amountNode?.currencyCode ?? amountNode?.CurrencyCode ?? currency, postedDate, raw: value });
     for (const [key, nested] of Object.entries(value)) if (nested && typeof nested === 'object' && !['amount', 'Amount', 'breakdownAmount', 'BreakdownAmount', 'chargeAmount', 'ChargeAmount', 'feeAmount', 'FeeAmount'].includes(key)) walk(nested, context, label ?? key);
   }
   if (Array.isArray(items) && items.length) {

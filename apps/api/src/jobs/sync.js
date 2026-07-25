@@ -20,6 +20,14 @@ function text(value) { return value == null ? undefined : String(value).trim() |
 function number(value) { const parsed = Number(String(value ?? '').replace(/[,₹$]/g, '')); return Number.isFinite(parsed) ? parsed : 0; }
 /** @param {unknown} value */
 function integer(value) { return Math.trunc(number(value)); }
+function reportDate(value) {
+  const input = text(value);
+  if (!input) return null;
+  const match = input.match(/^(\d{1,2})[./-](\d{1,2})[./-](\d{4})(?:\s+(.*))?$/);
+  if (!match) return input;
+  const [, day, month, year, time] = match;
+  return `${year}-${month.padStart(2, '0')}-${day.padStart(2, '0')}${time ? ` ${time}` : ''}`;
+}
 function firstAttribute(attributes, names) {
   for (const name of names) {
     const value = attributes?.[name];
@@ -118,7 +126,7 @@ async function saveSettlementRows(tenantId, content) {
       await client.query(
         `insert into settlement_rows(tenant_id, settlement_id, order_id, amount_type, amount_description, amount, posted_date, raw)
          values($1,$2,$3,$4,$5,$6,$7,$8) on conflict do nothing`,
-        [tenantId, text(pick(row, ['settlement-id', 'settlement id', 'settlementId'])), text(pick(row, ['order-id', 'order id', 'amazon-order-id', 'amazonOrderId'])), text(pick(row, ['amount-type', 'amount type', 'amountType'])), text(pick(row, ['amount-description', 'amount description', 'amountDescription'])), amount, text(pick(row, ['posted-date', 'posted date', 'postedDate'])) ?? null, row]
+        [tenantId, text(pick(row, ['settlement-id', 'settlement id', 'settlementId'])), text(pick(row, ['order-id', 'order id', 'amazon-order-id', 'amazonOrderId'])), text(pick(row, ['amount-type', 'amount type', 'amountType'])), text(pick(row, ['amount-description', 'amount description', 'amountDescription'])), amount, reportDate(pick(row, ['posted-date', 'posted date', 'postedDate'])), row]
       );
     }
   });
@@ -407,6 +415,7 @@ export async function syncRecentApiDataForTenant(tenantId, options = {}) {
           // Finances API field casing and nested breakdown names can vary by
           // generation. Persist every source node in raw so classifications
           // that land in `other` can be inspected and improved safely.
+          await db.query('delete from finance_transaction_items where tenant_id=$1 and transaction_id=$2', [parsedTenantId, transactionId]);
           for (const component of flattenFinanceTransaction(transaction)) {
             await db.query(
               `insert into finance_transaction_items(tenant_id, transaction_id, order_id, sku, asin, category, amount_description, amount, currency, posted_date, raw)
