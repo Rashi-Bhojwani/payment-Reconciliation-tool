@@ -22,6 +22,7 @@ app.addContentTypeParser(/^application\/x-www-form-urlencoded(?:;.*)?$/, { parse
 
 const TenantParamsSchema = z.object({ tenantId: z.string().uuid() });
 const SyncParamsSchema = z.object({ tenantId: z.string().uuid(), reportType: z.enum(REPORT_TYPES) });
+const SellerSyncParamsSchema = z.object({ tenantId: z.string().uuid(), reportType: z.enum([...REPORT_TYPES, 'DIRECT_SP_API_SYNC']) });
 const AmazonCallbackSchema = z.object({ spapi_oauth_code: z.string().optional(), code: z.string().optional(), selling_partner_id: z.string().optional(), state: z.string().optional(), amazon_state: z.string().optional(), redirect_uri: z.string().url().optional(), error: z.string().optional(), error_description: z.string().optional() });
 const AmazonAccessTokenSchema = z.object({ sellerId: z.string().optional() });
 const DateRangeSchema = z.object({ start: z.string().datetime(), end: z.string().datetime() });
@@ -250,6 +251,59 @@ function summarizeComponents(rows) {
   return Object.fromEntries(byCategory.entries());
 }
 
+function buildOrderPaymentRows(orders, settlementRows, financeRows) {
+  const settlementByOrder = new Map();
+  for (const component of settlementComponentRows(settlementRows)) {
+    if (!component.related_order_id) continue;
+    const rows = settlementByOrder.get(component.related_order_id) ?? [];
+    rows.push(component);
+    settlementByOrder.set(component.related_order_id, rows);
+  }
+  const financeByOrder = new Map();
+  for (const transaction of financeRows) {
+    for (const component of financeComponentRows(transaction)) {
+      if (!component.related_order_id) continue;
+      const rows = financeByOrder.get(component.related_order_id) ?? [];
+      rows.push(component);
+      financeByOrder.set(component.related_order_id, rows);
+    }
+  }
+  return orders.map(order => {
+    // Settlement reports are the final accounting record. Finance API events
+    // are used only while an order has no settlement lines, preventing the
+    // same Amazon money movement from being counted twice.
+    const components = settlementByOrder.get(order.amazon_order_id) ?? financeByOrder.get(order.amazon_order_id) ?? [];
+    const amount = categories => components.filter(row => categories.includes(row.category)).reduce((sum, row) => sum + Number(row.amount ?? 0), 0);
+    const componentTotal = components.reduce((sum, row) => sum + Number(row.amount ?? 0), 0);
+    const orderGross = amount(['principal']) || Number(order.item_value ?? 0) + Number(order.item_tax ?? 0) - Number(order.promotion_discount ?? 0) || Number(order.total_amount ?? 0);
+    const deductions = components.filter(row => Number(row.amount) < 0).reduce((sum, row) => sum + Math.abs(Number(row.amount)), 0);
+    const credits = components.filter(row => Number(row.amount) > 0 && row.category !== 'principal').reduce((sum, row) => sum + Number(row.amount), 0);
+    return {
+      amazon_order_id: order.amazon_order_id,
+      order_date: order.order_date,
+      status: order.status,
+      product: order.product,
+      asin: order.asin,
+      sku: order.sku,
+      package_weight: order.package_weight,
+      package_dimensions: order.package_dimensions,
+      fulfillment: order.fulfillment_channel === 'AFN' ? 'FBA' : order.fulfillment_channel === 'MFN' ? 'FBM' : (order.fulfillment_channel ?? 'Unknown'),
+      gross_sales: orderGross,
+      referral_fee: Math.abs(amount(['commission', 'refund_commission'])),
+      fulfillment_fee: Math.abs(amount(['fba_fee'])),
+      shipping_and_tax: Math.abs(amount(['shipping', 'shipping_tax', 'tax'])),
+      refunds: Math.abs(amount(['refund'])),
+      other_deductions: Math.abs(amount(['other_fee', 'other_adjustment'])),
+      total_deductions: deductions,
+      credits,
+      seller_receivable: components.length ? componentTotal : orderGross,
+      payment_status: settlementByOrder.has(order.amazon_order_id) ? 'Settled' : financeByOrder.has(order.amazon_order_id) ? 'Finance posted' : 'Awaiting payment data',
+      source: settlementByOrder.has(order.amazon_order_id) ? 'Settlement report' : financeByOrder.has(order.amazon_order_id) ? 'Finances API' : 'Orders API',
+      components
+    };
+  });
+}
+
 function queueInitialSellerSync(tenantId) {
   // Keep the authorization callback fast and safe: mark the seller connected
   // first, then do only a small direct-API warmup in the background. Report
@@ -430,11 +484,15 @@ app.post('/api/admin/tenants/:tenantId/revoke-access', async request => { await 
 app.post('/api/admin/tenants/:tenantId/sync/:reportType', async request => { await requireAdmin(request); return syncReportForTenant(SyncParamsSchema.parse(request.params)); });
 
 app.post('/api/tenants/:tenantId/sync/:reportType', async request => {
-  const params = SyncParamsSchema.parse(request.params);
+  const params = SellerSyncParamsSchema.parse(request.params);
   const body = z.object({ range: DateRangeSchema.optional() }).parse(request.body ?? {});
   await requireTenantUser(request, params.tenantId);
   await assertActiveTenant(params.tenantId);
-  const directFirstReports = new Set(['GET_V2_SETTLEMENT_REPORT_DATA_FLAT_FILE_V2', 'GET_FBA_MYI_UNSUPPRESSED_INVENTORY_DATA', 'GET_FBA_REIMBURSEMENTS_DATA']);
+  if (params.reportType === 'DIRECT_SP_API_SYNC') {
+    const result = await syncRecentApiDataForTenant(params.tenantId, { range: body.range, maxOrderPages: 2, maxOrderItems: 20 });
+    return { reportType: params.reportType, status: 'completed', ...result };
+  }
+  const directFirstReports = new Set(['GET_FBA_MYI_UNSUPPRESSED_INVENTORY_DATA', 'GET_FBA_REIMBURSEMENTS_DATA']);
   if (directFirstReports.has(params.reportType)) {
     const familyOptions = params.reportType === 'GET_FBA_MYI_UNSUPPRESSED_INVENTORY_DATA'
       ? { includeOrders: false, includeFinance: false, includeInventory: true }
@@ -628,26 +686,45 @@ app.get('/api/tenants/:tenantId/dashboard', async request => {
     `, [tenantId])).rows;
     const settlementLines = (await client.query('select settlement_id, order_id, amount_type, amount_description, amount, posted_date from settlement_rows where tenant_id=$1 and posted_date >= $2 and posted_date < $3 order by posted_date desc nulls last limit 250', [tenantId, start, end])).rows;
     const orderRows = (await client.query(`
-      select o.amazon_order_id, o.order_date, o.status, o.total_amount,
+      select o.amazon_order_id, o.order_date, o.status, o.total_amount, o.fulfillment_channel, o.sales_channel,
         count(oi.id) item_lines,
+        string_agg(distinct oi.title, ', ') product,
+        string_agg(distinct oi.asin, ', ') asin,
+        string_agg(distinct oi.sku, ', ') sku,
+        string_agg(distinct case when oi.package_weight is not null then trim(to_char(oi.package_weight, 'FM999999990.###')) || ' ' || coalesce(oi.weight_unit, '') end, ', ') package_weight,
+        string_agg(distinct oi.package_dimensions, ', ') package_dimensions,
         coalesce(sum(oi.item_price),0) item_value,
         coalesce(sum(oi.item_tax),0) item_tax,
         coalesce(sum(oi.promotion_discount),0) promotion_discount
       from orders o
       left join order_items oi on oi.tenant_id=o.tenant_id and oi.amazon_order_id=o.amazon_order_id
       where o.tenant_id=$1 and o.order_date >= $2 and o.order_date < $3
-      group by o.amazon_order_id, o.order_date, o.status, o.total_amount
+      group by o.amazon_order_id, o.order_date, o.status, o.total_amount, o.fulfillment_channel, o.sales_channel
       order by o.order_date desc nulls last limit 250`, [tenantId, start, end])).rows;
     const inventory = (await client.query('select sku, fulfillable_quantity, snapshot_date from inventory_snapshots where tenant_id=$1 and snapshot_date >= $2::date and snapshot_date < $3::date order by snapshot_date desc, fulfillable_quantity desc nulls last limit 50', [tenantId, start, end])).rows;
     const returns = (await client.query('select order_id, return_reason, disposition, status, return_date from returns where tenant_id=$1 and return_date >= $2::date and return_date < $3::date order by return_date desc nulls last limit 50', [tenantId, start, end])).rows;
     const reimbursements = (await client.query('select sku, amount, reason, reimbursement_date from reimbursements where tenant_id=$1 and reimbursement_date >= $2::date and reimbursement_date < $3::date order by reimbursement_date desc nulls last limit 50', [tenantId, start, end])).rows;
     const invoices = (await client.query('select invoice_type, order_id, taxable_value, cgst, sgst, igst, invoice_date from gst_invoices where tenant_id=$1 and invoice_date >= $2::date and invoice_date < $3::date order by invoice_date desc nulls last limit 50', [tenantId, start, end])).rows;
     const orderItems = (await client.query('select oi.amazon_order_id, oi.asin, oi.sku, oi.title, oi.quantity_ordered, oi.item_price, oi.item_tax, oi.promotion_discount from order_items oi join orders o on o.tenant_id=oi.tenant_id and o.amazon_order_id=oi.amazon_order_id where oi.tenant_id=$1 and o.order_date >= $2 and o.order_date < $3 order by oi.quantity_ordered desc nulls last limit 50', [tenantId, start, end])).rows;
-    const financeTransactions = (await client.query('select transaction_id, transaction_type, posted_date, total_amount, currency, related_order_id, raw from finance_transactions where tenant_id=$1 and posted_date >= $2 and posted_date < $3 order by posted_date desc nulls last limit 250', [tenantId, start, end])).rows;
+    const financeTransactions = (await client.query('select transaction_id, transaction_type, posted_date, total_amount, currency, related_order_id, raw from finance_transactions where tenant_id=$1 and posted_date >= $2 and posted_date < $3 order by posted_date desc nulls last limit 2000', [tenantId, start, end])).rows;
     const financialComponents = [...settlementComponentRows(settlementLines), ...financeTransactions.flatMap(financeComponentRows)];
     const financialSummary = summarizeComponents(financialComponents);
+    const orderPayments = buildOrderPaymentRows(orderRows, settlementLines, financeTransactions);
+    const paymentComponents = orderPayments.flatMap(order => order.components.map(component => ({
+      amazon_order_id: order.amazon_order_id, product: order.product, asin: order.asin, sku: order.sku,
+      fulfillment: order.fulfillment, package_weight: order.package_weight, package_dimensions: order.package_dimensions,
+      posted_date: component.posted_date, source: component.source, category: component.category,
+      deduction: component.component, amount: component.amount
+    })));
+    const paymentSummary = orderPayments.reduce((summary, order) => {
+      summary.grossSales += Number(order.gross_sales ?? 0);
+      summary.deductions += Number(order.total_deductions ?? 0);
+      summary.sellerReceivable += Number(order.seller_receivable ?? 0);
+      summary[order.fulfillment === 'FBA' ? 'fbaReceivable' : order.fulfillment === 'FBM' ? 'fbmReceivable' : 'otherReceivable'] += Number(order.seller_receivable ?? 0);
+      return summary;
+    }, { grossSales: 0, deductions: 0, sellerReceivable: 0, fbaReceivable: 0, fbmReceivable: 0, otherReceivable: 0 });
     const hasImportedData = Number(orders.orders ?? 0) > 0 || Number(kpis.net_settled ?? 0) !== 0 || products.length > 0 || payments.length > 0 || inventory.length > 0;
-    return { seller, amazonAuth, hasImportedData, kpis, orders, orderRows, businessReportRows, products, trend, payments, settlementLines, financialComponents, financialSummary, jobs, inventory, returns, reimbursements, invoices, orderItems, financeTransactions };
+    return { seller, amazonAuth, hasImportedData, kpis, orders, orderRows, orderPayments, paymentComponents, paymentSummary, businessReportRows, products, trend, payments, settlementLines, financialComponents, financialSummary, jobs, inventory, returns, reimbursements, invoices, orderItems, financeTransactions };
   });
 });
 
