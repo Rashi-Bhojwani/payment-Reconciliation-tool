@@ -33,6 +33,19 @@ function catalogShippingFacts(catalog) {
     : null;
   return { weight: number(weight?.value), weightUnit: text(weight?.unit), dimensions: dimensionText };
 }
+function financeRelatedValue(transaction, wantedNames) {
+  const identifiers = transaction?.relatedIdentifiers ?? transaction?.RelatedIdentifiers;
+  if (Array.isArray(identifiers)) {
+    const match = identifiers.find(identifier => wantedNames.includes(String(identifier?.relatedIdentifierName ?? identifier?.RelatedIdentifierName ?? '').toUpperCase()));
+    return text(match?.relatedIdentifierValue ?? match?.RelatedIdentifierValue);
+  }
+  for (const name of wantedNames) {
+    const camelName = name.toLowerCase().replace(/_([a-z])/g, (_, letter) => letter.toUpperCase());
+    const value = identifiers?.[camelName] ?? identifiers?.[name] ?? identifiers?.[name.toLowerCase()];
+    if (value) return text(value);
+  }
+  return undefined;
+}
 /** @param {Record<string, unknown>} row @param {string[]} names */
 function pick(row, names) {
   const lowerMap = new Map(Object.entries(row).map(([key, value]) => [key.toLowerCase().replace(/[^a-z0-9]/g, ''), value]));
@@ -378,7 +391,7 @@ export async function syncRecentApiDataForTenant(tenantId, options = {}) {
             `insert into finance_transactions(tenant_id, transaction_id, transaction_type, posted_date, total_amount, currency, related_order_id, raw)
              values($1,$2,$3,$4,$5,$6,$7,$8)
              on conflict (tenant_id, transaction_id) do update set transaction_type=excluded.transaction_type, posted_date=excluded.posted_date, total_amount=excluded.total_amount, currency=excluded.currency, related_order_id=excluded.related_order_id, raw=excluded.raw`,
-            [parsedTenantId, transactionId, transaction.transactionType ?? transaction.TransactionType ?? null, transaction.postedDate ?? transaction.PostedDate ?? null, number(transaction.totalAmount?.currencyAmount ?? transaction.TotalAmount?.CurrencyAmount ?? transaction.totalAmount?.Amount ?? transaction.TotalAmount?.Amount), transaction.totalAmount?.currencyCode ?? transaction.TotalAmount?.CurrencyCode ?? 'INR', transaction.relatedIdentifiers?.orderId ?? transaction.RelatedIdentifiers?.OrderId ?? null, transaction]
+            [parsedTenantId, transactionId, transaction.transactionType ?? transaction.TransactionType ?? null, transaction.postedDate ?? transaction.PostedDate ?? null, number(transaction.totalAmount?.currencyAmount ?? transaction.TotalAmount?.CurrencyAmount ?? transaction.totalAmount?.Amount ?? transaction.TotalAmount?.Amount), transaction.totalAmount?.currencyCode ?? transaction.TotalAmount?.CurrencyCode ?? 'INR', financeRelatedValue(transaction, ['ORDER_ID', 'AMAZON_ORDER_ID']) ?? null, transaction]
           );
           transactionsImported += 1;
           const transactionType = String(transaction.transactionType ?? transaction.TransactionType ?? '').toLowerCase();
@@ -387,7 +400,7 @@ export async function syncRecentApiDataForTenant(tenantId, options = {}) {
               `insert into reimbursements(tenant_id, amount, reason, sku, reimbursement_date)
                values($1,$2,$3,$4,$5)
                on conflict (tenant_id, sku, reimbursement_date, amount, reason) do nothing`,
-              [parsedTenantId, number(transaction.totalAmount?.currencyAmount ?? transaction.TotalAmount?.CurrencyAmount ?? transaction.totalAmount?.Amount ?? transaction.TotalAmount?.Amount), transaction.transactionType ?? transaction.TransactionType ?? 'Finance reimbursement', transaction.relatedIdentifiers?.sku ?? transaction.RelatedIdentifiers?.Sku ?? transactionId, transaction.postedDate ?? transaction.PostedDate ?? null]
+              [parsedTenantId, number(transaction.totalAmount?.currencyAmount ?? transaction.TotalAmount?.CurrencyAmount ?? transaction.totalAmount?.Amount ?? transaction.TotalAmount?.Amount), transaction.transactionType ?? transaction.TransactionType ?? 'Finance reimbursement', financeRelatedValue(transaction, ['SKU']) ?? transactionId, transaction.postedDate ?? transaction.PostedDate ?? null]
             );
             reimbursementsImported += 1;
           }
