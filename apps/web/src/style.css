@@ -950,6 +950,9 @@ td { padding: 13px 14px; color:#344054; }
 .order-detail-grid { display: grid; grid-template-columns: minmax(260px, 1fr) minmax(360px, 2fr); gap: 28px; text-align: left; }
 .fee-line { display: grid; grid-template-columns: 1fr 160px 120px; gap: 12px; padding: 9px 0; border-bottom: 1px solid var(--border); }
 .fee-line strong { text-align: right; }
+.payout-equation { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin: 10px 0; padding: 12px; background: #fff; border: 1px solid var(--border); border-radius: 10px; }
+.payout-equation span { padding-right: 8px; border-right: 1px solid var(--border); }
+.payout-equation > strong { color: #047857; font-size: 17px; }
 .fee-audit-hero { display: flex; justify-content: space-between; align-items: center; gap: 24px; padding: 28px; }
 .fee-audit-hero h2 { margin: 5px 0; }
 @media(max-width:800px){.order-detail-grid{grid-template-columns:1fr}.fee-audit-hero{display:block}.calculation-components>div{grid-template-columns:1fr auto}.calculation-components small{display:none}}

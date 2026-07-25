@@ -623,12 +623,12 @@ app.get('/api/tenants/:tenantId/orders-reconciliation', async request => {
       sum(fi.amount) filter(where fi.category in ('gift_wrap_fee','digital_services_fee','storage_fee','chargeback','adjustment','other') and fi.amount<0) other_fees,sum(fi.amount) filter(where fi.category='promotion') promotion,sum(fi.amount) filter(where fi.category='refund') refund,sum(fi.amount) filter(where fi.category='reimbursement') reimbursement,
       sum(fi.amount) filter(where fi.category='shipping_charge') shipping_charge,sum(fi.amount) filter(where fi.category='tax') tax,
       sum(fi.amount) filter(where fi.category in ('item_price','shipping_charge','gift_wrap') and fi.amount>0) finance_gross,
-      max(ct.total_amount) net_total,max(ct.posted_date) transaction_date,sum(abs(fi.amount)) filter(where fi.amount<0 and fi.category=any($4)) total_deductions
+      sum(fi.amount) net_total,max(ct.total_amount) transaction_header_total,max(ct.posted_date) transaction_date,sum(abs(fi.amount)) filter(where fi.amount<0 and fi.category=any($4)) total_deductions
       from finance_transaction_items fi join chosen_transactions ct on ct.transaction_id=fi.transaction_id and ct.related_order_id=fi.order_id
       where fi.tenant_id=$1 group by fi.order_id)
       select o.amazon_order_id,o.order_date,f.transaction_date,o.status,o.fulfillment_channel,i.product,coalesce(i.units,0) units,case when coalesce(f.fee_lines,0)>0 then coalesce(f.finance_gross,i.gross_item_price,o.total_amount,0) else coalesce(i.gross_item_price,o.total_amount,0) end gross_item_price,
       abs(coalesce(f.referral_commission,0)) referral_commission,abs(coalesce(f.fulfillment_fee,0)) fulfillment_fee,abs(coalesce(f.shipping_fee,0)) shipping_fee,abs(coalesce(f.closing_fee,0)) closing_fee,abs(coalesce(f.other_fees,0)) other_fees,coalesce(f.promotion,0) promotion,coalesce(f.refund,0) refund,coalesce(f.reimbursement,0) reimbursement,coalesce(f.total_deductions,0) total_deductions,
-      case when coalesce(f.fee_lines,0)>0 then f.net_total-coalesce(f.finance_gross,0)-coalesce(f.promotion,0)+coalesce(f.total_deductions,0) else 0 end other_amount,
+      case when coalesce(f.fee_lines,0)>0 then f.net_total-coalesce(f.finance_gross,0)-coalesce(f.promotion,0)+coalesce(f.total_deductions,0) else 0 end other_amount,f.transaction_header_total,
       case when coalesce(f.fee_lines,0)>0 then f.net_total else null end net_payout,(coalesce(f.fee_lines,0)>0) "hasFeeData"
       from orders o left join item_totals i on i.amazon_order_id=o.amazon_order_id left join fees f on f.order_id=o.amazon_order_id where o.tenant_id=$1 and o.order_date >= $2 and o.order_date < $3 order by "hasFeeData" desc,o.order_date desc`,[tenantId,range.start,range.end,FEE_CATEGORIES])).rows;
     const hasFinanceItems=orders.some(order=>order.hasFeeData);
