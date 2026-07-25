@@ -485,6 +485,7 @@ function OrderPayments({ data }) {
     total_deductions: formatCurrency(row.total_deductions),
     seller_receivable: formatCurrency(row.seller_receivable)
   }));
+  const deductions = (data?.paymentComponents ?? []).map(row => ({ ...row, amount: formatCurrency(row.amount) }));
   return <>
     <Card className="money-flow-card">
       <div className="money-flow-heading"><div><span className="live-source">LIVE AMAZON SOURCES</span><h2>Where the order money goes</h2></div><p>Final settlements take priority over interim Finance events, so the same transaction is never counted twice.</p></div>
@@ -495,7 +496,8 @@ function OrderPayments({ data }) {
       </div>
       <div className="fulfillment-split"><div><span>FBA received</span><strong>{formatCurrency(summary.fbaReceivable)}</strong><small>Amazon fulfilled</small></div><div><span>FBM received</span><strong>{formatCurrency(summary.fbmReceivable)}</strong><small>Merchant fulfilled</small></div><div><span>Unclassified</span><strong>{formatCurrency(summary.otherReceivable)}</strong><small>Pending channel data</small></div></div>
     </Card>
-    <TableCard title="Order-by-order money trail" rows={displayed} columns={['amazon_order_id', 'order_date', 'fulfillment', 'gross_sales', 'referral_fee', 'fulfillment_fee', 'shipping_and_tax', 'refunds', 'other_deductions', 'total_deductions', 'seller_receivable', 'payment_status', 'source']} pageSize={10} />
+    <TableCard title="Order-by-order money trail" rows={displayed} columns={['amazon_order_id', 'product', 'sku', 'fulfillment', 'package_weight', 'package_dimensions', 'gross_sales', 'referral_fee', 'fulfillment_fee', 'shipping_and_tax', 'refunds', 'other_deductions', 'total_deductions', 'seller_receivable', 'payment_status', 'source']} pageSize={10} />
+    <TableCard title="Every Amazon money component" rows={deductions} columns={['amazon_order_id', 'product', 'asin', 'sku', 'fulfillment', 'package_weight', 'package_dimensions', 'posted_date', 'category', 'deduction', 'amount', 'source']} pageSize={12} />
     {!rows.length && <p className="alert warning">No order payment rows are available for this period. Connect Amazon, then run the real payment data sync above.</p>}
   </>;
 }

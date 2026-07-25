@@ -282,6 +282,11 @@ function buildOrderPaymentRows(orders, settlementRows, financeRows) {
       amazon_order_id: order.amazon_order_id,
       order_date: order.order_date,
       status: order.status,
+      product: order.product,
+      asin: order.asin,
+      sku: order.sku,
+      package_weight: order.package_weight,
+      package_dimensions: order.package_dimensions,
       fulfillment: order.fulfillment_channel === 'AFN' ? 'FBA' : order.fulfillment_channel === 'MFN' ? 'FBM' : (order.fulfillment_channel ?? 'Unknown'),
       gross_sales: orderGross,
       referral_fee: Math.abs(amount(['commission', 'refund_commission'])),
@@ -683,6 +688,11 @@ app.get('/api/tenants/:tenantId/dashboard', async request => {
     const orderRows = (await client.query(`
       select o.amazon_order_id, o.order_date, o.status, o.total_amount, o.fulfillment_channel, o.sales_channel,
         count(oi.id) item_lines,
+        string_agg(distinct oi.title, ', ') product,
+        string_agg(distinct oi.asin, ', ') asin,
+        string_agg(distinct oi.sku, ', ') sku,
+        string_agg(distinct case when oi.package_weight is not null then trim(to_char(oi.package_weight, 'FM999999990.###')) || ' ' || coalesce(oi.weight_unit, '') end, ', ') package_weight,
+        string_agg(distinct oi.package_dimensions, ', ') package_dimensions,
         coalesce(sum(oi.item_price),0) item_value,
         coalesce(sum(oi.item_tax),0) item_tax,
         coalesce(sum(oi.promotion_discount),0) promotion_discount
@@ -700,6 +710,12 @@ app.get('/api/tenants/:tenantId/dashboard', async request => {
     const financialComponents = [...settlementComponentRows(settlementLines), ...financeTransactions.flatMap(financeComponentRows)];
     const financialSummary = summarizeComponents(financialComponents);
     const orderPayments = buildOrderPaymentRows(orderRows, settlementLines, financeTransactions);
+    const paymentComponents = orderPayments.flatMap(order => order.components.map(component => ({
+      amazon_order_id: order.amazon_order_id, product: order.product, asin: order.asin, sku: order.sku,
+      fulfillment: order.fulfillment, package_weight: order.package_weight, package_dimensions: order.package_dimensions,
+      posted_date: component.posted_date, source: component.source, category: component.category,
+      deduction: component.component, amount: component.amount
+    })));
     const paymentSummary = orderPayments.reduce((summary, order) => {
       summary.grossSales += Number(order.gross_sales ?? 0);
       summary.deductions += Number(order.total_deductions ?? 0);
@@ -708,7 +724,7 @@ app.get('/api/tenants/:tenantId/dashboard', async request => {
       return summary;
     }, { grossSales: 0, deductions: 0, sellerReceivable: 0, fbaReceivable: 0, fbmReceivable: 0, otherReceivable: 0 });
     const hasImportedData = Number(orders.orders ?? 0) > 0 || Number(kpis.net_settled ?? 0) !== 0 || products.length > 0 || payments.length > 0 || inventory.length > 0;
-    return { seller, amazonAuth, hasImportedData, kpis, orders, orderRows, orderPayments, paymentSummary, businessReportRows, products, trend, payments, settlementLines, financialComponents, financialSummary, jobs, inventory, returns, reimbursements, invoices, orderItems, financeTransactions };
+    return { seller, amazonAuth, hasImportedData, kpis, orders, orderRows, orderPayments, paymentComponents, paymentSummary, businessReportRows, products, trend, payments, settlementLines, financialComponents, financialSummary, jobs, inventory, returns, reimbursements, invoices, orderItems, financeTransactions };
   });
 });
 
