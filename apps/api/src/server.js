@@ -639,7 +639,11 @@ app.get('/api/tenants/:tenantId/transactions', async request => {
 app.get('/api/tenants/:tenantId/orders-reconciliation', async request => {
   const { tenantId }=TenantParamsSchema.parse(request.params); const range=requestedRange(request.query); await requireTenantUser(request,tenantId); await assertActiveTenant(tenantId);
   return withTenant(tenantId,async db=>{
-    const orders=(await db.query(`with item_totals as (select amazon_order_id,sum(item_price) gross_item_price,sum(quantity_ordered) units,string_agg(distinct title,', ') product from order_items where tenant_id=$1 group by amazon_order_id),
+    const orders=(await db.query(`with scoped_order_ids as (
+        select amazon_order_id from orders where tenant_id=$1 and order_date >= $2 and order_date < $3
+        union select related_order_id from finance_transactions where tenant_id=$1 and related_order_id is not null and posted_date >= $2 and posted_date < $3),
+      scoped_orders as (select ids.amazon_order_id,o.order_date,coalesce(o.status,'Payment posted') status,o.fulfillment_channel,o.total_amount from scoped_order_ids ids left join orders o on o.tenant_id=$1 and o.amazon_order_id=ids.amazon_order_id),
+      item_totals as (select amazon_order_id,sum(item_price) gross_item_price,sum(quantity_ordered) units,string_agg(distinct title,', ') product from order_items where tenant_id=$1 group by amazon_order_id),
       chosen_transactions as (select distinct on (related_order_id) transaction_id,related_order_id,total_amount,posted_date,transaction_type,raw
         from finance_transactions where tenant_id=$1 and related_order_id is not null
         order by related_order_id,
@@ -665,7 +669,7 @@ app.get('/api/tenants/:tenantId/orders-reconciliation', async request => {
       abs(coalesce(f.referral_commission,0)) referral_commission,abs(coalesce(f.fulfillment_fee,0)) fulfillment_fee,abs(coalesce(f.shipping_fee,0)) shipping_fee,abs(coalesce(f.closing_fee,0)) closing_fee,abs(coalesce(f.other_fees,0)) other_fees,case when coalesce(f.summary_lines,0)>0 then coalesce(f.summary_promotional_rebates,0) else coalesce(f.promotion,0) end promotion,coalesce(f.refund,0) refund,coalesce(f.reimbursement,0) reimbursement,case when coalesce(f.summary_lines,0)>0 then abs(coalesce(f.summary_amazon_fees,0)) else coalesce(f.total_deductions,0) end total_deductions,
       case when coalesce(f.is_order_payment,false) and coalesce(f.summary_lines,0)>0 then coalesce(f.summary_other,0) when coalesce(f.is_order_payment,false) then f.leaf_total-coalesce(f.finance_gross,0)-coalesce(f.promotion,0)+coalesce(f.total_deductions,0) else 0 end other_amount,f.transaction_header_total,
       case when coalesce(f.is_order_payment,false) and coalesce(f.summary_lines,0)>0 then coalesce(f.summary_product_charges,0)+coalesce(f.summary_promotional_rebates,0)+coalesce(f.summary_amazon_fees,0)+coalesce(f.summary_other,0) when coalesce(f.is_order_payment,false) then f.leaf_total else null end net_payout,coalesce(f.is_order_payment,false) "hasFeeData"
-      from orders o left join item_totals i on i.amazon_order_id=o.amazon_order_id left join fees f on f.order_id=o.amazon_order_id where o.tenant_id=$1 and o.order_date >= $2 and o.order_date < $3 order by "hasFeeData" desc,o.order_date desc`,[tenantId,range.start,range.end,FEE_CATEGORIES])).rows;
+      from scoped_orders o left join item_totals i on i.amazon_order_id=o.amazon_order_id left join fees f on f.order_id=o.amazon_order_id order by "hasFeeData" desc,f.transaction_date desc nulls last,o.order_date desc`,[tenantId,range.start,range.end,FEE_CATEGORIES])).rows;
     const hasFinanceItems=orders.some(order=>order.hasFeeData);
     if (!hasFinanceItems) {
       const settlement=(await db.query('select order_id,amount_type,amount_description,amount from settlement_rows where tenant_id=$1 and order_id is not null',[tenantId])).rows;
