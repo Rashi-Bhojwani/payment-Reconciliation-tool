@@ -281,10 +281,11 @@ export async function syncRecentApiDataForTenant(tenantId, options = {}) {
           const orderId = order.AmazonOrderId ?? order.amazonOrderId;
           if (!orderId) continue;
           await db.query(
-            `insert into orders(tenant_id, amazon_order_id, order_date, total_amount, status)
-             values($1,$2,$3,$4,$5)
-             on conflict (tenant_id, amazon_order_id) do update set order_date=excluded.order_date, total_amount=excluded.total_amount, status=excluded.status`,
-            [parsedTenantId, orderId, order.PurchaseDate ?? order.purchaseDate ?? null, number(order.OrderTotal?.Amount ?? order.orderTotal?.amount), order.OrderStatus ?? order.orderStatus ?? null]
+            `insert into orders(tenant_id, amazon_order_id, order_date, total_amount, status, fulfillment_channel, sales_channel, raw)
+             values($1,$2,$3,$4,$5,$6,$7,$8::jsonb)
+             on conflict (tenant_id, amazon_order_id) do update set order_date=excluded.order_date, total_amount=excluded.total_amount,
+               status=excluded.status, fulfillment_channel=excluded.fulfillment_channel, sales_channel=excluded.sales_channel, raw=excluded.raw`,
+            [parsedTenantId, orderId, order.PurchaseDate ?? order.purchaseDate ?? null, number(order.OrderTotal?.Amount ?? order.orderTotal?.amount), order.OrderStatus ?? order.orderStatus ?? null, order.FulfillmentChannel ?? order.fulfillmentChannel ?? null, order.SalesChannel ?? order.salesChannel ?? null, JSON.stringify(order)]
           );
           ordersImported += 1;
           const existingItems = await db.query('select 1 from order_items where tenant_id=$1 and amazon_order_id=$2 limit 1', [parsedTenantId, orderId]);
