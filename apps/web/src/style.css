@@ -964,6 +964,8 @@ td { padding: 13px 14px; color:#344054; }
 .understand-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }.understand-grid > div { padding: 14px; border: 1px solid var(--border); border-radius: 10px; background: white; }.understand-grid h5 { margin: 0 0 10px; }
 .friendly-line { display: flex; justify-content: space-between; gap: 12px; padding: 8px 0; border-bottom: 1px solid var(--border); }.friendly-line.deduction strong { color: #c62828; }.friendly-line:not(.deduction) strong { color: #047857; }
 .source-lines { margin-top: 14px; }.source-lines summary { cursor: pointer; color: #2563eb; font-weight: 700; padding: 8px 0; }
+.transaction-ledger-intro { display: flex; justify-content: space-between; align-items: center; gap: 24px; padding: 22px 26px; }
+.transaction-ledger-intro h2 { margin: 4px 0; }.transaction-ledger-intro p { margin: 0; color: var(--muted); max-width: 850px; }.transaction-ledger-actions { display: grid; gap: 8px; text-align: right; }.transaction-ledger-actions strong { font-size: 24px; white-space: nowrap; }
 .fee-audit-hero { display: flex; justify-content: space-between; align-items: center; gap: 24px; padding: 28px; }
 .fee-audit-hero h2 { margin: 5px 0; }
 @media(max-width:800px){.order-detail-grid,.understand-grid,.reconciliation-summary{grid-template-columns:1fr}.journey-cards{grid-template-columns:1fr}.journey-cards>b{text-align:center}.fee-audit-hero{display:block}.calculation-components>div{grid-template-columns:1fr auto}.calculation-components small{display:none}}

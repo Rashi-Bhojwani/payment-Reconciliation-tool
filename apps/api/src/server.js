@@ -491,7 +491,7 @@ app.post('/api/tenants/:tenantId/sync/:reportType', async request => {
   await requireTenantUser(request, params.tenantId);
   await assertActiveTenant(params.tenantId);
   if (params.reportType === 'DIRECT_SP_API_SYNC') {
-    const result = await syncRecentApiDataForTenant(params.tenantId, { range: body.range, maxOrderPages: 3, maxOrderItems: 50 });
+    const result = await syncRecentApiDataForTenant(params.tenantId, { range: body.range, maxOrderPages: 100, maxOrderItems: 1000 });
     return { reportType: params.reportType, status: 'completed', ...result };
   }
   const directFirstReports = new Set(['GET_FBA_MYI_UNSUPPRESSED_INVENTORY_DATA', 'GET_FBA_REIMBURSEMENTS_DATA']);
@@ -605,6 +605,34 @@ app.get('/api/tenants/:tenantId/calculations/:metric', async request => {
     }
     const total = metric === 'deductions' ? rows.reduce((sum,row)=>sum+Math.abs(Number(row.amount)),0) : rows.reduce((sum,row)=>sum+Number(row.amount),0);
     return { metric,total,source,components:groupCalculationRows(rows),rows,columns:['transaction_id','order_id','sku','asin','category','amount_description','amount','currency','posted_date'] };
+  });
+});
+
+app.get('/api/tenants/:tenantId/transactions', async request => {
+  const { tenantId }=TenantParamsSchema.parse(request.params); const range=requestedRange(request.query); await requireTenantUser(request,tenantId); await assertActiveTenant(tenantId);
+  return withTenant(tenantId,async db=>{
+    const rows=(await db.query(`with item_titles as (select amazon_order_id,string_agg(distinct title,', ') product_details from order_items where tenant_id=$1 group by amazon_order_id), components as (
+      select transaction_id,count(*) filter(where category like 'summary_%') summary_lines,
+        sum(amount) filter(where category='summary_product_charges') summary_product_charges,
+        sum(amount) filter(where category='summary_promotional_rebates') summary_promotional_rebates,
+        sum(amount) filter(where category='summary_amazon_fees') summary_amazon_fees,
+        sum(amount) filter(where category='summary_other') summary_other,
+        sum(amount) filter(where category in ('item_price','shipping_charge','gift_wrap') and amount>0) leaf_product_charges,
+        sum(amount) filter(where category='promotion') leaf_promotions,
+        sum(amount) filter(where amount<0 and category=any($4)) leaf_amazon_fees,
+        sum(amount) filter(where category not like 'summary_%') leaf_total
+      from finance_transaction_items where tenant_id=$1 group by transaction_id)
+      select ft.transaction_id,ft.posted_date,coalesce(ft.raw->>'transactionStatus',ft.raw->>'TransactionStatus','Unknown') transaction_status,
+        coalesce(ft.raw->>'accountType',ft.raw->>'AccountType',ft.raw#>>'{sellingPartnerMetadata,accountType}','Amazon transactions') account_type,
+        ft.transaction_type,coalesce(ft.related_order_id,'---') order_id,coalesce(it.product_details,ft.raw->>'description',ft.transaction_type) product_details,
+        case when coalesce(c.summary_lines,0)>0 then coalesce(c.summary_product_charges,0) else coalesce(c.leaf_product_charges,0) end product_charges,
+        case when coalesce(c.summary_lines,0)>0 then coalesce(c.summary_promotional_rebates,0) else coalesce(c.leaf_promotions,0) end promotional_rebates,
+        case when coalesce(c.summary_lines,0)>0 then coalesce(c.summary_amazon_fees,0) else coalesce(c.leaf_amazon_fees,0) end amazon_fees,
+        case when coalesce(c.summary_lines,0)>0 then coalesce(c.summary_other,0) else coalesce(ft.total_amount,0)-coalesce(c.leaf_product_charges,0)-coalesce(c.leaf_promotions,0)-coalesce(c.leaf_amazon_fees,0) end other,
+        case when coalesce(c.summary_lines,0)>0 then coalesce(c.summary_product_charges,0)+coalesce(c.summary_promotional_rebates,0)+coalesce(c.summary_amazon_fees,0)+coalesce(c.summary_other,0) else coalesce(c.leaf_total,ft.total_amount,0) end total
+      from finance_transactions ft left join components c on c.transaction_id=ft.transaction_id left join item_titles it on it.amazon_order_id=ft.related_order_id
+      where ft.tenant_id=$1 and ft.posted_date >= $2 and ft.posted_date < $3 order by ft.posted_date desc,ft.transaction_id`,[tenantId,range.start,range.end,FEE_CATEGORIES])).rows;
+    return {transactions:rows,count:rows.length,columns:['posted_date','transaction_status','account_type','transaction_type','order_id','product_details','product_charges','promotional_rebates','amazon_fees','other','total']};
   });
 });
 

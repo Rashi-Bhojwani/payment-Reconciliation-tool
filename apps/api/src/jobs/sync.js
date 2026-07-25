@@ -278,8 +278,8 @@ export async function syncRecentApiDataForTenant(tenantId, options = {}) {
   const includeOrders = options.includeOrders ?? true;
   const includeFinance = options.includeFinance ?? true;
   const includeInventory = options.includeInventory ?? true;
-  const maxOrderPages = Math.max(1, Math.min(Number(options.maxOrderPages ?? 3), 5));
-  const maxOrderItems = Math.max(0, Math.min(Number(options.maxOrderItems ?? 25), 50));
+  const maxOrderPages = Math.max(1, Math.min(Number(options.maxOrderPages ?? 100), 100));
+  const maxOrderItems = Math.max(0, Math.min(Number(options.maxOrderItems ?? 1000), 1000));
   await assertActiveTenant(parsedTenantId);
   return runJob(`sync:direct-api:${parsedTenantId}`, async () => {
     const sync = await pool.query('insert into sync_jobs(tenant_id, report_type, status, started_at) values($1,$2,$3,now()) returning id', [parsedTenantId, 'DIRECT_SP_API_SYNC', 'running']);
@@ -311,9 +311,11 @@ export async function syncRecentApiDataForTenant(tenantId, options = {}) {
       const financeBefore = range ? new Date(Math.min(safeNow.getTime(), new Date(range.end).getTime() + 45 * 864e5)).toISOString() : createdBefore;
       let financeResponse = includeFinance ? await client.listFinanceTransactions(createdAfter, financeBefore).catch(error => ({ syncError: error instanceof Error ? error.message : 'Finance sync failed' })) : null;
       const financePages = financeResponse ? [financeResponse] : [];
-      for (let page = 1; includeFinance && page < 5; page += 1) {
+      const financeTokens = new Set();
+      for (let page = 1; includeFinance && page < 100; page += 1) {
         const nextToken = financeResponse?.payload?.nextToken ?? financeResponse?.nextToken ?? financeResponse?.payload?.NextToken ?? financeResponse?.NextToken;
-        if (!nextToken) break;
+        if (!nextToken || financeTokens.has(nextToken)) break;
+        financeTokens.add(nextToken);
         financeResponse = await client.listFinanceTransactions(undefined, undefined, nextToken).catch(error => ({ syncError: error instanceof Error ? error.message : 'Finance pagination failed' }));
         financePages.push(financeResponse);
         if (financeResponse.syncError) break;
