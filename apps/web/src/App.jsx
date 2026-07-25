@@ -43,6 +43,7 @@ function codeClass(code) { return `code-${CODE_COLOR_KEY[code] ?? code.toLowerCa
 // the report(s) it actually depends on.
 
 const NAV_ITEMS = [
+  { view: 'orderPayments', label: 'Order Payments', icon: '₹' },
   { view: 'dashboard', label: 'Dashboard', icon: '▦' },
   { view: 'sales', label: 'Sales Analytics', icon: '↗' },
   { view: 'businessPerformance', label: 'Business Performance', icon: '▤' },
@@ -51,6 +52,7 @@ const NAV_ITEMS = [
   { view: 'payouts', label: 'Payouts', icon: '₹' },
   { view: 'brand', label: 'Brand Analytics', icon: '☆' },
   { view: 'orders', label: 'Orders', icon: '☰' },
+  { view: 'feeAudit', label: 'Fee Leak Audit', icon: '!' },
   { view: 'returns', label: 'Returns', icon: '↩' },
   { view: 'reimbursements', label: 'Reimbursements', icon: '+' },
   { view: 'tax', label: 'GST & Tax', icon: '%' },
@@ -61,11 +63,13 @@ const NAV_ITEMS = [
 ];
 
 const VIEW_REPORT_TYPES = {
+  orderPayments: ['DIRECT_SP_API_SYNC', 'GET_V2_SETTLEMENT_REPORT_DATA_FLAT_FILE_V2'],
   sales: ['GET_SALES_AND_TRAFFIC_REPORT'],
   inventory: ['GET_FBA_MYI_UNSUPPRESSED_INVENTORY_DATA'],
   payouts: ['DIRECT_SP_API_SYNC', 'GET_V2_SETTLEMENT_REPORT_DATA_FLAT_FILE_V2'],
   brand: ['DIRECT_SP_API_SYNC'],
   orders: ['DIRECT_SP_API_SYNC'],
+  feeAudit: ['DIRECT_SP_API_SYNC'],
   returns: ['GET_FBA_FULFILLMENT_CUSTOMER_RETURNS_DATA'],
   reimbursements: ['GET_FBA_REIMBURSEMENTS_DATA'],
   tax: ['GET_GST_MTR_B2B_CUSTOM', 'GET_GST_MTR_B2C_CUSTOM'],
@@ -77,11 +81,13 @@ const VIEW_REPORT_TYPES = {
   rawData: REPORTS.map(r => r.type)
 };
 const VIEW_LEDGER_COPY = {
+  orderPayments: { title: 'Real payment data sync', subtitle: 'Orders API + Finances API + final settlement report' },
   sales: { title: 'Sales & traffic sync', subtitle: 'Powers this page only' },
   inventory: { title: 'Inventory sync', subtitle: 'This page only' },
   payouts: { title: 'Payout sync', subtitle: 'Orders, finance and settlements' },
   brand: { title: 'Brand analytics sync', subtitle: 'Orders and item performance' },
   orders: { title: 'Orders sync', subtitle: 'Order and item lines' },
+  feeAudit: { title: 'Fee data sync', subtitle: 'Sync finance items before running an audit' },
   returns: { title: 'Returns sync', subtitle: 'Customer return report' },
   reimbursements: { title: 'Reimbursements sync', subtitle: 'Amazon credits' },
   tax: { title: 'GST sync', subtitle: 'B2B and B2C invoice reports' },
@@ -110,12 +116,16 @@ const ACCESS_TOKEN_CACHE_PREFIX = 'amazon_spapi_access_token:';
 function readAmazonTokenCache(tenantId) { const cached = JSON.parse(localStorage.getItem(`${ACCESS_TOKEN_CACHE_PREFIX}${tenantId}`) ?? 'null'); return cached?.accessToken && cached?.expiresAt && Date.now() < cached.expiresAt - 60_000 ? cached : null; }
 async function getAmazonAccessToken(tenantId) { const cached = readAmazonTokenCache(tenantId); if (cached) return cached; const fresh = await api(`/api/tenants/${tenantId}/amazon/access-token`); localStorage.setItem(`${ACCESS_TOKEN_CACHE_PREFIX}${tenantId}`, JSON.stringify(fresh)); return fresh; }
 async function beginAmazonAuthorization(tenantId) { const { url } = await api(`/api/auth/amazon/start?tenantId=${tenantId}&json=1`); window.location.assign(url); }
+async function syncAmazonSource(tenantId, reportType, range) {
+  const payload = { method: 'POST', body: JSON.stringify({ range: { start: formatDateParam(range.start), end: formatDateParam(addDays(range.end, 1)) } }) };
+  return api(`/api/tenants/${tenantId}/sync/${reportType}`, payload);
+}
 
 function Button({ className = '', variant = 'primary', icon, children, ...props }) { return <button {...props} className={`btn btn-${variant} ${className}`}>{icon && <span className="btn-icon" aria-hidden="true">{icon}</span>}{children}</button>; }
 function Input(props) { return <input {...props} className="input" />; }
 function Card({ children, className = '' }) { return <section className={`card ${className}`}>{children}</section>; }
 function Empty({ text }) { return <div className="empty-state">{text}</div>; }
-function formatCurrency(value) { return `₹${Number(value ?? 0).toLocaleString('en-IN', { maximumFractionDigits: 0 })}`; }
+function formatCurrency(value) { return `₹${Number(value ?? 0).toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`; }
 function formatNumber(value) { return Number(value ?? 0).toLocaleString('en-IN'); }
 function csvEscape(value) {
   const text = String(value ?? '').replaceAll('₹', '').replaceAll('—', '').replaceAll('â€”', '').trim();
@@ -278,13 +288,13 @@ function SyncLedger({ tenantId, jobs = [], onSynced, reportTypes, title, subtitl
     if (disabled) return;
     setRowState(s => ({ ...s, [reportType]: { loading: true } }));
     try {
-      const result = reportType === 'DIRECT_SP_API_SYNC'
-        ? await api(`/api/tenants/${tenantId}/sync`, { method: 'POST', body: JSON.stringify({ reportTypes: [], range: { start: formatDateParam(range.start), end: formatDateParam(addDays(range.end, 1)) } }) })
-        : await api(`/api/tenants/${tenantId}/sync/${reportType}`, { method: 'POST', body: JSON.stringify({ range: { start: formatDateParam(range.start), end: formatDateParam(addDays(range.end, 1)) } }) });
+      const result = await syncAmazonSource(tenantId, reportType, range);
       if (result?.status === 'failed') throw new Error(result.error ?? 'Sync failed');
       const failedDirectSync = result?.results?.find?.(row => row.status === 'failed');
       if (failedDirectSync) throw new Error(failedDirectSync.error ?? 'Sync failed');
-      setRowState(s => ({ ...s, [reportType]: { loading: false, justSynced: true } }));
+      const syncResult = result?.results?.[0] ?? result;
+      const summary = reportType === 'DIRECT_SP_API_SYNC' ? `${formatNumber(syncResult?.ordersImported)} orders · ${formatNumber(syncResult?.transactionsImported)} finance transactions` : `${formatNumber(syncResult?.rowsImported)} report rows imported`;
+      setRowState(s => ({ ...s, [reportType]: { loading: false, justSynced: true, summary } }));
       await onSynced?.();
     } catch (e) {
       setRowState(s => ({ ...s, [reportType]: { loading: false, error: e.message } }));
@@ -317,7 +327,7 @@ function SyncLedger({ tenantId, jobs = [], onSynced, reportTypes, title, subtitl
               <span className={`ledger-code ${codeClass(report.code)}`}>{report.code}</span>
               <div className="ledger-meta">
                 <b>{report.label}</b>
-                <small>{local?.error ?? (job?.completed_at ? `Last synced ${timeAgo(job.completed_at)}` : report.hint)}</small>
+                <small>{local?.error ?? local?.summary ?? (job?.completed_at ? `Last synced ${timeAgo(job.completed_at)}` : report.hint)}</small>
               </div>
               <span className={`pill status-${statusLabel}`}>{statusLabel}</span>
               <Button variant="secondary" disabled={disabled || busy} onClick={() => syncOne(report.type)}>{busy ? 'Syncing…' : 'Sync'}</Button>
@@ -372,7 +382,7 @@ function AmazonConnectionPanel({ tenantId, seller, onChange, setError }) {
 function SellerDashboard() {
   const [params] = useSearchParams();
   const tenantId = params.get('tenantId') ?? '';
-  const view = params.get('view') ?? 'dashboard';
+  const view = params.get('view') ?? 'orderPayments';
   const freshAmazonAuth = params.get('auth') === 'complete';
   const amazonError = params.get('amazon') === 'error' ? (params.get('message') ?? 'Amazon authorization failed') : '';
   const { range } = useContext(DateRangeContext);
@@ -410,7 +420,7 @@ function SellerDashboard() {
     (async () => {
       try {
         for (const reportType of selectedReportTypes) {
-          await api(`/api/tenants/${tenantId}/sync/${reportType}`, { method: 'POST', body: JSON.stringify({ range: { start: formatDateParam(selectedRange.start), end: formatDateParam(addDays(selectedRange.end, 1)) } }) });
+          await syncAmazonSource(tenantId, reportType, selectedRange);
         }
         await load(selectedRange, requestId);
       } catch (e) {
@@ -439,9 +449,10 @@ function SellerDashboard() {
     {freshAmazonAuth && connected && <p className="alert success">Amazon account connected. Select a date range or use Sync on this page to pull limited data.</p>}
     {amazonError && <p className="alert warning">Amazon connection issue: {amazonError}</p>}
     {error && <p className="alert warning">{error}</p>}
-    {view === 'dashboard' && !connected && data && <p className="alert warning">Connect your Amazon account to start pulling data — nothing syncs until then.</p>}
+    {(view === 'dashboard' || view === 'orderPayments') && !connected && data && <p className="alert warning">Connect your Amazon account to start pulling real payment data — nothing syncs until then.</p>}
     {view !== 'dashboard' && !detailView && <SyncLedger tenantId={tenantId} jobs={data?.jobs ?? []} onSynced={load} reportTypes={reportTypes} title={ledgerCopy?.title} subtitle={ledgerCopy?.subtitle} disabled={!connected} />}
 
+    {view === 'orderPayments' && <OrderReconciliation tenantId={tenantId} />}
     {view === 'dashboard' && <DashboardOverview data={data} channelData={channelData} tenantId={tenantId} />}
     {view === 'sales' && <SalesAnalytics data={data} channelData={channelData} />}
     {view === 'businessPerformance' && <BusinessPerformanceReport data={data} />}
@@ -449,7 +460,8 @@ function SellerDashboard() {
     {view === 'inventory' && <TableCard title="Inventory" rows={data?.inventory ?? []} columns={['sku', 'fulfillable_quantity', 'snapshot_date']} />}
     {view === 'payouts' && <TableCard title="Payout Activity" rows={data?.payments ?? []} columns={['posted_date', 'settlement_id', 'net_amount', 'lines']} />}
     {view === 'brand' && <TableCard title="Product Performance" rows={data?.products ?? []} columns={['asin', 'units', 'sales', 'buy_box']} />}
-    {view === 'orders' && <TableCard title="Order Details" rows={data?.orderItems ?? []} columns={['amazon_order_id', 'asin', 'sku', 'title', 'quantity_ordered', 'item_price']} />}
+    {view === 'orders' && <OrderReconciliation tenantId={tenantId} />}
+    {view === 'feeAudit' && <FeeLeakAudit tenantId={tenantId} />}
     {view === 'returns' && <TableCard title="Return Details" rows={data?.returns ?? []} columns={['order_id', 'return_reason', 'disposition', 'status', 'return_date']} />}
     {view === 'reimbursements' && <TableCard title="Reimbursement Details" rows={data?.reimbursements ?? []} columns={['sku', 'amount', 'reason', 'reimbursement_date']} />}
     {view === 'tax' && <TableCard title="GST Invoice Details" rows={data?.invoices ?? []} columns={['invoice_type', 'order_id', 'taxable_value', 'cgst', 'sgst', 'igst', 'invoice_date']} />}
@@ -458,12 +470,92 @@ function SellerDashboard() {
     {view === 'reports' && <ReportsExplorer tenantId={tenantId} data={data} />}
     {view === 'rawData' && <RawApiDataExplorer data={data} />}
     {view === 'report-detail' && <ReportDetail data={data} reportType={params.get('reportType')} />}
-    {view === 'metric-detail' && <MetricDetail data={data} metric={params.get('metric')} tenantId={tenantId} />}
+    {view === 'metric-detail' && <MetricDetail metric={params.get('metric')} tenantId={tenantId} />}
   </div>;
 }
 
-function viewTitle(view) { return ({ dashboard: 'Dashboard', sales: 'Sales Analytics', businessPerformance: 'Business Performance', productPerformance: 'Product Performance', inventory: 'Inventory', payouts: 'Payout Reconciliation', brand: 'Brand Analytics', orders: 'Orders', returns: 'Returns', reimbursements: 'Reimbursements', tax: 'GST & Tax', pricing: 'Pricing & Buy Box', listings: 'Listings', reports: 'Reports', rawData: 'Raw API Data', 'report-detail': 'Report Detail', 'metric-detail': 'Calculation Detail' })[view] ?? 'Dashboard'; }
-function viewDescription(view) { return ({ dashboard: 'Amazon-only reconciliation KPIs with explainable drill-downs.', sales: 'Revenue, order value, units and product sales trends from Amazon reports.', businessPerformance: 'Excel-style quarterly business performance report with analysed KPIs and matching graphs.', productPerformance: 'Excel-style product performance analysis with top products and written insights.', inventory: 'FBA inventory snapshots imported from SP-API inventory reports.', payouts: 'Settlement rows and payout reconciliation from Amazon settlement reports.', brand: 'ASIN-level product performance from synced Amazon order items, with Sales & Traffic metrics when available.', orders: 'Order and item-level details imported from Amazon SP-API.', returns: 'Customer return reasons, status and disposition.', reimbursements: 'Amazon reimbursement credits for lost, damaged or adjusted inventory.', tax: 'GST B2B and B2C invoice rows in readable form.', pricing: 'ASP and Buy Box signals that influence sales.', listings: 'SKU availability and listing stock visibility.', reports: 'Open each fetched report and view human-readable data.', rawData: 'Inspect raw fields returned from each imported API/report source before finalizing calculations.', 'report-detail': 'Human-readable rows from the selected SP-API report.' })[view] ?? 'Live seller KPIs populated from synced SP-API orders and reports.'; }
+function viewTitle(view) { return ({ orderPayments: 'Order Payment Reconciliation', dashboard: 'Dashboard', sales: 'Sales Analytics', businessPerformance: 'Business Performance', productPerformance: 'Product Performance', inventory: 'Inventory', payouts: 'Payout Reconciliation', brand: 'Brand Analytics', orders: 'Order Reconciliation', feeAudit: 'Fee Leak Audit', returns: 'Returns', reimbursements: 'Reimbursements', tax: 'GST & Tax', pricing: 'Pricing & Buy Box', listings: 'Listings', reports: 'Reports', rawData: 'Raw API Data', 'report-detail': 'Report Detail', 'metric-detail': 'Calculation Detail' })[view] ?? 'Dashboard'; }
+function viewDescription(view) { return ({ orderPayments: 'See every rupee from customer order value, through Amazon deductions, to the final FBA or FBM seller receivable.', dashboard: 'Amazon-only reconciliation KPIs with explainable drill-downs.', sales: 'Revenue, order value, units and product sales trends from Amazon reports.', businessPerformance: 'Excel-style quarterly business performance report with analysed KPIs and matching graphs.', productPerformance: 'Excel-style product performance analysis with top products and written insights.', inventory: 'FBA inventory snapshots imported from SP-API inventory reports.', payouts: 'Settlement rows and payout reconciliation from Amazon settlement reports.', brand: 'ASIN-level product performance from synced Amazon order items, with Sales & Traffic metrics when available.', orders: 'Order and item-level details imported from Amazon SP-API.', returns: 'Customer return reasons, status and disposition.', reimbursements: 'Amazon reimbursement credits for lost, damaged or adjusted inventory.', tax: 'GST B2B and B2C invoice rows in readable form.', pricing: 'ASP and Buy Box signals that influence sales.', listings: 'SKU availability and listing stock visibility.', reports: 'Open each fetched report and view human-readable data.', rawData: 'Inspect raw fields returned from each imported API/report source before finalizing calculations.', 'report-detail': 'Human-readable rows from the selected SP-API report.' })[view] ?? 'Live seller KPIs populated from synced SP-API orders and reports.'; }
+
+function OrderPayments({ data }) {
+  const rows = data?.orderPayments ?? [];
+  const summary = data?.paymentSummary ?? {};
+  const displayed = rows.map(row => ({
+    ...row,
+    gross_sales: formatCurrency(row.gross_sales),
+    referral_fee: formatCurrency(row.referral_fee),
+    fulfillment_fee: formatCurrency(row.fulfillment_fee),
+    shipping_and_tax: formatCurrency(row.shipping_and_tax),
+    refunds: formatCurrency(row.refunds),
+    other_deductions: formatCurrency(row.other_deductions),
+    total_deductions: formatCurrency(row.total_deductions),
+    seller_receivable: formatCurrency(row.seller_receivable)
+  }));
+  const deductions = (data?.paymentComponents ?? []).map(row => ({ ...row, amount: formatCurrency(row.amount) }));
+  return <>
+    <Card className="money-flow-card">
+      <div className="money-flow-heading"><div><span className="live-source">LIVE AMAZON SOURCES</span><h2>Where the order money goes</h2></div><p>Final settlements take priority over interim Finance events, so the same transaction is never counted twice.</p></div>
+      <div className="money-flow">
+        <div><small>Customer order value</small><strong>{formatCurrency(summary.grossSales)}</strong><span>Orders API</span></div>
+        <b>−</b><div className="deduction-step"><small>Amazon deductions</small><strong>{formatCurrency(summary.deductions)}</strong><span>Fees · tax · refunds</span></div>
+        <b>=</b><div className="receivable-step"><small>Seller receives</small><strong>{formatCurrency(summary.sellerReceivable)}</strong><span>Settlement / Finances API</span></div>
+      </div>
+      <div className="fulfillment-split"><div><span>FBA received</span><strong>{formatCurrency(summary.fbaReceivable)}</strong><small>Amazon fulfilled</small></div><div><span>FBM received</span><strong>{formatCurrency(summary.fbmReceivable)}</strong><small>Merchant fulfilled</small></div><div><span>Unclassified</span><strong>{formatCurrency(summary.otherReceivable)}</strong><small>Pending channel data</small></div></div>
+    </Card>
+    <TableCard title="Order-by-order money trail" rows={displayed} columns={['amazon_order_id', 'product', 'sku', 'fulfillment', 'package_weight', 'package_dimensions', 'gross_sales', 'referral_fee', 'fulfillment_fee', 'shipping_and_tax', 'refunds', 'other_deductions', 'total_deductions', 'seller_receivable', 'payment_status', 'source']} pageSize={10} />
+    <TableCard title="Every Amazon money component" rows={deductions} columns={['amazon_order_id', 'product', 'asin', 'sku', 'fulfillment', 'package_weight', 'package_dimensions', 'posted_date', 'category', 'deduction', 'amount', 'source']} pageSize={12} />
+    {!rows.length && <p className="alert warning">No order payment rows are available for this period. Connect Amazon, then run the real payment data sync above.</p>}
+  </>;
+}
+const MONEY_LABELS = {
+  referral_commission: 'Referral commission', fulfillment_fee_per_order: 'FBA fulfillment fee', fulfillment_fee_per_unit: 'FBA per-unit fee', fulfillment_fee_weight: 'FBA weight handling',
+  closing_fee: 'Closing fee', shipping_fee: 'Shipping service fee', storage_fee: 'Storage fee', digital_services_fee: 'Digital services fee', tax: 'Tax / withholding',
+  promotion: 'Promotional rebate', shipping_charge: 'Shipping paid by customer', gift_wrap: 'Gift wrap paid by customer', refund: 'Customer refund', reimbursement: 'Amazon reimbursement', adjustment: 'Amazon adjustment', other: 'Other Amazon movement'
+};
+function friendlyMoneyLabel(row) { return MONEY_LABELS[row.category] ?? String(row.amount_description ?? row.category).replaceAll('_', ' '); }
+function OrderMoneyDetails({ order, detail }) {
+  const leafLines = detail.fees.filter(row => !String(row.category).startsWith('summary_'));
+  const deductions = leafLines.filter(row => Number(row.amount) < 0 && !['promotion', 'refund'].includes(row.category));
+  const additions = leafLines.filter(row => Number(row.amount) > 0 && row.category !== 'item_price');
+  return <div className="money-explainer">
+    <h4>Your money journey</h4>
+    <div className="journey-cards"><div><small>1 · Customer paid</small><strong>{formatCurrency(order.gross_item_price)}</strong></div><b>−</b><div className="journey-fees"><small>2 · Amazon deducted</small><strong>{formatCurrency(order.total_deductions)}</strong></div><b>+</b><div><small>3 · Tax, credits &amp; other</small><strong>{formatCurrency(order.other_amount)}</strong></div><b>=</b><div className="journey-net"><small>4 · You receive</small><strong>{formatCurrency(order.net_payout)}</strong></div></div>
+    <p className="plain-explanation">Amazon started with <b>{formatCurrency(order.gross_item_price)}</b>, deducted <b>{formatCurrency(order.total_deductions)}</b> in fees, applied <b>{formatCurrency(order.other_amount)}</b> in taxes/credits/other movements, and posted <b>{formatCurrency(order.net_payout)}</b> to this transaction.</p>
+    <div className="understand-grid"><div><h5>Where Amazon deducted money</h5>{deductions.length?deductions.map((fee,index)=><div className="friendly-line deduction" key={index}><span>{friendlyMoneyLabel(fee)}</span><strong>−{formatCurrency(Math.abs(Number(fee.amount)))}</strong></div>):<p className="muted">No individual deduction lines were returned.</p>}</div><div><h5>Credits, tax and other movements</h5>{additions.length?additions.map((fee,index)=><div className="friendly-line" key={index}><span>{friendlyMoneyLabel(fee)}</span><strong>+{formatCurrency(fee.amount)}</strong></div>):<p className="muted">No positive adjustments were returned.</p>}</div></div>
+    <details className="source-lines"><summary>Show Amazon source lines ({formatNumber(leafLines.length)})</summary>{leafLines.map((fee,index)=><div className={Number(fee.amount)<0?'fee-line negative':'fee-line'} key={index}><span>{fee.amount_description||fee.category}</span><small>{fee.category}</small><strong>{formatCurrency(fee.amount)}</strong></div>)}</details>
+  </div>;
+}
+function OrderReconciliation({ tenantId }) {
+  const { range } = useContext(DateRangeContext);
+  const [orders, setOrders] = useState([]); const [transactions,setTransactions]=useState([]); const [source,setSource]=useState(''); const [flags, setFlags] = useState([]); const [openId, setOpenId] = useState(''); const [details, setDetails] = useState({}); const [error, setError] = useState('');
+  const [orderSearch,setOrderSearch]=useState(''); const [orderView,setOrderView]=useState('matched'); const [ledgerFilters,setLedgerFilters]=useState({account:'',type:'',status:'',orderId:''});
+  useEffect(() => { let active=true; setError(''); Promise.all([api(`/api/tenants/${tenantId}/orders-reconciliation?${rangeQuery(range)}`),api(`/api/tenants/${tenantId}/transactions?${rangeQuery(range)}`),api(`/api/tenants/${tenantId}/fee-leaks?${rangeQuery(range)}`)]).then(([result,ledger,leaks])=>{if(active){setOrders(result.orders);setTransactions(ledger.transactions);setSource(result.source);setFlags(leaks.flags);}}).catch(e=>{if(active)setError(e.message)}); return()=>{active=false}; },[tenantId,range.start,range.end]);
+  async function toggle(orderId) { if(openId===orderId){setOpenId('');return;} setOpenId(orderId); if(!details[orderId]) { try { const detail=await api(`/api/tenants/${tenantId}/orders-reconciliation/${encodeURIComponent(orderId)}`); setDetails(value=>({...value,[orderId]:detail})); } catch(e){setError(e.message);} } }
+  const flagByOrder=new Map(flags.map(flag=>[flag.order_id,flag]));
+  const counts = { reconciled: orders.filter(order=>order.hasFeeData).length, awaiting: orders.filter(order=>!order.hasFeeData&&!/cancel/i.test(order.status??'')).length, cancelled: orders.filter(order=>/cancel/i.test(order.status??'')).length };
+  const filteredOrders=orders.filter(order=>(orderView==='all'||(orderView==='matched'&&order.hasFeeData)||(orderView==='awaiting'&&!order.hasFeeData&&!/cancel/i.test(order.status??''))||(orderView==='cancelled'&&/cancel/i.test(order.status??'')))&&String(order.amazon_order_id).toLowerCase().includes(orderSearch.trim().toLowerCase()));
+  const uniqueValues=key=>[...new Set(transactions.map(row=>row[key]).filter(Boolean))].sort();
+  const filteredTransactions=transactions.filter(row=>(!ledgerFilters.account||row.account_type===ledgerFilters.account)&&(!ledgerFilters.type||row.transaction_type===ledgerFilters.type)&&(!ledgerFilters.status||row.transaction_status===ledgerFilters.status)&&String(row.order_id??'').toLowerCase().includes(ledgerFilters.orderId.trim().toLowerCase()));
+  function statusBadge(order, flag) {
+    if (flag) return <span className="overcharge-badge">Overcharged {formatCurrency(flag.variance)}</span>;
+    if (order.hasFeeData) return <span className="pill status-completed">Payment matched</span>;
+    if (/cancel/i.test(order.status??'')) return <span className="pill status-idle">Cancelled · no payout</span>;
+    if (/pending|unshipped/i.test(order.status??'')) return <span className="pill status-idle">Not shipped yet</span>;
+    return <span className="pill status-idle">Awaiting Amazon payment</span>;
+  }
+  const reconciliationTable = <Card className="table-card"><PanelHeader title="Order-wise gross → fees → payout" subtitle={source||'Loading Amazon money lines'} /><div className="reconciliation-summary"><button type="button" className={orderView==='matched'?'active':''} onClick={()=>setOrderView('matched')}><strong>{formatNumber(counts.reconciled)}</strong><span>Payments posted in this period</span></button><button type="button" className={orderView==='awaiting'?'active':''} onClick={()=>setOrderView('awaiting')}><strong>{formatNumber(counts.awaiting)}</strong><span>Recent orders awaiting Amazon</span></button><button type="button" className={orderView==='cancelled'?'active':''} onClick={()=>setOrderView('cancelled')}><strong>{formatNumber(counts.cancelled)}</strong><span>Cancelled — no payout expected</span></button><button type="button" className={orderView==='all'?'active':''} onClick={()=>setOrderView('all')}><strong>{formatNumber(orders.length)}</strong><span>All orders</span></button></div><p className="reconciliation-note">By default this shows payments Amazon posted during the selected period, even when the customer ordered earlier. Use “Recent orders awaiting Amazon” only to review newly shipped orders whose fees and payout have not been posted yet.</p><div className="order-search"><Input value={orderSearch} onChange={event=>setOrderSearch(event.target.value)} placeholder="Search order ID…"/><span>{formatNumber(filteredOrders.length)} matching orders</span></div>{error&&<p className="alert error">{error}</p>}{filteredOrders.length?<div className="table-wrap"><table><thead><tr>{['Order','Amazon status','Transaction date','Product charges','Promotions','Referral','Fulfillment','Amazon fees','Other','Net payout','Reconciliation',''].map(label=><th key={label}>{label}</th>)}</tr></thead><tbody>{filteredOrders.map(order=>{const flag=flagByOrder.get(order.amazon_order_id);const detail=details[order.amazon_order_id];return <React.Fragment key={order.amazon_order_id}><tr><td>{order.amazon_order_id}</td><td>{order.status??'—'}</td><td>{String(order.transaction_date??order.order_date??'').slice(0,10)}</td><td>{Number(order.gross_item_price)?formatCurrency(order.gross_item_price):'Items pending'}</td><td>{order.hasFeeData?formatCurrency(order.promotion):'—'}</td><td>{order.hasFeeData?formatCurrency(order.referral_commission):'—'}</td><td>{order.hasFeeData?formatCurrency(order.fulfillment_fee):'—'}</td><td>{order.hasFeeData?formatCurrency(order.total_deductions):'—'}</td><td>{order.hasFeeData?formatCurrency(order.other_amount):'—'}</td><td><b>{order.hasFeeData?formatCurrency(order.net_payout):'—'}</b></td><td>{statusBadge(order,flag)}</td><td><Button variant="ghost" onClick={()=>toggle(order.amazon_order_id)}>{openId===order.amazon_order_id?'Hide':'Details'}</Button></td></tr>{openId===order.amazon_order_id&&<tr className="order-detail-row"><td colSpan="12">{detail?<div className="order-detail-grid"><div><h4>Items</h4>{detail.items.length?detail.items.map((item,index)=><p key={index}><b>{item.title}</b><br/>{item.sku} · {formatNumber(item.quantity_ordered)} × {formatCurrency(item.item_price)}{item.package_weight?` · ${item.package_weight} ${item.weight_unit??''}`:''}</p>):<p className="muted">Order items have not been returned by Amazon yet. Run Orders & finance sync again after the order is confirmed.</p>}</div><OrderMoneyDetails order={order} detail={detail} /></div>:<Empty text="Loading order details…" />}</td></tr>}</React.Fragment>})}</tbody></table></div>:<Empty text="No synced orders in this period."/>}</Card>;
+  const ledgerColumns=['posted_date','transaction_status','account_type','transaction_type','order_id','product_details','product_charges','promotional_rebates','amazon_fees','other','total'];
+  const ledgerRows=filteredTransactions.map(row=>({...row,posted_date:String(row.posted_date??'').slice(0,10),product_charges:formatCurrency(row.product_charges),promotional_rebates:formatCurrency(row.promotional_rebates),amazon_fees:formatCurrency(row.amazon_fees),other:formatCurrency(row.other),total:formatCurrency(row.total)}));
+  return <>{reconciliationTable}<Card className="transaction-ledger-intro"><div><span className="live-source">MATCHES SELLER CENTRAL TRANSACTION VIEW</span><h2>All Amazon transactions</h2><p>This includes Order Payments, refunds, Easy Ship charges, service fees, tax withheld, and standalone transactions—not only orders that have a payout.</p></div><div className="transaction-ledger-actions"><strong>{formatNumber(filteredTransactions.length)} of {formatNumber(transactions.length)} transactions</strong><Button variant="secondary" disabled={!ledgerRows.length} onClick={()=>downloadCsv('amazon-transactions.csv',ledgerRows,ledgerColumns)}>Download filtered CSV</Button></div></Card><Card className="transaction-filters"><div><label>Account type<select className="input" value={ledgerFilters.account} onChange={event=>setLedgerFilters(value=>({...value,account:event.target.value}))}><option value="">All account types</option>{uniqueValues('account_type').map(value=><option key={value}>{value}</option>)}</select></label><label>Transaction type<select className="input" value={ledgerFilters.type} onChange={event=>setLedgerFilters(value=>({...value,type:event.target.value}))}><option value="">All transaction types</option>{uniqueValues('transaction_type').map(value=><option key={value}>{value}</option>)}</select></label><label>Transaction status<select className="input" value={ledgerFilters.status} onChange={event=>setLedgerFilters(value=>({...value,status:event.target.value}))}><option value="">All statuses</option>{uniqueValues('transaction_status').map(value=><option key={value}>{value}</option>)}</select></label><label>Order ID<Input value={ledgerFilters.orderId} onChange={event=>setLedgerFilters(value=>({...value,orderId:event.target.value}))} placeholder="Enter order ID…"/></label></div><Button variant="ghost" onClick={()=>setLedgerFilters({account:'',type:'',status:'',orderId:''})}>Clear filters</Button></Card><TableCard title="Complete Amazon transaction ledger" rows={ledgerRows} columns={ledgerColumns} pageSize={10}/></>;
+}
+
+function FeeLeakAudit({tenantId}) {
+  const {range}=useContext(DateRangeContext); const [result,setResult]=useState({flags:[],totalOvercharged:0}); const [busy,setBusy]=useState(false); const [error,setError]=useState('');
+  async function load(){setResult(await api(`/api/tenants/${tenantId}/fee-leaks?${rangeQuery(range)}`));}
+  useEffect(()=>{load().catch(e=>setError(e.message));},[tenantId,range.start,range.end]);
+  async function audit(){setBusy(true);setError('');try{await api(`/api/tenants/${tenantId}/fee-audit`,{method:'POST',body:JSON.stringify({range:{start:formatDateParam(range.start),end:formatDateParam(addDays(range.end,1))},varianceThreshold:5})});await load();}catch(e){setError(e.message)}finally{setBusy(false)}}
+  return <><Card className="fee-audit-hero"><div><span className="live-source">AMAZON FEES ESTIMATE API</span><h2>{formatCurrency(result.totalOvercharged)} potential overcharge</h2><p>Expected Amazon fees compared with itemized fees actually deducted. Slab fallback is clearly identified when used.</p></div><Button onClick={audit} disabled={busy}>{busy?'Auditing…':'Run fee audit'}</Button></Card>{error&&<p className="alert error">{error}</p>}<TableCard title="Flagged fee discrepancies" rows={result.flags} columns={['order_id','sku','source','expected_fee','actual_fee','variance','flagged_at','resolved']} pageSize={15}/></>;
+}
 function DashboardOverview({ data, channelData, tenantId }) {
   const { range } = useContext(DateRangeContext);
   const summary = useMemo(() => buildDashboardSummary(data, range), [data, range]);
@@ -471,8 +563,8 @@ function DashboardOverview({ data, channelData, tenantId }) {
     <div className="metrics-strip">
       <DrillMetric to={`/seller?tenantId=${tenantId}&view=metric-detail&metric=netSales`} title="Net Sales" value={formatCurrency(summary.netSales)} hint="Click to see order-value formula" />
       <DrillMetric to={`/seller?tenantId=${tenantId}&view=metric-detail&metric=netQty`} title="Net Qty" value={formatNumber(summary.netQty)} hint="Click to see units source" />
-      <DrillMetric to={`/seller?tenantId=${tenantId}&view=metric-detail&metric=orders`} title="Orders Synced" value={formatNumber(summary.ordersCount)} hint="Click to audit order rows" />
-      <DrillMetric to={`/seller?tenantId=${tenantId}&view=metric-detail&metric=returns`} title="Returns" value={formatNumber(summary.returnQty)} hint="Open return lines" />
+      <MiniMetric title="Orders Synced" value={formatNumber(summary.ordersCount)} hint="Use Order Reconciliation for details" />
+      <MiniMetric title="Returns" value={formatNumber(summary.returnQty)} hint="Use Returns for source rows" />
     </div>
 
     <Card className="profit-control-card">
@@ -507,7 +599,8 @@ function ExplanationGrid({ summary, tenantId }) {
     ['Return rate', returnRate, 'Returns compared with total sold quantity for quick customer-experience review.', 'returns'],
     ['GST invoice value', formatCurrency(summary.gstValue), 'Total taxable value imported from GST B2B/B2C invoice rows.', 'tax']
   ];
-  return <div className="explain-grid">{cards.map(([title, value, copy, target]) => <NavLink key={title} to={`/seller?tenantId=${tenantId}&view=metric-detail&metric=${target}`} className="explain-card"><b>{title}</b><strong>{value}</strong><p>{copy}</p><span>Open calculation →</span></NavLink>)}</div>;
+  const calculationMetrics = new Set(['settled', 'deductions']);
+  return <div className="explain-grid">{cards.map(([title, value, copy, target]) => <NavLink key={title} to={calculationMetrics.has(target) ? `/seller?tenantId=${tenantId}&view=metric-detail&metric=${target}` : `/seller?tenantId=${tenantId}&view=${target}`} className="explain-card"><b>{title}</b><strong>{value}</strong><p>{copy}</p><span>{calculationMetrics.has(target) ? 'Open calculation' : 'Open source rows'} →</span></NavLink>)}</div>;
 }
 function InsightCards({ title, cards }) { return <Card><PanelHeader title={title} /><div className="explain-grid compact">{cards.map(([label, value]) => <div className="explain-card" key={label}><b>{label}</b><strong>{value}</strong></div>)}</div></Card>; }
 
@@ -596,72 +689,29 @@ function FormulaTree({ rows, total }) {
 
 function moneyRows(rows, mapper) { return rows.map((row, index) => ({ line: index + 1, ...mapper(row) })); }
 function sumRows(rows, key) { return rows.reduce((sum, row) => sum + Number(row[key] ?? 0), 0); }
-function buildMetricDetails(data, metric, range) {
-  const summary = buildDashboardSummary(data, range);
-  const products = data?.products ?? [];
-  const orderItems = data?.orderItems ?? [];
-  const orders = data?.orderRows ?? [];
-  const payments = data?.payments ?? [];
-  const settlementLines = data?.settlementLines ?? [];
-  const financeRows = data?.financeTransactions ?? [];
-  const returns = data?.returns ?? [];
-  const reimbursements = data?.reimbursements ?? [];
-  const invoices = data?.invoices ?? [];
-  const trend = data?.trend ?? [];
-  const financialComponents = data?.financialComponents ?? [];
-  const businessRows = amazonBusinessReportRows(data);
-  const orderedProductSales = sumRows(businessRows, 'ordered_product_sales') || sumRows(products, 'sales') || sumRows(orderItems, 'item_price') || summary.netSales;
-  const orderedProductSalesB2b = sumRows(businessRows, 'ordered_product_sales_b2b');
-  const grossItemPrice = componentAmount(data, ['principal']) || orderedProductSales;
-  const shippingIncome = componentAmount(data, ['shipping', 'gift_wrap']);
-  const promotions = componentAmount(data, ['promotion']) || -sumRows(orderItems, 'promotion_discount');
-  const refundAmount = componentAmount(data, ['refund']);
-  const referralCommission = componentAmount(data, ['commission', 'refund_commission']);
-  const fbaFees = componentAmount(data, ['fba_fee']);
-  const shippingFees = componentAmount(data, ['shipping', 'shipping_tax']);
-  const otherAdjustments = componentAmount(data, ['other_adjustment', 'other_fee', 'tax', 'gift_wrap', 'gift_wrap_tax']);
-  const days = Math.max(1, Math.round((startOfDay(range.end) - startOfDay(range.start)) / 864e5) + 1);
-  const productRows = products.length
-    ? moneyRows(products, row => ({ source: 'Sales & Traffic', asin: row.asin, sku: row.sku ?? '', units: Number(row.units ?? 0), gross_sales: Number(row.sales ?? 0), tax: 0, discounts: 0, net_sales: Number(row.sales ?? 0), share: summary.netSales ? `${Math.round((Number(row.sales ?? 0) / summary.netSales) * 100)}%` : '0%' }))
-    : moneyRows(orderItems, row => ({ source: financialComponents.length ? 'Finances API / Settlements' : 'Order Items', asin: row.asin, sku: row.sku ?? '', units: Number(row.quantity_ordered ?? 0), gross_sales: Number(row.item_price ?? 0), tax: Number(row.item_tax ?? 0), discounts: Number(row.promotion_discount ?? 0), net_sales: Number(row.item_price ?? 0), share: summary.netSales ? `${Math.round((Number(row.item_price ?? 0) / summary.netSales) * 100)}%` : '0%' }));
-  const orderRows = orders.length ? moneyRows(orders, row => ({ amazon_order_id: row.amazon_order_id, order_date: row.order_date, status: row.status, total_amount: Number(row.total_amount ?? 0), item_lines: row.item_lines ?? 0, item_value: Number(row.item_value ?? 0), item_tax: Number(row.item_tax ?? 0), discounts: Number(row.promotion_discount ?? 0) })) : moneyRows(orderItems, row => ({ amazon_order_id: row.amazon_order_id, order_date: '', status: '', total_amount: Number(row.item_price ?? 0), item_lines: 1, item_value: Number(row.item_price ?? 0), item_tax: Number(row.item_tax ?? 0), discounts: Number(row.promotion_discount ?? 0) }));
-  const deductionRows = settlementLines.length
-    ? moneyRows(settlementLines.filter(row => Number(row.amount ?? 0) < 0), row => ({ date: row.posted_date, source: 'Settlement', id: row.settlement_id ?? row.order_id, type: row.amount_type, description: row.amount_description, amount: Number(row.amount ?? 0), absolute_amount: Math.abs(Number(row.amount ?? 0)) }))
-    : moneyRows(financeRows.filter(row => Number(row.total_amount ?? 0) < 0), row => ({ date: row.posted_date, source: 'Finance', id: row.transaction_id ?? row.related_order_id, type: row.transaction_type, description: row.related_order_id, amount: Number(row.total_amount ?? 0), absolute_amount: Math.abs(Number(row.total_amount ?? 0)) }));
-  const netSalesTree = businessRows.length
-    ? formulaTreeRows([['Ordered Product Sales', orderedProductSales, '+', 'Business Reports'], ['Ordered Product Sales - B2B', orderedProductSalesB2b, 'included', 'Business Reports B2B subset']])
-    : formulaTreeRows([['Gross Item Price', grossItemPrice, '+', 'Principal / item price'], ['Shipping / Gift Wrap Income', shippingIncome, shippingIncome < 0 ? '−' : '+', 'ShippingCharge / GiftWrap'], ['Promotions', promotions, '−', 'Promotion discounts'], ['Returns / Refunds', refundAmount, '−', 'Finance refund components']]);
-  const settledTree = formulaTreeRows([['Net Sales', summary.netSales, '+', 'Net sales calculation'], ['Referral Commission', referralCommission, '−', 'Commission components'], ['FBA Fulfillment Fees', fbaFees, '−', 'FBA fee components'], ['Shipping Fees', shippingFees, '−', 'Shipping fee/tax components'], ['Reimbursements', summary.reimbursements, '+', 'Reimbursement credits'], ['Other Adjustments', otherAdjustments, otherAdjustments < 0 ? '−' : '+', 'Other finance/settlement components']]);
-  const details = {
-    netSales: { title: 'Net Sales', value: formatCurrency(summary.netSales), explanation: 'Net sales is matched to Amazon Business Reports first: Ordered Product Sales for the selected date range; Ordered Product Sales - B2B is shown separately because Amazon includes it in Ordered Product Sales. Finance components are used for payout reconciliation, not to replace the Business Reports sales total.', formula: `Net Sales = Ordered Product Sales ${formatCurrency(orderedProductSales)} (B2B subset ${formatCurrency(orderedProductSalesB2b)} already included) = ${formatCurrency(summary.netSales)}`, treeRows: netSalesTree, numericValue: summary.netSales, rows: businessRows.length ? moneyRows(businessRows, row => row) : productRows, columns: businessRows.length ? ['line', 'date', 'ordered_product_sales', 'ordered_product_sales_b2b', 'units_ordered', 'units_ordered_b2b', 'total_order_items', 'total_order_items_b2b', 'average_sales_per_order_item', 'average_selling_price'] : ['line', 'source', 'asin', 'sku', 'units', 'gross_sales', 'tax', 'discounts', 'net_sales', 'share'] },
-    netQty: { title: 'Net Qty', value: formatNumber(summary.netQty), explanation: 'Net quantity is the sum of sold units for the same rows used by Net Sales.', formula: `Net Qty = Σ units across ${formatNumber(productRows.length)} calculation rows = ${formatNumber(summary.netQty)}`, rows: productRows, columns: ['line', 'source', 'asin', 'sku', 'units', 'net_sales', 'share'] },
-    orders: { title: 'Orders Synced', value: formatNumber(summary.ordersCount), explanation: 'Orders synced counts Amazon order headers in the date range. Item-line totals are shown beside each order so the count can be audited against money rows.', formula: `Orders Synced = count(order headers) = ${formatNumber(summary.ordersCount)}`, rows: orderRows, columns: ['line', 'amazon_order_id', 'order_date', 'status', 'total_amount', 'item_lines', 'item_value', 'item_tax', 'discounts'] },
-    returns: { title: 'Returns', value: formatNumber(summary.returnQty), explanation: 'Returns count customer-return report lines. The return rate uses Returns ÷ Net Qty.', formula: `Return Rate = ${formatNumber(summary.returnQty)} ÷ ${formatNumber(summary.netQty)} = ${summary.netQty ? `${Math.round((summary.returnQty / summary.netQty) * 100)}%` : '0%'}`, rows: moneyRows(returns, row => row), columns: ['line', 'order_id', 'return_reason', 'disposition', 'status', 'return_date'] },
-    settled: { title: 'Settled Amount', value: formatCurrency(summary.settledAmount), explanation: 'Settled amount is reconciled from the net sales formula through Amazon commission, FBA fulfillment fees, shipping fees, reimbursements and other adjustments. Payout groups show the final settlement batches.', formula: `Settled Amount = Net Sales ${formatCurrency(summary.netSales)} − Referral Commission ${formatCurrency(Math.abs(referralCommission))} − FBA Fees ${formatCurrency(Math.abs(fbaFees))} − Shipping Fees ${formatCurrency(Math.abs(shippingFees))} + Reimbursements ${formatCurrency(summary.reimbursements)} + Other Adjustments ${formatCurrency(otherAdjustments)} = ${formatCurrency(summary.settledAmount)}`, treeRows: settledTree, numericValue: summary.settledAmount, rows: payments, columns: ['posted_date', 'settlement_id', 'net_amount', 'lines'] },
-    deductions: { title: 'Deductions', value: formatCurrency(summary.deductions), explanation: 'Deductions are negative Amazon settlement/finance lines such as fees, refunds, commission, shipping clawbacks and other charges.', formula: `Deductions = Σ absolute value of negative money lines = ${formatCurrency(sumRows(deductionRows, 'absolute_amount') || summary.deductions)}`, rows: financialComponents.filter(row => Number(row.amount ?? 0) < 0), columns: ['posted_date', 'source', 'transaction_id', 'related_order_id', 'category', 'component', 'amount'] },
-    reimbursements: { title: 'Reimbursements', value: formatCurrency(summary.reimbursements), explanation: 'Reimbursements are FBA credits imported from reimbursement rows.', formula: `Reimbursements = Σ amount across ${formatNumber(reimbursements.length)} rows = ${formatCurrency(summary.reimbursements)}`, rows: moneyRows(reimbursements, row => row), columns: ['line', 'sku', 'amount', 'reason', 'reimbursement_date'] },
-    drr: { title: 'Daily Run Rate', value: formatCurrency(summary.drr), explanation: 'Daily run rate divides net sales by the number of calendar days selected in the date picker.', formula: `DRR = ${formatCurrency(summary.netSales)} ÷ ${formatNumber(days)} days = ${formatCurrency(summary.netSales / days)}`, rows: trend.map(row => ({ ...row, drr_component: Number(row.sales ?? 0) / days })), columns: ['date', 'sales', 'units', 'sessions', 'drr_component'] },
-    tax: { title: 'GST Invoice Value', value: formatCurrency(summary.gstValue), explanation: 'GST invoice value is total taxable value from B2B and B2C GST invoice rows, with CGST/SGST/IGST shown separately for audit.', formula: `GST Invoice Value = Σ taxable_value across ${formatNumber(invoices.length)} invoice rows = ${formatCurrency(summary.gstValue)}`, rows: moneyRows(invoices, row => row), columns: ['line', 'invoice_type', 'order_id', 'taxable_value', 'cgst', 'sgst', 'igst', 'invoice_date'] }
-  };
-  return details[metric] ?? null;
-}
-function MetricDetail({ data, metric, tenantId }) {
+function MetricDetail({ metric, tenantId }) {
   const { range } = useContext(DateRangeContext);
   const navigate = useNavigate();
-  const details = buildMetricDetails(data, metric, range);
-  if (!details) return <Empty text="Select a metric from the dashboard to see its calculation." />;
+  const [details, setDetails] = useState(null);
+  const [error, setError] = useState('');
+  useEffect(() => {
+    let active = true; setDetails(null); setError('');
+    api(`/api/tenants/${tenantId}/calculations/${metric}?${rangeQuery(range)}`).then(result => { if (active) setDetails(result); }).catch(e => { if (active) setError(e.message); });
+    return () => { active = false; };
+  }, [tenantId, metric, range.start, range.end]);
+  if (error) return <p className="alert error">{error}</p>;
+  if (!details) return <Empty text="Loading real calculation rows…" />;
+  const deductionCategories = new Set(['referral_commission','fulfillment_fee_per_order','fulfillment_fee_per_unit','fulfillment_fee_weight','shipping_fee','storage_fee','chargeback','tax','promotion']);
   return <>
     <Card className="detail-hero">
-      <PanelHeader title={details.title} subtitle={details.value} />
-      <p>{details.explanation}</p>
-      <div className="calculation-box"><b>Calculation</b><code>{details.formula}</code></div>
-      {details.treeRows && <FormulaTree rows={details.treeRows} total={details.numericValue ?? Number(String(details.value).replace(/[^0-9.-]/g, ''))} />}
-      <div className="detail-actions"><Button variant="secondary" onClick={() => navigate(`/seller?tenantId=${tenantId}&view=dashboard`)}>← Back</Button><Button variant="accent" onClick={() => downloadCsv(`${details.title.toLowerCase().replaceAll(' ', '-')}-calculation.csv`, details.rows, details.columns)} disabled={!details.rows.length}>Download calculation CSV</Button><NavLink className="btn btn-secondary" to={`/seller?tenantId=${tenantId}&view=rawData`}>Review raw API data</NavLink></div>
+      <PanelHeader title={String(metric).replace(/([A-Z])/g, ' $1').trim()} subtitle={formatCurrency(details.total)} />
+      <p className="detail-note">Calculated directly from persisted Amazon rows for the selected period{details.source ? ` · ${details.source}` : ''}.</p>
+      <div className="calculation-components">{details.components.map(component => <div key={component.category} className={deductionCategories.has(component.category) ? 'negative' : ''}><span>{component.label}</span><small>{formatNumber(component.count)} rows</small><strong>{metric === 'netQty' ? formatNumber(component.amount) : formatCurrency(component.amount)}</strong></div>)}<div className="total"><span>Total</span><strong>{metric === 'netQty' ? formatNumber(details.total) : formatCurrency(details.total)}</strong></div></div>
+      <div className="detail-actions"><Button variant="secondary" onClick={() => navigate(`/seller?tenantId=${tenantId}&view=dashboard`)}>← Back</Button><Button variant="accent" onClick={() => downloadCsv(`${metric}-calculation.csv`, details.rows, details.columns)} disabled={!details.rows.length}>Download calculation CSV</Button></div>
     </Card>
-    <TableCard title="Rows used for this calculation" rows={details.rows} columns={details.columns} pageSize={6} />
+    <TableCard title="Actual database rows used" rows={details.rows} columns={details.columns} pageSize={10} />
   </>;
 }
-
 function buildDashboardSummary(data, range = defaultDateRange()) {
   const products = data?.products ?? [];
   const returns = data?.returns ?? [];
