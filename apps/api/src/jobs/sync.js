@@ -297,8 +297,16 @@ export async function syncRecentApiDataForTenant(tenantId, options = {}) {
         }
       }
       const orders = orderPages.flatMap(page => page?.payload?.Orders ?? page?.Orders ?? []);
-      const financeResponse = includeFinance ? await client.listFinanceTransactions(createdAfter, createdBefore).catch(error => ({ syncError: error instanceof Error ? error.message : 'Finance sync failed' })) : null;
-      const transactions = financeResponse?.payload?.transactions ?? financeResponse?.transactions ?? financeResponse?.payload?.Transactions ?? financeResponse?.Transactions ?? [];
+      let financeResponse = includeFinance ? await client.listFinanceTransactions(createdAfter, createdBefore).catch(error => ({ syncError: error instanceof Error ? error.message : 'Finance sync failed' })) : null;
+      const financePages = financeResponse ? [financeResponse] : [];
+      for (let page = 1; includeFinance && page < 5; page += 1) {
+        const nextToken = financeResponse?.payload?.nextToken ?? financeResponse?.nextToken ?? financeResponse?.payload?.NextToken ?? financeResponse?.NextToken;
+        if (!nextToken) break;
+        financeResponse = await client.listFinanceTransactions(undefined, undefined, nextToken).catch(error => ({ syncError: error instanceof Error ? error.message : 'Finance pagination failed' }));
+        financePages.push(financeResponse);
+        if (financeResponse.syncError) break;
+      }
+      const transactions = financePages.flatMap(page => page?.payload?.transactions ?? page?.transactions ?? page?.payload?.Transactions ?? page?.Transactions ?? []);
       const inventoryResponse = includeInventory ? await client.listInventorySummaries(marketplaceId).catch(error => ({ syncError: error instanceof Error ? error.message : 'Inventory sync failed' })) : null;
       const inventorySummaries = inventoryResponse?.payload?.inventorySummaries ?? inventoryResponse?.inventorySummaries ?? [];
       const snapshotDate = new Date().toISOString().slice(0, 10);

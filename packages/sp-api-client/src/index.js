@@ -243,7 +243,12 @@ export class SpApiClient {
   }
 
   /** @param {string} postedAfter @param {string} [postedBefore] */
-  async listFinanceTransactions(postedAfter, postedBefore) {
+  async listFinanceTransactions(postedAfter, postedBefore, nextToken) {
+    if (nextToken) {
+      const res = await this.request(`/finances/2024-06-19/transactions?nextToken=${encodeURIComponent(z.string().min(1).parse(nextToken))}`);
+      if (!res.ok) throw new Error(`Finance transactions page failed: ${res.status}`);
+      return res.json();
+    }
     const date = z.string().datetime().parse(postedAfter);
     const before = postedBefore ? z.string().datetime().parse(postedBefore) : null;
     const beforeQuery = before ? `&postedBefore=${encodeURIComponent(before)}` : '';

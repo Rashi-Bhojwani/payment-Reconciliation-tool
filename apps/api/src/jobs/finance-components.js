@@ -38,7 +38,7 @@ function identifierValue(value, pattern) {
 }
 
 export function flattenFinanceTransaction(transaction) {
-  const items = transaction?.items ?? transaction?.Items;
+  const items = transaction?.items ?? transaction?.Items ?? transaction?.contexts ?? transaction?.Contexts;
   const transactionId = transaction?.transactionId ?? transaction?.TransactionId ?? transaction?.financialEventGroupId ?? transaction?.FinancialEventGroupId;
   const postedDate = transaction?.postedDate ?? transaction?.PostedDate ?? null;
   const currency = transaction?.totalAmount?.currencyCode ?? transaction?.TotalAmount?.CurrencyCode ?? 'INR';
@@ -48,16 +48,23 @@ export function flattenFinanceTransaction(transaction) {
     if (Array.isArray(value)) return value.forEach(entry => walk(entry, context, inheritedLabel));
     if (!value || typeof value !== 'object') return;
     const label = value.description ?? value.Description ?? value.type ?? value.Type ?? value.breakdownType ?? value.BreakdownType ?? inheritedLabel;
-    const amountNode = value.amount ?? value.Amount ?? value.chargeAmount ?? value.ChargeAmount ?? value.feeAmount ?? value.FeeAmount;
+    const amountNode = value.amount ?? value.Amount ?? value.breakdownAmount ?? value.BreakdownAmount ?? value.chargeAmount ?? value.ChargeAmount ?? value.feeAmount ?? value.FeeAmount;
     if (amountNode != null && label) rows.push({ transactionId, ...context, category: categorizeFinanceLabel(label), description: String(label), amount: money(amountNode), currency: amountNode?.currencyCode ?? amountNode?.CurrencyCode ?? currency, postedDate, raw: value });
-    for (const [key, nested] of Object.entries(value)) if (nested && typeof nested === 'object' && !['amount', 'Amount', 'chargeAmount', 'ChargeAmount', 'feeAmount', 'FeeAmount'].includes(key)) walk(nested, context, label ?? key);
+    for (const [key, nested] of Object.entries(value)) if (nested && typeof nested === 'object' && !['amount', 'Amount', 'breakdownAmount', 'BreakdownAmount', 'chargeAmount', 'ChargeAmount', 'feeAmount', 'FeeAmount'].includes(key)) walk(nested, context, label ?? key);
   }
   if (Array.isArray(items) && items.length) {
     for (const item of items) {
-      const details = item.productDetails ?? item.ProductDetails ?? {};
+      const details = item.productDetails ?? item.ProductDetails ?? item.productContext ?? item.ProductContext ?? item;
       const context = { orderId: identifierValue(item.relatedIdentifiers ?? item.RelatedIdentifiers, /order/i) ?? transactionOrderId, sku: details.sku ?? details.Sku ?? details.sellerSku ?? details.SellerSKU, asin: details.asin ?? details.ASIN };
-      walk(item.breakdown ?? item.Breakdown ?? [], context);
+      walk(item.breakdown ?? item.Breakdown ?? item.breakdowns ?? item.Breakdowns ?? [], context);
     }
+  }
+  // Some 2024-06-19 responses put breakdowns directly on the transaction and
+  // expose SKU/ASIN separately in contexts rather than an items array.
+  if (!rows.length) {
+    const contextNode = (transaction?.contexts ?? transaction?.Contexts ?? [])[0] ?? {};
+    const details = contextNode.productContext ?? contextNode.ProductContext ?? contextNode;
+    walk(transaction?.breakdown ?? transaction?.Breakdown ?? transaction?.breakdowns ?? transaction?.Breakdowns ?? [], { orderId: transactionOrderId, sku: details.sku ?? details.Sku, asin: details.asin ?? details.ASIN });
   }
   if (!rows.length) rows.push({ transactionId, orderId: transactionOrderId, sku: identifierValue(transaction?.relatedIdentifiers ?? transaction?.RelatedIdentifiers, /sku/i), asin: undefined, category: categorizeFinanceLabel(transaction?.transactionType ?? transaction?.TransactionType), description: transaction?.transactionType ?? transaction?.TransactionType ?? 'Transaction total', amount: money(transaction?.totalAmount ?? transaction?.TotalAmount), currency, postedDate, raw: transaction });
   return rows.filter(row => row.transactionId);
