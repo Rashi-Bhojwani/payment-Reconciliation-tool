@@ -953,6 +953,17 @@ td { padding: 13px 14px; color:#344054; }
 .payout-equation { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin: 10px 0; padding: 12px; background: #fff; border: 1px solid var(--border); border-radius: 10px; }
 .payout-equation span { padding-right: 8px; border-right: 1px solid var(--border); }
 .payout-equation > strong { color: #047857; font-size: 17px; }
+.reconciliation-summary { display: grid; grid-template-columns: repeat(3,1fr); gap: 10px; margin: 12px 0; }
+.reconciliation-summary > div { display: grid; gap: 3px; padding: 12px 14px; background: #f8fafc; border: 1px solid var(--border); border-radius: 10px; }
+.reconciliation-summary strong { font-size: 22px; }.reconciliation-summary span,.reconciliation-note { color: var(--muted); font-size: 12px; }
+.reconciliation-note { margin: 0 0 16px; }
+.money-explainer { min-width: 0; }.journey-cards { display: grid; grid-template-columns: 1fr auto 1fr auto 1fr auto 1fr; gap: 8px; align-items: center; margin: 10px 0 14px; }
+.journey-cards > div { display: grid; gap: 4px; padding: 12px; background: white; border: 1px solid var(--border); border-radius: 10px; }.journey-cards > b { color: var(--muted); }
+.journey-cards small { color: var(--muted); }.journey-cards strong { font-size: 18px; }.journey-fees strong { color: #c62828; }.journey-net { background: #ecfdf5 !important; border-color: #a7f3d0 !important; }.journey-net strong { color: #047857; }
+.plain-explanation { padding: 12px 14px; background: #eff6ff; border-left: 3px solid #2563eb; border-radius: 6px; line-height: 1.5; }
+.understand-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }.understand-grid > div { padding: 14px; border: 1px solid var(--border); border-radius: 10px; background: white; }.understand-grid h5 { margin: 0 0 10px; }
+.friendly-line { display: flex; justify-content: space-between; gap: 12px; padding: 8px 0; border-bottom: 1px solid var(--border); }.friendly-line.deduction strong { color: #c62828; }.friendly-line:not(.deduction) strong { color: #047857; }
+.source-lines { margin-top: 14px; }.source-lines summary { cursor: pointer; color: #2563eb; font-weight: 700; padding: 8px 0; }
 .fee-audit-hero { display: flex; justify-content: space-between; align-items: center; gap: 24px; padding: 28px; }
 .fee-audit-hero h2 { margin: 5px 0; }
-@media(max-width:800px){.order-detail-grid{grid-template-columns:1fr}.fee-audit-hero{display:block}.calculation-components>div{grid-template-columns:1fr auto}.calculation-components small{display:none}}
+@media(max-width:800px){.order-detail-grid,.understand-grid,.reconciliation-summary{grid-template-columns:1fr}.journey-cards{grid-template-columns:1fr}.journey-cards>b{text-align:center}.fee-audit-hero{display:block}.calculation-components>div{grid-template-columns:1fr auto}.calculation-components small{display:none}}

@@ -37,6 +37,15 @@ function identifierValue(value, pattern) {
   return Object.entries(value).find(([key]) => pattern.test(key))?.[1];
 }
 
+function summaryCategory(label) {
+  const value = String(label ?? '').replace(/[^a-z0-9]/gi, '').toLowerCase();
+  if (/totalproductcharge|productcharge/.test(value)) return 'summary_product_charges';
+  if (/promotionalrebate|promotion/.test(value)) return 'summary_promotional_rebates';
+  if (/amazonfees|sellingfees/.test(value)) return 'summary_amazon_fees';
+  if (/^other$|othertransactions|otheramount/.test(value)) return 'summary_other';
+  return null;
+}
+
 export function flattenFinanceTransaction(transaction) {
   const items = transaction?.items ?? transaction?.Items ?? transaction?.contexts ?? transaction?.Contexts;
   const transactionId = transaction?.transactionId ?? transaction?.TransactionId ?? transaction?.financialEventGroupId ?? transaction?.FinancialEventGroupId;
@@ -51,8 +60,12 @@ export function flattenFinanceTransaction(transaction) {
     const amountNode = value.amount ?? value.Amount ?? value.breakdownAmount ?? value.BreakdownAmount ?? value.chargeAmount ?? value.ChargeAmount ?? value.feeAmount ?? value.FeeAmount;
     const childBreakdowns = value.breakdown ?? value.Breakdown ?? value.breakdowns ?? value.Breakdowns;
     // Amazon sometimes supplies a parent total alongside its nested component
-    // amounts. Store leaf money only or the same rupees are counted twice.
+    // amounts. Preserve those explicit Seller Central column totals under a
+    // summary category; calculations select either summaries or leaves, never
+    // both. This lets the UI match Transaction View without guessing buckets.
     const hasChildren = Array.isArray(childBreakdowns) ? childBreakdowns.length > 0 : Boolean(childBreakdowns && typeof childBreakdowns === 'object');
+    const summary = hasChildren ? summaryCategory(label) : null;
+    if (amountNode != null && summary) rows.push({ transactionId, ...context, category: summary, description: String(label), amount: money(amountNode), currency: amountNode?.currencyCode ?? amountNode?.CurrencyCode ?? currency, postedDate, raw: value });
     if (amountNode != null && label && !hasChildren) rows.push({ transactionId, ...context, category: categorizeFinanceLabel(label), description: String(label), amount: money(amountNode), currency: amountNode?.currencyCode ?? amountNode?.CurrencyCode ?? currency, postedDate, raw: value });
     for (const [key, nested] of Object.entries(value)) if (nested && typeof nested === 'object' && !['amount', 'Amount', 'breakdownAmount', 'BreakdownAmount', 'chargeAmount', 'ChargeAmount', 'feeAmount', 'FeeAmount'].includes(key)) walk(nested, context, label ?? key);
   }

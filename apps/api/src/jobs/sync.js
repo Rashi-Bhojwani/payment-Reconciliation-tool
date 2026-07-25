@@ -305,7 +305,11 @@ export async function syncRecentApiDataForTenant(tenantId, options = {}) {
         }
       }
       const orders = orderPages.flatMap(page => page?.payload?.Orders ?? page?.Orders ?? []);
-      let financeResponse = includeFinance ? await client.listFinanceTransactions(createdAfter, createdBefore).catch(error => ({ syncError: error instanceof Error ? error.message : 'Finance sync failed' })) : null;
+      // A shipped order is often posted to Transaction View days after its
+      // purchase date. Extend only the finance window so selecting Jul 1–2 can
+      // still retrieve Amazon's Jul 10 payment for those orders.
+      const financeBefore = range ? new Date(Math.min(safeNow.getTime(), new Date(range.end).getTime() + 45 * 864e5)).toISOString() : createdBefore;
+      let financeResponse = includeFinance ? await client.listFinanceTransactions(createdAfter, financeBefore).catch(error => ({ syncError: error instanceof Error ? error.message : 'Finance sync failed' })) : null;
       const financePages = financeResponse ? [financeResponse] : [];
       for (let page = 1; includeFinance && page < 5; page += 1) {
         const nextToken = financeResponse?.payload?.nextToken ?? financeResponse?.nextToken ?? financeResponse?.payload?.NextToken ?? financeResponse?.NextToken;

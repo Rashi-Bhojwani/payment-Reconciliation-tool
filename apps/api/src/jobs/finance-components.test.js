@@ -22,8 +22,21 @@ test('supports 2024 transaction-level plural breakdowns and contexts', () => {
 
 test('does not double-count parent totals that contain child breakdowns', () => {
   const rows = flattenFinanceTransaction({ transactionId:'tx-3', relatedIdentifiers:{orderId:'order-3'}, breakdowns:[{breakdownType:'AmazonFees',breakdownAmount:{currencyAmount:-115.64},breakdowns:[{breakdownType:'FBAPerUnitFulfillmentFee',breakdownAmount:{currencyAmount:-84}},{breakdownType:'Commission',breakdownAmount:{currencyAmount:-31.64}}]}] });
-  assert.equal(rows.reduce((sum,row)=>sum+row.amount,0),-115.64);
-  assert.equal(rows.length,2);
+  assert.equal(rows.find(row=>row.category==='summary_amazon_fees').amount,-115.64);
+  assert.equal(rows.filter(row=>!row.category.startsWith('summary_')).reduce((sum,row)=>sum+row.amount,0),-115.64);
+  assert.equal(rows.length,3);
+});
+
+test('preserves Seller Central Transaction View column summaries exactly', () => {
+  const rows = flattenFinanceTransaction({ transactionId:'tx-4', relatedIdentifiers:{orderId:'order-4'}, breakdowns:[
+    {breakdownType:'ProductCharges',breakdownAmount:{currencyAmount:583.90},breakdowns:[{breakdownType:'Principal',breakdownAmount:{currencyAmount:583.90}}]},
+    {breakdownType:'PromotionalRebates',breakdownAmount:{currencyAmount:0},breakdowns:[{breakdownType:'Promotion',breakdownAmount:{currencyAmount:0}}]},
+    {breakdownType:'AmazonFees',breakdownAmount:{currencyAmount:-115.64},breakdowns:[{breakdownType:'FulfillmentFee',breakdownAmount:{currencyAmount:-84}},{breakdownType:'ClosingFee',breakdownAmount:{currencyAmount:-31.64}}]},
+    {breakdownType:'Other',breakdownAmount:{currencyAmount:101.59},breakdowns:[{breakdownType:'Tax',breakdownAmount:{currencyAmount:101.59}}]}
+  ] });
+  const summaries=Object.fromEntries(rows.filter(row=>row.category.startsWith('summary_')).map(row=>[row.category,row.amount]));
+  assert.deepEqual(summaries,{summary_product_charges:583.9,summary_promotional_rebates:0,summary_amazon_fees:-115.64,summary_other:101.59});
+  assert.equal(Object.values(summaries).reduce((sum,value)=>sum+value,0),569.85);
 });
 
 test('computes seller-provided jewellery slabs', () => {
