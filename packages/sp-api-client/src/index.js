@@ -28,7 +28,8 @@ const SP_API_RATE_LIMITS = Object.freeze([
   { pattern: /^\/finances\//, intervalMs: 5000 },
   { pattern: /^\/fba\/inventory\//, intervalMs: 5000 },
   { pattern: /^\/tokens\//, intervalMs: 5000 },
-  { pattern: /^\/products\/fees\//, intervalMs: 2200 }
+  { pattern: /^\/products\/fees\//, intervalMs: 2200 },
+  { pattern: /^\/catalog\//, intervalMs: 2200 }
 ]);
 const DEFAULT_SP_API_INTERVAL_MS = 3000;
 const rateLimitState = new Map();
@@ -192,6 +193,15 @@ export class SpApiClient {
     const id = z.string().min(1).parse(orderId);
     const res = await this.request(`/orders/v0/orders/${encodeURIComponent(id)}/orderItems`);
     if (!res.ok) throw new Error(`List order items failed: ${res.status}`);
+    return res.json();
+  }
+
+  /** Fetches Amazon's catalog attributes used for package weight and dimensions. */
+  async getCatalogItem(asin, marketplaceId = INDIA_MARKETPLACE_ID) {
+    const parsedAsin = z.string().min(1).parse(asin);
+    const path = `/catalog/2022-04-01/items/${encodeURIComponent(parsedAsin)}?marketplaceIds=${encodeURIComponent(marketplaceId)}&includedData=attributes`;
+    const res = await this.request(path);
+    if (!res.ok) throw new Error(`Catalog item lookup failed: ${res.status}`);
     return res.json();
   }
 

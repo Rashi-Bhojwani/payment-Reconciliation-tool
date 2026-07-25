@@ -17,6 +17,22 @@ function text(value) { return value == null ? undefined : String(value).trim() |
 function number(value) { const parsed = Number(String(value ?? '').replace(/[,₹$]/g, '')); return Number.isFinite(parsed) ? parsed : 0; }
 /** @param {unknown} value */
 function integer(value) { return Math.trunc(number(value)); }
+function firstAttribute(attributes, names) {
+  for (const name of names) {
+    const value = attributes?.[name];
+    if (Array.isArray(value) && value[0]) return value[0];
+  }
+  return undefined;
+}
+function catalogShippingFacts(catalog) {
+  const attributes = catalog?.attributes ?? catalog?.payload?.attributes ?? {};
+  const weight = firstAttribute(attributes, ['item_package_weight', 'item_weight']);
+  const dimensions = firstAttribute(attributes, ['item_package_dimensions', 'item_dimensions']);
+  const dimensionText = dimensions
+    ? [dimensions.length, dimensions.width, dimensions.height].filter(value => value != null).join(' × ') + (dimensions.unit ? ` ${dimensions.unit}` : '')
+    : null;
+  return { weight: number(weight?.value), weightUnit: text(weight?.unit), dimensions: dimensionText };
+}
 /** @param {Record<string, unknown>} row @param {string[]} names */
 function pick(row, names) {
   const lowerMap = new Map(Object.entries(row).map(([key, value]) => [key.toLowerCase().replace(/[^a-z0-9]/g, ''), value]));
@@ -275,16 +291,19 @@ export async function syncRecentApiDataForTenant(tenantId, options = {}) {
       let inventoryImported = 0;
       let reimbursementsImported = 0;
       let orderItemsSkipped = 0;
+      let catalogItemsImported = 0;
+      const catalogCache = new Map();
       await withTenant(parsedTenantId, async db => {
         let orderItemsFetched = 0;
         for (const order of orders) {
           const orderId = order.AmazonOrderId ?? order.amazonOrderId;
           if (!orderId) continue;
           await db.query(
-            `insert into orders(tenant_id, amazon_order_id, order_date, total_amount, status)
-             values($1,$2,$3,$4,$5)
-             on conflict (tenant_id, amazon_order_id) do update set order_date=excluded.order_date, total_amount=excluded.total_amount, status=excluded.status`,
-            [parsedTenantId, orderId, order.PurchaseDate ?? order.purchaseDate ?? null, number(order.OrderTotal?.Amount ?? order.orderTotal?.amount), order.OrderStatus ?? order.orderStatus ?? null]
+            `insert into orders(tenant_id, amazon_order_id, order_date, total_amount, status, fulfillment_channel, sales_channel, raw)
+             values($1,$2,$3,$4,$5,$6,$7,$8::jsonb)
+             on conflict (tenant_id, amazon_order_id) do update set order_date=excluded.order_date, total_amount=excluded.total_amount,
+               status=excluded.status, fulfillment_channel=excluded.fulfillment_channel, sales_channel=excluded.sales_channel, raw=excluded.raw`,
+            [parsedTenantId, orderId, order.PurchaseDate ?? order.purchaseDate ?? null, number(order.OrderTotal?.Amount ?? order.orderTotal?.amount), order.OrderStatus ?? order.orderStatus ?? null, order.FulfillmentChannel ?? order.fulfillmentChannel ?? null, order.SalesChannel ?? order.salesChannel ?? null, JSON.stringify(order)]
           );
           ordersImported += 1;
           const existingItems = await db.query('select 1 from order_items where tenant_id=$1 and amazon_order_id=$2 limit 1', [parsedTenantId, orderId]);
@@ -300,13 +319,45 @@ export async function syncRecentApiDataForTenant(tenantId, options = {}) {
           orderItemsFetched += 1;
           const items = itemsResponse?.payload?.OrderItems ?? itemsResponse?.OrderItems ?? [];
           for (const item of items) {
+            const asin = item.ASIN ?? item.asin ?? null;
+            let catalog = asin ? catalogCache.get(asin) : null;
+            if (asin && !catalogCache.has(asin)) {
+              catalog = await client.getCatalogItem(asin, marketplaceId).catch(() => null);
+              catalogCache.set(asin, catalog);
+              if (catalog) catalogItemsImported += 1;
+            }
+            const shipping = catalogShippingFacts(catalog);
             await db.query(
-              `insert into order_items(tenant_id, amazon_order_id, asin, sku, title, quantity_ordered, item_price, item_tax, promotion_discount, raw)
-               values($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
-               on conflict (tenant_id, amazon_order_id, sku, asin) do update set title=excluded.title, quantity_ordered=excluded.quantity_ordered, item_price=excluded.item_price, item_tax=excluded.item_tax, promotion_discount=excluded.promotion_discount, raw=excluded.raw`,
-              [parsedTenantId, orderId, item.ASIN ?? item.asin ?? null, item.SellerSKU ?? item.sellerSku ?? null, item.Title ?? item.title ?? null, integer(item.QuantityOrdered ?? item.quantityOrdered), number(item.ItemPrice?.Amount ?? item.itemPrice?.amount), number(item.ItemTax?.Amount ?? item.itemTax?.amount), number(item.PromotionDiscount?.Amount ?? item.promotionDiscount?.amount), item]
+              `insert into order_items(tenant_id, amazon_order_id, asin, sku, title, quantity_ordered, item_price, item_tax, promotion_discount, raw, package_weight, weight_unit, package_dimensions, catalog_raw)
+               values($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
+               on conflict (tenant_id, amazon_order_id, sku, asin) do update set title=excluded.title, quantity_ordered=excluded.quantity_ordered, item_price=excluded.item_price, item_tax=excluded.item_tax, promotion_discount=excluded.promotion_discount, raw=excluded.raw,
+                 package_weight=excluded.package_weight, weight_unit=excluded.weight_unit, package_dimensions=excluded.package_dimensions, catalog_raw=excluded.catalog_raw`,
+              [parsedTenantId, orderId, asin, item.SellerSKU ?? item.sellerSku ?? null, item.Title ?? item.title ?? null, integer(item.QuantityOrdered ?? item.quantityOrdered), number(item.ItemPrice?.Amount ?? item.itemPrice?.amount), number(item.ItemTax?.Amount ?? item.itemTax?.amount), number(item.PromotionDiscount?.Amount ?? item.promotionDiscount?.amount), item, shipping.weight || null, shipping.weightUnit ?? null, shipping.dimensions, catalog ?? {}]
             );
           }
+        }
+        // Backfill catalog facts for previously imported order items as well;
+        // otherwise only brand-new orders would ever receive shipping weight.
+        const missingCatalogItems = (await db.query(
+          `select distinct asin from order_items
+           where tenant_id=$1 and asin is not null and package_weight is null
+           limit 25`,
+          [parsedTenantId]
+        )).rows;
+        for (const { asin } of missingCatalogItems) {
+          let catalog = catalogCache.get(asin);
+          if (!catalogCache.has(asin)) {
+            catalog = await client.getCatalogItem(asin, marketplaceId).catch(() => null);
+            catalogCache.set(asin, catalog);
+            if (catalog) catalogItemsImported += 1;
+          }
+          if (!catalog) continue;
+          const shipping = catalogShippingFacts(catalog);
+          await db.query(
+            `update order_items set package_weight=$3, weight_unit=$4, package_dimensions=$5, catalog_raw=$6
+             where tenant_id=$1 and asin=$2`,
+            [parsedTenantId, asin, shipping.weight || null, shipping.weightUnit ?? null, shipping.dimensions, catalog]
+          );
         }
         for (const summary of inventorySummaries) {
           const sku = summary.sellerSku ?? summary.SellerSKU ?? summary.sellerSKU;
@@ -343,7 +394,7 @@ export async function syncRecentApiDataForTenant(tenantId, options = {}) {
         }
       });
       await pool.query('update sync_jobs set status=$1, completed_at=now() where id=$2', ['completed', sync.rows[0].id]);
-      return { ordersImported, transactionsImported, inventoryImported, reimbursementsImported, orderItemsSkipped, incrementalSince: createdAfter, incrementalUntil: createdBefore, ordersWarning, financeWarning: financeResponse?.syncError, inventoryWarning: inventoryResponse?.syncError };
+      return { ordersImported, transactionsImported, inventoryImported, reimbursementsImported, catalogItemsImported, orderItemsSkipped, incrementalSince: createdAfter, incrementalUntil: createdBefore, ordersWarning, financeWarning: financeResponse?.syncError, inventoryWarning: inventoryResponse?.syncError };
     } catch (error) {
       await pool.query('update sync_jobs set status=$1, completed_at=now(), error_message=$2 where id=$3', ['failed', error instanceof Error ? error.message : 'unknown error', sync.rows[0].id]);
       throw error;
