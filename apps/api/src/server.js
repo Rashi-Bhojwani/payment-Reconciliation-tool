@@ -22,6 +22,7 @@ app.addContentTypeParser(/^application\/x-www-form-urlencoded(?:;.*)?$/, { parse
 
 const TenantParamsSchema = z.object({ tenantId: z.string().uuid() });
 const SyncParamsSchema = z.object({ tenantId: z.string().uuid(), reportType: z.enum(REPORT_TYPES) });
+const SellerSyncParamsSchema = z.object({ tenantId: z.string().uuid(), reportType: z.enum([...REPORT_TYPES, 'DIRECT_SP_API_SYNC']) });
 const AmazonCallbackSchema = z.object({ spapi_oauth_code: z.string().optional(), code: z.string().optional(), selling_partner_id: z.string().optional(), state: z.string().optional(), amazon_state: z.string().optional(), redirect_uri: z.string().url().optional(), error: z.string().optional(), error_description: z.string().optional() });
 const AmazonAccessTokenSchema = z.object({ sellerId: z.string().optional() });
 const DateRangeSchema = z.object({ start: z.string().datetime(), end: z.string().datetime() });
@@ -478,10 +479,14 @@ app.post('/api/admin/tenants/:tenantId/revoke-access', async request => { await 
 app.post('/api/admin/tenants/:tenantId/sync/:reportType', async request => { await requireAdmin(request); return syncReportForTenant(SyncParamsSchema.parse(request.params)); });
 
 app.post('/api/tenants/:tenantId/sync/:reportType', async request => {
-  const params = SyncParamsSchema.parse(request.params);
+  const params = SellerSyncParamsSchema.parse(request.params);
   const body = z.object({ range: DateRangeSchema.optional() }).parse(request.body ?? {});
   await requireTenantUser(request, params.tenantId);
   await assertActiveTenant(params.tenantId);
+  if (params.reportType === 'DIRECT_SP_API_SYNC') {
+    const result = await syncRecentApiDataForTenant(params.tenantId, { range: body.range, maxOrderPages: 2, maxOrderItems: 20 });
+    return { reportType: params.reportType, status: 'completed', ...result };
+  }
   const directFirstReports = new Set(['GET_V2_SETTLEMENT_REPORT_DATA_FLAT_FILE_V2', 'GET_FBA_MYI_UNSUPPRESSED_INVENTORY_DATA', 'GET_FBA_REIMBURSEMENTS_DATA']);
   if (directFirstReports.has(params.reportType)) {
     const familyOptions = params.reportType === 'GET_FBA_MYI_UNSUPPRESSED_INVENTORY_DATA'

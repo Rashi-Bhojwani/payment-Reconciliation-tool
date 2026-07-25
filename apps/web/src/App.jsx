@@ -113,6 +113,10 @@ const ACCESS_TOKEN_CACHE_PREFIX = 'amazon_spapi_access_token:';
 function readAmazonTokenCache(tenantId) { const cached = JSON.parse(localStorage.getItem(`${ACCESS_TOKEN_CACHE_PREFIX}${tenantId}`) ?? 'null'); return cached?.accessToken && cached?.expiresAt && Date.now() < cached.expiresAt - 60_000 ? cached : null; }
 async function getAmazonAccessToken(tenantId) { const cached = readAmazonTokenCache(tenantId); if (cached) return cached; const fresh = await api(`/api/tenants/${tenantId}/amazon/access-token`); localStorage.setItem(`${ACCESS_TOKEN_CACHE_PREFIX}${tenantId}`, JSON.stringify(fresh)); return fresh; }
 async function beginAmazonAuthorization(tenantId) { const { url } = await api(`/api/auth/amazon/start?tenantId=${tenantId}&json=1`); window.location.assign(url); }
+async function syncAmazonSource(tenantId, reportType, range) {
+  const payload = { method: 'POST', body: JSON.stringify({ range: { start: formatDateParam(range.start), end: formatDateParam(addDays(range.end, 1)) } }) };
+  return api(`/api/tenants/${tenantId}/sync/${reportType}`, payload);
+}
 
 function Button({ className = '', variant = 'primary', icon, children, ...props }) { return <button {...props} className={`btn btn-${variant} ${className}`}>{icon && <span className="btn-icon" aria-hidden="true">{icon}</span>}{children}</button>; }
 function Input(props) { return <input {...props} className="input" />; }
@@ -281,9 +285,7 @@ function SyncLedger({ tenantId, jobs = [], onSynced, reportTypes, title, subtitl
     if (disabled) return;
     setRowState(s => ({ ...s, [reportType]: { loading: true } }));
     try {
-      const result = reportType === 'DIRECT_SP_API_SYNC'
-        ? await api(`/api/tenants/${tenantId}/sync`, { method: 'POST', body: JSON.stringify({ reportTypes: [], range: { start: formatDateParam(range.start), end: formatDateParam(addDays(range.end, 1)) } }) })
-        : await api(`/api/tenants/${tenantId}/sync/${reportType}`, { method: 'POST', body: JSON.stringify({ range: { start: formatDateParam(range.start), end: formatDateParam(addDays(range.end, 1)) } }) });
+      const result = await syncAmazonSource(tenantId, reportType, range);
       if (result?.status === 'failed') throw new Error(result.error ?? 'Sync failed');
       const failedDirectSync = result?.results?.find?.(row => row.status === 'failed');
       if (failedDirectSync) throw new Error(failedDirectSync.error ?? 'Sync failed');
@@ -413,7 +415,7 @@ function SellerDashboard() {
     (async () => {
       try {
         for (const reportType of selectedReportTypes) {
-          await api(`/api/tenants/${tenantId}/sync/${reportType}`, { method: 'POST', body: JSON.stringify({ range: { start: formatDateParam(selectedRange.start), end: formatDateParam(addDays(selectedRange.end, 1)) } }) });
+          await syncAmazonSource(tenantId, reportType, selectedRange);
         }
         await load(selectedRange, requestId);
       } catch (e) {
