@@ -8,6 +8,7 @@ import { putRawReport } from '../storage/s3.js';
 import { runJob } from './runner.js';
 import { categorizeFinanceLabel, flattenFinanceTransaction } from './finance-components.js';
 import { parseSettlementContent } from './settlement-parser.js';
+import { number, pick, reportDate, text } from './report-parsing.js';
 
 export { categorizeFinanceLabel } from './finance-components.js';
 
@@ -16,19 +17,7 @@ const SyncParamsSchema = z.object({ tenantId: z.string().uuid(), reportType: z.e
 const ReportRowSchema = z.record(z.string(), z.unknown());
 
 /** @param {unknown} value */
-function text(value) { return value == null ? undefined : String(value).trim() || undefined; }
-/** @param {unknown} value */
-function number(value) { const parsed = Number(String(value ?? '').replace(/[,₹$]/g, '')); return Number.isFinite(parsed) ? parsed : 0; }
-/** @param {unknown} value */
 function integer(value) { return Math.trunc(number(value)); }
-function reportDate(value) {
-  const input = text(value);
-  if (!input) return null;
-  const match = input.match(/^(\d{1,2})[./-](\d{1,2})[./-](\d{4})(?:\s+(.*))?$/);
-  if (!match) return input;
-  const [, day, month, year, time] = match;
-  return `${year}-${month.padStart(2, '0')}-${day.padStart(2, '0')}${time ? ` ${time}` : ''}`;
-}
 function firstAttribute(attributes, names) {
   for (const name of names) {
     const value = attributes?.[name];
@@ -58,16 +47,6 @@ function financeRelatedValue(transaction, wantedNames) {
   }
   return undefined;
 }
-/** @param {Record<string, unknown>} row @param {string[]} names */
-function pick(row, names) {
-  const lowerMap = new Map(Object.entries(row).map(([key, value]) => [key.toLowerCase().replace(/[^a-z0-9]/g, ''), value]));
-  for (const name of names) {
-    const value = lowerMap.get(name.toLowerCase().replace(/[^a-z0-9]/g, ''));
-    if (value != null && String(value).trim() !== '') return value;
-  }
-  return undefined;
-}
-
 /** @param {string} textContent @returns {Array<Record<string, unknown>>} */
 function parseTsv(textContent) {
   const trimmed = z.string().parse(textContent).trim();

@@ -1,20 +1,5 @@
 import { createHash } from 'node:crypto';
-
-export function text(value) { return value == null ? undefined : String(value).trim() || undefined; }
-export function number(value) { const parsed = Number(String(value ?? '').replace(/[,₹$]/g, '')); return Number.isFinite(parsed) ? parsed : 0; }
-export function reportDate(value) {
-  const input = text(value); if (!input) return null;
-  const match = input.match(/^(\d{1,2})[./-](\d{1,2})[./-](\d{4})(?:\s+(.*))?$/);
-  if (!match) return input;
-  const [, day, month, year, time] = match;
-  return `${year}-${month.padStart(2, '0')}-${day.padStart(2, '0')}${time ? ` ${time}` : ''}`;
-}
-export function pick(row, names) {
-  const normalized = value => value.toLowerCase().replace(/[^a-z0-9]/g, '');
-  const values = new Map(Object.entries(row).map(([key, value]) => [normalized(key), value]));
-  for (const name of names) { const value = values.get(normalized(name)); if (value != null && String(value).trim() !== '') return value; }
-  return undefined;
-}
+import { number, pick, reportDate, text } from './report-parsing.js';
 
 const aliases = {
   posted_at: ['date/time', 'date time', 'posted-date', 'posted date', 'postedAt'], settlement_id: ['settlement id', 'settlement-id', 'settlementId'],
