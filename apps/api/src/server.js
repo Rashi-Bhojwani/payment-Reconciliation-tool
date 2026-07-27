@@ -491,7 +491,10 @@ app.post('/api/tenants/:tenantId/sync/:reportType', async request => {
   await requireTenantUser(request, params.tenantId);
   await assertActiveTenant(params.tenantId);
   if (params.reportType === 'DIRECT_SP_API_SYNC') {
-    const result = await syncRecentApiDataForTenant(params.tenantId, { range: body.range, maxOrderPages: 100, maxOrderItems: 1000 });
+    // Keep an interactive sync bounded. Fetching 1,000 order-item and catalog
+    // records serially can take well over half an hour at Amazon's rate limits.
+    // Subsequent syncs continue incrementally from the last completion.
+    const result = await syncRecentApiDataForTenant(params.tenantId, { range: body.range, maxOrderPages: 2, maxOrderItems: 20 });
     return { reportType: params.reportType, status: 'completed', ...result };
   }
   const directFirstReports = new Set(['GET_FBA_MYI_UNSUPPRESSED_INVENTORY_DATA', 'GET_FBA_REIMBURSEMENTS_DATA']);
@@ -722,6 +725,16 @@ app.get('/api/tenants/:tenantId/dashboard', async request => {
     ? { connected: true, sellerName: sellerRow.seller_name, sellerId: sellerRow.amazon_seller_id, marketplaceId: sellerRow.marketplace_id, authStatus: sellerRow.auth_status, connectedAt: sellerRow.connected_at, lastTokenRefreshAt: sellerRow.last_token_refresh_at }
     : { connected: false };
   return withTenant(tenantId, async client => {
+    // Requests interrupted by a process restart or disconnected client can
+    // leave a running row behind after imported data was committed. Persist
+    // the timeout so all pages agree and the stale state does not live forever.
+    await client.query(
+      `update sync_jobs
+       set status='failed', completed_at=coalesce(completed_at, started_at + interval '6 minutes'),
+           error_message=coalesce(error_message, 'Sync stopped before completion. Please retry.')
+       where tenant_id=$1 and status='running' and started_at < now() - interval '6 minutes'`,
+      [tenantId]
+    );
     const amazonAuth = (await pool.query("select amazon_seller_id, marketplace_id, auth_status, connected_at, last_token_refresh_at from sellers where tenant_id=$1 and auth_status='authorized' order by connected_at desc limit 1", [tenantId])).rows[0] ?? null;
     const kpis = (await client.query(`select coalesce(sum(amount),0) net_settled, coalesce(sum(case when amount > 0 then amount else 0 end),0) earnings, coalesce(sum(case when amount < 0 then amount else 0 end),0) deductions from settlement_rows where tenant_id=$1 and posted_date >= $2 and posted_date < $3`, [tenantId, start, end])).rows[0];
     const orders = (await client.query(`select count(*) orders, coalesce(sum(total_amount),0) order_value from orders where tenant_id=$1 and order_date >= $2 and order_date < $3`, [tenantId, start, end])).rows[0];
@@ -813,14 +826,8 @@ app.get('/api/tenants/:tenantId/dashboard', async request => {
       select settlement_id, posted_date, net_amount, lines from merged order by posted_date desc nulls last limit 100`, [tenantId, start, end])).rows;
     const jobs = (await client.query(`
       with normalized_jobs as (
-        select report_type,
-          case when status='running' and started_at < now() - interval '30 minutes' then 'failed' else status end status,
-          started_at,
-          case when status='running' and started_at < now() - interval '30 minutes' then started_at + interval '30 minutes' else completed_at end completed_at,
-          case when status='running' and started_at < now() - interval '30 minutes' then coalesce(error_message, 'Sync timed out. Please retry.') else error_message end error_message,
-          s3_key
-        from sync_jobs
-        where tenant_id=$1
+        select report_type, status, started_at, completed_at, error_message, s3_key
+        from sync_jobs where tenant_id=$1
       )
       select distinct on (report_type) report_type, status, started_at, completed_at, error_message, s3_key
       from normalized_jobs

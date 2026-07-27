@@ -309,6 +309,9 @@ function SyncLedger({ tenantId, jobs = [], onSynced, reportTypes, title, subtitl
         {reports.map((report, i) => {
           const job = jobs.find(j => j.report_type === report.type);
           const local = rowState[report.type];
+          // Only this mounted ledger owns its loading state. A persisted
+          // `running` row may belong to an abandoned request, so it must not
+          // leave this control disabled after the page is refreshed.
           const busy = local?.loading;
           const failed = local?.error || job?.status === 'failed';
           const statusLabel = disabled ? 'locked' : busy ? 'syncing' : failed ? 'failed' : job?.status ?? 'idle';
@@ -394,31 +397,6 @@ function SellerDashboard() {
     rangeSyncRef.current.requestId += 1;
     void load(range, rangeSyncRef.current.requestId);
   }, [tenantId, range.start, range.end]);
-
-  // On a selected dashboard range, pull the same Amazon Sales & Traffic source
-  // that Seller Central shows for ordered product sales/units. Capture the
-  // exact range and ignore stale completions, so a delayed sync cannot replace
-  // the user's current selection with another range.
-  useEffect(() => {
-    if (!data?.seller?.connected || !tenantId || freshAmazonAuth) return;
-    const selectedReportTypes = view === 'dashboard' ? ['GET_SALES_AND_TRAFFIC_REPORT'] : (VIEW_REPORT_TYPES[view] ?? []);
-    if (!selectedReportTypes.length) return;
-    const selectedRange = { label: range.label, start: range.start, end: range.end };
-    const syncKey = `${tenantId}:${view}:${selectedReportTypes.join(',')}:${formatDateParam(selectedRange.start)}:${formatDateParam(addDays(selectedRange.end, 1))}`;
-    if (rangeSyncRef.current.key === syncKey) return;
-    rangeSyncRef.current.key = syncKey;
-    const requestId = rangeSyncRef.current.requestId;
-    (async () => {
-      try {
-        for (const reportType of selectedReportTypes) {
-          await syncAmazonSource(tenantId, reportType, selectedRange);
-        }
-        await load(selectedRange, requestId);
-      } catch (e) {
-        if (requestId === rangeSyncRef.current.requestId) setError(e.message);
-      }
-    })();
-  }, [data?.seller?.connected, tenantId, view, freshAmazonAuth, range.start, range.end]);
 
   const channelData = useMemo(() => [
     { name: 'Order value', value: Number(data?.orders?.order_value ?? 0) },
