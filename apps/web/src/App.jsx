@@ -427,7 +427,7 @@ function SellerDashboard() {
     {view === 'businessPerformance' && <BusinessPerformanceReport data={data} />}
     {view === 'productPerformance' && <ProductPerformanceReport data={data} />}
     {view === 'inventory' && <TableCard title="Inventory" rows={data?.inventory ?? []} columns={['sku', 'fulfillable_quantity', 'snapshot_date']} />}
-    {view === 'payouts' && <TableCard title="Payout Activity" rows={data?.payments ?? []} columns={['posted_date', 'settlement_id', 'net_amount', 'lines']} />}
+    {view === 'payouts' && <PayoutReconciliation data={data} />}
     {view === 'brand' && <TableCard title="Product Performance" rows={data?.products ?? []} columns={['asin', 'units', 'sales', 'buy_box']} />}
     {view === 'feeAudit' && <FeeLeakAudit tenantId={tenantId} />}
     {view === 'returns' && <TableCard title="Return Details" rows={data?.returns ?? []} columns={['order_id', 'return_reason', 'disposition', 'status', 'return_date']} />}
@@ -743,6 +743,26 @@ function buildDashboardSummary(data, range = defaultDateRange()) {
       { area: 'Returns', count: formatNumber(returnQty), amount: formatCurrency(0), status: returnQty ? 'Action needed' : 'Clean' }
     ]
   };
+}
+function PayoutReconciliation({ data }) {
+  const kpis = data?.kpis ?? {};
+  const components = [
+    ['Product sales','product_sales'],['Shipping credits','shipping_credits'],['Gift wrap credits','gift_wrap_credits'],
+    ['Promotional rebates','promotional_rebates'],['Sales tax liable','total_sales_tax_liable'],['TCS (CGST + SGST + IGST)','tcs'],
+    ['TDS (Section 194-O)','tds_194o'],['Selling fees','selling_fees'],['FBA fees','fba_fees'],
+    ['Other transaction fees','other_transaction_fees'],['Other','other']
+  ].map(([component,key])=>({component,amount:formatCurrency(kpis[key])}));
+  return <>
+    <div className="metrics-strip">
+      <MiniMetric title="Released · money received" value={formatCurrency(kpis.released_total)} hint={kpis.source} />
+      <MiniMetric title="Deferred · pending" value={formatCurrency(kpis.deferred_total)} hint={kpis.next_release_date ? `Expected ${String(kpis.next_release_date).slice(0,10)}` : 'Release date not supplied'} />
+      <MiniMetric title="All transaction rows" value={formatNumber(kpis.line_count)} hint="Seller Central date-range report" />
+    </div>
+    <div className="dashboard-grid two">
+      <TableCard title="Amazon CSV field totals" rows={[...components,{component:'Grand total (Released + Deferred)',amount:formatCurrency(kpis.total)}]} columns={['component','amount']} />
+      <TableCard title="Payout Activity" rows={data?.payments ?? []} columns={['posted_date','settlement_id','transaction_status','transaction_release_date','net_amount','lines']} />
+    </div>
+  </>;
 }
 function readableTrend(data) {
   return (data?.trend ?? []).map(row => ({ ...row, label: new Date(row.date).toLocaleDateString('en-IN', { day: '2-digit', month: 'short' }) }));

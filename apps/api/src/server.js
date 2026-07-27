@@ -111,7 +111,7 @@ async function exchangeAmazonCode(code, redirectUri) {
 }
 
 
-const TENANT_DATA_TABLES = ['orders', 'settlement_rows', 'gst_invoices', 'returns', 'reimbursements', 'inventory_snapshots', 'sales_traffic_daily', 'fee_leak_flags', 'generated_reports', 'order_items', 'finance_transactions', 'finance_transaction_items', 'fee_estimates'];
+const TENANT_DATA_TABLES = ['orders', 'settlement_rows', 'settlement_transaction_lines', 'gst_invoices', 'returns', 'reimbursements', 'inventory_snapshots', 'sales_traffic_daily', 'fee_leak_flags', 'generated_reports', 'order_items', 'finance_transactions', 'finance_transaction_items', 'fee_estimates'];
 
 async function ensureSellerAuthSchema() {
   await pool.query(`
@@ -736,7 +736,24 @@ app.get('/api/tenants/:tenantId/dashboard', async request => {
       [tenantId]
     );
     const amazonAuth = (await pool.query("select amazon_seller_id, marketplace_id, auth_status, connected_at, last_token_refresh_at from sellers where tenant_id=$1 and auth_status='authorized' order by connected_at desc limit 1", [tenantId])).rows[0] ?? null;
-    const kpis = (await client.query(`select coalesce(sum(amount),0) net_settled, coalesce(sum(case when amount > 0 then amount else 0 end),0) earnings, coalesce(sum(case when amount < 0 then amount else 0 end),0) deductions from settlement_rows where tenant_id=$1 and posted_date >= $2 and posted_date < $3`, [tenantId, start, end])).rows[0];
+    const settlementKpis = (await client.query(`select count(*)::int line_count,
+      coalesce(sum(product_sales),0) product_sales, coalesce(sum(shipping_credits),0) shipping_credits,
+      coalesce(sum(gift_wrap_credits),0) gift_wrap_credits, coalesce(sum(promotional_rebates),0) promotional_rebates,
+      coalesce(sum(total_sales_tax_liable),0) total_sales_tax_liable,
+      coalesce(sum(tcs_cgst+tcs_sgst+tcs_igst),0) tcs, coalesce(sum(tds_194o),0) tds_194o,
+      coalesce(sum(selling_fees),0) selling_fees, coalesce(sum(fba_fees),0) fba_fees,
+      coalesce(sum(other_transaction_fees),0) other_transaction_fees, coalesce(sum(other),0) other,
+      coalesce(sum(total),0) total,
+      coalesce(sum(total) filter (where transaction_status='Released'),0) released_total,
+      coalesce(sum(total) filter (where transaction_status='Deferred'),0) deferred_total,
+      min(transaction_release_date) filter (where transaction_status='Deferred') next_release_date
+      from settlement_transaction_lines where tenant_id=$1 and posted_at >= $2 and posted_at < $3`, [tenantId, start, end])).rows[0];
+    let kpis = { ...settlementKpis, net_settled: settlementKpis.released_total, earnings: settlementKpis.released_total, deductions: Number(settlementKpis.selling_fees)+Number(settlementKpis.fba_fees)+Number(settlementKpis.other_transaction_fees), source: 'Settlement transaction report' };
+    if (!Number(settlementKpis.line_count)) {
+      const fallbackStart = new Date(Math.max(start.getTime(), Date.now() - 4 * 864e5));
+      const fallback = (await client.query(`select coalesce(sum(total_amount),0) total from finance_transactions where tenant_id=$1 and posted_date >= $2 and posted_date < $3`, [tenantId, fallbackStart, end])).rows[0];
+      kpis = { ...kpis, net_settled: fallback.total, released_total: fallback.total, total: fallback.total, source: 'Finances API fallback (recent 4 days)' };
+    }
     const orders = (await client.query(`select count(*) orders, coalesce(sum(total_amount),0) order_value from orders where tenant_id=$1 and order_date >= $2 and order_date < $3`, [tenantId, start, end])).rows[0];
     const businessReportRows = (await client.query(`
       with scoped as (
@@ -805,25 +822,10 @@ app.get('/api/tenants/:tenantId/dashboard', async request => {
       )
       select date, sales, units, sessions from merged order by date desc limit 90`, [tenantId, start, end])).rows.reverse();
     const payments = (await client.query(`
-      with settlement_payments as (
-        select settlement_id, date(posted_date) posted_date, sum(amount) net_amount, count(*) lines
-        from settlement_rows
-        where tenant_id=$1 and posted_date >= $2 and posted_date < $3
-        group by settlement_id,date(posted_date)
-      ), finance_payments as (
-        select coalesce(transaction_id, related_order_id, 'finance-' || date(posted_date)::text) settlement_id,
-          date(posted_date) posted_date,
-          sum(total_amount) net_amount,
-          count(*) lines
-        from finance_transactions
-        where tenant_id=$1 and posted_date >= $2 and posted_date < $3 and posted_date is not null
-        group by coalesce(transaction_id, related_order_id, 'finance-' || date(posted_date)::text), date(posted_date)
-      ), merged as (
-        select * from settlement_payments
-        union all
-        select * from finance_payments where not exists (select 1 from settlement_payments)
-      )
-      select settlement_id, posted_date, net_amount, lines from merged order by posted_date desc nulls last limit 100`, [tenantId, start, end])).rows;
+      select settlement_id, date(posted_at) posted_date, transaction_status,
+        min(transaction_release_date) transaction_release_date, sum(total) net_amount, count(*) lines
+      from settlement_transaction_lines where tenant_id=$1 and posted_at >= $2 and posted_at < $3
+      group by settlement_id,date(posted_at),transaction_status order by posted_date desc nulls last limit 100`, [tenantId, start, end])).rows;
     const jobs = (await client.query(`
       with normalized_jobs as (
         select report_type, status, started_at, completed_at, error_message, s3_key
@@ -833,7 +835,7 @@ app.get('/api/tenants/:tenantId/dashboard', async request => {
       from normalized_jobs
       order by report_type, started_at desc nulls last
     `, [tenantId])).rows;
-    const settlementLines = (await client.query('select settlement_id, order_id, amount_type, amount_description, amount, posted_date from settlement_rows where tenant_id=$1 and posted_date >= $2 and posted_date < $3 order by posted_date desc nulls last limit 250', [tenantId, start, end])).rows;
+    const settlementLines = (await client.query("select settlement_id,order_id,type amount_type,description amount_description,total amount,posted_at posted_date,transaction_status,transaction_release_date from settlement_transaction_lines where tenant_id=$1 and posted_at >= $2 and posted_at < $3 order by posted_at desc nulls last limit 250", [tenantId, start, end])).rows;
     const orderRows = (await client.query(`
       select o.amazon_order_id, o.order_date, o.status, o.total_amount, o.fulfillment_channel, o.sales_channel,
         count(oi.id) item_lines,
