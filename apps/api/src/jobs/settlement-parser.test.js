@@ -13,3 +13,16 @@ test('preserves duplicate Amazon CSV lines and parses quoted thousands', () => {
   assert.equal(rows[0].transaction_status, 'Deferred');
   assert.notEqual(rows[0].dedupe_key, rows[1].dedupe_key);
 });
+
+test('normalizes classic V2 settlement component lines without double-counting its header total', () => {
+  const classicHeader = 'settlement-id\tsettlement-start-date\tsettlement-end-date\tdeposit-date\ttotal-amount\tcurrency\ttransaction-type\torder-id\tmerchant-order-id\tadjustment-id\tshipment-id\tmarketplace-name\tamount-type\tamount-description\tamount\tfulfillment-id\tposted-date\tposted-date-time\torder-item-code\tsku\tquantity-purchased';
+  const summary = 'S1\t19.07.2026\t24.07.2026\t26.07.2026\t1684.07\tINR';
+  const sale = 'S1\t\t\t\t\t\tOrder\tORDER-1\t\t\tSHIP-1\tAmazon.in\tItemPrice\tPrincipal\t1694.07\tAFN\t23.07.2026\t23.07.2026 18:21:50 UTC\tITEM-1\tSKU-1\t1';
+  const fee = 'S1\t\t\t\t\t\tOrder\tORDER-1\t\t\tSHIP-1\tAmazon.in\tItemFees\tCommission\t-10\tAFN\t23.07.2026\t23.07.2026 18:21:50 UTC\tITEM-1\tSKU-1\t1';
+  const rows = parseSettlementContent(`${classicHeader}\n${summary}\n${sale}\n${fee}\n`);
+  assert.equal(rows.length, 2);
+  assert.equal(rows[0].product_sales, 1694.07);
+  assert.equal(rows[1].selling_fees, -10);
+  assert.equal(rows.reduce((sum, row) => sum + row.total, 0), 1684.07);
+  assert.equal(rows[0].raw_row['amount-description'], 'Principal');
+});
