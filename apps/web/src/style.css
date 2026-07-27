@@ -351,6 +351,16 @@ select, input { font-family: inherit; }
   color: var(--text);
   text-align: left;
 }
+.global-search-heading {
+  display: block;
+  padding: 6px 10px 7px;
+  color: var(--muted);
+  font-family: 'IBM Plex Mono', monospace;
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: .08em;
+  text-transform: uppercase;
+}
 .global-search-results button:hover,
 .global-search-results button:focus-visible { background: #f1f5ff; }
 .global-search-results button > span:last-child { display: grid; gap: 2px; }

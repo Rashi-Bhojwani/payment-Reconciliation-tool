@@ -969,9 +969,11 @@ function GlobalSearch({ tenantId }) {
   const navigate = useNavigate();
   const rootRef = useRef(null);
   const normalizedQuery = query.trim().toLowerCase();
-  const results = normalizedQuery
-    ? NAV_ITEMS.filter(item => `${item.label} ${item.view} ${SEARCH_KEYWORDS[item.view] ?? ''}`.toLowerCase().includes(normalizedQuery)).slice(0, 6)
-    : [];
+  const queryWords = normalizedQuery.split(/\s+/).filter(Boolean);
+  const results = NAV_ITEMS.filter(item => {
+    const searchableText = `${item.label} ${item.view} ${SEARCH_KEYWORDS[item.view] ?? ''}`.toLowerCase();
+    return queryWords.every(word => searchableText.includes(word));
+  }).slice(0, 6);
 
   useEffect(() => {
     function closeOnOutsideClick(event) {
@@ -1002,14 +1004,15 @@ function GlobalSearch({ tenantId }) {
       value={query}
       placeholder="Search reports, payments, payouts…"
       aria-label="Search sections"
-      aria-expanded={open && Boolean(normalizedQuery)}
+      aria-expanded={open}
       aria-controls="global-search-results"
       onChange={event => { setQuery(event.target.value); setOpen(true); }}
       onFocus={() => setOpen(true)}
       onKeyDown={onKeyDown}
     />
-    {open && normalizedQuery && <div className="global-search-results" id="global-search-results" role="listbox">
-      {results.length ? results.map(item => <button type="button" role="option" key={item.view} onClick={() => choose(item)}>
+    {open && <div className="global-search-results" id="global-search-results" role="listbox">
+      <span className="global-search-heading">{normalizedQuery ? 'Matching sections' : 'Quick navigation'}</span>
+      {results.length ? results.map(item => <button type="button" role="option" aria-selected="false" key={item.view} onClick={() => choose(item)}>
         <span className="nav-icon" aria-hidden="true">{item.icon}</span>
         <span><b>{item.label}</b><small>Open section</small></span>
       </button>) : <p>No matching section found.</p>}
