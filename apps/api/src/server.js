@@ -491,7 +491,10 @@ app.post('/api/tenants/:tenantId/sync/:reportType', async request => {
   await requireTenantUser(request, params.tenantId);
   await assertActiveTenant(params.tenantId);
   if (params.reportType === 'DIRECT_SP_API_SYNC') {
-    const result = await syncRecentApiDataForTenant(params.tenantId, { range: body.range, maxOrderPages: 100, maxOrderItems: 1000 });
+    // Keep an interactive sync bounded. Fetching 1,000 order-item and catalog
+    // records serially can take well over half an hour at Amazon's rate limits.
+    // Subsequent syncs continue incrementally from the last completion.
+    const result = await syncRecentApiDataForTenant(params.tenantId, { range: body.range, maxOrderPages: 2, maxOrderItems: 20 });
     return { reportType: params.reportType, status: 'completed', ...result };
   }
   const directFirstReports = new Set(['GET_FBA_MYI_UNSUPPRESSED_INVENTORY_DATA', 'GET_FBA_REIMBURSEMENTS_DATA']);
@@ -814,10 +817,10 @@ app.get('/api/tenants/:tenantId/dashboard', async request => {
     const jobs = (await client.query(`
       with normalized_jobs as (
         select report_type,
-          case when status='running' and started_at < now() - interval '30 minutes' then 'failed' else status end status,
+          case when status='running' and started_at < now() - interval '10 minutes' then 'failed' else status end status,
           started_at,
-          case when status='running' and started_at < now() - interval '30 minutes' then started_at + interval '30 minutes' else completed_at end completed_at,
-          case when status='running' and started_at < now() - interval '30 minutes' then coalesce(error_message, 'Sync timed out. Please retry.') else error_message end error_message,
+          case when status='running' and started_at < now() - interval '10 minutes' then started_at + interval '10 minutes' else completed_at end completed_at,
+          case when status='running' and started_at < now() - interval '10 minutes' then coalesce(error_message, 'Sync timed out. Please retry.') else error_message end error_message,
           s3_key
         from sync_jobs
         where tenant_id=$1

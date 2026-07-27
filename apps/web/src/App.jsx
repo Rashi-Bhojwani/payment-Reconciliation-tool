@@ -309,7 +309,9 @@ function SyncLedger({ tenantId, jobs = [], onSynced, reportTypes, title, subtitl
         {reports.map((report, i) => {
           const job = jobs.find(j => j.report_type === report.type);
           const local = rowState[report.type];
-          const busy = local?.loading;
+          // Preserve the running state after a refresh and prevent a second
+          // click from starting a concurrent sync for the same Amazon source.
+          const busy = local?.loading || job?.status === 'running';
           const failed = local?.error || job?.status === 'failed';
           const statusLabel = disabled ? 'locked' : busy ? 'syncing' : failed ? 'failed' : job?.status ?? 'idle';
           return (

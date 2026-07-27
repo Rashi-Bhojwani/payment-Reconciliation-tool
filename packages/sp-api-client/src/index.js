@@ -22,6 +22,8 @@ export const REPORT_TYPES = Object.freeze([
 const GST_REPORTS = new Set(['GET_GST_MTR_B2B_CUSTOM', 'GET_GST_MTR_B2C_CUSTOM']);
 const DateRangeSchema = z.object({ start: z.string().datetime(), end: z.string().datetime() });
 const REPORT_DATA_LAG_MS = 2 * 60 * 1000;
+const REPORT_POLL_INTERVAL_MS = 15_000;
+const REPORT_POLL_ATTEMPTS = 20;
 
 /**
  * Amazon rejects report requests whose dataEndTime is in the future. The web
@@ -179,7 +181,7 @@ export class SpApiClient {
     const { reportId } = z.object({ reportId: z.string().min(1) }).parse(await create.json());
 
     let reportDocumentId = '';
-    for (let attempt = 0; attempt < 30; attempt += 1) {
+    for (let attempt = 0; attempt < REPORT_POLL_ATTEMPTS; attempt += 1) {
       const poll = await this.request(`/reports/2021-06-30/reports/${reportId}`);
       if (!poll.ok) throw new Error(`Poll report failed: ${poll.status}`);
       const body = z.object({ processingStatus: z.string(), reportDocumentId: z.string().optional() }).parse(await poll.json());
@@ -188,7 +190,7 @@ export class SpApiClient {
         break;
       }
       if (['CANCELLED', 'FATAL'].includes(body.processingStatus)) throw new Error(`Report ${reportId} ${body.processingStatus}`);
-      await new Promise(resolve => setTimeout(resolve, 30_000));
+      await new Promise(resolve => setTimeout(resolve, REPORT_POLL_INTERVAL_MS));
     }
     if (!reportDocumentId) throw new Error(`Report ${reportId} timed out for tenant ${parsedTenant}`);
 
