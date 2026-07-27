@@ -51,5 +51,20 @@ export function parseDelimited(content) {
   const headers = parseLine(lines[headerIndex]).map(value => value.trim());
   return lines.slice(headerIndex + 1).map(parseLine).filter(values => values.some(Boolean)).map(values => Object.fromEntries(headers.map((header, index) => [header, values[index] ?? ''])));
 }
-export function parseSettlementContent(content) { return parseDelimited(content).map(mapSettlementRow); }
+export function parseSettlementContent(content) {
+  // Amazon does not provide a row id and can emit multiple byte-identical
+  // transaction lines. A hash alone would collapse those legitimate rows and
+  // make every aggregate smaller than Seller Central. Preserve their stable
+  // report order with a per-identity occurrence suffix.
+  const occurrences = new Map();
+  return parseDelimited(content).map(row => {
+    const mapped = mapSettlementRow(row);
+    const occurrence = occurrences.get(mapped.dedupe_key) ?? 0;
+    occurrences.set(mapped.dedupe_key, occurrence + 1);
+    // Keep occurrence zero compatible with rows imported before duplicate-line
+    // support, so the corrective rolling sync updates rather than doubles them.
+    if (occurrence > 0) mapped.dedupe_key = `${mapped.dedupe_key}:${occurrence}`;
+    return mapped;
+  });
+}
 export { aliases as SETTLEMENT_HEADER_ALIASES, numericFields as SETTLEMENT_NUMERIC_FIELDS };
