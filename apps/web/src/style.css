@@ -456,7 +456,7 @@ select, input { font-family: inherit; }
   color: var(--muted);
   justify-self: end;
 }
-.pill.status-completed, .pill.status-active { background: var(--success-bg); color: var(--emerald-deep); }
+.pill.status-completed, .pill.status-active { background: var(--success-bg); color: var(--emerald-deep); padding: 2px; }
 .pill.status-failed { background: var(--danger-bg); color: var(--danger); }
 .pill.status-syncing, .pill.status-running { background: rgba(109, 91, 208, 0.12); color: var(--violet-deep); }
 .pill.status-pending { background: var(--warn-bg); color: #8a5a12; }
@@ -466,7 +466,7 @@ select, input { font-family: inherit; }
 .ledger-locked-note {
   background: var(--danger-bg);
   color: var(--danger);
-  font-size: 12.5px;
+  font-size: 12px;
   padding: 10px 14px;
   border-radius: var(--radius-sm);
   margin-bottom: 4px;
