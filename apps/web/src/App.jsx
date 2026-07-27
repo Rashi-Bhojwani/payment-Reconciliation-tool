@@ -28,7 +28,7 @@ const REPORT_DETAIL_MAP = {
   GET_FBA_REIMBURSEMENTS_DATA: { source: 'reimbursements', title: 'Reimbursement report detail', columns: ['sku', 'amount', 'reason', 'reimbursement_date'], explanation: 'Shows Amazon reimbursement credits with SKU, reason and amount.' },
   GET_FBA_FULFILLMENT_CUSTOMER_RETURNS_DATA: { source: 'returns', title: 'Customer returns report detail', columns: ['order_id', 'return_reason', 'disposition', 'status', 'return_date'], explanation: 'Shows return rows with reason, disposition and current status.' }
 };
-const COLORS = ['#0f6bff', '#7c3aed', '#64748b', '#d8dde8'];
+const COLORS = ['#1668e8', '#7c3aed', '#22a65a', '#94a3b8'];
 
 // Maps each report code to a stable CSS class so the Sync Ledger and Reports
 // grid can color-code report families (each is a genuinely distinct SP-API
