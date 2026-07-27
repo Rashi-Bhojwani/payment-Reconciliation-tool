@@ -43,21 +43,18 @@ function codeClass(code) { return `code-${CODE_COLOR_KEY[code] ?? code.toLowerCa
 // the report(s) it actually depends on.
 
 const NAV_ITEMS = [
-  { view: 'orderPayments', label: 'Order Payments', icon: '₹' },
   { view: 'dashboard', label: 'Dashboard', icon: '▦' },
+  { view: 'orderPayments', label: 'Order Payments', icon: '₹' },
   { view: 'sales', label: 'Sales Analytics', icon: '↗' },
   { view: 'businessPerformance', label: 'Business Performance', icon: '▤' },
   { view: 'productPerformance', label: 'Product Performance', icon: '◈' },
   { view: 'inventory', label: 'Inventory', icon: '□' },
   { view: 'payouts', label: 'Payouts', icon: '₹' },
   { view: 'brand', label: 'Brand Analytics', icon: '☆' },
-  { view: 'orders', label: 'Orders', icon: '☰' },
   { view: 'feeAudit', label: 'Fee Leak Audit', icon: '!' },
   { view: 'returns', label: 'Returns', icon: '↩' },
   { view: 'reimbursements', label: 'Reimbursements', icon: '+' },
   { view: 'tax', label: 'GST & Tax', icon: '%' },
-  { view: 'pricing', label: 'Pricing & Buy Box', icon: '◇' },
-  { view: 'listings', label: 'Listings', icon: '⌂' },
   { view: 'reports', label: 'Reports', icon: '◎' },
   { view: 'rawData', label: 'Raw API Data', icon: '{}' }
 ];
@@ -68,13 +65,10 @@ const VIEW_REPORT_TYPES = {
   inventory: ['GET_FBA_MYI_UNSUPPRESSED_INVENTORY_DATA'],
   payouts: ['DIRECT_SP_API_SYNC', 'GET_V2_SETTLEMENT_REPORT_DATA_FLAT_FILE_V2'],
   brand: ['DIRECT_SP_API_SYNC'],
-  orders: ['DIRECT_SP_API_SYNC'],
   feeAudit: ['DIRECT_SP_API_SYNC'],
   returns: ['GET_FBA_FULFILLMENT_CUSTOMER_RETURNS_DATA'],
   reimbursements: ['GET_FBA_REIMBURSEMENTS_DATA'],
   tax: ['GET_GST_MTR_B2B_CUSTOM', 'GET_GST_MTR_B2C_CUSTOM'],
-  pricing: ['GET_SALES_AND_TRAFFIC_REPORT'],
-  listings: ['GET_FBA_MYI_UNSUPPRESSED_INVENTORY_DATA'],
   reports: REPORTS.map(r => r.type),
   businessPerformance: ['GET_SALES_AND_TRAFFIC_REPORT', 'DIRECT_SP_API_SYNC', 'GET_FBA_FULFILLMENT_CUSTOMER_RETURNS_DATA'],
   productPerformance: ['GET_SALES_AND_TRAFFIC_REPORT'],
@@ -86,13 +80,10 @@ const VIEW_LEDGER_COPY = {
   inventory: { title: 'Inventory sync', subtitle: 'This page only' },
   payouts: { title: 'Payout sync', subtitle: 'Orders, finance and settlements' },
   brand: { title: 'Brand analytics sync', subtitle: 'Orders and item performance' },
-  orders: { title: 'Orders sync', subtitle: 'Order and item lines' },
   feeAudit: { title: 'Fee data sync', subtitle: 'Sync finance items before running an audit' },
   returns: { title: 'Returns sync', subtitle: 'Customer return report' },
   reimbursements: { title: 'Reimbursements sync', subtitle: 'Amazon credits' },
   tax: { title: 'GST sync', subtitle: 'B2B and B2C invoice reports' },
-  pricing: { title: 'Pricing signals sync', subtitle: 'Sales and traffic metrics' },
-  listings: { title: 'Listings inventory sync', subtitle: 'FBA SKU availability' },
   reports: { title: 'Sync ledger', subtitle: 'Pull one report at a time' },
   businessPerformance: { title: 'Business performance sync', subtitle: 'Sales, traffic and refunds' },
   productPerformance: { title: 'Product performance sync', subtitle: 'ASIN-level sales and traffic' },
@@ -460,13 +451,10 @@ function SellerDashboard() {
     {view === 'inventory' && <TableCard title="Inventory" rows={data?.inventory ?? []} columns={['sku', 'fulfillable_quantity', 'snapshot_date']} />}
     {view === 'payouts' && <TableCard title="Payout Activity" rows={data?.payments ?? []} columns={['posted_date', 'settlement_id', 'net_amount', 'lines']} />}
     {view === 'brand' && <TableCard title="Product Performance" rows={data?.products ?? []} columns={['asin', 'units', 'sales', 'buy_box']} />}
-    {view === 'orders' && <OrderReconciliation tenantId={tenantId} />}
     {view === 'feeAudit' && <FeeLeakAudit tenantId={tenantId} />}
     {view === 'returns' && <TableCard title="Return Details" rows={data?.returns ?? []} columns={['order_id', 'return_reason', 'disposition', 'status', 'return_date']} />}
     {view === 'reimbursements' && <TableCard title="Reimbursement Details" rows={data?.reimbursements ?? []} columns={['sku', 'amount', 'reason', 'reimbursement_date']} />}
     {view === 'tax' && <TableCard title="GST Invoice Details" rows={data?.invoices ?? []} columns={['invoice_type', 'order_id', 'taxable_value', 'cgst', 'sgst', 'igst', 'invoice_date']} />}
-    {view === 'pricing' && <InsightCards title="Pricing & Buy Box" cards={[['Buy Box', `${formatNumber((data?.products ?? []).filter(p => p.buy_box).length)} ASIN signals`], ['ASP', formatCurrency(buildDashboardSummary(data).netQty ? buildDashboardSummary(data).netSales / buildDashboardSummary(data).netQty : 0)], ['Source', 'Sales & Traffic report']]} />}
-    {view === 'listings' && <TableCard title="Listing Availability" rows={data?.inventory ?? []} columns={['sku', 'fulfillable_quantity', 'snapshot_date']} />}
     {view === 'reports' && <ReportsExplorer tenantId={tenantId} data={data} />}
     {view === 'rawData' && <RawApiDataExplorer data={data} />}
     {view === 'report-detail' && <ReportDetail data={data} reportType={params.get('reportType')} />}
@@ -474,8 +462,8 @@ function SellerDashboard() {
   </div>;
 }
 
-function viewTitle(view) { return ({ orderPayments: 'Order Payment Reconciliation', dashboard: 'Dashboard', sales: 'Sales Analytics', businessPerformance: 'Business Performance', productPerformance: 'Product Performance', inventory: 'Inventory', payouts: 'Payout Reconciliation', brand: 'Brand Analytics', orders: 'Order Reconciliation', feeAudit: 'Fee Leak Audit', returns: 'Returns', reimbursements: 'Reimbursements', tax: 'GST & Tax', pricing: 'Pricing & Buy Box', listings: 'Listings', reports: 'Reports', rawData: 'Raw API Data', 'report-detail': 'Report Detail', 'metric-detail': 'Calculation Detail' })[view] ?? 'Dashboard'; }
-function viewDescription(view) { return ({ orderPayments: 'See every rupee from customer order value, through Amazon deductions, to the final FBA or FBM seller receivable.', dashboard: 'Amazon-only reconciliation KPIs with explainable drill-downs.', sales: 'Revenue, order value, units and product sales trends from Amazon reports.', businessPerformance: 'Excel-style quarterly business performance report with analysed KPIs and matching graphs.', productPerformance: 'Excel-style product performance analysis with top products and written insights.', inventory: 'FBA inventory snapshots imported from SP-API inventory reports.', payouts: 'Settlement rows and payout reconciliation from Amazon settlement reports.', brand: 'ASIN-level product performance from synced Amazon order items, with Sales & Traffic metrics when available.', orders: 'Order and item-level details imported from Amazon SP-API.', returns: 'Customer return reasons, status and disposition.', reimbursements: 'Amazon reimbursement credits for lost, damaged or adjusted inventory.', tax: 'GST B2B and B2C invoice rows in readable form.', pricing: 'ASP and Buy Box signals that influence sales.', listings: 'SKU availability and listing stock visibility.', reports: 'Open each fetched report and view human-readable data.', rawData: 'Inspect raw fields returned from each imported API/report source before finalizing calculations.', 'report-detail': 'Human-readable rows from the selected SP-API report.' })[view] ?? 'Live seller KPIs populated from synced SP-API orders and reports.'; }
+function viewTitle(view) { return ({ orderPayments: 'Order Payment Reconciliation', dashboard: 'Dashboard', sales: 'Sales Analytics', businessPerformance: 'Business Performance', productPerformance: 'Product Performance', inventory: 'Inventory', payouts: 'Payout Reconciliation', brand: 'Brand Analytics', feeAudit: 'Fee Leak Audit', returns: 'Returns', reimbursements: 'Reimbursements', tax: 'GST & Tax', reports: 'Reports', rawData: 'Raw API Data', 'report-detail': 'Report Detail', 'metric-detail': 'Calculation Detail' })[view] ?? 'Dashboard'; }
+function viewDescription(view) { return ({ orderPayments: 'See every rupee from customer order value, through Amazon deductions, to the final FBA or FBM seller receivable.', dashboard: 'Amazon-only reconciliation KPIs with explainable drill-downs.', sales: 'Revenue, order value, units and product sales trends from Amazon reports.', businessPerformance: 'Excel-style quarterly business performance report with analysed KPIs and matching graphs.', productPerformance: 'Excel-style product performance analysis with top products and written insights.', inventory: 'FBA inventory snapshots imported from SP-API inventory reports.', payouts: 'Settlement rows and payout reconciliation from Amazon settlement reports.', brand: 'ASIN-level product performance from synced Amazon order items, with Sales & Traffic metrics when available.', returns: 'Customer return reasons, status and disposition.', reimbursements: 'Amazon reimbursement credits for lost, damaged or adjusted inventory.', tax: 'GST B2B and B2C invoice rows in readable form.', reports: 'Open each fetched report and view human-readable data.', rawData: 'Inspect raw fields returned from each imported API/report source before finalizing calculations.', 'report-detail': 'Human-readable rows from the selected SP-API report.' })[view] ?? 'Live seller KPIs populated from synced SP-API orders and reports.'; }
 
 function OrderPayments({ data }) {
   const rows = data?.orderPayments ?? [];
@@ -594,9 +582,7 @@ function DashboardOverview({ data, channelData, tenantId }) {
 function DrillMetric({ to, title, value, hint }) { return <NavLink to={to} className="mini-metric drill-metric"><span>{title}</span><strong>{value}</strong>{trendHint(hint)}<em>View calculation →</em></NavLink>; }
 function ExplanationGrid({ summary, tenantId }) {
   const returnRate = summary.netQty ? `${Math.round((summary.returnQty / summary.netQty) * 100)}%` : '0%';
-  const payoutGap = summary.netSales - summary.settledAmount;
   const cards = [
-    ['Reconciliation gap', formatCurrency(payoutGap), 'Difference between Amazon net sales and settled amount; useful for payout follow-up.', 'settled'],
     ['Fee impact', formatCurrency(summary.deductions), 'Amazon fees, refunds and other charges imported from finance / settlement lines.', 'deductions'],
     ['Return rate', returnRate, 'Returns compared with total sold quantity for quick customer-experience review.', 'returns'],
     ['GST invoice value', formatCurrency(summary.gstValue), 'Total taxable value imported from GST B2B/B2C invoice rows.', 'tax']
@@ -960,6 +946,80 @@ function SidebarLink({ to, icon, children, onClick }) {
   return <NavLink className={active ? 'active' : ''} to={to} onClick={onClick}><span className="nav-icon" aria-hidden="true">{icon}</span><span>{children}</span></NavLink>;
 }
 
+const SEARCH_KEYWORDS = {
+  dashboard: 'overview summary kpi profit',
+  orderPayments: 'orders transactions money reconciliation customer payments fees',
+  sales: 'revenue trend traffic',
+  businessPerformance: 'quarterly report metrics',
+  productPerformance: 'products asin units conversion',
+  inventory: 'stock sku fba quantity',
+  payouts: 'settlements bank transfers earnings',
+  brand: 'asin buy box products',
+  feeAudit: 'overcharge deductions leak commission',
+  returns: 'refund customer disposition',
+  reimbursements: 'credits lost damaged inventory',
+  tax: 'gst b2b b2c invoices cgst sgst igst',
+  reports: 'amazon sync source data',
+  rawData: 'api json technical fields'
+};
+
+function GlobalSearch({ tenantId }) {
+  const [query, setQuery] = useState('');
+  const [open, setOpen] = useState(false);
+  const navigate = useNavigate();
+  const rootRef = useRef(null);
+  const normalizedQuery = query.trim().toLowerCase();
+  const queryWords = normalizedQuery.split(/\s+/).filter(Boolean);
+  const results = NAV_ITEMS.filter(item => {
+    const searchableText = `${item.label} ${item.view} ${SEARCH_KEYWORDS[item.view] ?? ''}`.toLowerCase();
+    return queryWords.every(word => searchableText.includes(word));
+  }).slice(0, 6);
+
+  useEffect(() => {
+    function closeOnOutsideClick(event) {
+      if (rootRef.current && !rootRef.current.contains(event.target)) setOpen(false);
+    }
+    document.addEventListener('mousedown', closeOnOutsideClick);
+    return () => document.removeEventListener('mousedown', closeOnOutsideClick);
+  }, []);
+
+  function choose(item) {
+    navigate(`/seller?tenantId=${tenantId ?? ''}&view=${item.view}`);
+    setQuery('');
+    setOpen(false);
+  }
+
+  function onKeyDown(event) {
+    if (event.key === 'Enter' && results[0]) {
+      event.preventDefault();
+      choose(results[0]);
+    }
+    if (event.key === 'Escape') setOpen(false);
+  }
+
+  return <div className="global-search" ref={rootRef}>
+    <span className="global-search-icon" aria-hidden="true">⌕</span>
+    <input
+      type="search"
+      value={query}
+      placeholder="Search reports, payments, payouts…"
+      aria-label="Search sections"
+      aria-expanded={open}
+      aria-controls="global-search-results"
+      onChange={event => { setQuery(event.target.value); setOpen(true); }}
+      onFocus={() => setOpen(true)}
+      onKeyDown={onKeyDown}
+    />
+    {open && <div className="global-search-results" id="global-search-results" role="listbox">
+      <span className="global-search-heading">{normalizedQuery ? 'Matching sections' : 'Quick navigation'}</span>
+      {results.length ? results.map(item => <button type="button" role="option" aria-selected="false" key={item.view} onClick={() => choose(item)}>
+        <span className="nav-icon" aria-hidden="true">{item.icon}</span>
+        <span><b>{item.label}</b><small>Open section</small></span>
+      </button>) : <p>No matching section found.</p>}
+    </div>}
+  </div>;
+}
+
 // Seller-facing shell: sidebar + topbar. Admins never render this component.
 function SellerShell({ session, setSession }) {
   function logout() { localStorage.removeItem('token'); setSession(null); }
@@ -976,7 +1036,7 @@ function SellerShell({ session, setSession }) {
     <main className="workspace">
       <header className="topbar">
         <button type="button" className="hamburger-btn" aria-label="Open menu" onClick={() => setMobileNavOpen(o => !o)}>☰</button>
-        <div className="search"><span>⌕</span><span>Search reports, orders, payouts…</span></div>
+        <GlobalSearch tenantId={session?.tenantId} />
         <select><option>Amazon.in</option></select>
         <DateRangePicker value={range} onChange={setRange} />
         <div className="avatar">{session?.email?.[0]?.toUpperCase()}</div>

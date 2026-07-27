@@ -228,7 +228,13 @@ select, input { font-family: inherit; }
 .small { font-size: 12px; }
 
 /* ---------- App shell ---------- */
-.app-shell { display: grid; grid-template-columns: 250px 1fr; min-height: 100vh; }
+.app-shell {
+  display: grid;
+  grid-template-columns: 250px minmax(0, 1fr);
+  height: 100vh;
+  height: 100dvh;
+  overflow: hidden;
+}
 .sidebar {
   background: linear-gradient(185deg, var(--ink-deep) 0%, #111536 100%);
   color: #fff;
@@ -236,7 +242,10 @@ select, input { font-family: inherit; }
   display: flex;
   flex-direction: column;
   gap: 34px;
+  min-height: 0;
   overflow-y: auto;
+  overscroll-behavior-y: contain;
+  scrollbar-gutter: stable;
 }
 .sidebar .logo { display: flex; align-items: center; gap: 12px; padding: 0 6px; }
 .sidebar .logo span {
@@ -263,7 +272,16 @@ select, input { font-family: inherit; }
 .sidebar nav a:hover { background: rgba(255, 255, 255, 0.06); color: #fff; }
 .sidebar nav a.active { background: linear-gradient(90deg, rgba(232, 162, 61, 0.22), rgba(232, 162, 61, 0.05)); color: #fff; border-left-color: var(--marigold); font-weight: 600; }
 
-.workspace { display: flex; flex-direction: column; min-height: 100vh; }
+.workspace {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  min-height: 0;
+  height: 100%;
+  overflow-y: auto;
+  overscroll-behavior-y: contain;
+  scrollbar-gutter: stable;
+}
 .topbar {
   display: flex;
   align-items: center;
@@ -277,8 +295,78 @@ select, input { font-family: inherit; }
      stacking contexts via backdrop-filter. */
   position: relative;
   z-index: 60;
+  flex: 0 0 auto;
 }
-.topbar .search { flex: 1; color: var(--muted); font-size: 13.5px; }
+.global-search {
+  position: relative;
+  flex: 1 1 280px;
+  min-width: 180px;
+}
+.global-search-icon {
+  position: absolute;
+  left: 14px;
+  top: 50%;
+  z-index: 1;
+  color: var(--muted);
+  transform: translateY(-50%);
+  pointer-events: none;
+}
+.global-search input {
+  width: 100%;
+  min-height: 40px;
+  padding: 9px 38px;
+  border: 1px solid var(--border-cool);
+  border-radius: 999px;
+  background: #f8fafc;
+  color: var(--text);
+  font-size: 13.5px;
+}
+.global-search input:focus {
+  outline: 2px solid var(--marigold);
+  outline-offset: 2px;
+  border-color: var(--violet);
+}
+.global-search-results {
+  position: absolute;
+  top: calc(100% + 10px);
+  left: 0;
+  right: 0;
+  z-index: 100;
+  overflow: hidden;
+  padding: 6px;
+  border: 1px solid var(--border);
+  border-radius: 14px;
+  background: var(--surface);
+  box-shadow: var(--shadow-lift);
+}
+.global-search-results button {
+  width: 100%;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 9px 10px;
+  border: 0;
+  border-radius: 10px;
+  background: transparent;
+  color: var(--text);
+  text-align: left;
+}
+.global-search-heading {
+  display: block;
+  padding: 6px 10px 7px;
+  color: var(--muted);
+  font-family: 'IBM Plex Mono', monospace;
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: .08em;
+  text-transform: uppercase;
+}
+.global-search-results button:hover,
+.global-search-results button:focus-visible { background: #f1f5ff; }
+.global-search-results button > span:last-child { display: grid; gap: 2px; }
+.global-search-results b { color: var(--ink); font-size: 13px; }
+.global-search-results small { color: var(--muted); font-size: 11px; }
+.global-search-results p { padding: 14px; color: var(--muted); font-size: 13px; text-align: center; }
 .topbar select { border: 1px solid var(--border-cool); border-radius: var(--radius-sm); padding: 7px 10px; font-size: 13px; background: var(--surface); color: var(--text); }
 .topbar .avatar {
   width: 32px; height: 32px; border-radius: 50%;
@@ -796,7 +884,7 @@ body { background: radial-gradient(circle at 82% -10%, rgba(37,99,235,.10), tran
 .sidebar nav a.active .nav-icon { background:#eff6ff; color:#2563eb; border-color:#bfdbfe; }
 .workspace { background: transparent; }
 .topbar { margin: 22px 32px 0; border: 1px solid var(--border); border-radius: 20px; background: rgba(255,255,255,.78); box-shadow: var(--shadow); backdrop-filter: blur(18px); }
-.topbar .search { flex: 1; display:flex; gap:10px; align-items:center; background:#f8fafc; border:1px solid var(--border); border-radius: 999px; padding: 10px 14px; }
+.global-search input { background: #f8fafc; border-color: var(--border); }
 .page-stack { padding: 30px 32px 60px; gap: 24px; }
 .section-title h1 { font-size: 34px; letter-spacing: -0.035em; }
 .section-title p { font-size: 16px; line-height: 1.55; }
