@@ -749,6 +749,10 @@ function buildDashboardSummary(data, range = defaultDateRange()) {
 }
 function PayoutReconciliation({ data }) {
   const kpis = data?.kpis ?? {};
+  const reconciliation = data?.statementReconciliation ?? {};
+  const statementRows = (data?.statementBreakdown ?? []).map(row=>({
+    ...row, amount: formatCurrency(row.amount), source_lines: formatNumber(row.source_lines)
+  }));
   const components = [
     ['Product sales','product_sales'],['Shipping credits','shipping_credits'],['Gift wrap credits','gift_wrap_credits'],
     ['Promotional rebates','promotional_rebates'],['Sales tax liable','total_sales_tax_liable'],['TCS (CGST + SGST + IGST)','tcs'],
@@ -765,6 +769,17 @@ function PayoutReconciliation({ data }) {
       <TableCard title="Amazon CSV field totals" rows={[...components,{component:'Grand total',released:formatCurrency(kpis.released_total),deferred:formatCurrency(kpis.deferred_total),total:formatCurrency(kpis.total)}]} columns={['component','released','deferred','total']} />
       <TableCard title="Payout Activity" rows={data?.payments ?? []} columns={['posted_date','settlement_id','transaction_status','transaction_release_date','net_amount','lines']} />
     </div>
+    <Card className="statement-audit">
+      <PanelHeader title="Every rupee in the Amazon statement" subtitle="Live GET_V2_SETTLEMENT_REPORT_DATA_FLAT_FILE_V2 data for the selected date range — no hardcoded amounts" />
+      <div className={reconciliation.matches?'statement-check matched':'statement-check mismatch'}>
+        <div><small>Sum of all money columns</small><strong>{formatCurrency(reconciliation.componentTotal)}</strong></div><b>−</b>
+        <div><small>Amazon row totals</small><strong>{formatCurrency(reconciliation.amazonTotal)}</strong></div><b>=</b>
+        <div><small>Difference</small><strong>{formatCurrency(reconciliation.difference)}</strong></div>
+        <span>{reconciliation.matches?'✓ Exact match to the paisa':'Review source rows — Amazon columns do not add up'}</span>
+      </div>
+      <p className="reconciliation-note">Each line below preserves Amazon’s transaction type and description, then shows which CSV money column supplied the amount. Positive amounts are credits to the seller; negative amounts are deductions or refunds.</p>
+      <TableCard title="Human-readable statement breakdown" rows={statementRows} columns={['transaction_type','description','fulfillment','transaction_status','amount_field','amount','source_lines']} pageSize={15} />
+    </Card>
   </>;
 }
 function readableTrend(data) {
