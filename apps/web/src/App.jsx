@@ -946,6 +946,80 @@ function SidebarLink({ to, icon, children, onClick }) {
   return <NavLink className={active ? 'active' : ''} to={to} onClick={onClick}><span className="nav-icon" aria-hidden="true">{icon}</span><span>{children}</span></NavLink>;
 }
 
+const SEARCH_KEYWORDS = {
+  dashboard: 'overview summary kpi profit',
+  orderPayments: 'orders transactions money reconciliation customer payments fees',
+  sales: 'revenue trend traffic',
+  businessPerformance: 'quarterly report metrics',
+  productPerformance: 'products asin units conversion',
+  inventory: 'stock sku fba quantity',
+  payouts: 'settlements bank transfers earnings',
+  brand: 'asin buy box products',
+  feeAudit: 'overcharge deductions leak commission',
+  returns: 'refund customer disposition',
+  reimbursements: 'credits lost damaged inventory',
+  tax: 'gst b2b b2c invoices cgst sgst igst',
+  reports: 'amazon sync source data',
+  rawData: 'api json technical fields'
+};
+
+function GlobalSearch({ tenantId }) {
+  const [query, setQuery] = useState('');
+  const [open, setOpen] = useState(false);
+  const navigate = useNavigate();
+  const rootRef = useRef(null);
+  const normalizedQuery = query.trim().toLowerCase();
+  const queryWords = normalizedQuery.split(/\s+/).filter(Boolean);
+  const results = NAV_ITEMS.filter(item => {
+    const searchableText = `${item.label} ${item.view} ${SEARCH_KEYWORDS[item.view] ?? ''}`.toLowerCase();
+    return queryWords.every(word => searchableText.includes(word));
+  }).slice(0, 6);
+
+  useEffect(() => {
+    function closeOnOutsideClick(event) {
+      if (rootRef.current && !rootRef.current.contains(event.target)) setOpen(false);
+    }
+    document.addEventListener('mousedown', closeOnOutsideClick);
+    return () => document.removeEventListener('mousedown', closeOnOutsideClick);
+  }, []);
+
+  function choose(item) {
+    navigate(`/seller?tenantId=${tenantId ?? ''}&view=${item.view}`);
+    setQuery('');
+    setOpen(false);
+  }
+
+  function onKeyDown(event) {
+    if (event.key === 'Enter' && results[0]) {
+      event.preventDefault();
+      choose(results[0]);
+    }
+    if (event.key === 'Escape') setOpen(false);
+  }
+
+  return <div className="global-search" ref={rootRef}>
+    <span className="global-search-icon" aria-hidden="true">⌕</span>
+    <input
+      type="search"
+      value={query}
+      placeholder="Search reports, payments, payouts…"
+      aria-label="Search sections"
+      aria-expanded={open}
+      aria-controls="global-search-results"
+      onChange={event => { setQuery(event.target.value); setOpen(true); }}
+      onFocus={() => setOpen(true)}
+      onKeyDown={onKeyDown}
+    />
+    {open && <div className="global-search-results" id="global-search-results" role="listbox">
+      <span className="global-search-heading">{normalizedQuery ? 'Matching sections' : 'Quick navigation'}</span>
+      {results.length ? results.map(item => <button type="button" role="option" aria-selected="false" key={item.view} onClick={() => choose(item)}>
+        <span className="nav-icon" aria-hidden="true">{item.icon}</span>
+        <span><b>{item.label}</b><small>Open section</small></span>
+      </button>) : <p>No matching section found.</p>}
+    </div>}
+  </div>;
+}
+
 // Seller-facing shell: sidebar + topbar. Admins never render this component.
 function SellerShell({ session, setSession }) {
   function logout() { localStorage.removeItem('token'); setSession(null); }
@@ -962,7 +1036,7 @@ function SellerShell({ session, setSession }) {
     <main className="workspace">
       <header className="topbar">
         <button type="button" className="hamburger-btn" aria-label="Open menu" onClick={() => setMobileNavOpen(o => !o)}>☰</button>
-        <div className="search"><span>⌕</span><span>Search reports, orders, payouts…</span></div>
+        <GlobalSearch tenantId={session?.tenantId} />
         <select><option>Amazon.in</option></select>
         <DateRangePicker value={range} onChange={setRange} />
         <div className="avatar">{session?.email?.[0]?.toUpperCase()}</div>
