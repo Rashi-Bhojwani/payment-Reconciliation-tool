@@ -10,6 +10,7 @@ import { secrets } from './config/secrets.js';
 import { decryptSecret, encryptSecret } from './config/crypto.js';
 import { buildGstInvoicesFromOrderItems, startScheduler, syncRecentApiDataForTenant, syncReportForTenant } from './jobs/sync.js';
 import { categorizeFinanceLabel } from './jobs/finance-components.js';
+import { buildStatement } from './jobs/statement-summary.js';
 import { runFeeAuditForTenant } from './jobs/fee-audit.js';
 
 const app = Fastify({ logger: { redact: ['req.headers.authorization', 'refresh_token', 'access_token', 'password', 'passwordHash'] }, trustProxy: true });
@@ -927,20 +928,8 @@ app.get('/api/tenants/:tenantId/dashboard', async request => {
     const hasImportedData = Number(orders.orders ?? 0) > 0 || Number(kpis.net_settled ?? 0) !== 0 || products.length > 0 || payments.length > 0 || inventory.length > 0;
     const componentTotal = ['product_sales','shipping_credits','gift_wrap_credits','promotional_rebates','total_sales_tax_liable','tcs','tds_194o','selling_fees','fba_fees','other_transaction_fees','other'].reduce((sum, field) => sum + Number(kpis[field] ?? 0), 0);
     const statementReconciliation = { componentTotal, amazonTotal: Number(kpis.total ?? 0), difference: componentTotal - Number(kpis.total ?? 0), matches: Math.abs(componentTotal - Number(kpis.total ?? 0)) < 0.01 };
-    const statementSection = row => {
-      const wording = `${row.transaction_type} ${row.description}`.toLowerCase();
-      if (/transfer|bank account|debt recovery/.test(wording)) return 'Transfers';
-      if (/gst collected|gst refund|goods and service/.test(wording)) return 'Goods and Services Tax';
-      if (['TCS-CGST','TCS-SGST','TCS-IGST','TDS - Section 194-O'].includes(row.amount_field)) return 'Tax';
-      if (row.amount_field === 'Product, shipping and gift wrap taxes') return 'Tax';
-      if (['Selling fees','FBA fees','Other transaction fees'].includes(row.amount_field)) return 'Expenses';
-      return 'Income';
-    };
-    const statementDetails = statementBreakdown.map(row => ({ ...row, section: statementSection(row) }));
-    const statementSummaries = Object.entries(statementDetails.reduce((summary, row) => {
-      summary[row.section] = (summary[row.section] ?? 0) + Number(row.amount ?? 0); return summary;
-    }, {})).map(([section,total]) => ({ section, total }));
-    return { seller, amazonAuth, hasImportedData, kpis, statementBreakdown: statementDetails, statementSummaries, statementReconciliation, orders, orderRows, orderPayments, paymentComponents, paymentSummary, businessReportRows, products, trend, payments, settlementLines, financialComponents, financialSummary, jobs, inventory, returns, reimbursements, invoices, orderItems, financeTransactions };
+    const { details: statementDetails, summaries: statementSummaries } = buildStatement(statementBreakdown);
+    return { seller, amazonAuth, hasImportedData, kpis, statementBreakdown: statementDetails, statementSourceBreakdown: statementBreakdown, statementSummaries, statementReconciliation, orders, orderRows, orderPayments, paymentComponents, paymentSummary, businessReportRows, products, trend, payments, settlementLines, financialComponents, financialSummary, jobs, inventory, returns, reimbursements, invoices, orderItems, financeTransactions };
   });
 });
 
