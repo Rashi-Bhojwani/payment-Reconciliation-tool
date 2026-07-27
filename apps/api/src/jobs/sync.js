@@ -239,6 +239,10 @@ export async function syncReportForTenant(params) {
   const parsed = SyncParamsSchema.parse(params);
   const range = parsed.range ?? { start: new Date(Date.now() - 30 * 864e5).toISOString(), end: new Date().toISOString() };
   await assertActiveTenant(parsed.tenantId);
+  // A report request creates a remote Amazon job. Retrying this whole block can
+  // create duplicate remote reports and keep the ledger running for 45+ minutes.
+  // The SP-API client already retries throttled HTTP calls, so execute each
+  // user-triggered report job only once.
   return runJob(`sync:${parsed.reportType}:${parsed.tenantId}`, async () => {
     const sync = await pool.query('insert into sync_jobs(tenant_id, report_type, status, started_at) values($1,$2,$3,now()) returning id', [parsed.tenantId, parsed.reportType, 'running']);
     try {
@@ -254,7 +258,7 @@ export async function syncReportForTenant(params) {
       await pool.query('update sync_jobs set status=$1, completed_at=now(), error_message=$2 where id=$3', ['failed', error instanceof Error ? error.message : 'unknown error', sync.rows[0].id]);
       throw error;
     }
-  });
+  }, 1);
 }
 
 
@@ -448,7 +452,7 @@ export async function syncRecentApiDataForTenant(tenantId, options = {}) {
       await pool.query('update sync_jobs set status=$1, completed_at=now(), error_message=$2 where id=$3', ['failed', error instanceof Error ? error.message : 'unknown error', sync.rows[0].id]);
       throw error;
     }
-  });
+  }, 1);
 }
 
 
