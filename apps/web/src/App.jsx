@@ -427,7 +427,7 @@ function SellerDashboard() {
     {view === 'businessPerformance' && <BusinessPerformanceReport data={data} />}
     {view === 'productPerformance' && <ProductPerformanceReport data={data} />}
     {view === 'inventory' && <TableCard title="Inventory" rows={data?.inventory ?? []} columns={['sku', 'fulfillable_quantity', 'snapshot_date']} />}
-    {view === 'payouts' && <TableCard title="Payout Activity" rows={data?.payments ?? []} columns={['posted_date', 'settlement_id', 'net_amount', 'lines']} />}
+    {view === 'payouts' && <PayoutReconciliation data={data} />}
     {view === 'brand' && <TableCard title="Product Performance" rows={data?.products ?? []} columns={['asin', 'units', 'sales', 'buy_box']} />}
     {view === 'feeAudit' && <FeeLeakAudit tenantId={tenantId} />}
     {view === 'returns' && <TableCard title="Return Details" rows={data?.returns ?? []} columns={['order_id', 'return_reason', 'disposition', 'status', 'return_date']} />}
@@ -645,6 +645,7 @@ function amazonNetSales(data) {
   return itemSales || Number(data?.orders?.order_value ?? 0);
 }
 function amazonDeductions(data) {
+  if (Number(data?.kpis?.line_count ?? 0) > 0) return Math.abs(Number(data.kpis.deductions ?? 0));
   if (hasFinancialComponents(data)) return Math.abs(componentAmount(data, ['commission', 'fba_fee', 'other_fee', 'tax', 'shipping_tax', 'gift_wrap_tax']));
   return Math.abs(Number(data?.kpis?.deductions ?? 0));
 }
@@ -689,7 +690,9 @@ function buildDashboardSummary(data, range = defaultDateRange()) {
   const netSales = amazonNetSales(data);
   const netQty = products.reduce((sum, product) => sum + Number(product.units ?? 0), 0) || orderItems.reduce((sum, item) => sum + Number(item.quantity_ordered ?? 0), 0);
   const returnQty = returns.length;
-  const settledAmount = payments.reduce((sum, payment) => sum + Number(payment.net_amount ?? 0), 0) || Number(data?.kpis?.net_settled ?? 0);
+  const settledAmount = Number(data?.kpis?.line_count ?? 0) > 0
+    ? Number(data.kpis.released_total ?? 0)
+    : payments.reduce((sum, payment) => sum + Number(payment.net_amount ?? 0), 0) || Number(data?.kpis?.net_settled ?? 0);
   const deductions = amazonDeductions(data);
   const reimbursementAmount = reimbursements.reduce((sum, row) => sum + Number(row.amount ?? 0), 0);
   const estimatedProfit = settledAmount || Math.max(0, netSales - deductions + reimbursementAmount);
@@ -743,6 +746,26 @@ function buildDashboardSummary(data, range = defaultDateRange()) {
       { area: 'Returns', count: formatNumber(returnQty), amount: formatCurrency(0), status: returnQty ? 'Action needed' : 'Clean' }
     ]
   };
+}
+function PayoutReconciliation({ data }) {
+  const kpis = data?.kpis ?? {};
+  const components = [
+    ['Product sales','product_sales'],['Shipping credits','shipping_credits'],['Gift wrap credits','gift_wrap_credits'],
+    ['Promotional rebates','promotional_rebates'],['Sales tax liable','total_sales_tax_liable'],['TCS (CGST + SGST + IGST)','tcs'],
+    ['TDS (Section 194-O)','tds_194o'],['Selling fees','selling_fees'],['FBA fees','fba_fees'],
+    ['Other transaction fees','other_transaction_fees'],['Other','other']
+  ].map(([component,key])=>({component,released:formatCurrency(kpis[`released_${key}`]),deferred:formatCurrency(kpis[`deferred_${key}`]),total:formatCurrency(kpis[key])}));
+  return <>
+    <div className="metrics-strip">
+      <MiniMetric title="Released · money received" value={formatCurrency(kpis.released_total)} hint={kpis.source} />
+      <MiniMetric title="Deferred · pending" value={formatCurrency(kpis.deferred_total)} hint={kpis.next_release_date ? `Expected ${String(kpis.next_release_date).slice(0,10)}` : 'Release date not supplied'} />
+      <MiniMetric title="All transaction rows" value={formatNumber(kpis.line_count)} hint="Seller Central date-range report" />
+    </div>
+    <div className="dashboard-grid two">
+      <TableCard title="Amazon CSV field totals" rows={[...components,{component:'Grand total',released:formatCurrency(kpis.released_total),deferred:formatCurrency(kpis.deferred_total),total:formatCurrency(kpis.total)}]} columns={['component','released','deferred','total']} />
+      <TableCard title="Payout Activity" rows={data?.payments ?? []} columns={['posted_date','settlement_id','transaction_status','transaction_release_date','net_amount','lines']} />
+    </div>
+  </>;
 }
 function readableTrend(data) {
   return (data?.trend ?? []).map(row => ({ ...row, label: new Date(row.date).toLocaleDateString('en-IN', { day: '2-digit', month: 'short' }) }));

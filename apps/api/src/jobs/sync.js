@@ -7,6 +7,8 @@ import { decryptSecret } from '../config/crypto.js';
 import { putRawReport } from '../storage/s3.js';
 import { runJob } from './runner.js';
 import { categorizeFinanceLabel, flattenFinanceTransaction } from './finance-components.js';
+import { parseSettlementContent } from './settlement-parser.js';
+import { number, pick, reportDate, text } from './report-parsing.js';
 
 export { categorizeFinanceLabel } from './finance-components.js';
 
@@ -15,19 +17,7 @@ const SyncParamsSchema = z.object({ tenantId: z.string().uuid(), reportType: z.e
 const ReportRowSchema = z.record(z.string(), z.unknown());
 
 /** @param {unknown} value */
-function text(value) { return value == null ? undefined : String(value).trim() || undefined; }
-/** @param {unknown} value */
-function number(value) { const parsed = Number(String(value ?? '').replace(/[,₹$]/g, '')); return Number.isFinite(parsed) ? parsed : 0; }
-/** @param {unknown} value */
 function integer(value) { return Math.trunc(number(value)); }
-function reportDate(value) {
-  const input = text(value);
-  if (!input) return null;
-  const match = input.match(/^(\d{1,2})[./-](\d{1,2})[./-](\d{4})(?:\s+(.*))?$/);
-  if (!match) return input;
-  const [, day, month, year, time] = match;
-  return `${year}-${month.padStart(2, '0')}-${day.padStart(2, '0')}${time ? ` ${time}` : ''}`;
-}
 function firstAttribute(attributes, names) {
   for (const name of names) {
     const value = attributes?.[name];
@@ -57,16 +47,6 @@ function financeRelatedValue(transaction, wantedNames) {
   }
   return undefined;
 }
-/** @param {Record<string, unknown>} row @param {string[]} names */
-function pick(row, names) {
-  const lowerMap = new Map(Object.entries(row).map(([key, value]) => [key.toLowerCase().replace(/[^a-z0-9]/g, ''), value]));
-  for (const name of names) {
-    const value = lowerMap.get(name.toLowerCase().replace(/[^a-z0-9]/g, ''));
-    if (value != null && String(value).trim() !== '') return value;
-  }
-  return undefined;
-}
-
 /** @param {string} textContent @returns {Array<Record<string, unknown>>} */
 function parseTsv(textContent) {
   const trimmed = z.string().parse(textContent).trim();
@@ -119,15 +99,12 @@ function parseReportRows(reportType, content) {
 
 /** @param {string} tenantId @param {string} content */
 async function saveSettlementRows(tenantId, content) {
-  const rows = z.array(ReportRowSchema).parse(parseReportRows('GET_V2_SETTLEMENT_REPORT_DATA_FLAT_FILE_V2', content));
+  const rows = parseSettlementContent(content);
   await withTenant(tenantId, async client => {
     for (const row of rows) {
-      const amount = number(pick(row, ['amount']));
-      await client.query(
-        `insert into settlement_rows(tenant_id, settlement_id, order_id, amount_type, amount_description, amount, posted_date, raw)
-         values($1,$2,$3,$4,$5,$6,$7,$8) on conflict do nothing`,
-        [tenantId, text(pick(row, ['settlement-id', 'settlement id', 'settlementId'])), text(pick(row, ['order-id', 'order id', 'amazon-order-id', 'amazonOrderId'])), text(pick(row, ['amount-type', 'amount type', 'amountType'])), text(pick(row, ['amount-description', 'amount description', 'amountDescription'])), amount, reportDate(pick(row, ['posted-date', 'posted date', 'postedDate'])), row]
-      );
+      const fields = ['posted_at','settlement_id','type','order_id','sku','description','quantity','marketplace','account_type','fulfillment','order_city','order_state','order_postal','product_sales','shipping_credits','gift_wrap_credits','promotional_rebates','total_sales_tax_liable','tcs_cgst','tcs_sgst','tcs_igst','tds_194o','selling_fees','fba_fees','other_transaction_fees','other','total','transaction_status','transaction_release_date','raw_row','dedupe_key'];
+      const updates = fields.filter(field => field !== 'dedupe_key').map(field => `${field}=excluded.${field}`).join(',');
+      await client.query(`insert into settlement_transaction_lines(tenant_id,${fields.join(',')}) values($1,${fields.map((_, index) => `$${index + 2}`).join(',')}) on conflict (tenant_id,dedupe_key) do update set ${updates}`, [tenantId, ...fields.map(field => row[field])]);
     }
   });
   return rows.length;
@@ -495,6 +472,16 @@ async function syncActiveTenants(reportType) {
   await Promise.all(tenants.rows.map(row => limit(() => syncReportForTenant({ tenantId: row.id, reportType: parsedReportType }))));
 }
 
+async function syncRecentSettlements() {
+  const end = new Date();
+  const days = Math.max(7, Math.min(10, Number(process.env.SETTLEMENT_ROLLING_DAYS ?? 10)));
+  const range = { start: new Date(end.getTime() - days * 864e5).toISOString(), end: end.toISOString() };
+  const tenants = await pool.query("select id from tenants where status = 'active'");
+  const limit = pLimit(3);
+  await Promise.all(tenants.rows.map(row => limit(() => syncReportForTenant({ tenantId: row.id, reportType: 'GET_V2_SETTLEMENT_REPORT_DATA_FLAT_FILE_V2', range }))));
+}
+
 export function startScheduler() {
   cron.schedule('0 2 * * *', () => { void Promise.all(NIGHTLY_REPORTS.map(reportType => syncActiveTenants(reportType))); });
+  cron.schedule(process.env.SETTLEMENT_SYNC_CRON ?? '0 */2 * * *', () => { void syncRecentSettlements(); });
 }

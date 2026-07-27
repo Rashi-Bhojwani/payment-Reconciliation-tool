@@ -111,7 +111,7 @@ async function exchangeAmazonCode(code, redirectUri) {
 }
 
 
-const TENANT_DATA_TABLES = ['orders', 'settlement_rows', 'gst_invoices', 'returns', 'reimbursements', 'inventory_snapshots', 'sales_traffic_daily', 'fee_leak_flags', 'generated_reports', 'order_items', 'finance_transactions', 'finance_transaction_items', 'fee_estimates'];
+const TENANT_DATA_TABLES = ['orders', 'settlement_rows', 'settlement_transaction_lines', 'gst_invoices', 'returns', 'reimbursements', 'inventory_snapshots', 'sales_traffic_daily', 'fee_leak_flags', 'generated_reports', 'order_items', 'finance_transactions', 'finance_transaction_items', 'fee_estimates'];
 
 async function ensureSellerAuthSchema() {
   await pool.query(`
@@ -593,6 +593,19 @@ app.get('/api/tenants/:tenantId/calculations/:metric', async request => {
       const total = metric === 'netSales' ? netSales : qty;
       return { metric, total, components: metric === 'netSales' ? [{category:'gross_item_price',label:'Gross item price',amount:rows.reduce((s,r)=>s+Number(r.gross_item_price),0),count:rows.length},{category:'promotion',label:'Promotion discounts',amount:-rows.reduce((s,r)=>s+Number(r.promotion_discount),0),count:rows.length}] : [{category:'quantity',label:'Quantity ordered',amount:qty,count:rows.length}], rows, columns:['amazon_order_id','order_date','asin','sku','title','quantity_ordered','gross_item_price','promotion_discount','net_sales'] };
     }
+    if (metric === 'settled' || metric === 'deductions') {
+      const settlementCount = Number((await db.query('select count(*) count from settlement_transaction_lines where tenant_id=$1 and posted_at >= $2 and posted_at < $3', [tenantId,range.start,range.end])).rows[0].count);
+      if (settlementCount) {
+        const rows = metric === 'settled'
+          ? (await db.query(`select settlement_id transaction_id,order_id,sku,type category,description amount_description,total amount,'INR' currency,posted_at posted_date,transaction_status,transaction_release_date
+              from settlement_transaction_lines where tenant_id=$1 and posted_at >= $2 and posted_at < $3 and transaction_status='Released' order by posted_at desc`, [tenantId,range.start,range.end])).rows
+          : (await db.query(`select line.settlement_id transaction_id,line.order_id,line.sku,fee.category,line.description amount_description,abs(fee.amount) amount,'INR' currency,line.posted_at posted_date,line.transaction_status,line.transaction_release_date
+              from settlement_transaction_lines line cross join lateral (values ('selling_fees',line.selling_fees),('fba_fees',line.fba_fees),('other_transaction_fees',line.other_transaction_fees)) fee(category,amount)
+              where line.tenant_id=$1 and line.posted_at >= $2 and line.posted_at < $3 and line.transaction_status='Released' and fee.amount<>0 order by line.posted_at desc`, [tenantId,range.start,range.end])).rows;
+        const total = rows.reduce((sum,row)=>sum+Number(row.amount),0);
+        return { metric,total,source:'Settlement transaction report · Released',components:groupCalculationRows(rows),rows,columns:['transaction_id','order_id','sku','category','amount_description','amount','currency','posted_date','transaction_status','transaction_release_date'] };
+      }
+    }
     let rows = (await db.query("select transaction_id,order_id,sku,asin,category,amount_description,amount,currency,posted_date from finance_transaction_items where tenant_id=$1 and posted_date >= $2 and posted_date < $3 and category not like 'summary_%' order by posted_date desc", [tenantId,range.start,range.end])).rows;
     let source = 'Finances API';
     if (!rows.length) { source='Settlement report'; rows=(await db.query('select settlement_id transaction_id,order_id,null::text sku,null::text asin,amount_type,amount_description,amount,\'INR\' currency,posted_date from settlement_rows where tenant_id=$1 and posted_date >= $2 and posted_date < $3 order by posted_date desc',[tenantId,range.start,range.end])).rows.map(row=>({...row,category:categorizeFinanceLabel(`${row.amount_type} ${row.amount_description}`)})); }
@@ -609,28 +622,25 @@ app.get('/api/tenants/:tenantId/calculations/:metric', async request => {
 app.get('/api/tenants/:tenantId/transactions', async request => {
   const { tenantId }=TenantParamsSchema.parse(request.params); const range=requestedRange(request.query); await requireTenantUser(request,tenantId); await assertActiveTenant(tenantId);
   return withTenant(tenantId,async db=>{
+    const settlementRows=(await db.query(`select posted_at posted_date,transaction_status,account_type,type transaction_type,
+      order_id,coalesce(description,type) product_details,
+      product_sales+shipping_credits+gift_wrap_credits product_charges,promotional_rebates,
+      selling_fees+fba_fees+other_transaction_fees amazon_fees,other,total,transaction_release_date
+      from settlement_transaction_lines where tenant_id=$1 and posted_at >= $2 and posted_at < $3 order by posted_at desc`,[tenantId,range.start,range.end])).rows;
+    if (settlementRows.length) return {transactions:settlementRows,count:settlementRows.length,source:'Settlement transaction report',columns:['posted_date','transaction_status','account_type','transaction_type','order_id','product_details','product_charges','promotional_rebates','amazon_fees','other','total','transaction_release_date']};
+    const fallbackStart = new Date(Math.max(new Date(range.start).getTime(), Date.now() - 4 * 864e5));
     const rows=(await db.query(`with item_titles as (select amazon_order_id,string_agg(distinct title,', ') product_details from order_items where tenant_id=$1 group by amazon_order_id), components as (
-      select transaction_id,count(*) filter(where category like 'summary_%') summary_lines,
-        sum(amount) filter(where category='summary_product_charges') summary_product_charges,
-        sum(amount) filter(where category='summary_promotional_rebates') summary_promotional_rebates,
-        sum(amount) filter(where category='summary_amazon_fees') summary_amazon_fees,
-        sum(amount) filter(where category='summary_other') summary_other,
-        sum(amount) filter(where category in ('item_price','shipping_charge','gift_wrap') and amount>0) leaf_product_charges,
-        sum(amount) filter(where category='promotion') leaf_promotions,
-        sum(amount) filter(where amount<0 and category=any($4)) leaf_amazon_fees,
-        sum(amount) filter(where category not like 'summary_%') leaf_total
-      from finance_transaction_items where tenant_id=$1 group by transaction_id)
-      select ft.transaction_id,ft.posted_date,coalesce(ft.raw->>'transactionStatus',ft.raw->>'TransactionStatus','Unknown') transaction_status,
-        coalesce(ft.raw->>'accountType',ft.raw->>'AccountType',ft.raw#>>'{sellingPartnerMetadata,accountType}','Amazon transactions') account_type,
-        ft.transaction_type,coalesce(ft.related_order_id,'---') order_id,coalesce(it.product_details,ft.raw->>'description',ft.transaction_type) product_details,
-        case when coalesce(c.summary_lines,0)>0 then coalesce(c.summary_product_charges,0) else coalesce(c.leaf_product_charges,0) end product_charges,
-        case when coalesce(c.summary_lines,0)>0 then coalesce(c.summary_promotional_rebates,0) else coalesce(c.leaf_promotions,0) end promotional_rebates,
-        case when coalesce(c.summary_lines,0)>0 then coalesce(c.summary_amazon_fees,0) else coalesce(c.leaf_amazon_fees,0) end amazon_fees,
-        coalesce(c.summary_other,coalesce(ft.total_amount,0)-case when coalesce(c.summary_lines,0)>0 then coalesce(c.summary_product_charges,0) else coalesce(c.leaf_product_charges,0) end-case when coalesce(c.summary_lines,0)>0 then coalesce(c.summary_promotional_rebates,0) else coalesce(c.leaf_promotions,0) end-case when coalesce(c.summary_lines,0)>0 then coalesce(c.summary_amazon_fees,0) else coalesce(c.leaf_amazon_fees,0) end) other,
-        coalesce(ft.total_amount,c.leaf_total,0) total
+      select transaction_id,sum(amount) filter(where category in ('item_price','shipping_charge','gift_wrap') and amount>0) product_charges,
+        sum(amount) filter(where category='promotion') promotional_rebates,sum(amount) filter(where amount<0 and category=any($4)) amazon_fees,
+        sum(amount) filter(where category not like 'summary_%') leaf_total from finance_transaction_items where tenant_id=$1 group by transaction_id)
+      select ft.posted_date,coalesce(ft.raw->>'transactionStatus',ft.raw->>'TransactionStatus','Unknown') transaction_status,
+        coalesce(ft.raw->>'accountType',ft.raw->>'AccountType','Amazon transactions') account_type,ft.transaction_type,
+        coalesce(ft.related_order_id,'---') order_id,coalesce(it.product_details,ft.raw->>'description',ft.transaction_type) product_details,
+        coalesce(c.product_charges,0) product_charges,coalesce(c.promotional_rebates,0) promotional_rebates,coalesce(c.amazon_fees,0) amazon_fees,
+        coalesce(ft.total_amount,0)-coalesce(c.product_charges,0)-coalesce(c.promotional_rebates,0)-coalesce(c.amazon_fees,0) other,coalesce(ft.total_amount,c.leaf_total,0) total
       from finance_transactions ft left join components c on c.transaction_id=ft.transaction_id left join item_titles it on it.amazon_order_id=ft.related_order_id
-      where ft.tenant_id=$1 and ft.posted_date >= $2 and ft.posted_date < $3 order by ft.posted_date desc,ft.transaction_id`,[tenantId,range.start,range.end,FEE_CATEGORIES])).rows;
-    return {transactions:rows,count:rows.length,columns:['posted_date','transaction_status','account_type','transaction_type','order_id','product_details','product_charges','promotional_rebates','amazon_fees','other','total']};
+      where ft.tenant_id=$1 and ft.posted_date >= $2 and ft.posted_date < $3 order by ft.posted_date desc`,[tenantId,fallbackStart,range.end,FEE_CATEGORIES])).rows;
+    return {transactions:rows,count:rows.length,source:'Finances API fallback (recent 4 days)',columns:['posted_date','transaction_status','account_type','transaction_type','order_id','product_details','product_charges','promotional_rebates','amazon_fees','other','total']};
   });
 });
 
@@ -639,7 +649,8 @@ app.get('/api/tenants/:tenantId/orders-reconciliation', async request => {
   return withTenant(tenantId,async db=>{
     const orders=(await db.query(`with scoped_order_ids as (
         select amazon_order_id from orders where tenant_id=$1 and order_date >= $2 and order_date < $3
-        union select related_order_id from finance_transactions where tenant_id=$1 and related_order_id is not null and posted_date >= $2 and posted_date < $3),
+        union select related_order_id from finance_transactions where tenant_id=$1 and related_order_id is not null and posted_date >= $2 and posted_date < $3
+        union select order_id from settlement_transaction_lines where tenant_id=$1 and order_id is not null and posted_at >= $2 and posted_at < $3),
       scoped_orders as (select ids.amazon_order_id,o.order_date,coalesce(o.status,'Payment posted') status,o.fulfillment_channel,o.total_amount from scoped_order_ids ids left join orders o on o.tenant_id=$1 and o.amazon_order_id=ids.amazon_order_id),
       item_totals as (select amazon_order_id,sum(item_price) gross_item_price,sum(quantity_ordered) units,string_agg(distinct title,', ') product from order_items where tenant_id=$1 group by amazon_order_id),
       chosen_transactions as (select distinct on (related_order_id) transaction_id,related_order_id,total_amount,posted_date,transaction_type,raw
@@ -672,25 +683,21 @@ app.get('/api/tenants/:tenantId/orders-reconciliation', async request => {
       case when coalesce(f.is_order_payment,false) then f.transaction_header_total else null end net_payout,coalesce(f.is_order_payment,false) "hasFeeData"
       from scoped_orders o left join item_totals i on i.amazon_order_id=o.amazon_order_id left join fees f on f.order_id=o.amazon_order_id order by "hasFeeData" desc,f.transaction_date desc nulls last,o.order_date desc`,[tenantId,range.start,range.end,FEE_CATEGORIES])).rows;
     const hasFinanceItems=orders.some(order=>order.hasFeeData);
-    if (!hasFinanceItems) {
-      const settlement=(await db.query('select order_id,amount_type,amount_description,amount from settlement_rows where tenant_id=$1 and order_id is not null',[tenantId])).rows;
-      const byOrder=new Map(); for(const row of settlement){const list=byOrder.get(row.order_id)??[];list.push({...row,category:categorizeFinanceLabel(`${row.amount_type} ${row.amount_description}`)});byOrder.set(row.order_id,list);}
-      for (const order of orders) {
-        const lines=byOrder.get(order.amazon_order_id)??[]; if(!lines.length) continue;
-        const sum=predicate=>lines.filter(predicate).reduce((total,line)=>total+Number(line.amount),0);
-        order.referral_commission=Math.abs(sum(line=>line.category==='referral_commission'&&Number(line.amount)<0));
-        order.fulfillment_fee=Math.abs(sum(line=>line.category.startsWith('fulfillment_fee')&&Number(line.amount)<0));
-        order.shipping_fee=Math.abs(sum(line=>line.category==='shipping_fee'&&Number(line.amount)<0));
-        order.closing_fee=Math.abs(sum(line=>line.category==='closing_fee'&&Number(line.amount)<0));
-        order.other_fees=Math.abs(sum(line=>['gift_wrap_fee','digital_services_fee','storage_fee','chargeback','adjustment','other'].includes(line.category)&&Number(line.amount)<0));
-        order.promotion=sum(line=>line.category==='promotion'); order.refund=sum(line=>line.category==='refund'); order.reimbursement=sum(line=>line.category==='reimbursement');
-        order.total_deductions=lines.filter(line=>FEE_CATEGORIES.includes(line.category)&&Number(line.amount)<0).reduce((total,line)=>total+Math.abs(Number(line.amount)),0);
-        const settlementGross=sum(line=>['item_price','shipping_charge','gift_wrap'].includes(line.category)&&Number(line.amount)>0); if(settlementGross) order.gross_item_price=settlementGross;
-        order.net_payout=lines.reduce((total,line)=>total+Number(line.amount),0); order.other_amount=order.net_payout-Number(order.gross_item_price)-Number(order.promotion)+order.total_deductions;
-        order.hasFeeData=true; order.feeSource='Settlement report';
-      }
+    const settlement=(await db.query(`select order_id,sum(product_sales+shipping_credits+gift_wrap_credits+total_sales_tax_liable) gross,
+      sum(promotional_rebates) promotion,sum(selling_fees) selling_fees,sum(fba_fees) fba_fees,
+      sum(other_transaction_fees) other_fees,sum(other+tcs_cgst+tcs_sgst+tcs_igst+tds_194o) other_amount,
+      sum(total) net_payout,min(transaction_release_date) transaction_release_date
+      from settlement_transaction_lines where tenant_id=$1 and order_id is not null and posted_at >= $2 and posted_at < $3 and transaction_status='Released' group by order_id`,[tenantId,range.start,range.end])).rows;
+    const byOrder=new Map(settlement.map(row=>[row.order_id,row]));
+    for (const order of orders) {
+      const line=byOrder.get(order.amazon_order_id); if(!line) continue;
+      order.gross_item_price=Number(line.gross); order.promotion=Number(line.promotion);
+      order.referral_commission=Math.abs(Number(line.selling_fees)); order.fulfillment_fee=Math.abs(Number(line.fba_fees));
+      order.other_fees=Math.abs(Number(line.other_fees)); order.total_deductions=Math.abs(Number(line.selling_fees)+Number(line.fba_fees)+Number(line.other_fees));
+      order.other_amount=Number(line.other_amount); order.net_payout=Number(line.net_payout); order.transaction_release_date=line.transaction_release_date;
+      order.hasFeeData=true; order.feeSource='Settlement transaction report · Released';
     }
-    return {orders,source:hasFinanceItems?'Finances API':'Settlement report fallback'};
+    return {orders,source:settlement.length?'Settlement transaction report · Released':hasFinanceItems?'Finances API fallback':'Awaiting settlement report'};
   });
 });
 
@@ -736,7 +743,46 @@ app.get('/api/tenants/:tenantId/dashboard', async request => {
       [tenantId]
     );
     const amazonAuth = (await pool.query("select amazon_seller_id, marketplace_id, auth_status, connected_at, last_token_refresh_at from sellers where tenant_id=$1 and auth_status='authorized' order by connected_at desc limit 1", [tenantId])).rows[0] ?? null;
-    const kpis = (await client.query(`select coalesce(sum(amount),0) net_settled, coalesce(sum(case when amount > 0 then amount else 0 end),0) earnings, coalesce(sum(case when amount < 0 then amount else 0 end),0) deductions from settlement_rows where tenant_id=$1 and posted_date >= $2 and posted_date < $3`, [tenantId, start, end])).rows[0];
+    const settlementKpis = (await client.query(`select count(*)::int line_count,
+      coalesce(sum(product_sales),0) product_sales, coalesce(sum(shipping_credits),0) shipping_credits,
+      coalesce(sum(gift_wrap_credits),0) gift_wrap_credits, coalesce(sum(promotional_rebates),0) promotional_rebates,
+      coalesce(sum(total_sales_tax_liable),0) total_sales_tax_liable,
+      coalesce(sum(tcs_cgst+tcs_sgst+tcs_igst),0) tcs, coalesce(sum(tds_194o),0) tds_194o,
+      coalesce(sum(selling_fees),0) selling_fees, coalesce(sum(fba_fees),0) fba_fees,
+      coalesce(sum(other_transaction_fees),0) other_transaction_fees, coalesce(sum(other),0) other,
+      coalesce(sum(product_sales) filter (where transaction_status='Released'),0) released_product_sales,
+      coalesce(sum(shipping_credits) filter (where transaction_status='Released'),0) released_shipping_credits,
+      coalesce(sum(gift_wrap_credits) filter (where transaction_status='Released'),0) released_gift_wrap_credits,
+      coalesce(sum(promotional_rebates) filter (where transaction_status='Released'),0) released_promotional_rebates,
+      coalesce(sum(total_sales_tax_liable) filter (where transaction_status='Released'),0) released_total_sales_tax_liable,
+      coalesce(sum(tcs_cgst+tcs_sgst+tcs_igst) filter (where transaction_status='Released'),0) released_tcs,
+      coalesce(sum(tds_194o) filter (where transaction_status='Released'),0) released_tds_194o,
+      coalesce(sum(selling_fees) filter (where transaction_status='Released'),0) released_selling_fees,
+      coalesce(sum(fba_fees) filter (where transaction_status='Released'),0) released_fba_fees,
+      coalesce(sum(other_transaction_fees) filter (where transaction_status='Released'),0) released_other_transaction_fees,
+      coalesce(sum(other) filter (where transaction_status='Released'),0) released_other,
+      coalesce(sum(product_sales) filter (where transaction_status='Deferred'),0) deferred_product_sales,
+      coalesce(sum(shipping_credits) filter (where transaction_status='Deferred'),0) deferred_shipping_credits,
+      coalesce(sum(gift_wrap_credits) filter (where transaction_status='Deferred'),0) deferred_gift_wrap_credits,
+      coalesce(sum(promotional_rebates) filter (where transaction_status='Deferred'),0) deferred_promotional_rebates,
+      coalesce(sum(total_sales_tax_liable) filter (where transaction_status='Deferred'),0) deferred_total_sales_tax_liable,
+      coalesce(sum(tcs_cgst+tcs_sgst+tcs_igst) filter (where transaction_status='Deferred'),0) deferred_tcs,
+      coalesce(sum(tds_194o) filter (where transaction_status='Deferred'),0) deferred_tds_194o,
+      coalesce(sum(selling_fees) filter (where transaction_status='Deferred'),0) deferred_selling_fees,
+      coalesce(sum(fba_fees) filter (where transaction_status='Deferred'),0) deferred_fba_fees,
+      coalesce(sum(other_transaction_fees) filter (where transaction_status='Deferred'),0) deferred_other_transaction_fees,
+      coalesce(sum(other) filter (where transaction_status='Deferred'),0) deferred_other,
+      coalesce(sum(total),0) total,
+      coalesce(sum(total) filter (where transaction_status='Released'),0) released_total,
+      coalesce(sum(total) filter (where transaction_status='Deferred'),0) deferred_total,
+      min(transaction_release_date) filter (where transaction_status='Deferred') next_release_date
+      from settlement_transaction_lines where tenant_id=$1 and posted_at >= $2 and posted_at < $3`, [tenantId, start, end])).rows[0];
+    let kpis = { ...settlementKpis, net_settled: settlementKpis.released_total, earnings: settlementKpis.released_total, deductions: Math.abs(Number(settlementKpis.released_selling_fees)+Number(settlementKpis.released_fba_fees)+Number(settlementKpis.released_other_transaction_fees)), source: 'Settlement transaction report' };
+    if (!Number(settlementKpis.line_count)) {
+      const fallbackStart = new Date(Math.max(start.getTime(), Date.now() - 4 * 864e5));
+      const fallback = (await client.query(`select coalesce(sum(total_amount),0) total from finance_transactions where tenant_id=$1 and posted_date >= $2 and posted_date < $3`, [tenantId, fallbackStart, end])).rows[0];
+      kpis = { ...kpis, net_settled: fallback.total, released_total: fallback.total, total: fallback.total, source: 'Finances API fallback (recent 4 days)' };
+    }
     const orders = (await client.query(`select count(*) orders, coalesce(sum(total_amount),0) order_value from orders where tenant_id=$1 and order_date >= $2 and order_date < $3`, [tenantId, start, end])).rows[0];
     const businessReportRows = (await client.query(`
       with scoped as (
@@ -805,25 +851,10 @@ app.get('/api/tenants/:tenantId/dashboard', async request => {
       )
       select date, sales, units, sessions from merged order by date desc limit 90`, [tenantId, start, end])).rows.reverse();
     const payments = (await client.query(`
-      with settlement_payments as (
-        select settlement_id, date(posted_date) posted_date, sum(amount) net_amount, count(*) lines
-        from settlement_rows
-        where tenant_id=$1 and posted_date >= $2 and posted_date < $3
-        group by settlement_id,date(posted_date)
-      ), finance_payments as (
-        select coalesce(transaction_id, related_order_id, 'finance-' || date(posted_date)::text) settlement_id,
-          date(posted_date) posted_date,
-          sum(total_amount) net_amount,
-          count(*) lines
-        from finance_transactions
-        where tenant_id=$1 and posted_date >= $2 and posted_date < $3 and posted_date is not null
-        group by coalesce(transaction_id, related_order_id, 'finance-' || date(posted_date)::text), date(posted_date)
-      ), merged as (
-        select * from settlement_payments
-        union all
-        select * from finance_payments where not exists (select 1 from settlement_payments)
-      )
-      select settlement_id, posted_date, net_amount, lines from merged order by posted_date desc nulls last limit 100`, [tenantId, start, end])).rows;
+      select settlement_id, date(posted_at) posted_date, transaction_status,
+        min(transaction_release_date) transaction_release_date, sum(total) net_amount, count(*) lines
+      from settlement_transaction_lines where tenant_id=$1 and posted_at >= $2 and posted_at < $3
+      group by settlement_id,date(posted_at),transaction_status order by posted_date desc nulls last limit 100`, [tenantId, start, end])).rows;
     const jobs = (await client.query(`
       with normalized_jobs as (
         select report_type, status, started_at, completed_at, error_message, s3_key
@@ -833,7 +864,7 @@ app.get('/api/tenants/:tenantId/dashboard', async request => {
       from normalized_jobs
       order by report_type, started_at desc nulls last
     `, [tenantId])).rows;
-    const settlementLines = (await client.query('select settlement_id, order_id, amount_type, amount_description, amount, posted_date from settlement_rows where tenant_id=$1 and posted_date >= $2 and posted_date < $3 order by posted_date desc nulls last limit 250', [tenantId, start, end])).rows;
+    const settlementLines = (await client.query("select settlement_id,order_id,type amount_type,description amount_description,total amount,posted_at posted_date,transaction_status,transaction_release_date from settlement_transaction_lines where tenant_id=$1 and posted_at >= $2 and posted_at < $3 order by posted_at desc nulls last limit 250", [tenantId, start, end])).rows;
     const orderRows = (await client.query(`
       select o.amazon_order_id, o.order_date, o.status, o.total_amount, o.fulfillment_channel, o.sales_channel,
         count(oi.id) item_lines,
@@ -856,7 +887,7 @@ app.get('/api/tenants/:tenantId/dashboard', async request => {
     const invoices = (await client.query('select invoice_type, order_id, taxable_value, cgst, sgst, igst, invoice_date from gst_invoices where tenant_id=$1 and invoice_date >= $2::date and invoice_date < $3::date order by invoice_date desc nulls last limit 50', [tenantId, start, end])).rows;
     const orderItems = (await client.query('select oi.amazon_order_id, oi.asin, oi.sku, oi.title, oi.quantity_ordered, oi.item_price, oi.item_tax, oi.promotion_discount from order_items oi join orders o on o.tenant_id=oi.tenant_id and o.amazon_order_id=oi.amazon_order_id where oi.tenant_id=$1 and o.order_date >= $2 and o.order_date < $3 order by oi.quantity_ordered desc nulls last limit 50', [tenantId, start, end])).rows;
     const financeTransactions = (await client.query('select transaction_id, transaction_type, posted_date, total_amount, currency, related_order_id, raw from finance_transactions where tenant_id=$1 and posted_date >= $2 and posted_date < $3 order by posted_date desc nulls last limit 2000', [tenantId, start, end])).rows;
-    const financialComponents = [...settlementComponentRows(settlementLines), ...financeTransactions.flatMap(financeComponentRows)];
+    const financialComponents = settlementLines.length ? settlementComponentRows(settlementLines) : financeTransactions.flatMap(financeComponentRows);
     const financialSummary = summarizeComponents(financialComponents);
     const orderPayments = buildOrderPaymentRows(orderRows, settlementLines, financeTransactions);
     const paymentComponents = orderPayments.flatMap(order => order.components.map(component => ({
