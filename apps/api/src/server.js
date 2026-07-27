@@ -855,6 +855,27 @@ app.get('/api/tenants/:tenantId/dashboard', async request => {
         min(transaction_release_date) transaction_release_date, sum(total) net_amount, count(*) lines
       from settlement_transaction_lines where tenant_id=$1 and posted_at >= $2 and posted_at < $3
       group by settlement_id,date(posted_at),transaction_status order by posted_date desc nulls last limit 100`, [tenantId, start, end])).rows;
+    // Keep Seller Central's transaction wording and split every amount column
+    // instead of mapping values into a small, lossy set of guessed fee buckets.
+    const statementBreakdown = (await client.query(`
+      select coalesce(nullif(type,''),'Unclassified transaction') transaction_type,
+        coalesce(nullif(description,''),nullif(type,''),'No description supplied') description,
+        coalesce(nullif(fulfillment,''),'Not specified') fulfillment,
+        coalesce(nullif(transaction_status,''),'Unknown') transaction_status,
+        amount_field, sum(amount) amount, count(*)::int source_lines
+      from settlement_transaction_lines line
+      cross join lateral (values
+        ('Product sales',line.product_sales), ('Shipping credits',line.shipping_credits),
+        ('Gift wrap credits',line.gift_wrap_credits), ('Promotional rebates',line.promotional_rebates),
+        ('Product, shipping and gift wrap taxes',line.total_sales_tax_liable),
+        ('TCS-CGST',line.tcs_cgst), ('TCS-SGST',line.tcs_sgst), ('TCS-IGST',line.tcs_igst),
+        ('TDS - Section 194-O',line.tds_194o), ('Selling fees',line.selling_fees),
+        ('FBA fees',line.fba_fees), ('Other transaction fees',line.other_transaction_fees),
+        ('Other',line.other)
+      ) component(amount_field,amount)
+      where line.tenant_id=$1 and line.posted_at >= $2 and line.posted_at < $3 and amount <> 0
+      group by type,description,fulfillment,transaction_status,amount_field
+      order by abs(sum(amount)) desc, transaction_type, description`, [tenantId, start, end])).rows;
     const jobs = (await client.query(`
       with normalized_jobs as (
         select report_type, status, started_at, completed_at, error_message, s3_key
@@ -904,7 +925,9 @@ app.get('/api/tenants/:tenantId/dashboard', async request => {
       return summary;
     }, { grossSales: 0, deductions: 0, sellerReceivable: 0, fbaReceivable: 0, fbmReceivable: 0, otherReceivable: 0 });
     const hasImportedData = Number(orders.orders ?? 0) > 0 || Number(kpis.net_settled ?? 0) !== 0 || products.length > 0 || payments.length > 0 || inventory.length > 0;
-    return { seller, amazonAuth, hasImportedData, kpis, orders, orderRows, orderPayments, paymentComponents, paymentSummary, businessReportRows, products, trend, payments, settlementLines, financialComponents, financialSummary, jobs, inventory, returns, reimbursements, invoices, orderItems, financeTransactions };
+    const componentTotal = ['product_sales','shipping_credits','gift_wrap_credits','promotional_rebates','total_sales_tax_liable','tcs','tds_194o','selling_fees','fba_fees','other_transaction_fees','other'].reduce((sum, field) => sum + Number(kpis[field] ?? 0), 0);
+    const statementReconciliation = { componentTotal, amazonTotal: Number(kpis.total ?? 0), difference: componentTotal - Number(kpis.total ?? 0), matches: Math.abs(componentTotal - Number(kpis.total ?? 0)) < 0.01 };
+    return { seller, amazonAuth, hasImportedData, kpis, statementBreakdown, statementReconciliation, orders, orderRows, orderPayments, paymentComponents, paymentSummary, businessReportRows, products, trend, payments, settlementLines, financialComponents, financialSummary, jobs, inventory, returns, reimbursements, invoices, orderItems, financeTransactions };
   });
 });
 
