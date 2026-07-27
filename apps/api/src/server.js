@@ -505,11 +505,6 @@ app.post('/api/tenants/:tenantId/sync/:reportType', async request => {
     await recordSyntheticReportSync(params.tenantId, params.reportType);
     return { reportType: params.reportType, status: 'completed', fallback: 'DIRECT_SP_API_SYNC', ...fallback };
   }
-  if (params.reportType === 'GET_FBA_FULFILLMENT_CUSTOMER_RETURNS_DATA') {
-    const existingReturns = await withTenant(params.tenantId, async client => (await client.query('select count(*) count from returns where tenant_id=$1', [params.tenantId])).rows[0].count);
-    await recordSyntheticReportSync(params.tenantId, params.reportType, 'fallback://existing-returns-cache');
-    return { reportType: params.reportType, status: 'completed', fallback: 'EXISTING_RETURNS_CACHE', rowsImported: Number(existingReturns ?? 0) };
-  }
   if (params.reportType === 'GET_GST_MTR_B2B_CUSTOM' || params.reportType === 'GET_GST_MTR_B2C_CUSTOM') {
     const invoiceType = params.reportType === 'GET_GST_MTR_B2B_CUSTOM' ? 'b2b' : 'b2c';
     const rowsImported = await buildGstInvoicesFromOrderItems(params.tenantId, invoiceType);
