@@ -766,8 +766,10 @@ function PayoutReconciliation({ data }) {
   const kpis = data?.kpis ?? {};
   const reconciliation = data?.statementReconciliation ?? {};
   const statementRows = (data?.statementBreakdown ?? []).map(row=>({
-    ...row, amount: formatCurrency(row.amount), source_lines: formatNumber(row.source_lines)
+    ...row, debits: formatCurrency(row.debits), credits: formatCurrency(row.credits), net: formatCurrency(row.net), source_lines: formatNumber(row.source_lines)
   }));
+  const statementTotals = (data?.statementSummaries ?? []).map(row=>({ section: row.section, label: 'subtotals', debits: formatCurrency(row.debits), credits: formatCurrency(row.credits), net: formatCurrency(row.total), source_lines: '—' }));
+  const sourceRows = (data?.statementSourceBreakdown ?? []).map(row=>({ ...row, amount: formatCurrency(row.amount), source_lines: formatNumber(row.source_lines) }));
   const components = [
     ['Product sales','product_sales'],['Shipping credits','shipping_credits'],['Gift wrap credits','gift_wrap_credits'],
     ['Promotional rebates','promotional_rebates'],['Sales tax liable','total_sales_tax_liable'],['TCS (CGST + SGST + IGST)','tcs'],
@@ -792,8 +794,9 @@ function PayoutReconciliation({ data }) {
         <div><small>Difference</small><strong>{formatCurrency(reconciliation.difference)}</strong></div>
         <span>{reconciliation.matches?'✓ Exact match to the paisa':'Review source rows — Amazon columns do not add up'}</span>
       </div>
-      <p className="reconciliation-note">Each line below preserves Amazon’s transaction type and description, then shows which CSV money column supplied the amount. Positive amounts are credits to the seller; negative amounts are deductions or refunds.</p>
-      <TableCard title="Human-readable statement breakdown" rows={statementRows} columns={['section','transaction_type','description','fulfillment','transaction_status','amount_field','amount','source_lines']} pageSize={15} />
+      <p className="reconciliation-note">This reproduces every Amazon statement heading, including zero-value lines. Debits and credits remain separate so refunds never disappear into a net figure.</p>
+      <TableCard title="Amazon statement — all categories" rows={[...statementRows,...statementTotals]} columns={['section','label','debits','credits','net','source_lines']} pageSize={60} />
+      <TableCard title="SP-API source audit — every imported detail" rows={sourceRows} columns={['transaction_type','description','fulfillment','transaction_status','amount_field','amount','source_lines']} pageSize={20} />
     </Card>
   </>;
 }
