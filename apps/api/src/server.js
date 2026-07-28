@@ -929,7 +929,7 @@ app.get('/api/tenants/:tenantId/dashboard', async request => {
     // Account Activity is built from Finances v2024-06-19 transactions. The
     // classifier owns API-shape knowledge; this route and the UI only consume
     // its stable statement model.
-    const { details: statementDetails, summaries: statementSummaries, reconciliation: statementReconciliation } = buildStatement(financeTransactions);
+     const { details: statementDetails, summaries: statementSummaries, reconciliation: statementReconciliation } = buildStatement(financeTransactions, settlementLines);
     return { seller, amazonAuth, hasImportedData, kpis, statementBreakdown: statementDetails, statementSourceBreakdown: statementBreakdown, statementSummaries, statementReconciliation, orders, orderRows, orderPayments, paymentComponents, paymentSummary, businessReportRows, products, trend, payments, settlementLines, financialComponents, financialSummary, jobs, inventory, returns, reimbursements, invoices, orderItems, financeTransactions };
   });
 });

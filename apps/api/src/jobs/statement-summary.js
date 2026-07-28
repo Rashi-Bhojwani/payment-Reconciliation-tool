@@ -86,6 +86,39 @@ function matches(rule, context, component, fulfillment) {
   return (!rule.context || rule.context.test(context)) && (!rule.component || rule.component.test(component)) && (!rule.fulfillment || rule.fulfillment.test(fulfillment));
 }
 
+export function classifySettlementLine(row) {
+  const type = String(row.type ?? '').toLowerCase();
+  const isRefund = /refund|retrocharge/.test(type) || Number(row.product_sales ?? 0) < 0;
+  const isFba = /amazon|fba/i.test(String(row.fulfillment ?? row.account_type ?? ''));
+  const isTransfer = /transfer|disbursement/.test(type) || /transfer|disbursement/i.test(String(row.description ?? ''));
+ 
+  const items = [];
+  function push(section, label, amount) {
+    const value = Number(amount ?? 0);
+    if (value) items.push({ section, label, amount: value, breakdownType: `settlement:${label}` });
+  }
+ 
+  if (isTransfer) {
+    push('Transfers', /failed/.test(type) ? 'Failed transfers to bank account' : 'Transfers to bank account', row.total);
+    return items;
+  }
+ 
+  push('Income', isRefund ? 'Seller fulfilled product sale refunds' : (isFba ? 'FBA product sales' : 'Seller fulfilled product sales'), row.product_sales);
+  push('Income', isRefund ? 'Shipping credit refunds' : 'Shipping credits', row.shipping_credits);
+  push('Income', isRefund ? 'Gift wrap credit refunds' : 'Gift wrap credits', row.gift_wrap_credits);
+  push('Income', isRefund ? 'Promotional rebate refunds' : 'Promotional rebates', row.promotional_rebates);
+  push('Tax', isRefund ? 'Product, shipping and gift wrap taxes refunded' : 'Product, shipping and gift wrap taxes collected', row.total_sales_tax_liable);
+  push('Expenses', 'TCS-CGST Net', row.tcs_cgst);
+  push('Expenses', 'TCS-SGST Net', row.tcs_sgst);
+  push('Expenses', 'TCS-IGST Net', row.tcs_igst);
+  push('Expenses', 'TDS - Section 194-O Net', row.tds_194o);
+  push('Expenses', isFba ? 'FBA selling fees' : 'Seller fulfilled selling fees', row.selling_fees);
+  push('Expenses', 'FBA transaction fees', row.fba_fees);
+  push('Expenses', 'Other transaction fees', row.other_transaction_fees);
+  push('Expenses', 'Adjustments', row.other);
+  return items;
+}
+
 /** Classify one transaction into configured statement buckets. */
 export function classifyTransaction(row) {
   const context = contextText(row); const fulfillment = fulfillmentText(row);
@@ -103,20 +136,55 @@ export function classifyTransaction(row) {
 }
 
 /** Compute every visible row, debit/credit subtotals, summary and net check. */
-export function buildStatement(transactions) {
-  const details = STATEMENT_CONFIG.flatMap(group => group.lines.map(rule => ({ section: group.name, label: rule.label, debits: 0, credits: 0, net: 0, source_lines: 0, todo: rule.todo ?? null })));
+export function buildStatement(transactions, settlementLines = []) {
+  const details = STATEMENT_CONFIG.flatMap(group => group.lines.map(rule => ({
+    section: group.name, label: rule.label, debits: 0, credits: 0, net: 0, source_lines: 0, todo: rule.todo ?? null
+  })));
   const byKey = new Map(details.map(row => [`${row.section}\0${row.label}`, row]));
-  for (const transaction of transactions) for (const item of classifyTransaction(transaction)) {
-    const target = byKey.get(`${item.section}\0${item.label}`); if (!target) continue;
-    target.net += item.amount; target.source_lines += 1;
+ 
+  const usingSettlement = settlementLines.length > 0;
+  const items = usingSettlement
+    ? settlementLines.flatMap(classifySettlementLine)
+    : transactions.flatMap(classifyTransaction);
+ 
+  for (const item of items) {
+    const target = byKey.get(`${item.section}\0${item.label}`);
+    if (!target) continue;
+    target.net += item.amount;
+    target.source_lines += 1;
     if (item.amount < 0) target.debits += item.amount; else target.credits += item.amount;
   }
+ 
   const summaries = STATEMENT_CONFIG.map(group => {
     const rows = details.filter(row => row.section === group.name);
-    return { section: group.name, description: group.description, debits: rows.reduce((n, r) => n + r.debits, 0), credits: rows.reduce((n, r) => n + r.credits, 0), total: rows.reduce((n, r) => n + r.net, 0) };
+    return {
+      section: group.name,
+      description: group.description,
+      debits: rows.reduce((n, r) => n + r.debits, 0),
+      credits: rows.reduce((n, r) => n + r.credits, 0),
+      total: rows.reduce((n, r) => n + r.net, 0)
+    };
   });
-  const net = summaries.reduce((n, row) => n + row.total, 0);
-  return { details, summaries, reconciliation: { componentTotal: net, amazonTotal: net, difference: 0, matches: true } };
+ 
+  const componentTotal = summaries.reduce((n, row) => n + row.total, 0);
+  // Real check: compare our bucketed total against Amazon's own `total`
+  // column sum from the settlement report (not a tautology against itself).
+  const amazonTotal = usingSettlement
+    ? settlementLines.reduce((sum, row) => sum + Number(row.total ?? 0), 0)
+    : componentTotal;
+  const difference = Math.round((componentTotal - amazonTotal) * 100) / 100;
+ 
+  return {
+    details,
+    summaries,
+    reconciliation: {
+      componentTotal,
+      amazonTotal,
+      difference,
+      matches: Math.abs(difference) < 0.01,
+      source: usingSettlement ? 'Settlement transaction report' : 'Finances API (no settlement rows in period)'
+    }
+  };
 }
 
 export const STATEMENT_SECTION_ORDER = STATEMENT_CONFIG.map(section => section.name);
