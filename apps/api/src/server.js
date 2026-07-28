@@ -642,15 +642,28 @@ app.get('/api/tenants/:tenantId/orders-reconciliation', async request => {
         union select related_order_id from finance_transactions where tenant_id=$1 and related_order_id is not null and posted_date >= $2 and posted_date < $3),
       scoped_orders as (select ids.amazon_order_id,o.order_date,coalesce(o.status,'Payment posted') status,o.fulfillment_channel,o.total_amount from scoped_order_ids ids left join orders o on o.tenant_id=$1 and o.amazon_order_id=ids.amazon_order_id),
       item_totals as (select amazon_order_id,sum(item_price) gross_item_price,sum(quantity_ordered) units,string_agg(distinct title,', ') product from order_items where tenant_id=$1 group by amazon_order_id),
-      latest_settlements as (select distinct on (order_id) order_id,settlement_id
-        from settlement_rows where tenant_id=$1 and order_id is not null and settlement_id is not null
+      latest_settlements as (select distinct on (line.order_id) line.order_id,line.settlement_id,
+        header.settlement_start_date,header.settlement_end_date,header.deposit_date,header.settlement_total,header.settlement_currency
+        from settlement_rows line
+        left join lateral (
+          select coalesce(raw->>'settlement-start-date',raw->>'settlement start date',raw->>'settlementStartDate') settlement_start_date,
+            coalesce(raw->>'settlement-end-date',raw->>'settlement end date',raw->>'settlementEndDate') settlement_end_date,
+            coalesce(raw->>'deposit-date',raw->>'deposit date',raw->>'depositDate') deposit_date,
+            coalesce(raw->>'total-amount',raw->>'total amount',raw->>'totalAmount') settlement_total,
+            coalesce(raw->>'currency',raw->>'Currency') settlement_currency
+          from settlement_rows settlement_header
+          where settlement_header.tenant_id=line.tenant_id and settlement_header.settlement_id=line.settlement_id
+            and coalesce(raw->>'deposit-date',raw->>'deposit date',raw->>'depositDate','')<>''
+          limit 1
+        ) header on true
+        where line.tenant_id=$1 and line.order_id is not null and line.settlement_id is not null
         -- An order can also appear in a different settlement as an Easy Ship or
         -- adjustment charge. Prefer the settlement containing the actual Order
         -- proceeds instead of simply choosing the latest charge row.
-        order by order_id,
-          case when lower(coalesce(raw->>'transaction-type',raw->>'transaction type',raw->>'transactionType',''))='order' then 0
-               when lower(coalesce(amount_type,''))='itemprice' then 0 else 1 end,
-          posted_date desc nulls last,settlement_id desc),
+        order by line.order_id,
+          case when lower(coalesce(line.raw->>'transaction-type',line.raw->>'transaction type',line.raw->>'transactionType',''))='order' then 0
+               when lower(coalesce(line.amount_type,''))='itemprice' then 0 else 1 end,
+          line.posted_date desc nulls last,line.settlement_id desc),
       chosen_transactions as (select distinct on (related_order_id) transaction_id,related_order_id,total_amount,posted_date,transaction_type,raw,
         coalesce(raw->>'transactionStatus',raw->>'TransactionStatus','Unknown') transaction_status
         from finance_transactions where tenant_id=$1 and related_order_id is not null
@@ -679,13 +692,15 @@ app.get('/api/tenants/:tenantId/orders-reconciliation', async request => {
       sum(abs(fi.amount)) filter(where fi.amount<0 and fi.category=any($4)) total_deductions
       from finance_transaction_items fi join chosen_transactions ct on ct.transaction_id=fi.transaction_id
       where fi.tenant_id=$1 group by ct.related_order_id)
-      select o.amazon_order_id,o.order_date,f.transaction_date,o.status,o.fulfillment_channel,i.product,coalesce(i.units,0) units,s.settlement_id,case when coalesce(f.is_order_payment,false) then coalesce(nullif(f.summary_product_charges,0),nullif(f.finance_gross,0),nullif(i.gross_item_price,0),o.total_amount,0) else coalesce(nullif(i.gross_item_price,0),o.total_amount,0) end gross_item_price,
+      select o.amazon_order_id,o.order_date,f.transaction_date,o.status,o.fulfillment_channel,i.product,coalesce(i.units,0) units,
+      s.settlement_id,s.settlement_start_date,s.settlement_end_date,s.deposit_date,s.settlement_total,s.settlement_currency,
+      case when coalesce(f.is_order_payment,false) then coalesce(nullif(f.summary_product_charges,0),nullif(f.finance_gross,0),nullif(i.gross_item_price,0),o.total_amount,0) else coalesce(nullif(i.gross_item_price,0),o.total_amount,0) end gross_item_price,
       abs(coalesce(f.referral_commission,0)) referral_commission,abs(coalesce(f.fulfillment_fee,0)) fulfillment_fee,abs(coalesce(f.shipping_fee,0)) shipping_fee,abs(coalesce(f.closing_fee,0)) closing_fee,abs(coalesce(f.other_fees,0)) other_fees,case when coalesce(f.summary_lines,0)>0 then coalesce(f.summary_promotional_rebates,0) else coalesce(f.promotion,0) end promotion,coalesce(f.refund,0) refund,coalesce(f.reimbursement,0) reimbursement,case when coalesce(f.summary_lines,0)>0 then abs(coalesce(f.summary_amazon_fees,0)) else coalesce(f.total_deductions,0) end total_deductions,
       case when coalesce(f.is_order_payment,false) then coalesce(f.summary_other,f.transaction_header_total-coalesce(nullif(f.summary_product_charges,0),f.finance_gross,0)-coalesce(f.summary_promotional_rebates,f.promotion,0)-coalesce(f.summary_amazon_fees,-f.total_deductions,0)) else 0 end other_amount,f.transaction_header_total,
       case when coalesce(f.is_order_payment,false) then f.transaction_header_total else null end net_payout,coalesce(f.is_order_payment,false) "hasFeeData",
-      coalesce(f.payment_released,false) payment_received,
-      case when coalesce(f.payment_released,false) then 'Released by Amazon' when coalesce(f.is_order_payment,false) then coalesce(f.transaction_status,'Not released') else 'Awaiting payment data' end payout_status,
-      f.payout_date_time
+      (s.deposit_date is not null or coalesce(f.payment_released,false)) payment_received,
+      case when s.deposit_date is not null then 'Deposit initiated by Amazon' when coalesce(f.payment_released,false) then 'Released by Amazon' when coalesce(f.is_order_payment,false) then coalesce(f.transaction_status,'Not released') else 'Awaiting payment data' end payout_status,
+      coalesce(s.deposit_date,f.payout_date_time::text) payout_date_time
       from scoped_orders o left join item_totals i on i.amazon_order_id=o.amazon_order_id left join fees f on f.order_id=o.amazon_order_id left join latest_settlements s on s.order_id=o.amazon_order_id order by "hasFeeData" desc,f.transaction_date desc nulls last,o.order_date desc`,[tenantId,range.start,range.end,FEE_CATEGORIES])).rows;
     const hasFinanceItems=orders.some(order=>order.hasFeeData);
     if (!hasFinanceItems) {
