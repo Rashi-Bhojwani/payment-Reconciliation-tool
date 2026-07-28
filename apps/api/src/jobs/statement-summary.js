@@ -89,8 +89,11 @@ function matches(rule, context, component, fulfillment) {
 export function classifySettlementLine(row) {
   const type = String(row.type ?? '').toLowerCase();
   const isRefund = /refund|retrocharge/.test(type) || Number(row.product_sales ?? 0) < 0;
-  const isFba = /amazon|fba/i.test(String(row.fulfillment ?? row.account_type ?? ''));
+  const isFba = /amazon|fba|afn/i.test(String(row.fulfillment ?? row.account_type ?? ''));
   const isTransfer = /transfer|disbursement/.test(type) || /transfer|disbursement/i.test(String(row.description ?? ''));
+  const classicAmountType = String(row.raw_row?.['amount-type'] ?? '');
+  const classicDescription = String(row.raw_row?.['amount-description'] ?? '');
+  const isClassicTax = /itemprice/i.test(classicAmountType) && /tax/i.test(classicDescription);
  
   const items = [];
   function push(section, label, amount) {
@@ -107,7 +110,9 @@ export function classifySettlementLine(row) {
   push('Income', isRefund ? 'Shipping credit refunds' : 'Shipping credits', row.shipping_credits);
   push('Income', isRefund ? 'Gift wrap credit refunds' : 'Gift wrap credits', row.gift_wrap_credits);
   push('Income', isRefund ? 'Promotional rebate refunds' : 'Promotional rebates', row.promotional_rebates);
-  push('Tax', isRefund ? 'Product, shipping and gift wrap taxes refunded' : 'Product, shipping and gift wrap taxes collected', row.total_sales_tax_liable);
+  push(isClassicTax ? 'Goods and Services Tax' : 'Tax', isClassicTax
+    ? (isRefund ? 'GST Refunds' : 'GST Collected')
+    : (isRefund ? 'Product, shipping and gift wrap taxes refunded' : 'Product, shipping and gift wrap taxes collected'), row.total_sales_tax_liable);
   push('Expenses', 'TCS-CGST Net', row.tcs_cgst);
   push('Expenses', 'TCS-SGST Net', row.tcs_sgst);
   push('Expenses', 'TCS-IGST Net', row.tcs_igst);
