@@ -765,10 +765,6 @@ function buildDashboardSummary(data, range = defaultDateRange()) {
 function PayoutReconciliation({ data }) {
   const kpis = data?.kpis ?? {};
   const reconciliation = data?.statementReconciliation ?? {};
-  const statementRows = (data?.statementBreakdown ?? []).map(row=>({
-    ...row, debits: formatCurrency(row.debits), credits: formatCurrency(row.credits), net: formatCurrency(row.net), source_lines: formatNumber(row.source_lines)
-  }));
-  const statementTotals = (data?.statementSummaries ?? []).map(row=>({ section: row.section, label: 'subtotals', debits: formatCurrency(row.debits), credits: formatCurrency(row.credits), net: formatCurrency(row.total), source_lines: '—' }));
   const sourceRows = (data?.statementSourceBreakdown ?? []).map(row=>({ ...row, amount: formatCurrency(row.amount), source_lines: formatNumber(row.source_lines) }));
   const components = [
     ['Product sales','product_sales'],['Shipping credits','shipping_credits'],['Gift wrap credits','gift_wrap_credits'],
@@ -786,19 +782,25 @@ function PayoutReconciliation({ data }) {
       <TableCard title="Amazon CSV field totals" rows={[...components,{component:'Grand total',released:formatCurrency(kpis.released_total),deferred:formatCurrency(kpis.deferred_total),total:formatCurrency(kpis.total)}]} columns={['component','released','deferred','total']} />
       <TableCard title="Payout Activity" rows={data?.payments ?? []} columns={['posted_date','settlement_id','transaction_status','transaction_release_date','net_amount','lines']} />
     </div>
-    <Card className="statement-audit">
-      <PanelHeader title="Every rupee in the Amazon statement" subtitle="Live GET_V2_SETTLEMENT_REPORT_DATA_FLAT_FILE_V2 data for the selected date range — no hardcoded amounts" />
+    <Card className="statement-audit account-activity">
+      <div className="account-activity-title"><div><span className="live-source">FINANCES API · v2024-06-19</span><h2>Account Activity</h2><p>Interactive Amazon.in statement for the selected date range</p></div><b>All amounts in INR</b></div>
+      <div className="account-summary"><h3>Summaries</h3>{['Income','Expenses','Tax','Goods and Services Tax','Transfers'].map(name=>(data?.statementSummaries??[]).find(row=>row.section===name)??{section:name,total:0,description:''}).map(row=><div key={row.section}><b>{row.section==='Goods and Services Tax'?'Goods and Service Tax':row.section}</b><span>{row.description}</span><strong className={Number(row.total)<0?'money-debit':'money-credit'}>{formatCurrency(row.total)}</strong></div>)}</div>
       <div className={reconciliation.matches?'statement-check matched':'statement-check mismatch'}>
-        <div><small>Sum of all money columns</small><strong>{formatCurrency(reconciliation.componentTotal)}</strong></div><b>−</b>
-        <div><small>Amazon row totals</small><strong>{formatCurrency(reconciliation.amazonTotal)}</strong></div><b>=</b>
-        <div><small>Difference</small><strong>{formatCurrency(reconciliation.difference)}</strong></div>
-        <span>{reconciliation.matches?'✓ Exact match to the paisa':'Review source rows — Amazon columns do not add up'}</span>
+        <div><small>Income + expenses + taxes + transfers</small><strong>{formatCurrency(reconciliation.componentTotal)}</strong></div>
+        <span>{reconciliation.matches?'✓ All displayed lines reconcile':'Review unclassified source rows'}</span>
       </div>
-      <p className="reconciliation-note">This reproduces every Amazon statement heading, including zero-value lines. Debits and credits remain separate so refunds never disappear into a net figure.</p>
-      <TableCard title="Amazon statement — all categories" rows={[...statementRows,...statementTotals]} columns={['section','label','debits','credits','net','source_lines']} pageSize={60} />
-      <TableCard title="SP-API source audit — every imported detail" rows={sourceRows} columns={['transaction_type','description','fulfillment','transaction_status','amount_field','amount','source_lines']} pageSize={20} />
+      <div className="account-sections">
+        <div>{['Income','Transfers','Goods and Services Tax'].map(name=><AccountStatementSection key={name} name={name} data={data}/>)}</div>
+        <div>{['Expenses','Tax'].map(name=><AccountStatementSection key={name} name={name} data={data}/>)}</div>
+      </div>
+      <details className="statement-source-audit"><summary>View legacy settlement source audit</summary><TableCard title="Imported source detail" rows={sourceRows} columns={['transaction_type','description','fulfillment','transaction_status','amount_field','amount','source_lines']} pageSize={20} /></details>
     </Card>
   </>;
+}
+function AccountStatementSection({ name, data }) {
+  const rows=(data?.statementBreakdown??[]).filter(row=>row.section===name);
+  const total=(data?.statementSummaries??[]).find(row=>row.section===name)??{};
+  return <section className="account-section"><header><h3>{name}</h3><strong className={Number(total.total)<0?'money-debit':'money-credit'}>{formatCurrency(total.total)}</strong></header><div className="account-columns"><span></span><b>Debits</b><b>Credits</b></div>{rows.map(row=><div className="account-line" key={row.label}><span>{row.label}{row.todo&&<i title={row.todo}>Unconfirmed mapping</i>}</span><b className="money-debit">{formatCurrency(row.debits)}</b><b className="money-credit">{formatCurrency(row.credits)}</b></div>)}<footer><span>subtotals</span><b className="money-debit">{formatCurrency(total.debits)}</b><b className="money-credit">{formatCurrency(total.credits)}</b></footer></section>;
 }
 function readableTrend(data) {
   return (data?.trend ?? []).map(row => ({ ...row, label: new Date(row.date).toLocaleDateString('en-IN', { day: '2-digit', month: 'short' }) }));

@@ -1,23 +1,32 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { buildStatement, statementSection } from './statement-summary.js';
+import { buildStatement, classifyTransaction, flattenBreakdowns, STATEMENT_CONFIG } from './statement-summary.js';
 
-test('matches Amazon India statement section semantics', () => {
-  assert.equal(statementSection({ description: 'GST Refunds' }), 'Goods and Services Tax');
-  assert.equal(statementSection({ amount_field: 'TCS-SGST' }), 'Expenses');
-  assert.equal(statementSection({ description: 'Transfers to bank account' }), 'Transfers');
-  assert.equal(statementSection({ amount_field: 'Product, shipping and gift wrap taxes' }), 'Tax');
+function transaction(transactionType, description, amount, breakdownType = 'PRINCIPAL') {
+  return { transactionType, description, breakdown: [{ breakdownType, breakdownAmount: { currencyCode: 'INR', currencyAmount: amount } }] };
+}
+
+test('recursively parses nested GST/TCS/TDS breakdown leaves without double counting parents', () => {
+  const parts = flattenBreakdowns({ breakdown: [{ breakdownType: 'FEE', breakdownAmount: { currencyAmount: -30 }, breakdown: [
+    { breakdownType: 'TCS-SGST', breakdownAmount: { currencyAmount: -10 } },
+    { breakdownType: 'TDS_194-O', breakdown: [{ breakdownType: 'TAX', breakdownAmount: { currencyAmount: -20 } }] }
+  ] }] });
+  assert.deepEqual(parts, [{ breakdownType: 'FEE > TCS-SGST', amount: -10 }, { breakdownType: 'FEE > TDS_194-O > TAX', amount: -20 }]);
 });
 
-test('retains debit and credit columns and includes zero-valued Amazon lines', () => {
-  const result = buildStatement([
-    { transaction_type: 'Order', description: 'FBA product sales', amount: 100, source_lines: 2 },
-    { transaction_type: 'Refund', description: 'FBA product sales', amount: -20, source_lines: 1 },
-    { description: 'GST Collected', amount: 18, source_lines: 1 },
-    { description: 'Transfers to bank account', amount: -98, source_lines: 1 }
-  ]);
+test('classifies listTransactions components using centralized config', () => {
+  assert.deepEqual(classifyTransaction(transaction('Refund', 'FBA customer refund', -250))[0], { section: 'Income', label: 'FBA product sale refunds', amount: -250, breakdownType: 'PRINCIPAL' });
+  assert.equal(classifyTransaction(transaction('ServiceFee', 'monthly service fee', -499, 'FEE'))[0].label, 'Service fees');
+  assert.equal(classifyTransaction(transaction('TaxWithholding', '', -62.9, 'TCS-SGST'))[0].label, 'TCS-SGST Net');
+});
+
+test('keeps every configured row visible and derives debit, credit and section totals', () => {
+  const result = buildStatement([transaction('Shipment', 'FBA order', 1000), transaction('Refund', 'FBA customer refund', -200)]);
+  assert.equal(result.details.length, STATEMENT_CONFIG.reduce((sum, section) => sum + section.lines.length, 0));
   const sales = result.details.find(row => row.label === 'FBA product sales');
-  assert.deepEqual({ debits: sales.debits, credits: sales.credits, net: sales.net }, { debits: -20, credits: 100, net: 80 });
-  assert.ok(result.details.some(row => row.label === 'SAFE-T Reimbursements' && row.net === 0));
-  assert.equal(result.summaries.reduce((sum, row) => sum + row.total, 0), 0);
+  const refunds = result.details.find(row => row.label === 'FBA product sale refunds');
+  assert.equal(sales.credits, 1000); assert.equal(refunds.debits, -200);
+  assert.ok(result.details.some(row => row.label === 'NetCo Transaction' && row.net === 0 && row.todo));
+  assert.equal(result.summaries.find(row => row.section === 'Income').total, 800);
+  assert.equal(result.reconciliation.componentTotal, 800);
 });

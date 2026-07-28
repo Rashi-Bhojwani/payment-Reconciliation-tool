@@ -290,18 +290,10 @@ export async function syncRecentApiDataForTenant(tenantId, options = {}) {
       // purchase date. Extend only the finance window so selecting Jul 1–2 can
       // still retrieve Amazon's Jul 10 payment for those orders.
       const financeBefore = range ? new Date(Math.min(safeNow.getTime(), new Date(range.end).getTime() + 45 * 864e5)).toISOString() : createdBefore;
-      let financeResponse = includeFinance ? await client.listFinanceTransactions(createdAfter, financeBefore).catch(error => ({ syncError: error instanceof Error ? error.message : 'Finance sync failed' })) : null;
-      const financePages = financeResponse ? [financeResponse] : [];
-      const financeTokens = new Set();
-      for (let page = 1; includeFinance && page < 100; page += 1) {
-        const nextToken = financeResponse?.payload?.nextToken ?? financeResponse?.nextToken ?? financeResponse?.payload?.NextToken ?? financeResponse?.NextToken;
-        if (!nextToken || financeTokens.has(nextToken)) break;
-        financeTokens.add(nextToken);
-        financeResponse = await client.listFinanceTransactions(undefined, undefined, nextToken).catch(error => ({ syncError: error instanceof Error ? error.message : 'Finance pagination failed' }));
-        financePages.push(financeResponse);
-        if (financeResponse.syncError) break;
-      }
-      const transactions = financePages.flatMap(page => page?.payload?.transactions ?? page?.transactions ?? page?.payload?.Transactions ?? page?.Transactions ?? []);
+      let financeWarning;
+      const transactions = includeFinance ? await client.fetchFinanceTransactions(createdAfter, financeBefore).catch(error => {
+        financeWarning = error instanceof Error ? error.message : 'Finance sync failed'; return [];
+      }) : [];
       const inventoryResponse = includeInventory ? await client.listInventorySummaries(marketplaceId).catch(error => ({ syncError: error instanceof Error ? error.message : 'Inventory sync failed' })) : null;
       const inventorySummaries = inventoryResponse?.payload?.inventorySummaries ?? inventoryResponse?.inventorySummaries ?? [];
       const snapshotDate = new Date().toISOString().slice(0, 10);
@@ -424,7 +416,7 @@ export async function syncRecentApiDataForTenant(tenantId, options = {}) {
         }
       });
       await pool.query('update sync_jobs set status=$1, completed_at=now() where id=$2', ['completed', sync.rows[0].id]);
-      return { ordersImported, transactionsImported, inventoryImported, reimbursementsImported, catalogItemsImported, orderItemsSkipped, incrementalSince: createdAfter, incrementalUntil: createdBefore, ordersWarning, financeWarning: financeResponse?.syncError, inventoryWarning: inventoryResponse?.syncError };
+      return { ordersImported, transactionsImported, inventoryImported, reimbursementsImported, catalogItemsImported, orderItemsSkipped, incrementalSince: createdAfter, incrementalUntil: createdBefore, ordersWarning, financeWarning, inventoryWarning: inventoryResponse?.syncError };
     } catch (error) {
       await pool.query('update sync_jobs set status=$1, completed_at=now(), error_message=$2 where id=$3', ['failed', error instanceof Error ? error.message : 'unknown error', sync.rows[0].id]);
       throw error;

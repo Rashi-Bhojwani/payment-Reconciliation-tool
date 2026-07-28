@@ -1062,6 +1062,20 @@ td { padding: 13px 14px; color:#344054; }
 .statement-inline-match,.statement-inline-mismatch { display: flex; flex-wrap: wrap; gap: 16px; justify-content: space-between; padding: 12px 15px; border-radius: 9px; }.statement-inline-match { color: #047857; background: #ecfdf5; }.statement-inline-mismatch { color: #c2410c; background: #fff7ed; }
 @media (max-width: 900px) { .statement-summary-grid { grid-template-columns: 1fr 1fr; } }
 .statement-audit .table-card { box-shadow: none; margin-top: 14px; }
+.account-activity { background: #fff; color: #17202a; }
+.account-activity-title { display:flex; align-items:flex-end; justify-content:space-between; padding-bottom:14px; border-bottom:2px solid #263238; }
+.account-activity-title h2 { margin:4px 0 2px; font-size:28px; }.account-activity-title p { margin:0; color:var(--muted); }
+.account-summary { margin:14px 0 18px; border-bottom:2px solid #263238; padding-bottom:8px; }.account-summary h3 { margin:0; padding-bottom:6px; border-bottom:1px solid #263238; }
+.account-summary>div { display:grid; grid-template-columns:220px 1fr 160px; gap:18px; padding:5px 2px; align-items:center; }.account-summary span { color:#77808b; font-size:13px; }.account-summary strong { text-align:right; font-family:'IBM Plex Mono',monospace; }
+.account-sections { display:grid; grid-template-columns:1fr 1fr; gap:22px; align-items:start; }.account-sections>div { display:grid; gap:18px; }
+.account-section header { display:flex; justify-content:space-between; align-items:baseline; border-top:2px solid #263238; border-bottom:1px solid #263238; padding:7px 2px 5px; }.account-section header h3 { margin:0; }.account-section header strong { font-size:20px; font-family:'IBM Plex Mono',monospace; }
+.account-columns,.account-line,.account-section footer { display:grid; grid-template-columns:minmax(190px,1fr) 125px 125px; gap:8px; align-items:center; }
+.account-columns { padding:4px 2px 2px; border-bottom:1px solid #899199; font-size:11px; text-align:right; }.account-line { min-height:25px; padding:2px; font-size:12px; }.account-line>b,.account-section footer>b { text-align:right; font-family:'IBM Plex Mono',monospace; font-size:12px; }
+.account-line i { display:inline-block; margin-left:8px; padding:2px 5px; border-radius:4px; background:#fff4d6; color:#805b00; font-size:9px; font-style:normal; vertical-align:middle; }
+.account-section footer { border-top:1px solid #263238; border-bottom:2px solid #263238; padding:5px 2px; }.account-section footer span { text-align:right; color:#68717b; font-size:11px; font-weight:700; }
+.money-debit { color:#b42318; }.money-credit { color:#067647; }.statement-source-audit { margin-top:24px; }.statement-source-audit summary { cursor:pointer; color:var(--muted); font-weight:700; }
+@media(max-width:1050px){.account-sections{grid-template-columns:1fr}.account-summary>div{grid-template-columns:160px 1fr 130px}}
+@media(max-width:650px){.account-summary>div{grid-template-columns:1fr auto}.account-summary span{grid-column:1/-1}.account-columns,.account-line,.account-section footer{grid-template-columns:minmax(125px,1fr) 95px 95px}.account-activity-title{align-items:start;gap:12px}.account-activity-title>b{font-size:11px}}
 .statement-check { display: grid; grid-template-columns: 1fr auto 1fr auto 1fr auto; gap: 12px; align-items: center; padding: 16px; margin: 14px 0 10px; border: 1px solid; border-radius: 12px; }
 .statement-check > div { display: grid; gap: 3px; }.statement-check small { color: var(--muted); }.statement-check strong { font-size: 20px; }
 .statement-check > span { padding: 7px 10px; border-radius: 999px; font-size: 12px; font-weight: 800; white-space: nowrap; }

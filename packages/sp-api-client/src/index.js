@@ -260,4 +260,19 @@ export class SpApiClient {
     if (!res.ok) throw new Error(`Finance transactions failed: ${res.status}`);
     return res.json();
   }
+
+  /** Fetch every listTransactions page for an inclusive API window. */
+  async fetchFinanceTransactions(postedAfter, postedBefore, maxPages = 100) {
+    const pages = [];
+    const seen = new Set();
+    let page = await this.listFinanceTransactions(postedAfter, postedBefore);
+    for (let index = 0; index < maxPages; index += 1) {
+      pages.push(page);
+      const nextToken = page?.payload?.nextToken ?? page?.nextToken ?? page?.payload?.NextToken ?? page?.NextToken;
+      if (!nextToken || seen.has(nextToken)) break;
+      seen.add(nextToken);
+      page = await this.listFinanceTransactions(undefined, undefined, nextToken);
+    }
+    return pages.flatMap(item => item?.payload?.transactions ?? item?.transactions ?? item?.payload?.Transactions ?? item?.Transactions ?? []);
+  }
 }
