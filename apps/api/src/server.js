@@ -644,7 +644,13 @@ app.get('/api/tenants/:tenantId/orders-reconciliation', async request => {
       item_totals as (select amazon_order_id,sum(item_price) gross_item_price,sum(quantity_ordered) units,string_agg(distinct title,', ') product from order_items where tenant_id=$1 group by amazon_order_id),
       latest_settlements as (select distinct on (order_id) order_id,settlement_id
         from settlement_rows where tenant_id=$1 and order_id is not null and settlement_id is not null
-        order by order_id,posted_date desc nulls last,settlement_id desc),
+        -- An order can also appear in a different settlement as an Easy Ship or
+        -- adjustment charge. Prefer the settlement containing the actual Order
+        -- proceeds instead of simply choosing the latest charge row.
+        order by order_id,
+          case when lower(coalesce(raw->>'transaction-type',raw->>'transaction type',raw->>'transactionType',''))='order' then 0
+               when lower(coalesce(amount_type,''))='itemprice' then 0 else 1 end,
+          posted_date desc nulls last,settlement_id desc),
       chosen_transactions as (select distinct on (related_order_id) transaction_id,related_order_id,total_amount,posted_date,transaction_type,raw,
         coalesce(raw->>'transactionStatus',raw->>'TransactionStatus','Unknown') transaction_status
         from finance_transactions where tenant_id=$1 and related_order_id is not null
@@ -684,6 +690,7 @@ app.get('/api/tenants/:tenantId/orders-reconciliation', async request => {
     const hasFinanceItems=orders.some(order=>order.hasFeeData);
     if (!hasFinanceItems) {
       const settlement=(await db.query(`select line.order_id,line.settlement_id,line.amount_type,line.amount_description,line.amount,line.posted_date,
+        coalesce(line.raw->>'transaction-type',line.raw->>'transaction type',line.raw->>'transactionType') transaction_type,
         metadata.deposit_date
         from settlement_rows line
         left join lateral (
@@ -707,8 +714,10 @@ app.get('/api/tenants/:tenantId/orders-reconciliation', async request => {
         order.total_deductions=lines.filter(line=>FEE_CATEGORIES.includes(line.category)&&Number(line.amount)<0).reduce((total,line)=>total+Math.abs(Number(line.amount)),0);
         const settlementGross=sum(line=>['item_price','shipping_charge','gift_wrap'].includes(line.category)&&Number(line.amount)>0); if(settlementGross) order.gross_item_price=settlementGross;
         order.net_payout=lines.reduce((total,line)=>total+Number(line.amount),0); order.other_amount=order.net_payout-Number(order.gross_item_price)-Number(order.promotion)+order.total_deductions;
-        const depositDate=lines.map(line=>line.deposit_date).find(Boolean);
-        order.settlement_id=lines.map(line=>line.settlement_id).find(Boolean)??order.settlement_id??null;
+        const payoutLine=lines.find(line=>String(line.transaction_type??'').toLowerCase()==='order'||String(line.amount_type??'').toLowerCase()==='itemprice')??lines[0];
+        const payoutSettlementId=payoutLine?.settlement_id??order.settlement_id??null;
+        const depositDate=lines.find(line=>line.settlement_id===payoutSettlementId&&line.deposit_date)?.deposit_date??null;
+        order.settlement_id=payoutSettlementId;
         order.hasFeeData=true; order.feeSource='Settlement report';
         order.payment_received=Boolean(depositDate); order.payout_date_time=depositDate??null;
         order.payout_status=depositDate?'Deposit initiated by Amazon':'Settlement recorded; deposit date unavailable';
