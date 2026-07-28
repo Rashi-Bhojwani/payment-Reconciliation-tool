@@ -30,3 +30,14 @@ test('keeps every configured row visible and derives debit, credit and section t
   assert.equal(result.summaries.find(row => row.section === 'Income').total, 800);
   assert.equal(result.reconciliation.componentTotal, 800);
 });
+
+test('maps classic India settlement product tax to GST and AFN sales to FBA', () => {
+  const result = buildStatement([], [{
+    type: 'Order', fulfillment: 'AFN', product_sales: 100, total_sales_tax_liable: 18,
+    total: 118, raw_row: { 'amount-type': 'ItemPrice', 'amount-description': 'Product Tax' }
+  }]);
+  assert.equal(result.details.find(row => row.label === 'FBA product sales').credits, 100);
+  assert.equal(result.details.find(row => row.label === 'GST Collected').credits, 18);
+  assert.equal(result.summaries.find(row => row.section === 'Tax').total, 0);
+  assert.equal(result.summaries.find(row => row.section === 'Goods and Services Tax').total, 18);
+});

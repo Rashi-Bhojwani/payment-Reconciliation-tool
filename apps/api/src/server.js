@@ -886,7 +886,14 @@ app.get('/api/tenants/:tenantId/dashboard', async request => {
       from normalized_jobs
       order by report_type, started_at desc nulls last
     `, [tenantId])).rows;
-    const settlementLines = (await client.query("select settlement_id,order_id,type amount_type,description amount_description,total amount,posted_at posted_date,transaction_status,transaction_release_date from settlement_transaction_lines where tenant_id=$1 and posted_at >= $2 and posted_at < $3 order by posted_at desc nulls last limit 250", [tenantId, start, end])).rows;
+    // buildStatement needs the component columns, not merely the display aliases.
+    // Limiting this query also made month totals depend on whichever 250 lines
+    // happened to sort first, so reconciliation must use the complete period.
+    const settlementLines = (await client.query(`select *,
+      type amount_type, description amount_description, total amount, posted_at posted_date
+      from settlement_transaction_lines
+      where tenant_id=$1 and posted_at >= $2 and posted_at < $3
+      order by posted_at desc nulls last`, [tenantId, start, end])).rows;
     const orderRows = (await client.query(`
       select o.amazon_order_id, o.order_date, o.status, o.total_amount, o.fulfillment_channel, o.sales_channel,
         count(oi.id) item_lines,

@@ -24,20 +24,24 @@ test('rejects a range with no data available before the safe boundary', () => {
   );
 });
 
-test('creates settlement reports with the explicit custom date range and never retries without it', async () => {
+test('downloads and combines all scheduled settlement reports in the requested range', async () => {
   const calls = [];
   const client = new SpApiClient('refresh-token', { clientId: 'id', clientSecret: 'secret' });
   client.request = async (path, init = {}) => {
     calls.push({ path, body: init.body ? JSON.parse(init.body) : null });
-    if (path === '/reports/2021-06-30/reports') return new Response(JSON.stringify({ reportId: 'R1' }), { status: 200 });
-    return new Response(JSON.stringify({ processingStatus: 'DONE', reportDocumentId: 'D1' }), { status: 200 });
+    assert.match(path, /^\/reports\/2021-06-30\/reports\?/);
+    return new Response(JSON.stringify({ reports: [
+      { reportId: 'R1', reportDocumentId: 'D1', processingStatus: 'DONE', dataStartTime: '2026-06-27T00:00:00Z' },
+      { reportId: 'R2', reportDocumentId: 'D2', processingStatus: 'DONE', dataStartTime: '2026-07-10T00:00:00Z' }
+    ] }), { status: 200 });
   };
-  client.downloadReportDocument = async () => ({ content: 'date/time\tsettlement id', compressionAlgorithm: undefined });
+  client.downloadReportDocument = async id => ({ content: `date/time\tsettlement id\n${id}\tS1`, compressionAlgorithm: undefined });
   const range = { start: '2026-06-27T00:00:00.000Z', end: '2026-07-27T00:00:00.000Z' };
-  await client.fetchReport('GET_V2_SETTLEMENT_REPORT_DATA_FLAT_FILE_V2', '00000000-0000-4000-8000-000000000001', range);
-  assert.equal(calls.filter(call => call.path === '/reports/2021-06-30/reports').length, 1);
-  assert.equal(calls[0].body.dataStartTime, range.start);
-  assert.equal(calls[0].body.dataEndTime, range.end);
+  const result = await client.fetchReport('GET_V2_SETTLEMENT_REPORT_DATA_FLAT_FILE_V2', '00000000-0000-4000-8000-000000000001', range);
+  assert.equal(calls.length, 1);
+  assert.match(calls[0].path, /createdSince=2026-06-27/);
+  assert.equal(result.reportsImported, 2);
+  assert.equal(result.content, 'date/time\tsettlement id\nD1\tS1\nD2\tS1');
 });
 
 test('fetches and combines every Finances listTransactions page', async () => {
