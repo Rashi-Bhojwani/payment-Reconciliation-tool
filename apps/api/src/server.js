@@ -926,9 +926,10 @@ app.get('/api/tenants/:tenantId/dashboard', async request => {
       return summary;
     }, { grossSales: 0, deductions: 0, sellerReceivable: 0, fbaReceivable: 0, fbmReceivable: 0, otherReceivable: 0 });
     const hasImportedData = Number(orders.orders ?? 0) > 0 || Number(kpis.net_settled ?? 0) !== 0 || products.length > 0 || payments.length > 0 || inventory.length > 0;
-    const componentTotal = ['product_sales','shipping_credits','gift_wrap_credits','promotional_rebates','total_sales_tax_liable','tcs','tds_194o','selling_fees','fba_fees','other_transaction_fees','other'].reduce((sum, field) => sum + Number(kpis[field] ?? 0), 0);
-    const statementReconciliation = { componentTotal, amazonTotal: Number(kpis.total ?? 0), difference: componentTotal - Number(kpis.total ?? 0), matches: Math.abs(componentTotal - Number(kpis.total ?? 0)) < 0.01 };
-    const { details: statementDetails, summaries: statementSummaries } = buildStatement(statementBreakdown);
+    // Account Activity is built from Finances v2024-06-19 transactions. The
+    // classifier owns API-shape knowledge; this route and the UI only consume
+    // its stable statement model.
+    const { details: statementDetails, summaries: statementSummaries, reconciliation: statementReconciliation } = buildStatement(financeTransactions);
     return { seller, amazonAuth, hasImportedData, kpis, statementBreakdown: statementDetails, statementSourceBreakdown: statementBreakdown, statementSummaries, statementReconciliation, orders, orderRows, orderPayments, paymentComponents, paymentSummary, businessReportRows, products, trend, payments, settlementLines, financialComponents, financialSummary, jobs, inventory, returns, reimbursements, invoices, orderItems, financeTransactions };
   });
 });

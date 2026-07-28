@@ -39,3 +39,15 @@ test('creates settlement reports with the explicit custom date range and never r
   assert.equal(calls[0].body.dataStartTime, range.start);
   assert.equal(calls[0].body.dataEndTime, range.end);
 });
+
+test('fetches and combines every Finances listTransactions page', async () => {
+  const client = new SpApiClient('refresh-token');
+  const calls = [];
+  client.listFinanceTransactions = async (after, before, token) => {
+    calls.push({ after, before, token });
+    return token ? { transactions: [{ transactionId: 'T2' }] } : { payload: { transactions: [{ transactionId: 'T1' }], nextToken: 'page-2' } };
+  };
+  const rows = await client.fetchFinanceTransactions('2026-07-01T00:00:00.000Z', '2026-07-28T00:00:00.000Z');
+  assert.deepEqual(rows.map(row => row.transactionId), ['T1', 'T2']);
+  assert.deepEqual(calls[1], { after: undefined, before: undefined, token: 'page-2' });
+});
