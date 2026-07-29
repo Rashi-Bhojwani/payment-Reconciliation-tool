@@ -1,12 +1,13 @@
 import { gunzipSync } from 'node:zlib';
+import { createDecipheriv } from 'node:crypto';
 import { z } from 'zod';
 
 export const SP_API_BASE_URL = 'https://sellingpartnerapi-eu.amazon.com';
 export const INDIA_MARKETPLACE_ID = 'A21TJRUUN4KGV';
 export const MARKETPLACES = Object.freeze({
-  A21TJRUUN4KGV: { country: 'India', region: 'IN', endpoint: 'https://sellingpartnerapi-eu.amazon.com', sellerCentralHost: 'sellercentral.amazon.in' },
-  ATVPDKIKX0DER: { country: 'United States', region: 'NA', endpoint: 'https://sellingpartnerapi-na.amazon.com', sellerCentralHost: 'sellercentral.amazon.com' },
-  A1F83G8C2ARO7P: { country: 'United Kingdom', region: 'EU', endpoint: 'https://sellingpartnerapi-eu.amazon.com', sellerCentralHost: 'sellercentral.amazon.co.uk' }
+  A21TJRUUN4KGV: { country: 'India', region: 'IN', timeZone:'Asia/Kolkata', endpoint: 'https://sellingpartnerapi-eu.amazon.com', sellerCentralHost: 'sellercentral.amazon.in' },
+  ATVPDKIKX0DER: { country: 'United States', region: 'NA', timeZone:'America/Los_Angeles', endpoint: 'https://sellingpartnerapi-na.amazon.com', sellerCentralHost: 'sellercentral.amazon.com' },
+  A1F83G8C2ARO7P: { country: 'United Kingdom', region: 'EU', timeZone:'Europe/London', endpoint: 'https://sellingpartnerapi-eu.amazon.com', sellerCentralHost: 'sellercentral.amazon.co.uk' }
 });
 export function getSpApiEndpoint(marketplaceId = INDIA_MARKETPLACE_ID) { return MARKETPLACES[marketplaceId]?.endpoint ?? SP_API_BASE_URL; }
 export const REPORT_TYPES = Object.freeze([
@@ -112,7 +113,7 @@ export class SpApiClient {
       const rateLimit = Number(res.headers.get('x-amzn-RateLimit-Limit') ?? '0.5');
       if (![429, 503].includes(res.status)) return res;
       const retryAfter = Number(res.headers.get('retry-after'));
-      const backoffMs = Number.isFinite(retryAfter) && retryAfter > 0 ? retryAfter * 1000 : (1000 / Math.max(rateLimit, 0.05)) * 2 ** attempt;
+      const backoffMs = Number.isFinite(retryAfter) && retryAfter > 0 ? retryAfter * 1000 : (1000 / Math.max(rateLimit, 0.05)) * 2 ** attempt + Math.floor(Math.random()*500);
       await new Promise(resolve => setTimeout(resolve, Math.min(120_000, backoffMs)));
       accessToken = token ?? (await this.getAccessToken()).accessToken;
     }
@@ -141,21 +142,26 @@ export class SpApiClient {
       // reliably be created on demand. Select the latest completed report
       // covering the requested period instead of calling createReport.
       const createdSince = new Date(new Date(parsedRange.start).getTime() - 45 * 864e5).toISOString();
-      const listPath = `/reports/2021-06-30/reports?reportTypes=${encodeURIComponent(parsedReportType)}&processingStatuses=DONE&marketplaceIds=${encodeURIComponent(marketplaceId)}&createdSince=${encodeURIComponent(createdSince)}&pageSize=100`;
-      const list = await this.request(listPath);
-      if (!list.ok) throw new Error(`List settlement reports failed: ${list.status}`);
-      const reports = z.object({ reports: z.array(z.object({ reportId: z.string(), reportDocumentId: z.string().optional(), dataStartTime: z.string().optional(), dataEndTime: z.string().optional(), createdTime: z.string().optional() })).default([]) }).parse(await list.json()).reports;
+      let nextToken;
+      const reports = [];
+      do {
+        const listPath = nextToken
+          ? `/reports/2021-06-30/reports?nextToken=${encodeURIComponent(nextToken)}`
+          : `/reports/2021-06-30/reports?reportTypes=${encodeURIComponent(parsedReportType)}&processingStatuses=DONE,IN_QUEUE,IN_PROGRESS&marketplaceIds=${encodeURIComponent(marketplaceId)}&createdSince=${encodeURIComponent(createdSince)}&pageSize=100`;
+        const list = await this.request(listPath);
+        if (!list.ok) throw new Error(`List settlement reports failed: ${list.status}`);
+        const page = z.object({ reports: z.array(z.object({ reportId: z.string(),reportDocumentId:z.string().optional(),processingStatus:z.string().optional(),dataStartTime:z.string().optional(),dataEndTime:z.string().optional(),createdTime:z.string().optional() })).default([]), nextToken: z.string().optional() }).parse(await list.json());
+        reports.push(...page.reports); nextToken = page.nextToken;
+      } while (nextToken);
       const requestedStart = new Date(parsedRange.start).getTime();
       const requestedEnd = new Date(parsedRange.end).getTime();
-      const matchingReports = reports
-        .filter(item => item.reportDocumentId && (!item.dataEndTime || new Date(item.dataEndTime).getTime() >= requestedStart) && (!item.dataStartTime || new Date(item.dataStartTime).getTime() <= requestedEnd))
-        .sort((a, b) => new Date(b.dataEndTime ?? b.createdTime ?? 0).getTime() - new Date(a.dataEndTime ?? a.createdTime ?? 0).getTime())
-        .slice(0, 10);
+      const candidates=reports.filter(item=>(!item.dataEndTime||new Date(item.dataEndTime).getTime()>requestedStart)&&(!item.dataStartTime||new Date(item.dataStartTime).getTime()<requestedEnd));
+      for(const report of candidates){if(report.reportDocumentId)continue;for(let attempt=0;attempt<REPORT_POLL_ATTEMPTS;attempt++){const poll=await this.request(`/reports/2021-06-30/reports/${report.reportId}`);if(!poll.ok)throw new Error(`Poll settlement report failed: ${poll.status}`);const state=await poll.json();report.processingStatus=state.processingStatus;report.reportDocumentId=state.reportDocumentId;if(state.processingStatus==='DONE'&&state.reportDocumentId)break;if(['CANCELLED','FATAL'].includes(state.processingStatus))break;await new Promise(resolve=>setTimeout(resolve,REPORT_POLL_INTERVAL_MS));}}
+      const matchingReports = candidates.filter(item=>item.processingStatus!=='CANCELLED'&&item.processingStatus!=='FATAL'&&item.reportDocumentId).sort((a,b)=>new Date(b.dataEndTime??b.createdTime??0).getTime()-new Date(a.dataEndTime??a.createdTime??0).getTime());
       if (!matchingReports.length) throw new Error('No completed Amazon settlement report is available for this date range yet');
       const documents = [];
-      for (const report of matchingReports) documents.push(await this.downloadReportDocument(report.reportDocumentId));
-      const content = documents.map((document, index) => index === 0 ? document.content : document.content.split(/\r?\n/).slice(1).join('\n')).join('\n');
-      return { reportId: matchingReports[0].reportId, reportDocumentId: matchingReports[0].reportDocumentId, content, compressionAlgorithm: 'MERGED_SETTLEMENT_REPORTS', reportsMerged: matchingReports.length };
+      for (const report of matchingReports) documents.push({ ...report, ...(await this.downloadReportDocument(report.reportDocumentId)) });
+      return { reportId: matchingReports[0].reportId, reportDocumentId: matchingReports[0].reportDocumentId, content: documents[0].content, documents, coverage: matchingReports };
     }
     const reportOptions = parsedReportType === 'GET_SALES_AND_TRAFFIC_REPORT'
       ? { dateGranularity: 'DAY', asinGranularity: 'CHILD' }
@@ -167,11 +173,12 @@ export class SpApiClient {
       dataEndTime: parsedRange.end,
       ...(reportOptions ? { reportOptions } : {})
     };
-    let create = await this.request('/reports/2021-06-30/reports', {
+    let rangeApplied=true;let create = await this.request('/reports/2021-06-30/reports', {
       method: 'POST',
       body: JSON.stringify(createReportBody)
     });
     if (!create.ok && create.status === 400) {
+      rangeApplied=false;
       create = await this.request('/reports/2021-06-30/reports', {
         method: 'POST',
         body: JSON.stringify({ reportType: parsedReportType, marketplaceIds: [marketplaceId] })
@@ -196,16 +203,17 @@ export class SpApiClient {
 
     const documentToken = GST_REPORTS.has(parsedReportType) ? await this.restrictedDataToken(reportDocumentId) : undefined;
     const downloaded = await this.downloadReportDocument(reportDocumentId, documentToken);
-    return { reportId, reportDocumentId, ...downloaded };
+    return { reportId, reportDocumentId,requestedRangeApplied:rangeApplied, ...downloaded };
   }
 
   async downloadReportDocument(reportDocumentId, token) {
     const document = await this.request(`/reports/2021-06-30/documents/${encodeURIComponent(reportDocumentId)}`, {}, token);
     if (!document.ok) throw new Error(`Document lookup failed: ${document.status}`);
-    const { url, compressionAlgorithm } = z.object({ url: z.string().url(), compressionAlgorithm: z.string().optional() }).parse(await document.json());
+    const { url, compressionAlgorithm,encryptionDetails } = z.object({ url:z.string().url(),compressionAlgorithm:z.string().optional(),encryptionDetails:z.object({standard:z.string(),key:z.string(),initializationVector:z.string()}).optional() }).parse(await document.json());
     const download = await fetch(url);
     if (!download.ok) throw new Error(`Document download failed: ${download.status}`);
-    const buffer = Buffer.from(await download.arrayBuffer());
+    let buffer = Buffer.from(await download.arrayBuffer());
+    if(encryptionDetails){const key=Buffer.from(encryptionDetails.key,'base64');const algorithm=encryptionDetails.standard.toUpperCase().includes('AES')?`aes-${key.length*8}-cbc`:null;if(!algorithm)throw new Error(`Unsupported report encryption: ${encryptionDetails.standard}`);const decipher=createDecipheriv(algorithm,key,Buffer.from(encryptionDetails.initializationVector,'base64'));buffer=Buffer.concat([decipher.update(buffer),decipher.final()]);}
     let content = buffer.toString('utf8');
     if (compressionAlgorithm === 'GZIP') {
       try { content = gunzipSync(buffer).toString('utf8'); } catch { content = buffer.toString('utf8'); }
@@ -246,6 +254,7 @@ export class SpApiClient {
     if (!res.ok) throw new Error(`List order items failed: ${res.status}`);
     return res.json();
   }
+  async listOrderItemsByNextToken(orderId,nextToken){const id=z.string().min(1).parse(orderId);const token=z.string().min(1).parse(nextToken);const res=await this.request(`/orders/v0/orders/${encodeURIComponent(id)}/orderItems?NextToken=${encodeURIComponent(token)}`);if(!res.ok)throw new Error(`List order items page failed: ${res.status}`);return res.json();}
 
   /** Fetches Amazon's catalog attributes used for package weight and dimensions. */
   async getCatalogItem(asin, marketplaceId = INDIA_MARKETPLACE_ID) {

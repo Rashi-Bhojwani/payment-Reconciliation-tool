@@ -1,4 +1,5 @@
 import cron from 'node-cron';
+import { createHash } from 'node:crypto';
 import pLimit from 'p-limit';
 import { z } from 'zod';
 import { assertActiveTenant, pool, withTenant } from '@recon/db';
@@ -118,16 +119,44 @@ function parseReportRows(reportType, content) {
 }
 
 /** @param {string} tenantId @param {string} content */
-async function saveSettlementRows(tenantId, content) {
+async function saveSettlementRows(tenantId, content, source = {}) {
   const rows = z.array(ReportRowSchema).parse(parseReportRows('GET_V2_SETTLEMENT_REPORT_DATA_FLAT_FILE_V2', content));
+  const contentHash=createHash('sha256').update(content).digest('hex');
+  const starts=rows.map(row=>reportDate(pick(row,['settlement-start-date','settlement start date']))).filter(Boolean).map(value=>new Date(value)).filter(value=>!Number.isNaN(value.getTime()));
+  const ends=rows.map(row=>reportDate(pick(row,['settlement-end-date','settlement end date']))).filter(Boolean).map(value=>new Date(value)).filter(value=>!Number.isNaN(value.getTime()));
+  const dataStartTime=source.dataStartTime??(starts.length?new Date(Math.min(...starts)).toISOString():null);
+  const dataEndTime=source.dataEndTime??(ends.length?new Date(Math.max(...ends)).toISOString():null);
   await withTenant(tenantId, async client => {
-    for (const row of rows) {
+    if (source.reportId) await client.query(
+      `insert into settlement_reports(tenant_id,report_id,document_id,marketplace_id,data_start_time,data_end_time,created_time,content_hash,parsed_row_count,import_status)
+       values($1,$2,$3,$4,$5,$6,$7,$8,$9,'imported') on conflict(tenant_id,report_id) do update set imported_at=now(),content_hash=excluded.content_hash,parsed_row_count=excluded.parsed_row_count,import_status='imported'`,
+      [tenantId,source.reportId,source.reportDocumentId,source.marketplaceId,dataStartTime,dataEndTime,source.createdTime,contentHash,rows.length]
+    );
+    for (const [index,row] of rows.entries()) {
       const amount = number(pick(row, ['amount']));
+      const currency = text(pick(row,['currency'])) ?? 'INR';
+      const lineHash=createHash('sha256').update(`${source.reportDocumentId??''}|${index+2}|${JSON.stringify(row)}`).digest('hex');
       await client.query(
-        `insert into settlement_rows(tenant_id, settlement_id, order_id, amount_type, amount_description, amount, posted_date, raw)
-         values($1,$2,$3,$4,$5,$6,$7,$8) on conflict do nothing`,
-        [tenantId, text(pick(row, ['settlement-id', 'settlement id', 'settlementId'])), text(pick(row, ['order-id', 'order id', 'amazon-order-id', 'amazonOrderId'])), text(pick(row, ['amount-type', 'amount type', 'amountType'])), text(pick(row, ['amount-description', 'amount description', 'amountDescription'])), amount, reportDate(pick(row, ['posted-date', 'posted date', 'postedDate'])), row]
+        `insert into settlement_rows(tenant_id,settlement_id,order_id,amount_type,amount_description,amount,amount_minor,currency,posted_date,raw,source_report_id,source_document_id,source_line_number,source_line_hash,transaction_type,shipment_id,marketplace_name,settlement_start_date,settlement_end_date,deposit_date,header_total_minor)
+         values($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21) on conflict do nothing`,
+        [tenantId,text(pick(row,['settlement-id','settlement id','settlementId'])),text(pick(row,['order-id','order id','amazon-order-id','amazonOrderId'])),text(pick(row,['amount-type','amount type','amountType'])),text(pick(row,['amount-description','amount description','amountDescription'])),amount,Math.round(amount*100),currency,reportDate(pick(row,['posted-date','posted date','postedDate'])),row,source.reportId,source.reportDocumentId,index+2,lineHash,text(pick(row,['transaction-type'])),text(pick(row,['shipment-id'])),text(pick(row,['marketplace-name'])),reportDate(pick(row,['settlement-start-date'])),reportDate(pick(row,['settlement-end-date'])),reportDate(pick(row,['deposit-date'])),pick(row,['total-amount'])==null?null:Math.round(number(pick(row,['total-amount']))*100)]
       );
+    }
+    const settlements=new Map();
+    for(const row of rows){
+      const settlementId=text(pick(row,['settlement-id','settlement id','settlementId'])); if(!settlementId) continue;
+      const state=settlements.get(settlementId)??{header:null,detailMinor:0,count:0};
+      const rowAmount=pick(row,['amount']); const headerTotal=pick(row,['total-amount','total amount','totalAmount']);
+      if((rowAmount==null||String(rowAmount).trim()==='')&&headerTotal!=null) state.header=Math.round(number(headerTotal)*100);
+      else {state.detailMinor+=Math.round(number(rowAmount)*100);state.count++;}
+      settlements.set(settlementId,state);
+    }
+    for(const [settlementId,state] of settlements){
+      if(state.header==null) continue;
+      const difference=state.detailMinor-state.header;
+      await client.query(`insert into settlement_controls(tenant_id,report_id,document_id,settlement_id,header_total_minor,detail_total_minor,control_difference_minor,imported_row_count,completeness_status)
+        values($1,$2,$3,$4,$5,$6,$7,$8,$9) on conflict(tenant_id,report_id,settlement_id) do update set header_total_minor=excluded.header_total_minor,detail_total_minor=excluded.detail_total_minor,control_difference_minor=excluded.control_difference_minor,imported_row_count=excluded.imported_row_count,completeness_status=excluded.completeness_status,validated_at=now()`,
+      [tenantId,source.reportId,source.reportDocumentId,settlementId,state.header,state.detailMinor,difference,state.count,difference===0?'complete':'reconciliation_error']);
     }
   });
   return rows.length;
@@ -250,10 +279,18 @@ export async function syncReportForTenant(params) {
       if (!seller.rowCount) throw new Error('No connected Amazon seller account');
       const client = new SpApiClient(decryptSecret(seller.rows[0].refresh_token_encrypted), { baseUrl: getSpApiEndpoint(seller.rows[0].marketplace_id) });
       const report = await client.fetchReport(parsed.reportType, parsed.tenantId, range, seller.rows[0].marketplace_id);
-      const s3Key = await putRawReport({ tenantId: parsed.tenantId, reportType: parsed.reportType, reportId: report.reportId, content: report.content });
-      const rowsImported = await saveStructuredRows(parsed.tenantId, parsed.reportType, report.content, range);
+      let rowsImported=0; let s3Key;
+      if(parsed.reportType==='GET_V2_SETTLEMENT_REPORT_DATA_FLAT_FILE_V2'){
+        for(const document of report.documents??[report]){
+          s3Key=await putRawReport({tenantId:parsed.tenantId,reportType:parsed.reportType,reportId:document.reportId,content:document.content});
+          rowsImported+=await saveSettlementRows(parsed.tenantId,document.content,{...document,marketplaceId:seller.rows[0].marketplace_id});
+        }
+      }else{
+        s3Key=await putRawReport({tenantId:parsed.tenantId,reportType:parsed.reportType,reportId:report.reportId,content:report.content});
+        rowsImported=await saveStructuredRows(parsed.tenantId,parsed.reportType,report.content,range);
+      }
       await pool.query('update sync_jobs set status=$1, completed_at=now(), s3_key=$2 where id=$3', ['completed', s3Key, sync.rows[0].id]);
-      return { rowsImported, s3Key };
+      return { rowsImported, s3Key,requestedRangeApplied:report.requestedRangeApplied??true,reportsDiscovered:report.documents?.length??1 };
     } catch (error) {
       await pool.query('update sync_jobs set status=$1, completed_at=now(), error_message=$2 where id=$3', ['failed', error instanceof Error ? error.message : 'unknown error', sync.rows[0].id]);
       throw error;
@@ -293,6 +330,7 @@ export async function syncRecentApiDataForTenant(tenantId, options = {}) {
       const marketplaceId = seller.rows[0].marketplace_id;
       const client = new SpApiClient(decryptSecret(seller.rows[0].refresh_token_encrypted), { baseUrl: getSpApiEndpoint(marketplaceId) });
       let ordersWarning;
+      let ordersNextTokenPresent=false,financeNextTokenPresent=false;
       const orderPages = [];
       if (includeOrders) {
         try {
@@ -304,6 +342,7 @@ export async function syncRecentApiDataForTenant(tenantId, options = {}) {
             ordersResponse = await client.listOrdersByNextToken(nextToken);
             orderPages.push(ordersResponse);
           }
+          ordersNextTokenPresent=Boolean(ordersResponse?.payload?.NextToken??ordersResponse?.NextToken);
         } catch (error) {
           ordersWarning = error instanceof Error ? error.message : 'Orders sync failed';
         }
@@ -324,6 +363,7 @@ export async function syncRecentApiDataForTenant(tenantId, options = {}) {
         financePages.push(financeResponse);
         if (financeResponse.syncError) break;
       }
+      financeNextTokenPresent=Boolean(financeResponse?.payload?.nextToken??financeResponse?.nextToken??financeResponse?.payload?.NextToken??financeResponse?.NextToken);
       const transactions = financePages.flatMap(page => page?.payload?.transactions ?? page?.transactions ?? page?.payload?.Transactions ?? page?.Transactions ?? []);
       const inventoryResponse = includeInventory ? await client.listInventorySummaries(marketplaceId).catch(error => ({ syncError: error instanceof Error ? error.message : 'Inventory sync failed' })) : null;
       const inventorySummaries = inventoryResponse?.payload?.inventorySummaries ?? inventoryResponse?.inventorySummaries ?? [];
@@ -336,7 +376,7 @@ export async function syncRecentApiDataForTenant(tenantId, options = {}) {
       let catalogItemsImported = 0;
       const catalogCache = new Map();
       await withTenant(parsedTenantId, async db => {
-        let orderItemsFetched = 0;
+        let orderItemsFetched = 0, itemPagesFetched=0, itemPagesFailed=0;
         for (const order of orders) {
           const orderId = order.AmazonOrderId ?? order.amazonOrderId;
           if (!orderId) continue;
@@ -349,7 +389,7 @@ export async function syncRecentApiDataForTenant(tenantId, options = {}) {
           );
           ordersImported += 1;
           const existingItems = await db.query('select 1 from order_items where tenant_id=$1 and amazon_order_id=$2 limit 1', [parsedTenantId, orderId]);
-          if (existingItems.rowCount) {
+          if (existingItems.rowCount&&!options.full) {
             orderItemsSkipped += 1;
             continue;
           }
@@ -357,9 +397,12 @@ export async function syncRecentApiDataForTenant(tenantId, options = {}) {
             orderItemsSkipped += 1;
             continue;
           }
-          const itemsResponse = await client.listOrderItems(orderId).catch(() => undefined);
+          let itemsResponse;
+          try{itemsResponse=await client.listOrderItems(orderId);itemPagesFetched++;}catch{itemPagesFailed++;}
           orderItemsFetched += 1;
-          const items = itemsResponse?.payload?.OrderItems ?? itemsResponse?.OrderItems ?? [];
+          const itemPages=itemsResponse?[itemsResponse]:[];const tokens=new Set();
+          while(itemsResponse){const nextToken=itemsResponse?.payload?.NextToken??itemsResponse?.NextToken;if(!nextToken||tokens.has(nextToken))break;tokens.add(nextToken);try{itemsResponse=await client.listOrderItemsByNextToken(orderId,nextToken);itemPages.push(itemsResponse);itemPagesFetched++;}catch{itemPagesFailed++;break;}}
+          const items = itemPages.flatMap(page=>page?.payload?.OrderItems??page?.OrderItems??[]);
           for (const item of items) {
             const asin = item.ASIN ?? item.asin ?? null;
             let catalog = asin ? catalogCache.get(asin) : null;
@@ -447,7 +490,7 @@ export async function syncRecentApiDataForTenant(tenantId, options = {}) {
         }
       });
       await pool.query('update sync_jobs set status=$1, completed_at=now() where id=$2', ['completed', sync.rows[0].id]);
-      return { ordersImported, transactionsImported, inventoryImported, reimbursementsImported, catalogItemsImported, orderItemsSkipped, incrementalSince: createdAfter, incrementalUntil: createdBefore, ordersWarning, financeWarning: financeResponse?.syncError, inventoryWarning: inventoryResponse?.syncError };
+      return { ordersImported,orderItemsImported:orderItemsFetched,itemPagesFetched,itemPagesFailed,ordersNextTokenPresent,financeNextTokenPresent,transactionsImported,inventoryImported,reimbursementsImported,catalogItemsImported,orderItemsSkipped,incrementalSince:createdAfter,incrementalUntil:createdBefore,ordersWarning,financeWarning:financeResponse?.syncError,inventoryWarning:inventoryResponse?.syncError };
     } catch (error) {
       await pool.query('update sync_jobs set status=$1, completed_at=now(), error_message=$2 where id=$3', ['failed', error instanceof Error ? error.message : 'unknown error', sync.rows[0].id]);
       throw error;
@@ -455,37 +498,6 @@ export async function syncRecentApiDataForTenant(tenantId, options = {}) {
   }, 1);
 }
 
-
-/** @param {string} tenantId @param {'b2b'|'b2c'} invoiceType */
-export async function buildGstInvoicesFromOrderItems(tenantId, invoiceType) {
-  const parsedTenantId = z.string().uuid().parse(tenantId);
-  const parsedInvoiceType = z.enum(['b2b', 'b2c']).parse(invoiceType);
-  await assertActiveTenant(parsedTenantId);
-  return withTenant(parsedTenantId, async db => {
-    const result = await db.query(
-      `insert into gst_invoices(tenant_id, invoice_type, order_id, taxable_value, cgst, sgst, igst, invoice_date)
-       select oi.tenant_id,
-         $2,
-         oi.amazon_order_id,
-         sum(greatest(coalesce(oi.item_price,0) - coalesce(oi.item_tax,0), 0)) taxable_value,
-         sum(coalesce(oi.item_tax,0) / 2) cgst,
-         sum(coalesce(oi.item_tax,0) / 2) sgst,
-         0 igst,
-         date(coalesce(o.order_date, now())) invoice_date
-       from order_items oi
-       left join orders o on o.tenant_id=oi.tenant_id and o.amazon_order_id=oi.amazon_order_id
-       where oi.tenant_id=$1
-       group by oi.tenant_id, oi.amazon_order_id, date(coalesce(o.order_date, now()))
-       on conflict (tenant_id, invoice_type, order_id, invoice_date) do update set
-         taxable_value=excluded.taxable_value,
-         cgst=excluded.cgst,
-         sgst=excluded.sgst,
-         igst=excluded.igst`,
-      [parsedTenantId, parsedInvoiceType]
-    );
-    return result.rowCount ?? 0;
-  });
-}
 
 /** @param {string} reportType */
 async function syncActiveTenants(reportType) {
