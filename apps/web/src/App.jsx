@@ -539,8 +539,8 @@ function DashboardOverview({ data, channelData, tenantId }) {
     <div className="metrics-strip">
       <DrillMetric to={`/seller?tenantId=${tenantId}&view=metric-detail&metric=netSales`} title="Net Sales" value={formatCurrency(summary.netSales)} hint="Click to see order-value formula" />
       <DrillMetric to={`/seller?tenantId=${tenantId}&view=metric-detail&metric=netQty`} title="Net Qty" value={formatNumber(summary.netQty)} hint="Click to see units source" />
-      <MiniMetric title="Orders Synced" value={formatNumber(summary.ordersCount)} hint="Use Order Reconciliation for details" />
-      <MiniMetric title="Returns" value={formatNumber(summary.returnQty)} hint="Use Returns for source rows" />
+      <DrillMetric to={`/seller?tenantId=${tenantId}&view=metric-detail&metric=orders`} title="Orders Synced" value={formatNumber(summary.ordersCount)} hint="Distinct eligible Amazon order IDs" />
+      <DrillMetric to={`/seller?tenantId=${tenantId}&view=metric-detail&metric=returns`} title="Returns" value={formatNumber(summary.returnQty)} hint="Total returned quantity" />
     </div>
 
     <Card className="profit-control-card">
@@ -555,6 +555,13 @@ function DashboardOverview({ data, channelData, tenantId }) {
 
     <ExplanationGrid summary={summary} tenantId={tenantId} />
 
+    <Card className="profit-control-card">
+      <PanelHeader title="Amazon Account Activity" subtitle="Matches Amazon statement sections" />
+      <div className="profit-kpi-grid account-activity-grid">
+        {['income','expenses','tax','transfers','gst'].map(metric=><DrillMetric key={metric} to={`/seller?tenantId=${tenantId}&view=metric-detail&metric=${metric}`} title={metric==='gst'?'Goods and Services Tax':metric[0].toUpperCase()+metric.slice(1)} value={formatCurrency(data?.dashboardCalculations?.statement?.[metric]?.value)} hint="Open Amazon source rows and formula" />)}
+      </div>
+    </Card>
+
     <SalesAnalytics data={data} channelData={channelData} />
 
     <div className="dashboard-grid two">
@@ -567,14 +574,12 @@ function DashboardOverview({ data, channelData, tenantId }) {
 
 function DrillMetric({ to, title, value, hint }) { return <NavLink to={to} className="mini-metric drill-metric"><span>{title}</span><strong>{value}</strong>{trendHint(hint)}<em>View calculation →</em></NavLink>; }
 function ExplanationGrid({ summary, tenantId }) {
-  const returnRate = summary.netQty ? `${Math.round((summary.returnQty / summary.netQty) * 100)}%` : '0%';
   const cards = [
-    ['Fee impact', formatCurrency(summary.deductions), 'Amazon fees, refunds and other charges imported from finance / settlement lines.', 'deductions'],
-    ['Return rate', returnRate, 'Returns compared with total sold quantity for quick customer-experience review.', 'returns'],
-    ['GST invoice value', formatCurrency(summary.gstValue), 'Total taxable value imported from GST B2B/B2C invoice rows.', 'tax']
+    ['Fee impact', `${Number(summary.feeImpact).toLocaleString('en-IN',{maximumFractionDigits:2})}%`, 'Net Amazon fees excluding TCS/TDS as a percentage of gross product sales.', 'feeImpact'],
+    ['Return rate', `${Number(summary.returnRate).toLocaleString('en-IN',{maximumFractionDigits:2})}%`, 'Returned units divided by shipped units.', 'returnRate'],
+    ['GST invoice value', formatCurrency(summary.gstValue), 'Sales-invoice taxable value minus credit-note/refund taxable value.', 'gstValue']
   ];
-  const calculationMetrics = new Set(['settled', 'deductions']);
-  return <div className="explain-grid">{cards.map(([title, value, copy, target]) => <NavLink key={title} to={calculationMetrics.has(target) ? `/seller?tenantId=${tenantId}&view=metric-detail&metric=${target}` : `/seller?tenantId=${tenantId}&view=${target}`} className="explain-card"><b>{title}</b><strong>{value}</strong><p>{copy}</p><span>{calculationMetrics.has(target) ? 'Open calculation' : 'Open source rows'} →</span></NavLink>)}</div>;
+  return <div className="explain-grid">{cards.map(([title, value, copy, target]) => <NavLink key={title} to={`/seller?tenantId=${tenantId}&view=metric-detail&metric=${target}`} className="explain-card"><b>{title}</b><strong>{value}</strong><p>{copy}</p><span>Open calculation →</span></NavLink>)}</div>;
 }
 function InsightCards({ title, cards }) { return <Card><PanelHeader title={title} /><div className="explain-grid compact">{cards.map(([label, value]) => <div className="explain-card" key={label}><b>{label}</b><strong>{value}</strong></div>)}</div></Card>; }
 
@@ -678,32 +683,33 @@ function MetricDetail({ metric, tenantId }) {
   const deductionCategories = new Set(['referral_commission','fulfillment_fee_per_order','fulfillment_fee_per_unit','fulfillment_fee_weight','shipping_fee','storage_fee','chargeback','tax','promotion']);
   return <>
     <Card className="detail-hero">
-      <PanelHeader title={String(metric).replace(/([A-Z])/g, ' $1').trim()} subtitle={formatCurrency(details.total)} />
-      <p className="detail-note">Calculated directly from persisted Amazon rows for the selected period{details.source ? ` · ${details.source}` : ''}.</p>
-      <div className="calculation-components">{details.components.map(component => <div key={component.category} className={deductionCategories.has(component.category) ? 'negative' : ''}><span>{component.label}</span><small>{formatNumber(component.count)} rows</small><strong>{metric === 'netQty' ? formatNumber(component.amount) : formatCurrency(component.amount)}</strong></div>)}<div className="total"><span>Total</span><strong>{metric === 'netQty' ? formatNumber(details.total) : formatCurrency(details.total)}</strong></div></div>
+      <PanelHeader title={String(metric).replace(/([A-Z])/g, ' $1').trim()} subtitle={details.unit==='percentage'?`${formatNumber(details.total)}%`:details.unit==='quantity'?formatNumber(details.total):formatCurrency(details.total)} />
+      <p className="detail-note"><b>Formula:</b> {details.formula}. Calculated directly from persisted Amazon rows for the selected period.</p>
+      <div className="calculation-components">{details.components.map(component => <div key={component.category} className={deductionCategories.has(component.category) ? 'negative' : ''}><span>{component.operation} {component.label}</span><small>{formatNumber(component.count)} source rows</small><strong>{details.unit==='quantity'||component.category==='days'?formatNumber(component.amount):formatCurrency(component.amount)}</strong></div>)}<div className="total"><span>Total ({details.unit})</span><strong>{details.unit==='percentage'?`${formatNumber(details.total)}%`:details.unit==='quantity'?formatNumber(details.total):formatCurrency(details.total)}</strong></div></div>
       <div className="detail-actions"><Button variant="secondary" onClick={() => navigate(`/seller?tenantId=${tenantId}&view=dashboard`)}>← Back</Button><Button variant="accent" onClick={() => downloadCsv(`${metric}-calculation.csv`, details.rows, details.columns)} disabled={!details.rows.length}>Download calculation CSV</Button></div>
     </Card>
     <TableCard title="Actual database rows used" rows={details.rows} columns={details.columns} pageSize={10} />
   </>;
 }
 function buildDashboardSummary(data, range = defaultDateRange()) {
+  const calculated=data?.dashboardCalculations?.metrics;
   const products = data?.products ?? [];
   const returns = data?.returns ?? [];
   const payments = data?.payments ?? [];
   const reimbursements = data?.reimbursements ?? [];
   const invoices = data?.invoices ?? [];
   const orderItems = data?.orderItems ?? [];
-  const ordersCount = Number(data?.orders?.orders ?? 0);
-  const netSales = amazonNetSales(data);
-  const netQty = products.reduce((sum, product) => sum + Number(product.units ?? 0), 0) || orderItems.reduce((sum, item) => sum + Number(item.quantity_ordered ?? 0), 0);
-  const returnQty = returns.length;
-  const settledAmount = payments.reduce((sum, payment) => sum + Number(payment.net_amount ?? 0), 0) || Number(data?.kpis?.net_settled ?? 0);
-  const deductions = amazonDeductions(data);
-  const reimbursementAmount = reimbursements.reduce((sum, row) => sum + Number(row.amount ?? 0), 0);
+  const ordersCount = Number(calculated?.orders?.value??data?.orders?.orders??0);
+  const netSales = Number(calculated?.netSales?.value??amazonNetSales(data));
+  const netQty = Number(calculated?.netQty?.value??(products.reduce((sum, product) => sum + Number(product.units ?? 0), 0) || orderItems.reduce((sum, item) => sum + Number(item.quantity_ordered ?? 0), 0)));
+  const returnQty = Number(calculated?.returns?.value??returns.length);
+  const settledAmount = Number(calculated?.settled?.value??(payments.reduce((sum, payment) => sum + Number(payment.net_amount ?? 0), 0) || Number(data?.kpis?.net_settled??0)));
+  const deductions = Number(calculated?.deductions?.value??amazonDeductions(data));
+  const reimbursementAmount = Number(calculated?.reimbursements?.value??reimbursements.reduce((sum, row) => sum + Number(row.amount ?? 0), 0));
   const estimatedProfit = settledAmount || Math.max(0, netSales - deductions + reimbursementAmount);
   const profitRate = netSales ? Math.round((estimatedProfit / netSales) * 100) : 0;
   const selectedDays = Math.max(1, Math.round((startOfDay(range.end) - startOfDay(range.start)) / 864e5) + 1);
-  const drr = netSales / selectedDays;
+  const drr = Number(calculated?.drr?.value??netSales/selectedDays);
   const netAsp = netQty ? netSales / netQty : 0;
   const baseRow = {
     view: 'Amazon-India',
@@ -741,7 +747,8 @@ function buildDashboardSummary(data, range = defaultDateRange()) {
     profitRate,
     drr,
     ordersCount,
-    gstValue: invoices.reduce((sum, row) => sum + Number(row.taxable_value ?? 0), 0),
+    feeImpact:Number(calculated?.feeImpact?.value??0),returnRate:Number(calculated?.returnRate?.value??0),
+    gstValue: Number(calculated?.gstValue?.value??invoices.reduce((sum, row) => sum + Number(row.taxable_value ?? 0), 0)),
     profitRows: [baseRow, totalRow],
     returnRows: [returnSummary, { ...returnSummary, channel: 'Total' }],
     reconcileRows: [
