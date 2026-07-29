@@ -537,7 +537,7 @@ function DashboardOverview({ data, channelData, tenantId }) {
   const summary = useMemo(() => buildDashboardSummary(data, range), [data, range]);
   return <>
     <div className="metrics-strip">
-      <DrillMetric to={`/seller?tenantId=${tenantId}&view=metric-detail&metric=netSales`} title="Net Sales" value={formatCurrency(summary.netSales)} hint="Click to see order-value formula" />
+      <DrillMetric to={`/seller?tenantId=${tenantId}&view=metric-detail&metric=netSales`} title="Net Sales" value={summary.netSales==null?'Incomplete source data':formatCurrency(summary.netSales)} hint="Click to see order-value formula" />
       <DrillMetric to={`/seller?tenantId=${tenantId}&view=metric-detail&metric=netQty`} title="Net Qty" value={summary.netQty==null?'Unavailable':formatNumber(summary.netQty)} hint="Click to see units source" />
       <DrillMetric to={`/seller?tenantId=${tenantId}&view=metric-detail&metric=orders`} title="Orders Synced" value={formatNumber(summary.ordersCount)} hint="Distinct eligible Amazon order IDs" />
       <DrillMetric to={`/seller?tenantId=${tenantId}&view=metric-detail&metric=returns`} title="Returns" value={formatNumber(summary.returnQty)} hint="Total returned quantity" />
@@ -546,10 +546,10 @@ function DashboardOverview({ data, channelData, tenantId }) {
     <Card className="profit-control-card">
       <PanelHeader title="Profit Analysis" subtitle="Clean overview" />
       <div className="profit-kpi-grid">
-        <DrillMetric to={`/seller?tenantId=${tenantId}&view=metric-detail&metric=settled`} title="Settled Amount" value={formatCurrency(summary.settledAmount)} hint="From settlements / finance" />
-        <DrillMetric to={`/seller?tenantId=${tenantId}&view=metric-detail&metric=deductions`} title="Deductions" value={formatCurrency(summary.deductions)} hint="Fees, refunds, charges" />
-        <DrillMetric to={`/seller?tenantId=${tenantId}&view=metric-detail&metric=reimbursements`} title="Reimbursements" value={formatCurrency(summary.reimbursements)} hint="Credits imported" />
-        <DrillMetric to={`/seller?tenantId=${tenantId}&view=metric-detail&metric=drr`} title="DRR" value={formatCurrency(summary.drr)} hint="Daily run rate" />
+        <DrillMetric to={`/seller?tenantId=${tenantId}&view=metric-detail&metric=settled`} title="Settled Amount" value={summary.settledAmount==null?'Unavailable':formatCurrency(summary.settledAmount)} hint="Successful deposits by deposit date" />
+        <DrillMetric to={`/seller?tenantId=${tenantId}&view=metric-detail&metric=deductions`} title="Deductions" value={summary.deductions==null?'Incomplete source data':formatCurrency(summary.deductions)} hint="Fees, refunds, charges" />
+        <DrillMetric to={`/seller?tenantId=${tenantId}&view=metric-detail&metric=reimbursements`} title="Reimbursements" value={summary.reimbursements==null?'Incomplete source data':formatCurrency(summary.reimbursements)} hint="Credits imported" />
+        <DrillMetric to={`/seller?tenantId=${tenantId}&view=metric-detail&metric=drr`} title="DRR" value={summary.drr==null?'Incomplete source data':formatCurrency(summary.drr)} hint="Daily run rate" />
       </div>
     </Card>
 
@@ -557,8 +557,9 @@ function DashboardOverview({ data, channelData, tenantId }) {
 
     <Card className="profit-control-card">
       <PanelHeader title="Amazon Account Activity" subtitle="Matches Amazon statement sections" />
+      {data?.dashboardCalculations?.diagnostics?.sourceComplete===false&&<p className="alert error"><b>Reconciliation failed: incomplete settlement source data.</b> Missing or uncontrolled settlement IDs: {(data.dashboardCalculations.diagnostics.missingSettlementIds??[]).join(', ')||'report document metadata unavailable'}. Re-sync the V2 Settlement report for this period.</p>}
       <div className="profit-kpi-grid account-activity-grid">
-        {['income','expenses','tax','transfers','gst'].map(metric=><DrillMetric key={metric} to={`/seller?tenantId=${tenantId}&view=metric-detail&metric=${metric}`} title={metric==='gst'?'Goods and Services Tax':metric[0].toUpperCase()+metric.slice(1)} value={formatCurrency(data?.dashboardCalculations?.statement?.[metric]?.value)} hint="Open Amazon source rows and formula" />)}
+        {['income','expenses','tax','transfers','gst'].map(metric=>{const detail=data?.dashboardCalculations?.statement?.[metric];return <DrillMetric key={metric} to={`/seller?tenantId=${tenantId}&view=metric-detail&metric=${metric}`} title={metric==='gst'?'Goods and Services Tax':metric[0].toUpperCase()+metric.slice(1)} value={detail?.status??formatCurrency(detail?.value)} hint="Open Amazon source rows and formula" />})}
       </div>
     </Card>
 
@@ -686,8 +687,11 @@ function MetricDetail({ metric, tenantId }) {
     <Card className="detail-hero">
       <PanelHeader title={String(metric).replace(/([A-Z])/g, ' $1').trim()} subtitle={details.status??(details.unit==='percentage'?`${formatNumber(details.total)}%`:details.unit==='quantity'?formatNumber(details.total):formatCurrency(details.total))} />
       <p className="detail-note"><b>Selected range:</b> {String(details.range?.start??range.start)} → {String(details.range?.end??range.end)} (end exclusive)<br/><b>Source:</b> {details.source}<br/><b>Formula:</b> {details.formula}.</p>
+      <p className="detail-note"><b>Amazon marketplace range:</b> {details.marketplaceRange?.start} → {details.marketplaceRange?.end} ({details.marketplaceRange?.timeZone}, end exclusive).</p>
+      {details.diagnostics?.sourceComplete===false&&<p className="alert error"><b>Incomplete source data.</b> Missing or failed settlement controls: {(details.diagnostics.missingSettlementIds??[]).join(', ')||'report document metadata unavailable'}.</p>}
       <div className="calculation-components">{details.components.map(component => <div key={component.category} className={deductionCategories.has(component.category) ? 'negative' : ''}><span>{component.operation} {component.label}</span><small>{formatNumber(component.count)} source rows</small><strong>{component.amount==null?'Unavailable':details.unit==='quantity'||component.category==='days'?formatNumber(component.amount):formatCurrency(component.amount)}</strong></div>)}<div className="total"><span>Total ({details.unit})</span><strong>{details.status??(details.unit==='percentage'?`${formatNumber(details.total)}%`:details.unit==='quantity'?formatNumber(details.total):formatCurrency(details.total))}</strong></div></div>
       <div className="detail-note"><b>Reconciliation diagnostics:</b> {formatNumber(details.diagnostics?.includedRows)} included · {formatNumber(details.diagnostics?.excludedRows)} excluded by source precedence · {formatNumber(details.diagnostics?.duplicateRows)} duplicates removed.</div>
+      {details.diagnostics?.quantity&&<div className="detail-note"><b>Quantity source:</b> {formatNumber(details.diagnostics.quantity.eligibleOrders)} eligible orders · {formatNumber(details.diagnostics.quantity.eligibleOrderItems)} item rows · {formatNumber(details.diagnostics.quantity.rowsWithQuantity)} with quantity · {formatNumber(details.diagnostics.quantity.rowsMissingQuantity)} missing quantity · shipped {details.diagnostics.quantity.shippedUnits??'Unavailable'} · returned {details.diagnostics.quantity.returnedUnits??'Unavailable'}.</div>}
       <div className="detail-actions"><Button variant="secondary" onClick={() => navigate(`/seller?tenantId=${tenantId}&view=dashboard`)}>← Back</Button><Button variant="accent" onClick={() => downloadCsv(`${metric}-calculation.csv`, details.rows, details.columns)} disabled={!details.rows.length}>Download calculation CSV</Button></div>
     </Card>
     <TableCard title="Actual database rows used" rows={details.rows} columns={details.columns} pageSize={10} />
@@ -702,16 +706,16 @@ function buildDashboardSummary(data, range = defaultDateRange()) {
   const invoices = data?.invoices ?? [];
   const orderItems = data?.orderItems ?? [];
   const ordersCount = Number(calculated?.orders?.value??data?.orders?.orders??0);
-  const netSales = Number(calculated?.netSales?.value??amazonNetSales(data));
+  const netSales = calculated?.netSales ? calculated.netSales.value : amazonNetSales(data);
   const netQty = calculated?.netQty ? calculated.netQty.value : (products.reduce((sum, product) => sum + Number(product.units ?? 0), 0) || orderItems.reduce((sum, item) => sum + Number(item.quantity_ordered ?? 0), 0));
   const returnQty = Number(calculated?.returns?.value??returns.length);
-  const settledAmount = Number(calculated?.settled?.value??(payments.reduce((sum, payment) => sum + Number(payment.net_amount ?? 0), 0) || Number(data?.kpis?.net_settled??0)));
-  const deductions = Number(calculated?.deductions?.value??amazonDeductions(data));
-  const reimbursementAmount = Number(calculated?.reimbursements?.value??reimbursements.reduce((sum, row) => sum + Number(row.amount ?? 0), 0));
-  const estimatedProfit = settledAmount || Math.max(0, netSales - deductions + reimbursementAmount);
+  const settledAmount = calculated?.settled ? calculated.settled.value : null;
+  const deductions = calculated?.deductions ? calculated.deductions.value : null;
+  const reimbursementAmount = calculated?.reimbursements ? calculated.reimbursements.value : null;
+  const estimatedProfit = [settledAmount,netSales,deductions,reimbursementAmount].every(value=>value!=null) ? (settledAmount || Math.max(0,netSales-deductions+reimbursementAmount)) : null;
   const profitRate = netSales ? Math.round((estimatedProfit / netSales) * 100) : 0;
   const selectedDays = Math.max(1, Math.round((startOfDay(range.end) - startOfDay(range.start)) / 864e5) + 1);
-  const drr = Number(calculated?.drr?.value??netSales/selectedDays);
+  const drr = calculated?.drr ? calculated.drr.value : (netSales==null?null:netSales/selectedDays);
   const netAsp = netQty ? netSales / netQty : 0;
   const baseRow = {
     view: 'Amazon-India',

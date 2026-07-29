@@ -582,24 +582,20 @@ function groupCalculationRows(rows) {
 }
 
 async function loadDashboardCalculations(db, tenantId, range) {
-  const [orders,orderItems,returns,settlementRows,settlementHeaders,financeItems,financeTransactions,reimbursements,gstInvoices]=await Promise.all([
+  const scopedSettlementIds=(await db.query(`select distinct settlement_id from settlement_rows where tenant_id=$1 and settlement_id is not null and posted_date >= $2 and posted_date < $3`,[tenantId,range.start,range.end])).rows.map(row=>row.settlement_id);
+  const [orders,orderItems,returns,settlementRows,settlementHeaders,settlementDocuments,settlementSyncJobs,financeItems,reimbursements,gstInvoices]=await Promise.all([
     db.query('select id source_row_id,amazon_order_id,status,order_date,total_amount,raw from orders where tenant_id=$1 and order_date >= $2 and order_date < $3',[tenantId,range.start,range.end]),
     db.query(`select oi.id source_row_id,oi.amazon_order_id,oi.asin,oi.sku,oi.title,oi.quantity_ordered,oi.item_price,oi.promotion_discount,oi.raw,o.status,o.order_date from order_items oi join orders o on o.tenant_id=oi.tenant_id and o.amazon_order_id=oi.amazon_order_id where oi.tenant_id=$1 and o.order_date >= $2 and o.order_date < $3`,[tenantId,range.start,range.end]),
     db.query('select id source_row_id,order_id,return_date,return_reason,disposition,status,quantity,raw from returns where tenant_id=$1 and return_date >= $2::date and return_date < $3::date',[tenantId,range.start,range.end]),
-    db.query(`select id source_row_id,settlement_id,order_id,amount_type,amount_description,amount,posted_date,raw,
-      coalesce(raw->>'transaction-type',raw->>'transaction type',raw->>'transactionType') parent_transaction_type
-      from settlement_rows where tenant_id=$1 and posted_date >= $2 and posted_date < $3`,[tenantId,range.start,range.end]),
-    db.query(`select settlement_id,coalesce(raw->>'deposit-date',raw->>'deposit date',raw->>'depositDate') deposit_date,coalesce(nullif(raw->>'total-amount',''),nullif(raw->>'total amount',''),nullif(raw->>'totalAmount','')) total_amount,coalesce(raw->>'transaction-type',raw->>'transaction type') transaction_type,raw from settlement_rows where tenant_id=$1 and coalesce(raw->>'deposit-date',raw->>'deposit date',raw->>'depositDate','')<>''`,[tenantId]),
-    db.query(`select fi.id source_row_id,fi.transaction_id,fi.order_id,fi.sku,fi.asin,fi.category,fi.amount_description,fi.amount,fi.currency,fi.posted_date,fi.raw,
-      ft.transaction_type parent_transaction_type,
-      coalesce(ft.raw->>'accountType',ft.raw->>'AccountType',ft.raw#>>'{sellingPartnerMetadata,accountType}') account_type
-      from finance_transaction_items fi left join finance_transactions ft on ft.tenant_id=fi.tenant_id and ft.transaction_id=fi.transaction_id
-      where fi.tenant_id=$1 and fi.posted_date >= $2 and fi.posted_date < $3`,[tenantId,range.start,range.end]),
-    db.query('select transaction_id,transaction_type,posted_date,total_amount,currency,related_order_id,raw from finance_transactions where tenant_id=$1 and posted_date >= $2 and posted_date < $3',[tenantId,range.start,range.end]),
+    db.query(`select id source_row_id,settlement_id,order_id,amount_type,amount_description,amount,posted_date,raw,report_document_id,source_row_key,coalesce(raw->>'transaction-type',raw->>'transaction type',raw->>'transactionType') parent_transaction_type from settlement_rows where tenant_id=$1 and settlement_id=any($2::text[])`,[tenantId,scopedSettlementIds]),
+    db.query(`select id source_row_id,settlement_id,report_document_id,coalesce(raw->>'deposit-date',raw->>'deposit date',raw->>'depositDate') deposit_date,coalesce(nullif(raw->>'total-amount',''),nullif(raw->>'total amount',''),nullif(raw->>'totalAmount','')) total_amount,coalesce(raw->>'transaction-type',raw->>'transaction type') transaction_type,raw from settlement_rows where tenant_id=$1 and coalesce(raw->>'deposit-date',raw->>'deposit date',raw->>'depositDate','')<>''`,[tenantId]),
+    db.query(`select report_id,report_document_id,data_start_time,data_end_time,imported_at,row_count,settlement_ids from settlement_report_documents where tenant_id=$1 and settlement_ids && $2::text[] order by imported_at desc`,[tenantId,scopedSettlementIds]),
+    db.query(`select status,error_message,started_at,completed_at from sync_jobs where tenant_id=$1 and report_type='GET_V2_SETTLEMENT_REPORT_DATA_FLAT_FILE_V2' and started_at >= $2::timestamptz - interval '60 days' order by started_at desc limit 1`,[tenantId,range.start]),
+    db.query(`select fi.id source_row_id,fi.transaction_id,fi.order_id,fi.sku,fi.asin,fi.category,fi.amount_description,fi.amount,fi.currency,fi.posted_date,fi.raw,ft.transaction_type parent_transaction_type,coalesce(ft.raw->>'accountType',ft.raw->>'AccountType',ft.raw#>>'{sellingPartnerMetadata,accountType}') account_type from finance_transaction_items fi left join finance_transactions ft on ft.tenant_id=fi.tenant_id and ft.transaction_id=fi.transaction_id where fi.tenant_id=$1 and fi.posted_date >= $2 and fi.posted_date < $3`,[tenantId,range.start,range.end]),
     db.query('select amount,reason,sku,reimbursement_date from reimbursements where tenant_id=$1 and reimbursement_date >= $2::date and reimbursement_date < $3::date',[tenantId,range.start,range.end]),
     db.query('select id source_row_id,invoice_type,order_id,cgst,sgst,igst,taxable_value,invoice_date,raw from gst_invoices where tenant_id=$1 and invoice_date >= $2::date and invoice_date < $3::date',[tenantId,range.start,range.end])
   ]);
-  return calculateDashboardMetrics({orders:orders.rows,orderItems:orderItems.rows,returns:returns.rows,settlementRows:settlementRows.rows,settlementHeaders:settlementHeaders.rows,financeItems:financeItems.rows,financeTransactions:financeTransactions.rows,reimbursements:reimbursements.rows,gstInvoices:gstInvoices.rows},range);
+  return calculateDashboardMetrics({orders:orders.rows,orderItems:orderItems.rows,returns:returns.rows,scopedSettlementIds,settlementRows:settlementRows.rows,settlementHeaders:settlementHeaders.rows,settlementDocuments:settlementDocuments.rows,settlementSyncJobs:settlementSyncJobs.rows,financeItems:financeItems.rows,reimbursements:reimbursements.rows,gstInvoices:gstInvoices.rows},range);
 }
 
 app.get('/api/tenants/:tenantId/calculations/:metric', async request => {
@@ -609,7 +605,7 @@ app.get('/api/tenants/:tenantId/calculations/:metric', async request => {
     const calculated=await loadDashboardCalculations(db,tenantId,range);
     const detail=calculated.metrics[metric]??calculated.statement[metric];
     const rows=detail.rows??[];
-    return {metric,total:detail.value,unit:detail.unit,status:detail.status,formula:detail.formula,source:detail.source,range:detail.range,diagnostics:detail.diagnostics,components:detail.components,rows,columns:rows.length?[...new Set(rows.flatMap(row=>Object.keys(row).filter(key=>key!=='raw')))].slice(0,14):[]};
+    return {metric,total:detail.value,unit:detail.unit,status:detail.status,formula:detail.formula,source:detail.source,range:detail.range,marketplaceRange:detail.marketplaceRange,diagnostics:detail.diagnostics,components:detail.components,rows,columns:rows.length?[...new Set(rows.flatMap(row=>Object.keys(row).filter(key=>key!=='raw')))].slice(0,14):[]};
   });
 });
 
