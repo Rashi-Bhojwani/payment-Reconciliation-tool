@@ -1,4 +1,5 @@
 import cron from 'node-cron';
+import { createHash } from 'node:crypto';
 import pLimit from 'p-limit';
 import { z } from 'zod';
 import { assertActiveTenant, pool, withTenant } from '@recon/db';
@@ -118,15 +119,22 @@ function parseReportRows(reportType, content) {
 }
 
 /** @param {string} tenantId @param {string} content */
-async function saveSettlementRows(tenantId, content) {
+async function saveSettlementRows(tenantId, content, source = {}) {
   const rows = z.array(ReportRowSchema).parse(parseReportRows('GET_V2_SETTLEMENT_REPORT_DATA_FLAT_FILE_V2', content));
   await withTenant(tenantId, async client => {
-    for (const row of rows) {
+    if (source.reportId) await client.query(
+      `insert into settlement_reports(tenant_id,report_id,document_id,marketplace_id,data_start_time,data_end_time,created_time)
+       values($1,$2,$3,$4,$5,$6,$7) on conflict(tenant_id,report_id) do update set imported_at=now()`,
+      [tenantId,source.reportId,source.reportDocumentId,source.marketplaceId,source.dataStartTime,source.dataEndTime,source.createdTime]
+    );
+    for (const [index,row] of rows.entries()) {
       const amount = number(pick(row, ['amount']));
+      const currency = text(pick(row,['currency'])) ?? 'INR';
+      const lineHash=createHash('sha256').update(`${source.reportDocumentId??''}|${index+2}|${JSON.stringify(row)}`).digest('hex');
       await client.query(
-        `insert into settlement_rows(tenant_id, settlement_id, order_id, amount_type, amount_description, amount, posted_date, raw)
-         values($1,$2,$3,$4,$5,$6,$7,$8) on conflict do nothing`,
-        [tenantId, text(pick(row, ['settlement-id', 'settlement id', 'settlementId'])), text(pick(row, ['order-id', 'order id', 'amazon-order-id', 'amazonOrderId'])), text(pick(row, ['amount-type', 'amount type', 'amountType'])), text(pick(row, ['amount-description', 'amount description', 'amountDescription'])), amount, reportDate(pick(row, ['posted-date', 'posted date', 'postedDate'])), row]
+        `insert into settlement_rows(tenant_id,settlement_id,order_id,amount_type,amount_description,amount,amount_minor,currency,posted_date,raw,source_report_id,source_document_id,source_line_number,source_line_hash)
+         values($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14) on conflict do nothing`,
+        [tenantId,text(pick(row,['settlement-id','settlement id','settlementId'])),text(pick(row,['order-id','order id','amazon-order-id','amazonOrderId'])),text(pick(row,['amount-type','amount type','amountType'])),text(pick(row,['amount-description','amount description','amountDescription'])),amount,Math.round(amount*100),currency,reportDate(pick(row,['posted-date','posted date','postedDate'])),row,source.reportId,source.reportDocumentId,index+2,lineHash]
       );
     }
   });
@@ -250,8 +258,16 @@ export async function syncReportForTenant(params) {
       if (!seller.rowCount) throw new Error('No connected Amazon seller account');
       const client = new SpApiClient(decryptSecret(seller.rows[0].refresh_token_encrypted), { baseUrl: getSpApiEndpoint(seller.rows[0].marketplace_id) });
       const report = await client.fetchReport(parsed.reportType, parsed.tenantId, range, seller.rows[0].marketplace_id);
-      const s3Key = await putRawReport({ tenantId: parsed.tenantId, reportType: parsed.reportType, reportId: report.reportId, content: report.content });
-      const rowsImported = await saveStructuredRows(parsed.tenantId, parsed.reportType, report.content, range);
+      let rowsImported=0; let s3Key;
+      if(parsed.reportType==='GET_V2_SETTLEMENT_REPORT_DATA_FLAT_FILE_V2'){
+        for(const document of report.documents??[report]){
+          s3Key=await putRawReport({tenantId:parsed.tenantId,reportType:parsed.reportType,reportId:document.reportId,content:document.content});
+          rowsImported+=await saveSettlementRows(parsed.tenantId,document.content,{...document,marketplaceId:seller.rows[0].marketplace_id});
+        }
+      }else{
+        s3Key=await putRawReport({tenantId:parsed.tenantId,reportType:parsed.reportType,reportId:report.reportId,content:report.content});
+        rowsImported=await saveStructuredRows(parsed.tenantId,parsed.reportType,report.content,range);
+      }
       await pool.query('update sync_jobs set status=$1, completed_at=now(), s3_key=$2 where id=$3', ['completed', s3Key, sync.rows[0].id]);
       return { rowsImported, s3Key };
     } catch (error) {
