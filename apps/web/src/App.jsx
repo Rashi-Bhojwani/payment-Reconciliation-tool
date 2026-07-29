@@ -511,7 +511,15 @@ function OrderReconciliation({ tenantId }) {
     if (/pending|unshipped/i.test(order.status??'')) return <span className="pill status-idle">Not shipped yet</span>;
     return <span className="pill status-idle">Awaiting Amazon payment</span>;
   }
-  const reconciliationTable = <Card className="table-card"><PanelHeader title="Order-wise gross → fees → payout" subtitle={source||'Loading Amazon money lines'} /><div className="reconciliation-summary"><button type="button" className={orderView==='matched'?'active':''} onClick={()=>setOrderView('matched')}><strong>{formatNumber(counts.reconciled)}</strong><span>Payments posted in this period</span></button><button type="button" className={orderView==='awaiting'?'active':''} onClick={()=>setOrderView('awaiting')}><strong>{formatNumber(counts.awaiting)}</strong><span>Recent orders awaiting Amazon</span></button><button type="button" className={orderView==='cancelled'?'active':''} onClick={()=>setOrderView('cancelled')}><strong>{formatNumber(counts.cancelled)}</strong><span>Cancelled — no payout expected</span></button><button type="button" className={orderView==='all'?'active':''} onClick={()=>setOrderView('all')}><strong>{formatNumber(orders.length)}</strong><span>All orders</span></button></div><p className="reconciliation-note">By default this shows payments Amazon posted during the selected period, even when the customer ordered earlier. Use “Recent orders awaiting Amazon” only to review newly shipped orders whose fees and payout have not been posted yet.</p><div className="order-search"><Input value={orderSearch} onChange={event=>setOrderSearch(event.target.value)} placeholder="Search order ID…"/><span>{formatNumber(filteredOrders.length)} matching orders</span></div>{error&&<p className="alert error">{error}</p>}{filteredOrders.length?<><div className="table-wrap"><table><thead><tr>{['Order','Amazon status','Transaction date','Product charges','Promotions','Referral','Fulfillment','Amazon fees','Other','Net payout','Reconciliation',''].map(label=><th key={label}>{label}</th>)}</tr></thead><tbody>{visibleOrders.map(order=>{const flag=flagByOrder.get(order.amazon_order_id);const detail=details[order.amazon_order_id];return <React.Fragment key={order.amazon_order_id}><tr><td>{order.amazon_order_id}</td><td>{order.status??'—'}</td><td>{String(order.transaction_date??order.order_date??'').slice(0,10)}</td><td>{Number(order.gross_item_price)?formatCurrency(order.gross_item_price):'Items pending'}</td><td>{order.hasFeeData?formatCurrency(order.promotion):'—'}</td><td>{order.hasFeeData?formatCurrency(order.referral_commission):'—'}</td><td>{order.hasFeeData?formatCurrency(order.fulfillment_fee):'—'}</td><td>{order.hasFeeData?formatCurrency(order.total_deductions):'—'}</td><td>{order.hasFeeData?formatCurrency(order.other_amount):'—'}</td><td><b>{order.hasFeeData?formatCurrency(order.net_payout):'—'}</b></td><td>{statusBadge(order,flag)}</td><td><Button variant="ghost" onClick={()=>toggle(order.amazon_order_id)}>{openId===order.amazon_order_id?'Hide':'Details'}</Button></td></tr>{openId===order.amazon_order_id&&<tr className="order-detail-row"><td colSpan="12">{detail?<div className="order-detail-grid"><div><h4>Items</h4>{detail.items.length?detail.items.map((item,index)=><p key={index}><b>{item.title}</b><br/>{item.sku} · {formatNumber(item.quantity_ordered)} × {formatCurrency(item.item_price)}{item.package_weight?` · ${item.package_weight} ${item.weight_unit??''}`:''}</p>):<p className="muted">Order items have not been returned by Amazon yet. Run Orders & finance sync again after the order is confirmed.</p>}</div><OrderMoneyDetails order={order} detail={detail} /></div>:<Empty text="Loading order details…" />}</td></tr>}</React.Fragment>})}</tbody></table></div>{orderTotalPages>1&&<div className="pager"><Button variant="ghost" disabled={safeOrderPage===0} onClick={()=>setOrderPage(page=>Math.max(0,page-1))}>← Previous</Button><span>Page {safeOrderPage+1} of {orderTotalPages} · {formatNumber(filteredOrders.length)} orders</span><Button variant="ghost" disabled={safeOrderPage>=orderTotalPages-1} onClick={()=>setOrderPage(page=>Math.min(orderTotalPages-1,page+1))}>Next →</Button></div>}</>:<Empty text="No synced orders in this period."/>}</Card>;
+  const payoutTime=order=>{
+    const raw=String(order.payout_date_time??''); if(!raw) return '—';
+    const reportMatch=raw.match(/^(\d{1,2})[./-](\d{1,2})[./-](\d{4})(?:\s+(\d{1,2}):(\d{2}):(\d{2}))?/);
+    const parsed=reportMatch?new Date(Date.UTC(Number(reportMatch[3]),Number(reportMatch[2])-1,Number(reportMatch[1]),Number(reportMatch[4]??0),Number(reportMatch[5]??0),Number(reportMatch[6]??0))):new Date(raw);
+    return Number.isNaN(parsed.getTime())?raw:new Intl.DateTimeFormat('en-GB',{
+      day:'2-digit',month:'short',year:'numeric',hour:'2-digit',minute:'2-digit',second:'2-digit',hourCycle:'h23',timeZone:'UTC',timeZoneName:'short'
+    }).format(parsed);
+  };
+  const reconciliationTable = <Card className="table-card"><PanelHeader title="Order-wise gross → fees → payout" subtitle={source||'Loading Amazon money lines'} /><div className="reconciliation-summary"><button type="button" className={orderView==='matched'?'active':''} onClick={()=>setOrderView('matched')}><strong>{formatNumber(counts.reconciled)}</strong><span>Payments posted in this period</span></button><button type="button" className={orderView==='awaiting'?'active':''} onClick={()=>setOrderView('awaiting')}><strong>{formatNumber(counts.awaiting)}</strong><span>Recent orders awaiting Amazon</span></button><button type="button" className={orderView==='cancelled'?'active':''} onClick={()=>setOrderView('cancelled')}><strong>{formatNumber(counts.cancelled)}</strong><span>Cancelled — no payout expected</span></button><button type="button" className={orderView==='all'?'active':''} onClick={()=>setOrderView('all')}><strong>{formatNumber(orders.length)}</strong><span>All orders</span></button></div><p className="reconciliation-note">The payout columns use the Finances API transaction status and posted timestamp. Settlement ID and deposit-date data come from Amazon's settlement report. “Yes” means Amazon released or initiated the payout; SP-API cannot confirm when the seller's bank actually credited it.</p><div className="order-search"><Input value={orderSearch} onChange={event=>setOrderSearch(event.target.value)} placeholder="Search order ID…"/><span>{formatNumber(filteredOrders.length)} matching orders</span></div>{error&&<p className="alert error">{error}</p>}{filteredOrders.length?<><div className="table-wrap"><table><thead><tr>{['Order','Settlement ID','Amazon status','Transaction date','Product charges','Promotions','Referral','Fulfillment','Amazon fees','Other','Net payout','Money released?','Released / deposit time','Payout status','Reconciliation',''].map(label=><th key={label}>{label}</th>)}</tr></thead><tbody>{visibleOrders.map(order=>{const flag=flagByOrder.get(order.amazon_order_id);const detail=details[order.amazon_order_id];return <React.Fragment key={order.amazon_order_id}><tr><td>{order.amazon_order_id}</td><td>{order.settlement_id??'—'}</td><td>{order.status??'—'}</td><td>{String(order.transaction_date??order.order_date??'').slice(0,10)}</td><td>{Number(order.gross_item_price)?formatCurrency(order.gross_item_price):'Items pending'}</td><td>{order.hasFeeData?formatCurrency(order.promotion):'—'}</td><td>{order.hasFeeData?formatCurrency(order.referral_commission):'—'}</td><td>{order.hasFeeData?formatCurrency(order.fulfillment_fee):'—'}</td><td>{order.hasFeeData?formatCurrency(order.total_deductions):'—'}</td><td>{order.hasFeeData?formatCurrency(order.other_amount):'—'}</td><td><b>{order.hasFeeData?formatCurrency(order.net_payout):'—'}</b></td><td><span className={`pill ${order.payment_received?'status-completed':'status-idle'}`}>{order.payment_received?'Yes':'No'}</span></td><td>{payoutTime(order)}</td><td>{order.payout_status??'Awaiting payment data'}</td><td>{statusBadge(order,flag)}</td><td><Button variant="ghost" onClick={()=>toggle(order.amazon_order_id)}>{openId===order.amazon_order_id?'Hide':'Details'}</Button></td></tr>{openId===order.amazon_order_id&&<tr className="order-detail-row"><td colSpan="16">{detail?<div className="order-detail-grid"><div><h4>Items</h4>{detail.items.length?detail.items.map((item,index)=><p key={index}><b>{item.title}</b><br/>{item.sku} · {formatNumber(item.quantity_ordered)} × {formatCurrency(item.item_price)}{item.package_weight?` · ${item.package_weight} ${item.weight_unit??''}`:''}</p>):<p className="muted">Order items have not been returned by Amazon yet. Run Orders & finance sync again after the order is confirmed.</p>}</div><OrderMoneyDetails order={order} detail={detail} /></div>:<Empty text="Loading order details…" />}</td></tr>}</React.Fragment>})}</tbody></table></div>{orderTotalPages>1&&<div className="pager"><Button variant="ghost" disabled={safeOrderPage===0} onClick={()=>setOrderPage(page=>Math.max(0,page-1))}>← Previous</Button><span>Page {safeOrderPage+1} of {orderTotalPages} · {formatNumber(filteredOrders.length)} orders</span><Button variant="ghost" disabled={safeOrderPage>=orderTotalPages-1} onClick={()=>setOrderPage(page=>Math.min(orderTotalPages-1,page+1))}>Next →</Button></div>}</>:<Empty text="No synced orders in this period."/>}</Card>;
   const ledgerColumns=['posted_date','transaction_status','account_type','transaction_type','order_id','product_details','product_charges','promotional_rebates','amazon_fees','other','total'];
   const ledgerRows=filteredTransactions.map(row=>({...row,posted_date:String(row.posted_date??'').slice(0,10),product_charges:formatCurrency(row.product_charges),promotional_rebates:formatCurrency(row.promotional_rebates),amazon_fees:formatCurrency(row.amazon_fees),other:formatCurrency(row.other),total:formatCurrency(row.total)}));
   return <>{reconciliationTable}<Card className="transaction-ledger-intro"><div><span className="live-source">MATCHES SELLER CENTRAL TRANSACTION VIEW</span><h2>All Amazon transactions</h2><p>This includes Order Payments, refunds, Easy Ship charges, service fees, tax withheld, and standalone transactions—not only orders that have a payout.</p></div><div className="transaction-ledger-actions"><strong>{formatNumber(filteredTransactions.length)} of {formatNumber(transactions.length)} transactions</strong><Button variant="secondary" disabled={!ledgerRows.length} onClick={()=>downloadCsv('amazon-transactions.csv',ledgerRows,ledgerColumns)}>Download filtered CSV</Button></div></Card><Card className="transaction-filters"><div><label>Account type<select className="input" value={ledgerFilters.account} onChange={event=>setLedgerFilters(value=>({...value,account:event.target.value}))}><option value="">All account types</option>{uniqueValues('account_type').map(value=><option key={value}>{value}</option>)}</select></label><label>Transaction type<select className="input" value={ledgerFilters.type} onChange={event=>setLedgerFilters(value=>({...value,type:event.target.value}))}><option value="">All transaction types</option>{uniqueValues('transaction_type').map(value=><option key={value}>{value}</option>)}</select></label><label>Transaction status<select className="input" value={ledgerFilters.status} onChange={event=>setLedgerFilters(value=>({...value,status:event.target.value}))}><option value="">All statuses</option>{uniqueValues('transaction_status').map(value=><option key={value}>{value}</option>)}</select></label><label>Order ID<Input value={ledgerFilters.orderId} onChange={event=>setLedgerFilters(value=>({...value,orderId:event.target.value}))} placeholder="Enter order ID…"/></label></div><Button variant="ghost" onClick={()=>setLedgerFilters({account:'',type:'',status:'',orderId:''})}>Clear filters</Button></Card><TableCard title="Complete Amazon transaction ledger" rows={ledgerRows} columns={ledgerColumns} pageSize={10}/></>;
@@ -530,9 +538,9 @@ function DashboardOverview({ data, channelData, tenantId }) {
   return <>
     <div className="metrics-strip">
       <DrillMetric to={`/seller?tenantId=${tenantId}&view=metric-detail&metric=netSales`} title="Net Sales" value={formatCurrency(summary.netSales)} hint="Click to see order-value formula" />
-      <DrillMetric to={`/seller?tenantId=${tenantId}&view=metric-detail&metric=netQty`} title="Net Qty" value={formatNumber(summary.netQty)} hint="Click to see units source" />
-      <MiniMetric title="Orders Synced" value={formatNumber(summary.ordersCount)} hint="Use Order Reconciliation for details" />
-      <MiniMetric title="Returns" value={formatNumber(summary.returnQty)} hint="Use Returns for source rows" />
+      <DrillMetric to={`/seller?tenantId=${tenantId}&view=metric-detail&metric=netQty`} title="Net Qty" value={summary.netQty==null?'Unavailable':formatNumber(summary.netQty)} hint="Click to see units source" />
+      <DrillMetric to={`/seller?tenantId=${tenantId}&view=metric-detail&metric=orders`} title="Orders Synced" value={formatNumber(summary.ordersCount)} hint="Distinct eligible Amazon order IDs" />
+      <DrillMetric to={`/seller?tenantId=${tenantId}&view=metric-detail&metric=returns`} title="Returns" value={formatNumber(summary.returnQty)} hint="Total returned quantity" />
     </div>
 
     <Card className="profit-control-card">
@@ -547,6 +555,13 @@ function DashboardOverview({ data, channelData, tenantId }) {
 
     <ExplanationGrid summary={summary} tenantId={tenantId} />
 
+    <Card className="profit-control-card">
+      <PanelHeader title="Amazon Account Activity" subtitle="Matches Amazon statement sections" />
+      <div className="profit-kpi-grid account-activity-grid">
+        {['income','expenses','tax','transfers','gst'].map(metric=><DrillMetric key={metric} to={`/seller?tenantId=${tenantId}&view=metric-detail&metric=${metric}`} title={metric==='gst'?'Goods and Services Tax':metric[0].toUpperCase()+metric.slice(1)} value={formatCurrency(data?.dashboardCalculations?.statement?.[metric]?.value)} hint="Open Amazon source rows and formula" />)}
+      </div>
+    </Card>
+
     <SalesAnalytics data={data} channelData={channelData} />
 
     <div className="dashboard-grid two">
@@ -559,14 +574,13 @@ function DashboardOverview({ data, channelData, tenantId }) {
 
 function DrillMetric({ to, title, value, hint }) { return <NavLink to={to} className="mini-metric drill-metric"><span>{title}</span><strong>{value}</strong>{trendHint(hint)}<em>View calculation →</em></NavLink>; }
 function ExplanationGrid({ summary, tenantId }) {
-  const returnRate = summary.netQty ? `${Math.round((summary.returnQty / summary.netQty) * 100)}%` : '0%';
   const cards = [
-    ['Fee impact', formatCurrency(summary.deductions), 'Amazon fees, refunds and other charges imported from finance / settlement lines.', 'deductions'],
-    ['Return rate', returnRate, 'Returns compared with total sold quantity for quick customer-experience review.', 'returns'],
-    ['GST invoice value', formatCurrency(summary.gstValue), 'Total taxable value imported from GST B2B/B2C invoice rows.', 'tax']
+    ['Fee impact', summary.feeImpact==null?'Unavailable':`${Number(summary.feeImpact).toLocaleString('en-IN',{maximumFractionDigits:2})}%`, 'Net Amazon fees excluding TCS/TDS as a percentage of gross product sales.', 'feeImpact'],
+    ['Return rate', summary.returnRate==null?'Unavailable / source mismatch':`${Number(summary.returnRate).toLocaleString('en-IN',{maximumFractionDigits:2})}%`, 'Physically returned units divided by shipped units.', 'returnRate'],
+    ['Refund value rate', summary.refundValueRate==null?'Unavailable':`${Number(summary.refundValueRate).toLocaleString('en-IN',{maximumFractionDigits:2})}%`, 'Product refund value divided by gross product sales; separate from unit return rate.', 'refundValueRate'],
+    ['GST invoice value', summary.gstValue==null?'Unavailable':formatCurrency(summary.gstValue), 'Sales-invoice taxable value minus credit-note/refund taxable value.', 'gstValue']
   ];
-  const calculationMetrics = new Set(['settled', 'deductions']);
-  return <div className="explain-grid">{cards.map(([title, value, copy, target]) => <NavLink key={title} to={calculationMetrics.has(target) ? `/seller?tenantId=${tenantId}&view=metric-detail&metric=${target}` : `/seller?tenantId=${tenantId}&view=${target}`} className="explain-card"><b>{title}</b><strong>{value}</strong><p>{copy}</p><span>{calculationMetrics.has(target) ? 'Open calculation' : 'Open source rows'} →</span></NavLink>)}</div>;
+  return <div className="explain-grid">{cards.map(([title, value, copy, target]) => <NavLink key={title} to={`/seller?tenantId=${tenantId}&view=metric-detail&metric=${target}`} className="explain-card"><b>{title}</b><strong>{value}</strong><p>{copy}</p><span>Open calculation →</span></NavLink>)}</div>;
 }
 function InsightCards({ title, cards }) { return <Card><PanelHeader title={title} /><div className="explain-grid compact">{cards.map(([label, value]) => <div className="explain-card" key={label}><b>{label}</b><strong>{value}</strong></div>)}</div></Card>; }
 
@@ -670,32 +684,34 @@ function MetricDetail({ metric, tenantId }) {
   const deductionCategories = new Set(['referral_commission','fulfillment_fee_per_order','fulfillment_fee_per_unit','fulfillment_fee_weight','shipping_fee','storage_fee','chargeback','tax','promotion']);
   return <>
     <Card className="detail-hero">
-      <PanelHeader title={String(metric).replace(/([A-Z])/g, ' $1').trim()} subtitle={formatCurrency(details.total)} />
-      <p className="detail-note">Calculated directly from persisted Amazon rows for the selected period{details.source ? ` · ${details.source}` : ''}.</p>
-      <div className="calculation-components">{details.components.map(component => <div key={component.category} className={deductionCategories.has(component.category) ? 'negative' : ''}><span>{component.label}</span><small>{formatNumber(component.count)} rows</small><strong>{metric === 'netQty' ? formatNumber(component.amount) : formatCurrency(component.amount)}</strong></div>)}<div className="total"><span>Total</span><strong>{metric === 'netQty' ? formatNumber(details.total) : formatCurrency(details.total)}</strong></div></div>
+      <PanelHeader title={String(metric).replace(/([A-Z])/g, ' $1').trim()} subtitle={details.status??(details.unit==='percentage'?`${formatNumber(details.total)}%`:details.unit==='quantity'?formatNumber(details.total):formatCurrency(details.total))} />
+      <p className="detail-note"><b>Selected range:</b> {String(details.range?.start??range.start)} → {String(details.range?.end??range.end)} (end exclusive)<br/><b>Source:</b> {details.source}<br/><b>Formula:</b> {details.formula}.</p>
+      <div className="calculation-components">{details.components.map(component => <div key={component.category} className={deductionCategories.has(component.category) ? 'negative' : ''}><span>{component.operation} {component.label}</span><small>{formatNumber(component.count)} source rows</small><strong>{component.amount==null?'Unavailable':details.unit==='quantity'||component.category==='days'?formatNumber(component.amount):formatCurrency(component.amount)}</strong></div>)}<div className="total"><span>Total ({details.unit})</span><strong>{details.status??(details.unit==='percentage'?`${formatNumber(details.total)}%`:details.unit==='quantity'?formatNumber(details.total):formatCurrency(details.total))}</strong></div></div>
+      <div className="detail-note"><b>Reconciliation diagnostics:</b> {formatNumber(details.diagnostics?.includedRows)} included · {formatNumber(details.diagnostics?.excludedRows)} excluded by source precedence · {formatNumber(details.diagnostics?.duplicateRows)} duplicates removed.</div>
       <div className="detail-actions"><Button variant="secondary" onClick={() => navigate(`/seller?tenantId=${tenantId}&view=dashboard`)}>← Back</Button><Button variant="accent" onClick={() => downloadCsv(`${metric}-calculation.csv`, details.rows, details.columns)} disabled={!details.rows.length}>Download calculation CSV</Button></div>
     </Card>
     <TableCard title="Actual database rows used" rows={details.rows} columns={details.columns} pageSize={10} />
   </>;
 }
 function buildDashboardSummary(data, range = defaultDateRange()) {
+  const calculated=data?.dashboardCalculations?.metrics;
   const products = data?.products ?? [];
   const returns = data?.returns ?? [];
   const payments = data?.payments ?? [];
   const reimbursements = data?.reimbursements ?? [];
   const invoices = data?.invoices ?? [];
   const orderItems = data?.orderItems ?? [];
-  const ordersCount = Number(data?.orders?.orders ?? 0);
-  const netSales = amazonNetSales(data);
-  const netQty = products.reduce((sum, product) => sum + Number(product.units ?? 0), 0) || orderItems.reduce((sum, item) => sum + Number(item.quantity_ordered ?? 0), 0);
-  const returnQty = returns.length;
-  const settledAmount = payments.reduce((sum, payment) => sum + Number(payment.net_amount ?? 0), 0) || Number(data?.kpis?.net_settled ?? 0);
-  const deductions = amazonDeductions(data);
-  const reimbursementAmount = reimbursements.reduce((sum, row) => sum + Number(row.amount ?? 0), 0);
+  const ordersCount = Number(calculated?.orders?.value??data?.orders?.orders??0);
+  const netSales = Number(calculated?.netSales?.value??amazonNetSales(data));
+  const netQty = calculated?.netQty ? calculated.netQty.value : (products.reduce((sum, product) => sum + Number(product.units ?? 0), 0) || orderItems.reduce((sum, item) => sum + Number(item.quantity_ordered ?? 0), 0));
+  const returnQty = Number(calculated?.returns?.value??returns.length);
+  const settledAmount = Number(calculated?.settled?.value??(payments.reduce((sum, payment) => sum + Number(payment.net_amount ?? 0), 0) || Number(data?.kpis?.net_settled??0)));
+  const deductions = Number(calculated?.deductions?.value??amazonDeductions(data));
+  const reimbursementAmount = Number(calculated?.reimbursements?.value??reimbursements.reduce((sum, row) => sum + Number(row.amount ?? 0), 0));
   const estimatedProfit = settledAmount || Math.max(0, netSales - deductions + reimbursementAmount);
   const profitRate = netSales ? Math.round((estimatedProfit / netSales) * 100) : 0;
   const selectedDays = Math.max(1, Math.round((startOfDay(range.end) - startOfDay(range.start)) / 864e5) + 1);
-  const drr = netSales / selectedDays;
+  const drr = Number(calculated?.drr?.value??netSales/selectedDays);
   const netAsp = netQty ? netSales / netQty : 0;
   const baseRow = {
     view: 'Amazon-India',
@@ -733,7 +749,8 @@ function buildDashboardSummary(data, range = defaultDateRange()) {
     profitRate,
     drr,
     ordersCount,
-    gstValue: invoices.reduce((sum, row) => sum + Number(row.taxable_value ?? 0), 0),
+    feeImpact:calculated?.feeImpact?.value??null,returnRate:calculated?.returnRate?.value??null,refundValueRate:calculated?.refundValueRate?.value??null,
+    gstValue: calculated?.gstValue ? calculated.gstValue.value : null,
     profitRows: [baseRow, totalRow],
     returnRows: [returnSummary, { ...returnSummary, channel: 'Total' }],
     reconcileRows: [

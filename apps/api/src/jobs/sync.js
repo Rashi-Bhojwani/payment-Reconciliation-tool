@@ -139,10 +139,10 @@ async function saveGstInvoices(tenantId, content, invoiceType) {
   await withTenant(tenantId, async client => {
     for (const row of rows) {
       await client.query(
-        `insert into gst_invoices(tenant_id, invoice_type, order_id, cgst, sgst, igst, taxable_value, invoice_date)
-         values($1,$2,$3,$4,$5,$6,$7,$8)
-         on conflict (tenant_id, invoice_type, order_id, invoice_date) do update set cgst=excluded.cgst, sgst=excluded.sgst, igst=excluded.igst, taxable_value=excluded.taxable_value`,
-        [tenantId, invoiceType, text(pick(row, ['order-id', 'order id', 'amazon-order-id', 'amazonOrderId'])), number(pick(row, ['cgst', 'cgst tax', 'cgst amount'])), number(pick(row, ['sgst', 'sgst tax', 'sgst amount'])), number(pick(row, ['igst', 'igst tax', 'igst amount'])), number(pick(row, ['taxable-value', 'taxable value', 'taxableValue', 'taxable amount'])), text(pick(row, ['invoice-date', 'invoice date', 'invoiceDate', 'transaction-date', 'transaction date'])) ?? null]
+        `insert into gst_invoices(tenant_id, invoice_type, order_id, cgst, sgst, igst, taxable_value, invoice_date, raw)
+         values($1,$2,$3,$4,$5,$6,$7,$8,$9)
+         on conflict (tenant_id, invoice_type, order_id, invoice_date) do update set cgst=excluded.cgst, sgst=excluded.sgst, igst=excluded.igst, taxable_value=excluded.taxable_value, raw=excluded.raw`,
+        [tenantId, invoiceType, text(pick(row, ['order-id', 'order id', 'amazon-order-id', 'amazonOrderId'])), number(pick(row, ['cgst', 'cgst tax', 'cgst amount'])), number(pick(row, ['sgst', 'sgst tax', 'sgst amount'])), number(pick(row, ['igst', 'igst tax', 'igst amount'])), number(pick(row, ['taxable-value', 'taxable value', 'taxableValue', 'taxable amount'])), text(pick(row, ['invoice-date', 'invoice date', 'invoiceDate', 'transaction-date', 'transaction date'])) ?? null, row]
       );
     }
   });
@@ -155,10 +155,10 @@ async function saveReturns(tenantId, content) {
   await withTenant(tenantId, async client => {
     for (const row of rows) {
       await client.query(
-        `insert into returns(tenant_id, order_id, return_reason, disposition, status, return_date)
-         values($1,$2,$3,$4,$5,$6)
-         on conflict (tenant_id, order_id, return_date, return_reason, disposition) do update set status=excluded.status`,
-        [tenantId, text(pick(row, ['order-id', 'order id', 'amazon-order-id', 'amazonOrderId'])), text(pick(row, ['reason', 'return-reason', 'return reason', 'returnReason'])), text(pick(row, ['disposition', 'detailed-disposition', 'detailed disposition'])), 'yet_to_receive', text(pick(row, ['return-date', 'return date', 'returnDate', 'date'])) ?? null]
+        `insert into returns(tenant_id, order_id, return_reason, disposition, status, return_date, quantity, raw)
+         values($1,$2,$3,$4,$5,$6,$7,$8)
+         on conflict (tenant_id, order_id, return_date, return_reason, disposition) do update set status=excluded.status, quantity=excluded.quantity, raw=excluded.raw`,
+        [tenantId, text(pick(row, ['order-id', 'order id', 'amazon-order-id', 'amazonOrderId'])), text(pick(row, ['reason', 'return-reason', 'return reason', 'returnReason'])), text(pick(row, ['disposition', 'detailed-disposition', 'detailed disposition'])), 'yet_to_receive', text(pick(row, ['return-date', 'return date', 'returnDate', 'date'])) ?? null, pick(row, ['quantity','quantity-returned','return quantity']) == null ? null : integer(pick(row, ['quantity','quantity-returned','return quantity'])), row]
       );
     }
   });
