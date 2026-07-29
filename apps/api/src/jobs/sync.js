@@ -1,4 +1,5 @@
 import cron from 'node-cron';
+import { createHash } from 'node:crypto';
 import pLimit from 'p-limit';
 import { z } from 'zod';
 import { assertActiveTenant, pool, withTenant } from '@recon/db';
@@ -118,19 +119,52 @@ function parseReportRows(reportType, content) {
 }
 
 /** @param {string} tenantId @param {string} content */
-async function saveSettlementRows(tenantId, content) {
+async function saveSettlementRows(tenantId, content, source = {}) {
   const rows = z.array(ReportRowSchema).parse(parseReportRows('GET_V2_SETTLEMENT_REPORT_DATA_FLAT_FILE_V2', content));
+  const contentHash=createHash('sha256').update(content).digest('hex');
+  const starts=rows.map(row=>reportDate(pick(row,['settlement-start-date','settlement start date']))).filter(Boolean).map(value=>new Date(value)).filter(value=>!Number.isNaN(value.getTime()));
+  const ends=rows.map(row=>reportDate(pick(row,['settlement-end-date','settlement end date']))).filter(Boolean).map(value=>new Date(value)).filter(value=>!Number.isNaN(value.getTime()));
+  const dataStartTime=source.dataStartTime??(starts.length?new Date(Math.min(...starts)).toISOString():null);
+  const dataEndTime=source.dataEndTime??(ends.length?new Date(Math.max(...ends)).toISOString():null);
   await withTenant(tenantId, async client => {
-    for (const row of rows) {
+    if (source.reportId) await client.query(
+      `insert into settlement_reports(tenant_id,report_id,document_id,marketplace_id,data_start_time,data_end_time,created_time,content_hash,parsed_row_count,import_status)
+       values($1,$2,$3,$4,$5,$6,$7,$8,$9,'imported') on conflict(tenant_id,report_id) do update set imported_at=now(),content_hash=excluded.content_hash,parsed_row_count=excluded.parsed_row_count,import_status='imported'`,
+      [tenantId,source.reportId,source.reportDocumentId,source.marketplaceId,dataStartTime,dataEndTime,source.createdTime,contentHash,rows.length]
+    );
+    for (const [index,row] of rows.entries()) {
       const amount = number(pick(row, ['amount']));
+      const currency = text(pick(row,['currency'])) ?? 'INR';
+      const lineHash=createHash('sha256').update(`${source.reportDocumentId??''}|${index+2}|${JSON.stringify(row)}`).digest('hex');
       await client.query(
-        `insert into settlement_rows(tenant_id, settlement_id, order_id, amount_type, amount_description, amount, posted_date, raw)
-         values($1,$2,$3,$4,$5,$6,$7,$8) on conflict do nothing`,
-        [tenantId, text(pick(row, ['settlement-id', 'settlement id', 'settlementId'])), text(pick(row, ['order-id', 'order id', 'amazon-order-id', 'amazonOrderId'])), text(pick(row, ['amount-type', 'amount type', 'amountType'])), text(pick(row, ['amount-description', 'amount description', 'amountDescription'])), amount, reportDate(pick(row, ['posted-date', 'posted date', 'postedDate'])), row]
+        `insert into settlement_rows(tenant_id,settlement_id,order_id,amount_type,amount_description,amount,amount_minor,currency,posted_date,raw,source_report_id,source_document_id,source_line_number,source_line_hash)
+         values($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14) on conflict do nothing`,
+        [tenantId,text(pick(row,['settlement-id','settlement id','settlementId'])),text(pick(row,['order-id','order id','amazon-order-id','amazonOrderId'])),text(pick(row,['amount-type','amount type','amountType'])),text(pick(row,['amount-description','amount description','amountDescription'])),amount,Math.round(amount*100),currency,reportDate(pick(row,['posted-date','posted date','postedDate'])),row,source.reportId,source.reportDocumentId,index+2,lineHash]
       );
+    }
+    const settlements=new Map();
+    for(const row of rows){
+      const settlementId=text(pick(row,['settlement-id','settlement id','settlementId'])); if(!settlementId) continue;
+      const state=settlements.get(settlementId)??{header:null,detailMinor:0,count:0};
+      const rowAmount=pick(row,['amount']); const headerTotal=pick(row,['total-amount','total amount','totalAmount']);
+      if((rowAmount==null||String(rowAmount).trim()==='')&&headerTotal!=null) state.header=Math.round(number(headerTotal)*100);
+      else {state.detailMinor+=Math.round(number(rowAmount)*100);state.count++;}
+      settlements.set(settlementId,state);
+    }
+    for(const [settlementId,state] of settlements){
+      if(state.header==null) continue;
+      const difference=state.detailMinor-state.header;
+      await client.query(`insert into settlement_controls(tenant_id,report_id,document_id,settlement_id,header_total_minor,detail_total_minor,control_difference_minor,imported_row_count,completeness_status)
+        values($1,$2,$3,$4,$5,$6,$7,$8,$9) on conflict(tenant_id,report_id,settlement_id) do update set header_total_minor=excluded.header_total_minor,detail_total_minor=excluded.detail_total_minor,control_difference_minor=excluded.control_difference_minor,imported_row_count=excluded.imported_row_count,completeness_status=excluded.completeness_status,validated_at=now()`,
+      [tenantId,source.reportId,source.reportDocumentId,settlementId,state.header,state.detailMinor,difference,state.count,difference===0?'complete':'reconciliation_error']);
     }
   });
   return rows.length;
+}
+
+export async function importUploadedSettlementReport({tenantId,marketplaceId,content,fileName='manual-upload'}){
+  const hash=createHash('sha256').update(content).digest('hex');
+  return saveSettlementRows(tenantId,content,{reportId:`upload-${hash}`,reportDocumentId:`upload-${hash}`,marketplaceId,createdTime:new Date().toISOString(),fileName});
 }
 
 /** @param {string} tenantId @param {string} content @param {'b2b'|'b2c'} invoiceType */
@@ -250,8 +284,16 @@ export async function syncReportForTenant(params) {
       if (!seller.rowCount) throw new Error('No connected Amazon seller account');
       const client = new SpApiClient(decryptSecret(seller.rows[0].refresh_token_encrypted), { baseUrl: getSpApiEndpoint(seller.rows[0].marketplace_id) });
       const report = await client.fetchReport(parsed.reportType, parsed.tenantId, range, seller.rows[0].marketplace_id);
-      const s3Key = await putRawReport({ tenantId: parsed.tenantId, reportType: parsed.reportType, reportId: report.reportId, content: report.content });
-      const rowsImported = await saveStructuredRows(parsed.tenantId, parsed.reportType, report.content, range);
+      let rowsImported=0; let s3Key;
+      if(parsed.reportType==='GET_V2_SETTLEMENT_REPORT_DATA_FLAT_FILE_V2'){
+        for(const document of report.documents??[report]){
+          s3Key=await putRawReport({tenantId:parsed.tenantId,reportType:parsed.reportType,reportId:document.reportId,content:document.content});
+          rowsImported+=await saveSettlementRows(parsed.tenantId,document.content,{...document,marketplaceId:seller.rows[0].marketplace_id});
+        }
+      }else{
+        s3Key=await putRawReport({tenantId:parsed.tenantId,reportType:parsed.reportType,reportId:report.reportId,content:report.content});
+        rowsImported=await saveStructuredRows(parsed.tenantId,parsed.reportType,report.content,range);
+      }
       await pool.query('update sync_jobs set status=$1, completed_at=now(), s3_key=$2 where id=$3', ['completed', s3Key, sync.rows[0].id]);
       return { rowsImported, s3Key };
     } catch (error) {
@@ -455,37 +497,6 @@ export async function syncRecentApiDataForTenant(tenantId, options = {}) {
   }, 1);
 }
 
-
-/** @param {string} tenantId @param {'b2b'|'b2c'} invoiceType */
-export async function buildGstInvoicesFromOrderItems(tenantId, invoiceType) {
-  const parsedTenantId = z.string().uuid().parse(tenantId);
-  const parsedInvoiceType = z.enum(['b2b', 'b2c']).parse(invoiceType);
-  await assertActiveTenant(parsedTenantId);
-  return withTenant(parsedTenantId, async db => {
-    const result = await db.query(
-      `insert into gst_invoices(tenant_id, invoice_type, order_id, taxable_value, cgst, sgst, igst, invoice_date)
-       select oi.tenant_id,
-         $2,
-         oi.amazon_order_id,
-         sum(greatest(coalesce(oi.item_price,0) - coalesce(oi.item_tax,0), 0)) taxable_value,
-         sum(coalesce(oi.item_tax,0) / 2) cgst,
-         sum(coalesce(oi.item_tax,0) / 2) sgst,
-         0 igst,
-         date(coalesce(o.order_date, now())) invoice_date
-       from order_items oi
-       left join orders o on o.tenant_id=oi.tenant_id and o.amazon_order_id=oi.amazon_order_id
-       where oi.tenant_id=$1
-       group by oi.tenant_id, oi.amazon_order_id, date(coalesce(o.order_date, now()))
-       on conflict (tenant_id, invoice_type, order_id, invoice_date) do update set
-         taxable_value=excluded.taxable_value,
-         cgst=excluded.cgst,
-         sgst=excluded.sgst,
-         igst=excluded.igst`,
-      [parsedTenantId, parsedInvoiceType]
-    );
-    return result.rowCount ?? 0;
-  });
-}
 
 /** @param {string} reportType */
 async function syncActiveTenants(reportType) {
