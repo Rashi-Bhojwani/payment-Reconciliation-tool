@@ -72,8 +72,10 @@ function parseTsv(textContent) {
   const trimmed = z.string().parse(textContent).trim();
   if (!trimmed) return [];
   const [headerLine, ...lines] = trimmed.split(/\r?\n/);
-  const headers = headerLine.split('\t').map(header => header.trim());
-  return lines.filter(Boolean).map(line => Object.fromEntries(line.split('\t').map((value, index) => [headers[index], value])));
+  const delimiter=headerLine.includes('\t')?'\t':',';
+  const split=line=>{const cells=[];let cell='',quoted=false;for(let i=0;i<line.length;i++){const char=line[i];if(char==='"'&&line[i+1]==='"'){cell+='"';i++;}else if(char==='"')quoted=!quoted;else if(char===delimiter&&!quoted){cells.push(cell);cell='';}else cell+=char;}cells.push(cell);return cells;};
+  const headers = split(headerLine).map(header => header.trim());
+  return lines.filter(Boolean).map(line => Object.fromEntries(split(line).map((value, index) => [headers[index], value])));
 }
 
 /** @param {Record<string, unknown>} object @returns {Record<string, unknown>} */
@@ -118,7 +120,7 @@ function parseReportRows(reportType, content) {
 }
 
 /** @param {string} tenantId @param {string} content */
-async function saveSettlementRows(tenantId, content, document = {}) {
+export async function saveSettlementRows(tenantId, content, document = {}) {
   const rows = z.array(ReportRowSchema).parse(parseReportRows('GET_V2_SETTLEMENT_REPORT_DATA_FLAT_FILE_V2', content));
   await withTenant(tenantId, async client => {
     for (const [index,row] of rows.entries()) {
@@ -131,8 +133,8 @@ async function saveSettlementRows(tenantId, content, document = {}) {
         [tenantId, text(pick(row, ['settlement-id', 'settlement id', 'settlementId'])), text(pick(row, ['order-id', 'order id', 'amazon-order-id', 'amazonOrderId'])), text(pick(row, ['amount-type', 'amount type', 'amountType'])), text(pick(row, ['amount-description', 'amount description', 'amountDescription'])), amount, reportDate(pick(row, ['posted-date-time','posted date time','postedDateTime','posted-date', 'posted date', 'postedDate'])), raw, document.documentId??null, sourceRowKey]
       );
     }
-    if(document.documentId) await client.query(`insert into settlement_report_documents(tenant_id,report_id,report_document_id,data_start_time,data_end_time,row_count,settlement_ids)
-      values($1,$2,$3,$4,$5,$6,$7) on conflict(tenant_id,report_document_id) do update set imported_at=now(),row_count=excluded.row_count,settlement_ids=excluded.settlement_ids`,[tenantId,document.reportId,document.documentId,document.dataStartTime??null,document.dataEndTime??null,rows.length,[...new Set(rows.map(row=>text(pick(row,['settlement-id','settlementId']))).filter(Boolean))]]);
+    if(document.documentId) await client.query(`insert into settlement_report_documents(tenant_id,report_id,report_document_id,data_start_time,data_end_time,row_count,settlement_ids,content_hash)
+      values($1,$2,$3,$4,$5,$6,$7,$8) on conflict(tenant_id,report_document_id) do update set imported_at=now(),row_count=excluded.row_count,settlement_ids=excluded.settlement_ids,content_hash=coalesce(excluded.content_hash,settlement_report_documents.content_hash)`,[tenantId,document.reportId,document.documentId,document.dataStartTime??null,document.dataEndTime??null,rows.length,[...new Set(rows.map(row=>text(pick(row,['settlement-id','settlementId']))).filter(Boolean))],document.contentHash??null]);
   });
   return rows.length;
 }
@@ -461,37 +463,6 @@ export async function syncRecentApiDataForTenant(tenantId, options = {}) {
   }, 1);
 }
 
-
-/** @param {string} tenantId @param {'b2b'|'b2c'} invoiceType */
-export async function buildGstInvoicesFromOrderItems(tenantId, invoiceType) {
-  const parsedTenantId = z.string().uuid().parse(tenantId);
-  const parsedInvoiceType = z.enum(['b2b', 'b2c']).parse(invoiceType);
-  await assertActiveTenant(parsedTenantId);
-  return withTenant(parsedTenantId, async db => {
-    const result = await db.query(
-      `insert into gst_invoices(tenant_id, invoice_type, order_id, taxable_value, cgst, sgst, igst, invoice_date)
-       select oi.tenant_id,
-         $2,
-         oi.amazon_order_id,
-         sum(greatest(coalesce(oi.item_price,0) - coalesce(oi.item_tax,0), 0)) taxable_value,
-         sum(coalesce(oi.item_tax,0) / 2) cgst,
-         sum(coalesce(oi.item_tax,0) / 2) sgst,
-         0 igst,
-         date(coalesce(o.order_date, now())) invoice_date
-       from order_items oi
-       left join orders o on o.tenant_id=oi.tenant_id and o.amazon_order_id=oi.amazon_order_id
-       where oi.tenant_id=$1
-       group by oi.tenant_id, oi.amazon_order_id, date(coalesce(o.order_date, now()))
-       on conflict (tenant_id, invoice_type, order_id, invoice_date) do update set
-         taxable_value=excluded.taxable_value,
-         cgst=excluded.cgst,
-         sgst=excluded.sgst,
-         igst=excluded.igst`,
-      [parsedTenantId, parsedInvoiceType]
-    );
-    return result.rowCount ?? 0;
-  });
-}
 
 /** @param {string} reportType */
 async function syncActiveTenants(reportType) {

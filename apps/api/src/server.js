@@ -8,7 +8,7 @@ import { assertActiveTenant, databaseUrlConfigured, pool, withTenant } from '@re
 import { getSpApiEndpoint, MARKETPLACES, REPORT_TYPES, SpApiClient } from '@recon/sp-api-client';
 import { secrets } from './config/secrets.js';
 import { decryptSecret, encryptSecret } from './config/crypto.js';
-import { buildGstInvoicesFromOrderItems, startScheduler, syncRecentApiDataForTenant, syncReportForTenant } from './jobs/sync.js';
+import { saveSettlementRows, startScheduler, syncRecentApiDataForTenant, syncReportForTenant } from './jobs/sync.js';
 import { categorizeFinanceLabel } from './jobs/finance-components.js';
 import { calculateDashboardMetrics } from './jobs/dashboard-calculations.js';
 import { runFeeAuditForTenant } from './jobs/fee-audit.js';
@@ -29,7 +29,7 @@ const SellerSyncParamsSchema = z.object({ tenantId: z.string().uuid(), reportTyp
 const AmazonCallbackSchema = z.object({ spapi_oauth_code: z.string().optional(), code: z.string().optional(), selling_partner_id: z.string().optional(), state: z.string().optional(), amazon_state: z.string().optional(), redirect_uri: z.string().url().optional(), error: z.string().optional(), error_description: z.string().optional() });
 const AmazonAccessTokenSchema = z.object({ sellerId: z.string().optional() });
 const DateRangeSchema = z.object({ start: z.string().datetime(), end: z.string().datetime() });
-const DashboardQuerySchema = z.object({ start: z.string().datetime().optional(), end: z.string().datetime().optional() });
+const DashboardQuerySchema = z.object({ start: z.string().datetime().optional(), end: z.string().datetime().optional(), marketplaceId: z.string().min(1).optional() });
 const SellerSyncSchema = z.object({ reportTypes: z.array(z.enum(REPORT_TYPES)).default(['GET_SALES_AND_TRAFFIC_REPORT', 'GET_V2_SETTLEMENT_REPORT_DATA_FLAT_FILE_V2']), range: DateRangeSchema.optional() });
 const RegisterSchema = z.object({ companyName: z.string().min(2), ownerEmail: z.string().email(), password: z.string().min(8), marketplaceId: z.string().default('A21TJRUUN4KGV') });
 const LoginSchema = z.object({ email: z.string().email(), password: z.string().min(1) });
@@ -509,30 +509,10 @@ app.post('/api/tenants/:tenantId/sync/:reportType', async request => {
     await recordSyntheticReportSync(params.tenantId, params.reportType);
     return { reportType: params.reportType, status: 'completed', fallback: 'DIRECT_SP_API_SYNC', ...fallback };
   }
-  if (params.reportType === 'GET_GST_MTR_B2B_CUSTOM' || params.reportType === 'GET_GST_MTR_B2C_CUSTOM') {
-    const invoiceType = params.reportType === 'GET_GST_MTR_B2B_CUSTOM' ? 'b2b' : 'b2c';
-    const rowsImported = await buildGstInvoicesFromOrderItems(params.tenantId, invoiceType);
-    if (rowsImported > 0) {
-      await recordSyntheticReportSync(params.tenantId, params.reportType, 'fallback://order-items-gst-estimate');
-      return { reportType: params.reportType, status: 'completed', fallback: 'ORDER_ITEMS_GST_ESTIMATE', rowsImported };
-    }
-  }
   try {
     const result = await syncReportForTenant({ ...params, range: body.range });
     return { reportType: params.reportType, status: 'completed', ...result };
   } catch (error) {
-    if (params.reportType === 'GET_GST_MTR_B2B_CUSTOM' || params.reportType === 'GET_GST_MTR_B2C_CUSTOM') {
-      const invoiceType = params.reportType === 'GET_GST_MTR_B2B_CUSTOM' ? 'b2b' : 'b2c';
-      const rowsImported = await buildGstInvoicesFromOrderItems(params.tenantId, invoiceType);
-      if (rowsImported > 0) {
-        await pool.query(
-          `update sync_jobs set status='completed', completed_at=now(), error_message=null, s3_key=$3
-           where id = (select id from sync_jobs where tenant_id=$1 and report_type=$2 order by started_at desc nulls last limit 1)`,
-          [params.tenantId, params.reportType, 'fallback://order-items-gst-estimate']
-        );
-        return { reportType: params.reportType, status: 'completed', fallback: 'ORDER_ITEMS_GST_ESTIMATE', rowsImported, warning: error instanceof Error ? error.message : 'GST report sync failed' };
-      }
-    }
     const directFallbackReports = new Set(['GET_SALES_AND_TRAFFIC_REPORT', 'GET_FBA_MYI_UNSUPPRESSED_INVENTORY_DATA', 'GET_FBA_REIMBURSEMENTS_DATA']);
     if (directFallbackReports.has(params.reportType)) {
       try {
@@ -578,7 +558,19 @@ app.post('/api/tenants/:tenantId/reconcile-sources',async request=>{
   return{results};
 });
 
-const DASHBOARD_METRICS = ['netSales','netQty','orders','returns','settled','deductions','reimbursements','drr','feeImpact','returnRate','refundValueRate','gstValue','income','expenses','tax','transfers','gst'];
+app.post('/api/tenants/:tenantId/import/settlement',async request=>{
+  const {tenantId}=TenantParamsSchema.parse(request.params);await requireTenantUser(request,tenantId);await assertActiveTenant(tenantId);
+  const {content}=z.object({content:z.string().min(1).max(25_000_000)}).parse(request.body??{});
+  const contentHash=crypto.createHash('sha256').update(content).digest('hex');
+  const marketplaceId=(await pool.query("select marketplace_id from sellers where tenant_id=$1 and auth_status='authorized' order by connected_at desc limit 1",[tenantId])).rows[0]?.marketplace_id;
+  if(!marketplaceId)throw new Error('No authorized marketplace selected');
+  const documentId=`manual-${contentHash}`;const existing=await pool.query('select 1 from settlement_report_documents where tenant_id=$1 and marketplace_id=$2 and content_hash=$3',[tenantId,marketplaceId,contentHash]);
+  if(existing.rowCount)return{status:'duplicate',rowsImported:0,contentHash};
+  const rowsImported=await saveSettlementRows(tenantId,content,{reportId:documentId,documentId,contentHash});
+  return{status:'completed',rowsImported,contentHash,recalculation:'automatic on next dashboard request'};
+});
+
+const DASHBOARD_METRICS = ['grossSales','productRefunds','netPromotions','shippedQty','returnRecords','tcsTds','operationalFees','netSales','netQty','orders','returns','settled','deductions','reimbursements','drr','feeImpact','returnRate','refundValueRate','gstValue','income','expenses','tax','transfers','gst'];
 const CalculationParamsSchema = z.object({ tenantId: z.string().uuid(), metric: z.enum(DASHBOARD_METRICS) });
 const OrderDetailParamsSchema = z.object({ tenantId: z.string().uuid(), orderId: z.string().min(1) });
 const FEE_CATEGORIES = ['referral_commission', 'fulfillment_fee_per_order', 'fulfillment_fee_per_unit', 'fulfillment_fee_weight', 'shipping_fee', 'gift_wrap_fee', 'closing_fee', 'digital_services_fee', 'storage_fee', 'chargeback', 'tax'];
@@ -589,31 +581,33 @@ function groupCalculationRows(rows) {
   return [...grouped.values()];
 }
 
-async function loadDashboardCalculations(db, tenantId, range) {
-  const scopedSettlementIds=(await db.query(`select distinct settlement_id from settlement_rows where tenant_id=$1 and settlement_id is not null and posted_date >= $2 and posted_date < $3`,[tenantId,range.start,range.end])).rows.map(row=>row.settlement_id);
-  const [orders,orderItems,returns,settlementRows,settlementHeaders,settlementDocuments,settlementSyncJobs,financeItems,reimbursements,gstInvoices]=await Promise.all([
-    db.query('select id source_row_id,amazon_order_id,status,order_date,total_amount,raw from orders where tenant_id=$1 and order_date >= $2 and order_date < $3',[tenantId,range.start,range.end]),
-    db.query(`select oi.id source_row_id,oi.amazon_order_id,oi.asin,oi.sku,oi.title,oi.quantity_ordered,oi.item_price,oi.promotion_discount,oi.raw,o.status,o.order_date from order_items oi join orders o on o.tenant_id=oi.tenant_id and o.amazon_order_id=oi.amazon_order_id where oi.tenant_id=$1 and o.order_date >= $2 and o.order_date < $3`,[tenantId,range.start,range.end]),
-    db.query('select id source_row_id,order_id,return_date,return_reason,disposition,status,quantity,raw from returns where tenant_id=$1 and return_date >= $2::date and return_date < $3::date',[tenantId,range.start,range.end]),
-    db.query(`select id source_row_id,settlement_id,order_id,amount_type,amount_description,amount,posted_date,raw,report_document_id,source_row_key,coalesce(raw->>'transaction-type',raw->>'transaction type',raw->>'transactionType') parent_transaction_type from settlement_rows where tenant_id=$1 and settlement_id=any($2::text[])`,[tenantId,scopedSettlementIds]),
-    db.query(`select id source_row_id,settlement_id,report_document_id,coalesce(raw->>'settlement-start-date',raw->>'settlement start date',raw->>'settlementStartDate') settlement_start_date,coalesce(raw->>'settlement-end-date',raw->>'settlement end date',raw->>'settlementEndDate') settlement_end_date,coalesce(raw->>'deposit-date',raw->>'deposit date',raw->>'depositDate') deposit_date,coalesce(nullif(raw->>'total-amount',''),nullif(raw->>'total amount',''),nullif(raw->>'totalAmount','')) total_amount,coalesce(raw->>'transaction-type',raw->>'transaction type') transaction_type,raw from settlement_rows where tenant_id=$1 and coalesce(raw->>'total-amount',raw->>'total amount',raw->>'totalAmount','')<>''`,[tenantId]),
-    db.query(`select report_id,report_document_id,data_start_time,data_end_time,imported_at,row_count,settlement_ids from settlement_report_documents where tenant_id=$1 and settlement_ids && $2::text[] order by imported_at desc`,[tenantId,scopedSettlementIds]),
+async function loadDashboardCalculations(db, tenantId, marketplaceId, range) {
+  const scopedSettlementIds=(await db.query(`select distinct settlement_id from settlement_rows where tenant_id=$1 and marketplace_id=$4 and settlement_id is not null and posted_date >= $2 and posted_date < $3`,[tenantId,range.start,range.end,marketplaceId])).rows.map(row=>row.settlement_id);
+  const [orders,orderItems,returns,settlementRows,settlementHeaders,settlementDocuments,settlementSyncJobs,financeItems,reimbursements,gstInvoices,sourceStatuses]=await Promise.all([
+    db.query('select id source_row_id,amazon_order_id,status,order_date,total_amount,raw from orders where tenant_id=$1 and marketplace_id=$4 and order_date >= $2 and order_date < $3',[tenantId,range.start,range.end,marketplaceId]),
+    db.query(`select oi.id source_row_id,oi.amazon_order_id,oi.asin,oi.sku,oi.title,oi.quantity_ordered,oi.item_price,oi.promotion_discount,oi.raw,o.status,o.order_date from order_items oi join orders o on o.tenant_id=oi.tenant_id and o.amazon_order_id=oi.amazon_order_id where oi.tenant_id=$1 and oi.marketplace_id=$4 and o.marketplace_id=$4 and o.order_date >= $2 and o.order_date < $3`,[tenantId,range.start,range.end,marketplaceId]),
+    db.query('select id source_row_id,order_id,return_date,return_reason,disposition,status,quantity,raw from returns where tenant_id=$1 and marketplace_id=$4 and return_date >= $2::date and return_date < $3::date',[tenantId,range.start,range.end,marketplaceId]),
+    db.query(`select id source_row_id,settlement_id,order_id,amount_type,amount_description,amount,posted_date,raw,report_document_id,source_row_key,coalesce(raw->>'transaction-type',raw->>'transaction type',raw->>'transactionType') parent_transaction_type from settlement_rows where tenant_id=$1 and marketplace_id=$4 and settlement_id=any($2::text[])`,[tenantId,scopedSettlementIds,null,marketplaceId]),
+    db.query(`select id source_row_id,settlement_id,report_document_id,coalesce(raw->>'settlement-start-date',raw->>'settlement start date',raw->>'settlementStartDate') settlement_start_date,coalesce(raw->>'settlement-end-date',raw->>'settlement end date',raw->>'settlementEndDate') settlement_end_date,coalesce(raw->>'deposit-date',raw->>'deposit date',raw->>'depositDate') deposit_date,coalesce(nullif(raw->>'total-amount',''),nullif(raw->>'total amount',''),nullif(raw->>'totalAmount','')) total_amount,coalesce(raw->>'transaction-type',raw->>'transaction type') transaction_type,raw from settlement_rows where tenant_id=$1 and marketplace_id=$4 and coalesce(raw->>'total-amount',raw->>'total amount',raw->>'totalAmount','')<>''`,[tenantId,null,null,marketplaceId]),
+    db.query(`select report_id,report_document_id,data_start_time,data_end_time,imported_at,row_count,settlement_ids from settlement_report_documents where tenant_id=$1 and marketplace_id=$4 and settlement_ids && $2::text[] order by imported_at desc`,[tenantId,scopedSettlementIds,null,marketplaceId]),
     db.query(`select status,error_message,started_at,completed_at from sync_jobs where tenant_id=$1 and report_type='GET_V2_SETTLEMENT_REPORT_DATA_FLAT_FILE_V2' and started_at >= $2::timestamptz - interval '60 days' order by started_at desc limit 1`,[tenantId,range.start]),
-    db.query(`select fi.id source_row_id,fi.transaction_id,fi.order_id,fi.sku,fi.asin,fi.category,fi.amount_description,fi.amount,fi.currency,fi.posted_date,fi.raw,ft.transaction_type parent_transaction_type,coalesce(ft.raw->>'accountType',ft.raw->>'AccountType',ft.raw#>>'{sellingPartnerMetadata,accountType}') account_type from finance_transaction_items fi left join finance_transactions ft on ft.tenant_id=fi.tenant_id and ft.transaction_id=fi.transaction_id where fi.tenant_id=$1 and fi.posted_date >= $2 and fi.posted_date < $3`,[tenantId,range.start,range.end]),
-    db.query('select amount,reason,sku,reimbursement_date from reimbursements where tenant_id=$1 and reimbursement_date >= $2::date and reimbursement_date < $3::date',[tenantId,range.start,range.end]),
-    db.query('select id source_row_id,invoice_type,order_id,cgst,sgst,igst,taxable_value,invoice_date,raw from gst_invoices where tenant_id=$1 and invoice_date >= $2::date and invoice_date < $3::date',[tenantId,range.start,range.end])
+    db.query(`select fi.id source_row_id,fi.transaction_id,fi.order_id,fi.sku,fi.asin,fi.category,fi.amount_description,fi.amount,fi.currency,fi.posted_date,fi.raw,ft.transaction_type parent_transaction_type,coalesce(ft.raw->>'accountType',ft.raw->>'AccountType',ft.raw#>>'{sellingPartnerMetadata,accountType}') account_type from finance_transaction_items fi left join finance_transactions ft on ft.tenant_id=fi.tenant_id and ft.transaction_id=fi.transaction_id where fi.tenant_id=$1 and fi.marketplace_id=$4 and ft.marketplace_id=$4 and fi.posted_date >= $2 and fi.posted_date < $3`,[tenantId,range.start,range.end,marketplaceId]),
+    db.query('select amount,reason,sku,reimbursement_date from reimbursements where tenant_id=$1 and marketplace_id=$4 and reimbursement_date >= $2::date and reimbursement_date < $3::date',[tenantId,range.start,range.end,marketplaceId]),
+    db.query('select id source_row_id,invoice_type,order_id,cgst,sgst,igst,taxable_value,invoice_date,raw from gst_invoices where tenant_id=$1 and marketplace_id=$4 and invoice_date >= $2::date and invoice_date < $3::date',[tenantId,range.start,range.end,marketplaceId]),
+    db.query(`select distinct on(report_type) report_type,status from sync_jobs where tenant_id=$1 and report_type=any($2::text[]) order by report_type,started_at desc`,[tenantId,['GET_FBA_FULFILLMENT_CUSTOMER_RETURNS_DATA','GET_GST_MTR_B2B_CUSTOM','GET_GST_MTR_B2C_CUSTOM','GET_V2_SETTLEMENT_REPORT_DATA_FLAT_FILE_V2']])
   ]);
-  return calculateDashboardMetrics({orders:orders.rows,orderItems:orderItems.rows,returns:returns.rows,scopedSettlementIds,settlementRows:settlementRows.rows,settlementHeaders:settlementHeaders.rows,settlementDocuments:settlementDocuments.rows,settlementSyncJobs:settlementSyncJobs.rows,financeItems:financeItems.rows,reimbursements:reimbursements.rows,gstInvoices:gstInvoices.rows},range);
+  return calculateDashboardMetrics({orders:orders.rows,orderItems:orderItems.rows,returns:returns.rows,scopedSettlementIds,settlementRows:settlementRows.rows,settlementHeaders:settlementHeaders.rows,settlementDocuments:settlementDocuments.rows,settlementSyncJobs:settlementSyncJobs.rows,financeItems:financeItems.rows,reimbursements:reimbursements.rows,gstInvoices:gstInvoices.rows,returnsSourceComplete:sourceStatuses.rows.some(r=>r.report_type==='GET_FBA_FULFILLMENT_CUSTOMER_RETURNS_DATA'&&r.status==='completed'),transfersSourceComplete:settlementSyncJobs.rows[0]?.status==='completed',gstSourceComplete:['GET_GST_MTR_B2B_CUSTOM','GET_GST_MTR_B2C_CUSTOM'].every(type=>sourceStatuses.rows.some(r=>r.report_type===type&&r.status==='completed')),marketplaceId},range);
 }
 
 app.get('/api/tenants/:tenantId/calculations/:metric', async request => {
   const {tenantId,metric}=CalculationParamsSchema.parse(request.params); const range=requestedRange(request.query);
   await requireTenantUser(request,tenantId); await assertActiveTenant(tenantId);
   return withTenant(tenantId,async db=>{
-    const calculated=await loadDashboardCalculations(db,tenantId,range);
+    const effectiveSeller=(await db.query("select amazon_seller_id,marketplace_id from sellers where tenant_id=$1 and auth_status='authorized' and ($2::text is null or marketplace_id=$2) order by connected_at desc limit 1",[tenantId,request.query.marketplaceId??null])).rows[0];const marketplaceId=effectiveSeller?.marketplace_id;if(!marketplaceId) throw new Error('No authorized marketplace selected');
+    const calculated=await loadDashboardCalculations(db,tenantId,marketplaceId,range);
     const detail=calculated.metrics[metric]??calculated.statement[metric];
     const rows=detail.rows??[];
-    return {metric,total:detail.value,unit:detail.unit,status:detail.status,formula:detail.formula,source:detail.source,range:detail.range,marketplaceRange:detail.marketplaceRange,diagnostics:detail.diagnostics,components:detail.components,rows,columns:rows.length?[...new Set(rows.flatMap(row=>Object.keys(row).filter(key=>key!=='raw')))].slice(0,14):[]};
+    return {metric,total:detail.value,unit:detail.unit,status:detail.status,reason:detail.reason,formula:detail.formula,dateField:detail.dateField,source:detail.source,effectiveSeller:{sellerId:effectiveSeller.amazon_seller_id,marketplaceId},range:detail.range,marketplaceRange:detail.marketplaceRange,diagnostics:detail.diagnostics,components:detail.components,includedRows:detail.includedRows,excludedRows:detail.excludedRows,duplicateRows:detail.duplicateRows,rows,columns:rows.length?[...new Set(rows.flatMap(row=>Object.keys(row).filter(key=>key!=='raw')))].slice(0,14):[]};
   });
 });
 
@@ -779,7 +773,7 @@ app.get('/api/tenants/:tenantId/dashboard', async request => {
   const start = range.start ? new Date(range.start) : new Date(Date.now() - 30 * 864e5);
   const end = range.end ? new Date(range.end) : new Date();
   const sellerRow = (await pool.query(`select seller_name, amazon_seller_id, marketplace_id, auth_status, connected_at, last_token_refresh_at from sellers
-    where tenant_id=$1 and auth_status='authorized' order by connected_at desc limit 1`, [tenantId])).rows[0] ?? null;
+    where tenant_id=$1 and auth_status='authorized' and ($2::text is null or marketplace_id=$2) order by connected_at desc limit 1`, [tenantId,range.marketplaceId??null])).rows[0] ?? null;
   const seller = sellerRow
     ? { connected: true, sellerName: sellerRow.seller_name, sellerId: sellerRow.amazon_seller_id, marketplaceId: sellerRow.marketplace_id, authStatus: sellerRow.auth_status, connectedAt: sellerRow.connected_at, lastTokenRefreshAt: sellerRow.last_token_refresh_at }
     : { connected: false };
@@ -931,7 +925,7 @@ app.get('/api/tenants/:tenantId/dashboard', async request => {
       summary[order.fulfillment === 'FBA' ? 'fbaReceivable' : order.fulfillment === 'FBM' ? 'fbmReceivable' : 'otherReceivable'] += Number(order.seller_receivable ?? 0);
       return summary;
     }, { grossSales: 0, deductions: 0, sellerReceivable: 0, fbaReceivable: 0, fbmReceivable: 0, otherReceivable: 0 });
-    const dashboardCalculations=await loadDashboardCalculations(client,tenantId,{start:start.toISOString(),end:end.toISOString()});
+    const dashboardCalculations=await loadDashboardCalculations(client,tenantId,seller.marketplaceId,{start:start.toISOString(),end:end.toISOString()});
     const hasImportedData = Number(orders.orders ?? 0) > 0 || Number(kpis.net_settled ?? 0) !== 0 || products.length > 0 || payments.length > 0 || inventory.length > 0;
     return { seller, amazonAuth, hasImportedData, kpis, orders, orderRows, orderPayments, paymentComponents, paymentSummary, dashboardCalculations, businessReportRows, products, trend, payments, settlementLines, financialComponents, financialSummary, jobs, inventory, returns, reimbursements, invoices, orderItems, financeTransactions };
   });
