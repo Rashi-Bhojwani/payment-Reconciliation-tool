@@ -9,7 +9,7 @@ function mindcircusFixture(){return{
   returns:[{source_row_id:'ret1',order_id:'shipped',sku:'same',return_date:'2026-07-12',quantity:2,raw:{eventId:'event-1'}}],
   settlementRows:[
     line('sf-sale','Principal',164084.08,'Order'),line('sf-refund','Principal',-45927.15,'Refund'),line('fba-sale','Principal',49861.08,'Order'),line('fba-refund','Principal',-10996.61,'Refund'),
-    line('promo','Promotional rebate',-2955.62),line('promo-refund','Promotional rebate refund',457.02,'Refund'),line('safe','SAFE-T Reimbursement',196.72,'SAFE-T Reimbursement'),line('shipping','Shipping credits',1686.50),
+    line('promo','Promotional rebate',-2955.62),line('promo-refund','Promotional rebate refund',457.02,'Refund'),line('safe','SAFE-T Reimbursement',196.72,'SAFE-T Reimbursement'),line('shipping','Shipping credits',1686.50),line('shipping-refund','Shipping credits',-169.50,'Refund'),line('inventory-credit','Shipping credits',169.50,'other-transaction'),
     line('fees','Selling fees',-56358.40,'ServiceFee'),line('fee-refund','Selling fee refunds',7397.65,'ServiceFeeRefund'),line('tds','TCS/TDS withholding',-1469.30,'Withholding'),
     line('gst-collected','Product Tax GST collected',38146.06),line('gst-refund','Product Tax GST refund',-10194.50,'Refund')
   ],
@@ -25,7 +25,15 @@ test('matches the MINDCIRCUS Amazon Account Activity fixture without constants',
   assert.equal(r.metrics.settled.value,131801.69);assert.equal(r.statement.transfers.value,-131801.69);assert.equal(r.statement.expenses.value,-50430.05);
   assert.equal(r.metrics.drr.value,5150.76);assert.equal(Number(r.metrics.feeImpact.value.toFixed(2)),22.88);assert.equal(Number(r.metrics.refundValueRate.value.toFixed(2)),26.61);
   assert.equal(r.diagnostics.sourcePolicy.financial.startsWith('Amazon Settlement report'),true);
+  assert.deepEqual([r.statement.income.debit,r.statement.income.credit],[60048.88,216454.9]);
+  assert.deepEqual([r.statement.expenses.debit,r.statement.expenses.credit],[57827.7,7397.65]);
+  assert.deepEqual([r.statement.gst.debit,r.statement.gst.credit],[10194.5,38146.06]);
+  assert.deepEqual([r.statement.transfers.debit,r.statement.transfers.credit],[131801.69,0]);
+  assert.equal(Object.values(r.statement).reduce((sum,section)=>sum+Math.round(section.value*100),0),212584);
 });
+test('fixture remains data-driven when a source paise changes',()=>{const input=mindcircusFixture();input.settlementRows.find(row=>row.source_row_id==='sf-sale').amount+=0.01;const r=calculateDashboardMetrics(input,range);assert.equal(r.statement.income.value,156406.03);assert.equal(Object.values(r.statement).reduce((sum,section)=>sum+Math.round(section.value*100),0),212585);});
+test('an unknown non-zero settlement label is auditable and prevents reconciliation',()=>{const input=mindcircusFixture();input.settlementRows.push(line('unknown','Future Amazon Label',1.23,'NewEvent',{amount_type:'NewAmountType'}));const r=calculateDashboardMetrics(input,range);assert.equal(r.statement.income.status,'Does not reconcile');assert.equal(r.diagnostics.unmappedAmount,1.23);assert.equal(r.diagnostics.unmappedRows[0].source_row_id,'unknown');});
+test('a report coverage gap makes statement sections incomplete',()=>{const input=mindcircusFixture();input.reportDocuments=[{data_start_time:range.start,data_end_time:'2026-07-10T00:00:00Z'}];const r=calculateDashboardMetrics(input,range);assert.equal(r.diagnostics.coverageComplete,false);assert.equal(r.statement.income.status,'Incomplete');});
 test('uses current status only and preserves identical-SKU lines with stable item IDs',()=>{const r=calculateDashboardMetrics(mindcircusFixture(),range);assert.equal(r.metrics.netQty.value,3);assert.equal(r.metrics.orders.value,1);assert.equal(r.metrics.returnRate.value,40);});
 test('negative Principal is a refund through parent transaction metadata',()=>{const input=mindcircusFixture();const refund=input.settlementRows.find(x=>x.source_row_id==='sf-refund');delete refund.transaction_type;assert.equal(calculateDashboardMetrics(input,range).metrics.netSales.value,154522.8);});
 test('missing return quantity makes quantity KPIs unavailable instead of guessing one',()=>{const input=mindcircusFixture();input.returns[0].quantity=null;const r=calculateDashboardMetrics(input,range);assert.equal(r.metrics.returns.value,null);assert.equal(r.metrics.netQty.value,null);assert.equal(r.metrics.returnRate.value,null);assert.equal(r.metrics.returnRate.status,'Unavailable / source mismatch');});

@@ -5,10 +5,10 @@ import rateLimit from '@fastify/rate-limit';
 import jwt from '@fastify/jwt';
 import { z } from 'zod';
 import { assertActiveTenant, databaseUrlConfigured, pool, withTenant } from '@recon/db';
-import { getSpApiEndpoint, MARKETPLACES, REPORT_TYPES, SpApiClient } from '@recon/sp-api-client';
+import { getSpApiEndpoint, marketplaceCalendarRange, MARKETPLACES, REPORT_TYPES, SpApiClient } from '@recon/sp-api-client';
 import { secrets } from './config/secrets.js';
 import { decryptSecret, encryptSecret } from './config/crypto.js';
-import { buildGstInvoicesFromOrderItems, startScheduler, syncRecentApiDataForTenant, syncReportForTenant } from './jobs/sync.js';
+import { startScheduler, syncRecentApiDataForTenant, syncReportForTenant } from './jobs/sync.js';
 import { categorizeFinanceLabel } from './jobs/finance-components.js';
 import { calculateDashboardMetrics } from './jobs/dashboard-calculations.js';
 import { runFeeAuditForTenant } from './jobs/fee-audit.js';
@@ -29,7 +29,7 @@ const SellerSyncParamsSchema = z.object({ tenantId: z.string().uuid(), reportTyp
 const AmazonCallbackSchema = z.object({ spapi_oauth_code: z.string().optional(), code: z.string().optional(), selling_partner_id: z.string().optional(), state: z.string().optional(), amazon_state: z.string().optional(), redirect_uri: z.string().url().optional(), error: z.string().optional(), error_description: z.string().optional() });
 const AmazonAccessTokenSchema = z.object({ sellerId: z.string().optional() });
 const DateRangeSchema = z.object({ start: z.string().datetime(), end: z.string().datetime() });
-const DashboardQuerySchema = z.object({ start: z.string().datetime().optional(), end: z.string().datetime().optional() });
+const DashboardQuerySchema = z.object({ start: z.string().datetime().optional(), end: z.string().datetime().optional(), startDate:z.string().date().optional(), endDateExclusive:z.string().date().optional() });
 const SellerSyncSchema = z.object({ reportTypes: z.array(z.enum(REPORT_TYPES)).default(['GET_SALES_AND_TRAFFIC_REPORT', 'GET_V2_SETTLEMENT_REPORT_DATA_FLAT_FILE_V2']), range: DateRangeSchema.optional() });
 const RegisterSchema = z.object({ companyName: z.string().min(2), ownerEmail: z.string().email(), password: z.string().min(8), marketplaceId: z.string().default('A21TJRUUN4KGV') });
 const LoginSchema = z.object({ email: z.string().email(), password: z.string().min(1) });
@@ -488,9 +488,10 @@ app.post('/api/admin/tenants/:tenantId/sync/:reportType', async request => { awa
 
 app.post('/api/tenants/:tenantId/sync/:reportType', async request => {
   const params = SellerSyncParamsSchema.parse(request.params);
-  const body = z.object({ range: DateRangeSchema.optional() }).parse(request.body ?? {});
+  const body = z.object({ range: DateRangeSchema.optional(), startDate:z.string().date().optional(), endDateExclusive:z.string().date().optional() }).parse(request.body ?? {});
   await requireTenantUser(request, params.tenantId);
   await assertActiveTenant(params.tenantId);
+  if(body.startDate&&body.endDateExclusive) body.range=await requestedMarketplaceRange(params.tenantId,body);
   if (params.reportType === 'DIRECT_SP_API_SYNC') {
     // Keep an interactive sync bounded. Fetching 1,000 order-item and catalog
     // records serially can take well over half an hour at Amazon's rate limits.
@@ -509,30 +510,10 @@ app.post('/api/tenants/:tenantId/sync/:reportType', async request => {
     await recordSyntheticReportSync(params.tenantId, params.reportType);
     return { reportType: params.reportType, status: 'completed', fallback: 'DIRECT_SP_API_SYNC', ...fallback };
   }
-  if (params.reportType === 'GET_GST_MTR_B2B_CUSTOM' || params.reportType === 'GET_GST_MTR_B2C_CUSTOM') {
-    const invoiceType = params.reportType === 'GET_GST_MTR_B2B_CUSTOM' ? 'b2b' : 'b2c';
-    const rowsImported = await buildGstInvoicesFromOrderItems(params.tenantId, invoiceType);
-    if (rowsImported > 0) {
-      await recordSyntheticReportSync(params.tenantId, params.reportType, 'fallback://order-items-gst-estimate');
-      return { reportType: params.reportType, status: 'completed', fallback: 'ORDER_ITEMS_GST_ESTIMATE', rowsImported };
-    }
-  }
   try {
     const result = await syncReportForTenant({ ...params, range: body.range });
     return { reportType: params.reportType, status: 'completed', ...result };
   } catch (error) {
-    if (params.reportType === 'GET_GST_MTR_B2B_CUSTOM' || params.reportType === 'GET_GST_MTR_B2C_CUSTOM') {
-      const invoiceType = params.reportType === 'GET_GST_MTR_B2B_CUSTOM' ? 'b2b' : 'b2c';
-      const rowsImported = await buildGstInvoicesFromOrderItems(params.tenantId, invoiceType);
-      if (rowsImported > 0) {
-        await pool.query(
-          `update sync_jobs set status='completed', completed_at=now(), error_message=null, s3_key=$3
-           where id = (select id from sync_jobs where tenant_id=$1 and report_type=$2 order by started_at desc nulls last limit 1)`,
-          [params.tenantId, params.reportType, 'fallback://order-items-gst-estimate']
-        );
-        return { reportType: params.reportType, status: 'completed', fallback: 'ORDER_ITEMS_GST_ESTIMATE', rowsImported, warning: error instanceof Error ? error.message : 'GST report sync failed' };
-      }
-    }
     const directFallbackReports = new Set(['GET_SALES_AND_TRAFFIC_REPORT', 'GET_FBA_MYI_UNSUPPRESSED_INVENTORY_DATA', 'GET_FBA_REIMBURSEMENTS_DATA']);
     if (directFallbackReports.has(params.reportType)) {
       try {
@@ -575,6 +556,7 @@ const CalculationParamsSchema = z.object({ tenantId: z.string().uuid(), metric: 
 const OrderDetailParamsSchema = z.object({ tenantId: z.string().uuid(), orderId: z.string().min(1) });
 const FEE_CATEGORIES = ['referral_commission', 'fulfillment_fee_per_order', 'fulfillment_fee_per_unit', 'fulfillment_fee_weight', 'shipping_fee', 'gift_wrap_fee', 'closing_fee', 'digital_services_fee', 'storage_fee', 'chargeback', 'tax'];
 function requestedRange(query) { const parsed = DashboardQuerySchema.parse(query); return { start: parsed.start ?? new Date(Date.now() - 30 * 864e5).toISOString(), end: parsed.end ?? new Date().toISOString() }; }
+async function requestedMarketplaceRange(tenantId,query){const parsed=DashboardQuerySchema.parse(query);if(!parsed.startDate||!parsed.endDateExclusive)return requestedRange(query);const marketplaceId=(await pool.query("select marketplace_id from sellers where tenant_id=$1 and auth_status='authorized' order by connected_at desc limit 1",[tenantId])).rows[0]?.marketplace_id??'A21TJRUUN4KGV';return marketplaceCalendarRange(parsed.startDate,parsed.endDateExclusive,marketplaceId);}
 function groupCalculationRows(rows) {
   const grouped = new Map();
   for (const row of rows) { const key = row.category; const current = grouped.get(key) ?? { category: key, label: key.replaceAll('_', ' '), amount: 0, count: 0 }; current.amount += Number(row.amount ?? 0); current.count += 1; grouped.set(key, current); }
@@ -582,11 +564,11 @@ function groupCalculationRows(rows) {
 }
 
 async function loadDashboardCalculations(db, tenantId, range) {
-  const [orders,orderItems,returns,settlementRows,settlementHeaders,financeItems,financeTransactions,reimbursements,gstInvoices]=await Promise.all([
+  const [orders,orderItems,returns,settlementRows,settlementHeaders,financeItems,financeTransactions,reimbursements,gstInvoices,reportDocumentsResult]=await Promise.all([
     db.query('select id source_row_id,amazon_order_id,status,order_date,total_amount,raw from orders where tenant_id=$1 and order_date >= $2 and order_date < $3',[tenantId,range.start,range.end]),
     db.query(`select oi.id source_row_id,oi.amazon_order_id,oi.asin,oi.sku,oi.title,oi.quantity_ordered,oi.item_price,oi.promotion_discount,oi.raw,o.status,o.order_date from order_items oi join orders o on o.tenant_id=oi.tenant_id and o.amazon_order_id=oi.amazon_order_id where oi.tenant_id=$1 and o.order_date >= $2 and o.order_date < $3`,[tenantId,range.start,range.end]),
     db.query('select id source_row_id,order_id,return_date,return_reason,disposition,status,quantity,raw from returns where tenant_id=$1 and return_date >= $2::date and return_date < $3::date',[tenantId,range.start,range.end]),
-    db.query(`select id source_row_id,settlement_id,order_id,amount_type,amount_description,amount,posted_date,raw,
+    db.query(`select id source_row_id,settlement_id,order_id,amount_type,amount_description,amount,amount_minor,currency,posted_date,raw,source_report_id,source_document_id,source_line_id,
       coalesce(raw->>'transaction-type',raw->>'transaction type',raw->>'transactionType') parent_transaction_type
       from settlement_rows where tenant_id=$1 and posted_date >= $2 and posted_date < $3`,[tenantId,range.start,range.end]),
     db.query(`select settlement_id,coalesce(raw->>'deposit-date',raw->>'deposit date',raw->>'depositDate') deposit_date,coalesce(nullif(raw->>'total-amount',''),nullif(raw->>'total amount',''),nullif(raw->>'totalAmount','')) total_amount,coalesce(raw->>'transaction-type',raw->>'transaction type') transaction_type,raw from settlement_rows where tenant_id=$1 and coalesce(raw->>'deposit-date',raw->>'deposit date',raw->>'depositDate','')<>''`,[tenantId]),
@@ -597,13 +579,15 @@ async function loadDashboardCalculations(db, tenantId, range) {
       where fi.tenant_id=$1 and fi.posted_date >= $2 and fi.posted_date < $3`,[tenantId,range.start,range.end]),
     db.query('select transaction_id,transaction_type,posted_date,total_amount,currency,related_order_id,raw from finance_transactions where tenant_id=$1 and posted_date >= $2 and posted_date < $3',[tenantId,range.start,range.end]),
     db.query('select amount,reason,sku,reimbursement_date from reimbursements where tenant_id=$1 and reimbursement_date >= $2::date and reimbursement_date < $3::date',[tenantId,range.start,range.end]),
-    db.query('select id source_row_id,invoice_type,order_id,cgst,sgst,igst,taxable_value,invoice_date,raw from gst_invoices where tenant_id=$1 and invoice_date >= $2::date and invoice_date < $3::date',[tenantId,range.start,range.end])
+    db.query('select id source_row_id,invoice_type,order_id,cgst,sgst,igst,taxable_value,invoice_date,raw from gst_invoices where tenant_id=$1 and invoice_date >= $2::date and invoice_date < $3::date',[tenantId,range.start,range.end]),
+    db.query('select report_id,report_document_id,marketplace_id,data_start_time,data_end_time,created_time,imported_at from settlement_report_documents where tenant_id=$1 and data_end_time>$2 and data_start_time<$3 order by data_start_time',[tenantId,range.start,range.end])
   ]);
-  return calculateDashboardMetrics({orders:orders.rows,orderItems:orderItems.rows,returns:returns.rows,settlementRows:settlementRows.rows,settlementHeaders:settlementHeaders.rows,financeItems:financeItems.rows,financeTransactions:financeTransactions.rows,reimbursements:reimbursements.rows,gstInvoices:gstInvoices.rows},range);
+  const reportDocuments=reportDocumentsResult.rows;
+  return calculateDashboardMetrics({orders:orders.rows,orderItems:orderItems.rows,returns:returns.rows,settlementRows:settlementRows.rows,settlementHeaders:settlementHeaders.rows,financeItems:financeItems.rows,financeTransactions:financeTransactions.rows,reimbursements:reimbursements.rows,gstInvoices:gstInvoices.rows,reportDocuments},range);
 }
 
 app.get('/api/tenants/:tenantId/calculations/:metric', async request => {
-  const {tenantId,metric}=CalculationParamsSchema.parse(request.params); const range=requestedRange(request.query);
+  const {tenantId,metric}=CalculationParamsSchema.parse(request.params); const range=await requestedMarketplaceRange(tenantId,request.query);
   await requireTenantUser(request,tenantId); await assertActiveTenant(tenantId);
   return withTenant(tenantId,async db=>{
     const calculated=await loadDashboardCalculations(db,tenantId,range);
@@ -771,9 +755,9 @@ app.get('/api/tenants/:tenantId/fee-leaks',async request=>{const {tenantId}=Tena
 
 app.get('/api/tenants/:tenantId/dashboard', async request => {
   const { tenantId } = TenantParamsSchema.parse(request.params); await requireTenantUser(request, tenantId); await assertActiveTenant(tenantId);
-  const range = DashboardQuerySchema.parse(request.query);
-  const start = range.start ? new Date(range.start) : new Date(Date.now() - 30 * 864e5);
-  const end = range.end ? new Date(range.end) : new Date();
+  const range = await requestedMarketplaceRange(tenantId,request.query);
+  const start = new Date(range.start);
+  const end = new Date(range.end);
   const sellerRow = (await pool.query(`select seller_name, amazon_seller_id, marketplace_id, auth_status, connected_at, last_token_refresh_at from sellers
     where tenant_id=$1 and auth_status='authorized' order by connected_at desc limit 1`, [tenantId])).rows[0] ?? null;
   const seller = sellerRow
