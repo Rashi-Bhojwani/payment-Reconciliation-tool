@@ -162,6 +162,11 @@ async function saveSettlementRows(tenantId, content, source = {}) {
   return rows.length;
 }
 
+export async function importUploadedSettlementReport({tenantId,marketplaceId,content,fileName='manual-upload'}){
+  const hash=createHash('sha256').update(content).digest('hex');
+  return saveSettlementRows(tenantId,content,{reportId:`upload-${hash}`,reportDocumentId:`upload-${hash}`,marketplaceId,createdTime:new Date().toISOString(),fileName});
+}
+
 /** @param {string} tenantId @param {string} content @param {'b2b'|'b2c'} invoiceType */
 async function saveGstInvoices(tenantId, content, invoiceType) {
   const rows = z.array(ReportRowSchema).parse(parseReportRows(invoiceType === 'b2b' ? 'GET_GST_MTR_B2B_CUSTOM' : 'GET_GST_MTR_B2C_CUSTOM', content));

@@ -680,6 +680,8 @@ function MetricDetail({ metric, tenantId }) {
   const navigate = useNavigate();
   const [details, setDetails] = useState(null);
   const [error, setError] = useState('');
+  const [uploading,setUploading]=useState(false);
+  async function uploadSettlement(event){const file=event.target.files?.[0];if(!file)return;setUploading(true);setError('');try{await api(`/api/tenants/${tenantId}/uploads/settlement`,{method:'POST',body:JSON.stringify({fileName:file.name,content:await file.text()})});const refreshed=await api(`/api/tenants/${tenantId}/calculations/${metric}?${rangeQuery(range)}`);setDetails(refreshed);}catch(e){setError(e.message)}finally{setUploading(false);event.target.value='';}}
   useEffect(() => {
     let active = true; setDetails(null); setError('');
     api(`/api/tenants/${tenantId}/calculations/${metric}?${rangeQuery(range)}`).then(result => { if (active) setDetails(result); }).catch(e => { if (active) setError(e.message); });

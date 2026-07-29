@@ -35,6 +35,7 @@ const LocalRangeSchema=z.object({start:z.string().regex(/^\d{4}-\d{2}-\d{2}$/),e
 const DashboardSyncSchema=z.object({marketplaceId:z.string().min(1),localStartDate:z.string().regex(/^\d{4}-\d{2}-\d{2}$/),localEndDate:z.string().regex(/^\d{4}-\d{2}-\d{2}$/)});
 const DashboardQuerySchema = z.object({ start: z.string().datetime().optional(), end: z.string().datetime().optional(),localStart:z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional(),localEndExclusive:z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional() });
 const SellerSyncSchema = z.object({ reportTypes: z.array(z.enum(REPORT_TYPES)).default(['GET_SALES_AND_TRAFFIC_REPORT', 'GET_V2_SETTLEMENT_REPORT_DATA_FLAT_FILE_V2']), range: DateRangeSchema.optional() });
+const SettlementUploadSchema=z.object({fileName:z.string().min(1).max(255),content:z.string().min(1).max(25_000_000)});
 const RegisterSchema = z.object({ companyName: z.string().min(2), ownerEmail: z.string().email(), password: z.string().min(8), marketplaceId: z.string().default('A21TJRUUN4KGV') });
 const LoginSchema = z.object({ email: z.string().email(), password: z.string().min(1) });
 const adminId = '00000000-0000-0000-0000-000000000001';
