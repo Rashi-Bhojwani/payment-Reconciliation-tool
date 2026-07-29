@@ -8,9 +8,10 @@ import { assertActiveTenant, databaseUrlConfigured, pool, withTenant } from '@re
 import { getSpApiEndpoint, MARKETPLACES, REPORT_TYPES, SpApiClient } from '@recon/sp-api-client';
 import { secrets } from './config/secrets.js';
 import { decryptSecret, encryptSecret } from './config/crypto.js';
-import { buildGstInvoicesFromOrderItems, startScheduler, syncRecentApiDataForTenant, syncReportForTenant } from './jobs/sync.js';
+import { importUploadedSettlementReport, startScheduler, syncRecentApiDataForTenant, syncReportForTenant } from './jobs/sync.js';
 import { categorizeFinanceLabel } from './jobs/finance-components.js';
 import { calculateDashboardMetrics } from './jobs/dashboard-calculations.js';
+import { marketplaceLocalDate, zonedCalendarInstant } from './jobs/marketplace-time.js';
 import { runFeeAuditForTenant } from './jobs/fee-audit.js';
 
 const app = Fastify({ logger: { redact: ['req.headers.authorization', 'refresh_token', 'access_token', 'password', 'passwordHash'] }, trustProxy: true });
@@ -29,8 +30,10 @@ const SellerSyncParamsSchema = z.object({ tenantId: z.string().uuid(), reportTyp
 const AmazonCallbackSchema = z.object({ spapi_oauth_code: z.string().optional(), code: z.string().optional(), selling_partner_id: z.string().optional(), state: z.string().optional(), amazon_state: z.string().optional(), redirect_uri: z.string().url().optional(), error: z.string().optional(), error_description: z.string().optional() });
 const AmazonAccessTokenSchema = z.object({ sellerId: z.string().optional() });
 const DateRangeSchema = z.object({ start: z.string().datetime(), end: z.string().datetime() });
-const DashboardQuerySchema = z.object({ start: z.string().datetime().optional(), end: z.string().datetime().optional() });
+const LocalRangeSchema=z.object({start:z.string().regex(/^\d{4}-\d{2}-\d{2}$/),endExclusive:z.string().regex(/^\d{4}-\d{2}-\d{2}$/)});
+const DashboardQuerySchema = z.object({ start: z.string().datetime().optional(), end: z.string().datetime().optional(),localStart:z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional(),localEndExclusive:z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional() });
 const SellerSyncSchema = z.object({ reportTypes: z.array(z.enum(REPORT_TYPES)).default(['GET_SALES_AND_TRAFFIC_REPORT', 'GET_V2_SETTLEMENT_REPORT_DATA_FLAT_FILE_V2']), range: DateRangeSchema.optional() });
+const SettlementUploadSchema=z.object({fileName:z.string().min(1).max(255),content:z.string().min(1).max(25_000_000)});
 const RegisterSchema = z.object({ companyName: z.string().min(2), ownerEmail: z.string().email(), password: z.string().min(8), marketplaceId: z.string().default('A21TJRUUN4KGV') });
 const LoginSchema = z.object({ email: z.string().email(), password: z.string().min(1) });
 const adminId = '00000000-0000-0000-0000-000000000001';
@@ -488,14 +491,16 @@ app.post('/api/admin/tenants/:tenantId/sync/:reportType', async request => { awa
 
 app.post('/api/tenants/:tenantId/sync/:reportType', async request => {
   const params = SellerSyncParamsSchema.parse(request.params);
-  const body = z.object({ range: DateRangeSchema.optional() }).parse(request.body ?? {});
+  const body = z.object({ range: DateRangeSchema.optional(),localRange:LocalRangeSchema.optional() }).parse(request.body ?? {});
   await requireTenantUser(request, params.tenantId);
   await assertActiveTenant(params.tenantId);
+  const marketplaceRow=(await pool.query("select marketplace_id from sellers where tenant_id=$1 and auth_status='authorized' order by connected_at desc limit 1",[params.tenantId])).rows[0];const syncTimezone=MARKETPLACES[marketplaceRow?.marketplace_id]?.timeZone??'UTC';
+  const syncRange=body.localRange?{start:zonedCalendarInstant(body.localRange.start,syncTimezone),end:zonedCalendarInstant(body.localRange.endExclusive,syncTimezone)}:body.range;
   if (params.reportType === 'DIRECT_SP_API_SYNC') {
     // Keep an interactive sync bounded. Fetching 1,000 order-item and catalog
     // records serially can take well over half an hour at Amazon's rate limits.
     // Subsequent syncs continue incrementally from the last completion.
-    const result = await syncRecentApiDataForTenant(params.tenantId, { range: body.range, maxOrderPages: 2, maxOrderItems: 20 });
+    const result = await syncRecentApiDataForTenant(params.tenantId, { range: syncRange, maxOrderPages: 2, maxOrderItems: 20 });
     return { reportType: params.reportType, status: 'completed', ...result };
   }
   const directFirstReports = new Set(['GET_FBA_MYI_UNSUPPRESSED_INVENTORY_DATA', 'GET_FBA_REIMBURSEMENTS_DATA']);
@@ -505,34 +510,14 @@ app.post('/api/tenants/:tenantId/sync/:reportType', async request => {
       : params.reportType === 'GET_FBA_REIMBURSEMENTS_DATA'
         ? { includeOrders: false, includeFinance: true, includeInventory: false }
         : { includeOrders: false, includeFinance: true, includeInventory: false };
-    const fallback = await syncRecentApiDataForTenant(params.tenantId, { range: body.range, ...familyOptions });
+    const fallback = await syncRecentApiDataForTenant(params.tenantId, { range: syncRange, ...familyOptions });
     await recordSyntheticReportSync(params.tenantId, params.reportType);
     return { reportType: params.reportType, status: 'completed', fallback: 'DIRECT_SP_API_SYNC', ...fallback };
   }
-  if (params.reportType === 'GET_GST_MTR_B2B_CUSTOM' || params.reportType === 'GET_GST_MTR_B2C_CUSTOM') {
-    const invoiceType = params.reportType === 'GET_GST_MTR_B2B_CUSTOM' ? 'b2b' : 'b2c';
-    const rowsImported = await buildGstInvoicesFromOrderItems(params.tenantId, invoiceType);
-    if (rowsImported > 0) {
-      await recordSyntheticReportSync(params.tenantId, params.reportType, 'fallback://order-items-gst-estimate');
-      return { reportType: params.reportType, status: 'completed', fallback: 'ORDER_ITEMS_GST_ESTIMATE', rowsImported };
-    }
-  }
   try {
-    const result = await syncReportForTenant({ ...params, range: body.range });
+    const result = await syncReportForTenant({ ...params, range: syncRange });
     return { reportType: params.reportType, status: 'completed', ...result };
   } catch (error) {
-    if (params.reportType === 'GET_GST_MTR_B2B_CUSTOM' || params.reportType === 'GET_GST_MTR_B2C_CUSTOM') {
-      const invoiceType = params.reportType === 'GET_GST_MTR_B2B_CUSTOM' ? 'b2b' : 'b2c';
-      const rowsImported = await buildGstInvoicesFromOrderItems(params.tenantId, invoiceType);
-      if (rowsImported > 0) {
-        await pool.query(
-          `update sync_jobs set status='completed', completed_at=now(), error_message=null, s3_key=$3
-           where id = (select id from sync_jobs where tenant_id=$1 and report_type=$2 order by started_at desc nulls last limit 1)`,
-          [params.tenantId, params.reportType, 'fallback://order-items-gst-estimate']
-        );
-        return { reportType: params.reportType, status: 'completed', fallback: 'ORDER_ITEMS_GST_ESTIMATE', rowsImported, warning: error instanceof Error ? error.message : 'GST report sync failed' };
-      }
-    }
     const directFallbackReports = new Set(['GET_SALES_AND_TRAFFIC_REPORT', 'GET_FBA_MYI_UNSUPPRESSED_INVENTORY_DATA', 'GET_FBA_REIMBURSEMENTS_DATA']);
     if (directFallbackReports.has(params.reportType)) {
       try {
@@ -545,6 +530,15 @@ app.post('/api/tenants/:tenantId/sync/:reportType', async request => {
     }
     return { reportType: params.reportType, status: 'failed', error: error instanceof Error ? error.message : 'Report sync failed' };
   }
+});
+
+app.post('/api/tenants/:tenantId/uploads/settlement',async request=>{
+  const {tenantId}=TenantParamsSchema.parse(request.params);await requireTenantUser(request,tenantId);await assertActiveTenant(tenantId);
+  const body=SettlementUploadSchema.parse(request.body??{});
+  const seller=(await pool.query("select marketplace_id from sellers where tenant_id=$1 and auth_status='authorized' order by connected_at desc limit 1",[tenantId])).rows[0];
+  if(!seller) throw Object.assign(new Error('Connect an Amazon seller before importing its settlement report'),{statusCode:409});
+  const rowsImported=await importUploadedSettlementReport({tenantId,marketplaceId:seller.marketplace_id,content:body.content,fileName:body.fileName});
+  return {rowsImported,source:'manual_upload',fileName:body.fileName};
 });
 
 app.post('/api/tenants/:tenantId/sync', async request => {
@@ -574,23 +568,26 @@ const DASHBOARD_METRICS = ['netSales','netQty','orders','returns','settled','ded
 const CalculationParamsSchema = z.object({ tenantId: z.string().uuid(), metric: z.enum(DASHBOARD_METRICS) });
 const OrderDetailParamsSchema = z.object({ tenantId: z.string().uuid(), orderId: z.string().min(1) });
 const FEE_CATEGORIES = ['referral_commission', 'fulfillment_fee_per_order', 'fulfillment_fee_per_unit', 'fulfillment_fee_weight', 'shipping_fee', 'gift_wrap_fee', 'closing_fee', 'digital_services_fee', 'storage_fee', 'chargeback', 'tax'];
-function requestedRange(query) { const parsed = DashboardQuerySchema.parse(query); return { start: parsed.start ?? new Date(Date.now() - 30 * 864e5).toISOString(), end: parsed.end ?? new Date().toISOString() }; }
+function requestedRange(query,timeZone='UTC') { const parsed = DashboardQuerySchema.parse(query); return { start: parsed.localStart?zonedCalendarInstant(parsed.localStart,timeZone):parsed.start ?? new Date(Date.now() - 30 * 864e5).toISOString(), end: parsed.localEndExclusive?zonedCalendarInstant(parsed.localEndExclusive,timeZone):parsed.end ?? new Date().toISOString() }; }
+async function tenantRequestedRange(tenantId,query){const row=(await pool.query("select marketplace_id from sellers where tenant_id=$1 and auth_status='authorized' order by connected_at desc limit 1",[tenantId])).rows[0];return requestedRange(query,MARKETPLACES[row?.marketplace_id]?.timeZone??'UTC');}
 function groupCalculationRows(rows) {
   const grouped = new Map();
   for (const row of rows) { const key = row.category; const current = grouped.get(key) ?? { category: key, label: key.replaceAll('_', ' '), amount: 0, count: 0 }; current.amount += Number(row.amount ?? 0); current.count += 1; grouped.set(key, current); }
   return [...grouped.values()];
 }
 
-async function loadDashboardCalculations(db, tenantId, range) {
-  const [orders,orderItems,returns,settlementRows,settlementHeaders,financeItems,financeTransactions,reimbursements,gstInvoices,settlementReports]=await Promise.all([
+function coverageContains(reports,range){const intervals=reports.filter(r=>r.data_start_time&&r.data_end_time).map(r=>[new Date(r.data_start_time).getTime(),new Date(r.data_end_time).getTime()]).sort((a,b)=>a[0]-b[0]);let cursor=new Date(range.start).getTime();const end=new Date(range.end).getTime();for(const [start,finish] of intervals){if(start>cursor)return false;if(finish>cursor)cursor=finish;if(cursor>=end)return true;}return false;}
+async function loadDashboardCalculations(db, tenantId, range, context={}) {
+  const [orders,orderItems,returns,settlementRows,settlementHeaders,financeItems,financeTransactions,reimbursements,gstInvoices,settlementReports,settlementControls,failedJobs,completedSources]=await Promise.all([
     db.query('select id source_row_id,amazon_order_id,status,order_date,total_amount,raw from orders where tenant_id=$1 and order_date >= $2 and order_date < $3',[tenantId,range.start,range.end]),
     db.query(`select oi.id source_row_id,oi.amazon_order_id,oi.asin,oi.sku,oi.title,oi.quantity_ordered,oi.item_price,oi.promotion_discount,oi.raw,o.status,o.order_date from order_items oi join orders o on o.tenant_id=oi.tenant_id and o.amazon_order_id=oi.amazon_order_id where oi.tenant_id=$1 and o.order_date >= $2 and o.order_date < $3`,[tenantId,range.start,range.end]),
     db.query('select id source_row_id,order_id,return_date,return_reason,disposition,status,quantity,raw from returns where tenant_id=$1 and return_date >= $2::date and return_date < $3::date',[tenantId,range.start,range.end]),
     db.query(`select source_row_id,settlement_id,order_id,amount_type,amount_description,amount,amount_minor,currency,posted_date,raw,source_report_id,source_line_number,
       coalesce(raw->>'transaction-type',raw->>'transaction type',raw->>'transactionType') parent_transaction_type
       from (select sr.id source_row_id,sr.*,row_number() over(partition by sr.settlement_id,coalesce(sr.source_line_number,0),sr.order_id,sr.amount_type,sr.amount_description,sr.amount,sr.posted_date order by rep.imported_at desc nulls last) canonical
-        from settlement_rows sr left join settlement_reports rep on rep.tenant_id=sr.tenant_id and rep.report_id=sr.source_report_id
-        where sr.tenant_id=$1 and sr.posted_date >= $2 and sr.posted_date < $3) selected where canonical=1`,[tenantId,range.start,range.end]),
+        from settlement_rows sr join settlement_reports rep on rep.tenant_id=sr.tenant_id and rep.report_id=sr.source_report_id
+        join settlement_controls control on control.tenant_id=sr.tenant_id and control.report_id=sr.source_report_id and control.settlement_id=sr.settlement_id and control.completeness_status='complete' and control.control_difference_minor=0
+        where sr.tenant_id=$1) selected where canonical=1`,[tenantId]),
     db.query(`select settlement_id,coalesce(raw->>'deposit-date',raw->>'deposit date',raw->>'depositDate') deposit_date,coalesce(nullif(raw->>'total-amount',''),nullif(raw->>'total amount',''),nullif(raw->>'totalAmount','')) total_amount,coalesce(raw->>'transaction-type',raw->>'transaction type') transaction_type,raw from settlement_rows where tenant_id=$1 and coalesce(raw->>'deposit-date',raw->>'deposit date',raw->>'depositDate','')<>''`,[tenantId]),
     db.query(`select fi.id source_row_id,fi.transaction_id,fi.order_id,fi.sku,fi.asin,fi.category,fi.amount_description,fi.amount,fi.currency,fi.posted_date,fi.raw,
       ft.transaction_type parent_transaction_type,
@@ -600,26 +597,36 @@ async function loadDashboardCalculations(db, tenantId, range) {
     db.query('select transaction_id,transaction_type,posted_date,total_amount,currency,related_order_id,raw from finance_transactions where tenant_id=$1 and posted_date >= $2 and posted_date < $3',[tenantId,range.start,range.end]),
     db.query('select amount,reason,sku,reimbursement_date from reimbursements where tenant_id=$1 and reimbursement_date >= $2::date and reimbursement_date < $3::date',[tenantId,range.start,range.end]),
     db.query('select id source_row_id,invoice_type,order_id,cgst,sgst,igst,taxable_value,invoice_date,raw from gst_invoices where tenant_id=$1 and invoice_date >= $2::date and invoice_date < $3::date',[tenantId,range.start,range.end]),
-    db.query('select report_id,document_id,data_start_time,data_end_time,created_time,imported_at from settlement_reports where tenant_id=$1 and data_end_time>$2 and data_start_time<$3 order by data_start_time',[tenantId,range.start,range.end])
+    db.query('select report_id,document_id,data_start_time,data_end_time,created_time,imported_at,content_hash,parsed_row_count,import_status from settlement_reports where tenant_id=$1 and data_end_time>$2 and data_start_time<$3 order by data_start_time',[tenantId,range.start,range.end]),
+    db.query(`select distinct on(c.settlement_id) c.report_id,c.document_id,c.settlement_id,c.header_total_minor,c.detail_total_minor,c.control_difference_minor,c.imported_row_count,c.completeness_status
+      from settlement_controls c join settlement_reports r on r.tenant_id=c.tenant_id and r.report_id=c.report_id
+      where c.tenant_id=$1 and r.data_end_time>$2 and r.data_start_time<$3 order by c.settlement_id,r.imported_at desc`,[tenantId,range.start,range.end]),
+    db.query("select report_type,error_message,completed_at from sync_jobs where tenant_id=$1 and status='failed' order by completed_at desc limit 20",[tenantId]),
+    db.query("select distinct report_type from sync_jobs where tenant_id=$1 and status='completed'",[tenantId])
   ]);
-  const result=calculateDashboardMetrics({orders:orders.rows,orderItems:orderItems.rows,returns:returns.rows,settlementRows:settlementRows.rows,settlementHeaders:settlementHeaders.rows,financeItems:financeItems.rows,financeTransactions:financeTransactions.rows,reimbursements:reimbursements.rows,gstInvoices:gstInvoices.rows},range);
+  const marketplaceTimezone=context.marketplaceTimezone??'UTC';
+  const calculationContext={...context,marketplaceTimezone,selectedLocalRange:{start:marketplaceLocalDate(range.start,marketplaceTimezone),endExclusive:marketplaceLocalDate(range.end,marketplaceTimezone)}};
+  const completed=new Set(completedSources.rows.map(row=>row.report_type));
+  const result=calculateDashboardMetrics({orders:orders.rows,orderItems:orderItems.rows,returns:returns.rows,settlementRows:settlementRows.rows,settlementHeaders:settlementHeaders.rows,settlementControls:settlementControls.rows,financeItems:financeItems.rows,financeTransactions:financeTransactions.rows,reimbursements:reimbursements.rows,gstInvoices:gstInvoices.rows,failedJobs:failedJobs.rows,context:calculationContext,sourceCompleteness:{settlementCoverageComplete:coverageContains(settlementReports.rows,range),financesCoverageComplete:false,ordersCoverageComplete:completed.has('DIRECT_SP_API_SYNC'),returnsCoverageComplete:completed.has('GET_FBA_FULFILLMENT_CUSTOMER_RETURNS_DATA')}},range);
   result.diagnostics.reportCoverage=settlementReports.rows;
   return result;
 }
 
 app.get('/api/tenants/:tenantId/calculations/:metric', async request => {
-  const {tenantId,metric}=CalculationParamsSchema.parse(request.params); const range=requestedRange(request.query);
+  const {tenantId,metric}=CalculationParamsSchema.parse(request.params);
   await requireTenantUser(request,tenantId); await assertActiveTenant(tenantId);
+  const seller=(await pool.query("select amazon_seller_id,marketplace_id from sellers where tenant_id=$1 and auth_status='authorized' order by connected_at desc limit 1",[tenantId])).rows[0]??{};
+  const sellerMarketplace=MARKETPLACES[seller.marketplace_id]??{};const range=requestedRange(request.query,sellerMarketplace.timeZone??'UTC');
   return withTenant(tenantId,async db=>{
-    const calculated=await loadDashboardCalculations(db,tenantId,range);
+    const calculated=await loadDashboardCalculations(db,tenantId,range,{sellerId:seller.amazon_seller_id,marketplaceId:seller.marketplace_id,marketplaceTimezone:MARKETPLACES[seller.marketplace_id]?.timeZone??'UTC',region:MARKETPLACES[seller.marketplace_id]?.region});
     const detail=calculated.metrics[metric]??calculated.statement[metric];
     const rows=detail.rows??[];
-    return {metric,total:detail.value,unit:detail.unit,status:detail.status,formula:detail.formula,source:detail.source,range:detail.range,diagnostics:detail.diagnostics,components:detail.components,rows,columns:rows.length?[...new Set(rows.flatMap(row=>Object.keys(row).filter(key=>key!=='raw')))].slice(0,14):[]};
+    return {...detail,metric,total:detail.value,rows,columns:rows.length?[...new Set(rows.flatMap(row=>Object.keys(row).filter(key=>key!=='raw')))].slice(0,14):[]};
   });
 });
 
 app.get('/api/tenants/:tenantId/transactions', async request => {
-  const { tenantId }=TenantParamsSchema.parse(request.params); const range=requestedRange(request.query); await requireTenantUser(request,tenantId); await assertActiveTenant(tenantId);
+  const { tenantId }=TenantParamsSchema.parse(request.params); await requireTenantUser(request,tenantId); await assertActiveTenant(tenantId);const range=await tenantRequestedRange(tenantId,request.query);
   return withTenant(tenantId,async db=>{
     const rows=(await db.query(`with item_titles as (select amazon_order_id,string_agg(distinct title,', ') product_details from order_items where tenant_id=$1 group by amazon_order_id), components as (
       select transaction_id,count(*) filter(where category like 'summary_%') summary_lines,
@@ -647,7 +654,7 @@ app.get('/api/tenants/:tenantId/transactions', async request => {
 });
 
 app.get('/api/tenants/:tenantId/orders-reconciliation', async request => {
-  const { tenantId }=TenantParamsSchema.parse(request.params); const range=requestedRange(request.query); await requireTenantUser(request,tenantId); await assertActiveTenant(tenantId);
+  const { tenantId }=TenantParamsSchema.parse(request.params); await requireTenantUser(request,tenantId); await assertActiveTenant(tenantId);const range=await tenantRequestedRange(tenantId,request.query);
   return withTenant(tenantId,async db=>{
     const orders=(await db.query(`with scoped_order_ids as (
         select amazon_order_id from orders where tenant_id=$1 and order_date >= $2 and order_date < $3
@@ -771,16 +778,15 @@ app.get('/api/tenants/:tenantId/orders-reconciliation/:orderId', async request =
   });
 });
 
-app.post('/api/tenants/:tenantId/fee-audit',async request=>{const {tenantId}=TenantParamsSchema.parse(request.params);await requireTenantUser(request,tenantId);await assertActiveTenant(tenantId);const body=z.object({range:DateRangeSchema.optional(),varianceThreshold:z.number().min(0).optional()}).parse(request.body??{});return runFeeAuditForTenant(tenantId,body);});
-app.get('/api/tenants/:tenantId/fee-leaks',async request=>{const {tenantId}=TenantParamsSchema.parse(request.params);const range=requestedRange(request.query);await requireTenantUser(request,tenantId);await assertActiveTenant(tenantId);return withTenant(tenantId,async db=>{const flags=(await db.query('select order_id,sku,category,source,expected_fee,actual_fee,variance,flagged_at,resolved from fee_leak_flags where tenant_id=$1 and flagged_at >= $2 and flagged_at < $3 order by abs(variance) desc',[tenantId,range.start,range.end])).rows;return{flags,totalOvercharged:flags.filter(row=>Number(row.variance)>0).reduce((sum,row)=>sum+Number(row.variance),0)};});});
+app.post('/api/tenants/:tenantId/fee-audit',async request=>{const {tenantId}=TenantParamsSchema.parse(request.params);await requireTenantUser(request,tenantId);await assertActiveTenant(tenantId);const body=z.object({range:DateRangeSchema.optional(),localRange:LocalRangeSchema.optional(),varianceThreshold:z.number().min(0).optional()}).parse(request.body??{});const marketplace=(await pool.query("select marketplace_id from sellers where tenant_id=$1 and auth_status='authorized' order by connected_at desc limit 1",[tenantId])).rows[0];const timeZone=MARKETPLACES[marketplace?.marketplace_id]?.timeZone??'UTC';const range=body.localRange?{start:zonedCalendarInstant(body.localRange.start,timeZone),end:zonedCalendarInstant(body.localRange.endExclusive,timeZone)}:body.range;return runFeeAuditForTenant(tenantId,{range,varianceThreshold:body.varianceThreshold});});
+app.get('/api/tenants/:tenantId/fee-leaks',async request=>{const{tenantId}=TenantParamsSchema.parse(request.params);await requireTenantUser(request,tenantId);await assertActiveTenant(tenantId);const range=await tenantRequestedRange(tenantId,request.query);return withTenant(tenantId,async db=>{const flags=(await db.query('select order_id,sku,category,source,expected_fee,actual_fee,variance,flagged_at,resolved from fee_leak_flags where tenant_id=$1 and flagged_at >= $2 and flagged_at < $3 order by abs(variance) desc',[tenantId,range.start,range.end])).rows;return{flags,totalOvercharged:flags.filter(row=>Number(row.variance)>0).reduce((sum,row)=>sum+Number(row.variance),0)};});});
 
 app.get('/api/tenants/:tenantId/dashboard', async request => {
   const { tenantId } = TenantParamsSchema.parse(request.params); await requireTenantUser(request, tenantId); await assertActiveTenant(tenantId);
-  const range = DashboardQuerySchema.parse(request.query);
-  const start = range.start ? new Date(range.start) : new Date(Date.now() - 30 * 864e5);
-  const end = range.end ? new Date(range.end) : new Date();
   const sellerRow = (await pool.query(`select seller_name, amazon_seller_id, marketplace_id, auth_status, connected_at, last_token_refresh_at from sellers
     where tenant_id=$1 and auth_status='authorized' order by connected_at desc limit 1`, [tenantId])).rows[0] ?? null;
+  const range=requestedRange(request.query,MARKETPLACES[sellerRow?.marketplace_id]?.timeZone??'UTC');
+  const start=new Date(range.start),end=new Date(range.end);
   const seller = sellerRow
     ? { connected: true, sellerName: sellerRow.seller_name, sellerId: sellerRow.amazon_seller_id, marketplaceId: sellerRow.marketplace_id, authStatus: sellerRow.auth_status, connectedAt: sellerRow.connected_at, lastTokenRefreshAt: sellerRow.last_token_refresh_at }
     : { connected: false };
@@ -932,7 +938,8 @@ app.get('/api/tenants/:tenantId/dashboard', async request => {
       summary[order.fulfillment === 'FBA' ? 'fbaReceivable' : order.fulfillment === 'FBM' ? 'fbmReceivable' : 'otherReceivable'] += Number(order.seller_receivable ?? 0);
       return summary;
     }, { grossSales: 0, deductions: 0, sellerReceivable: 0, fbaReceivable: 0, fbmReceivable: 0, otherReceivable: 0 });
-    const dashboardCalculations=await loadDashboardCalculations(client,tenantId,{start:start.toISOString(),end:end.toISOString()});
+    const marketplace=MARKETPLACES[sellerRow?.marketplace_id]??{};
+    const dashboardCalculations=await loadDashboardCalculations(client,tenantId,{start:start.toISOString(),end:end.toISOString()},{sellerId:sellerRow?.amazon_seller_id,marketplaceId:sellerRow?.marketplace_id,marketplaceTimezone:marketplace.timeZone??'UTC',region:marketplace.region});
     const hasImportedData = Number(orders.orders ?? 0) > 0 || Number(kpis.net_settled ?? 0) !== 0 || products.length > 0 || payments.length > 0 || inventory.length > 0;
     return { seller, amazonAuth, hasImportedData, kpis, orders, orderRows, orderPayments, paymentComponents, paymentSummary, dashboardCalculations, businessReportRows, products, trend, payments, settlementLines, financialComponents, financialSummary, jobs, inventory, returns, reimbursements, invoices, orderItems, financeTransactions };
   });

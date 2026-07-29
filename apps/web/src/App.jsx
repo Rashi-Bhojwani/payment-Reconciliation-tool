@@ -108,7 +108,7 @@ function readAmazonTokenCache(tenantId) { const cached = JSON.parse(localStorage
 async function getAmazonAccessToken(tenantId) { const cached = readAmazonTokenCache(tenantId); if (cached) return cached; const fresh = await api(`/api/tenants/${tenantId}/amazon/access-token`); localStorage.setItem(`${ACCESS_TOKEN_CACHE_PREFIX}${tenantId}`, JSON.stringify(fresh)); return fresh; }
 async function beginAmazonAuthorization(tenantId) { const { url } = await api(`/api/auth/amazon/start?tenantId=${tenantId}&json=1`); window.location.assign(url); }
 async function syncAmazonSource(tenantId, reportType, range) {
-  const payload = { method: 'POST', body: JSON.stringify({ range: { start: formatDateParam(range.start), end: formatDateParam(addDays(range.end, 1)) } }) };
+  const payload = { method: 'POST', body: JSON.stringify({ localRange: { start: localCalendarDate(range.start), endExclusive: localCalendarDate(addDays(range.end, 1)) } }) };
   return api(`/api/tenants/${tenantId}/sync/${reportType}`, payload);
 }
 
@@ -116,8 +116,11 @@ function Button({ className = '', variant = 'primary', icon, children, ...props 
 function Input(props) { return <input {...props} className="input" />; }
 function Card({ children, className = '' }) { return <section className={`card ${className}`}>{children}</section>; }
 function Empty({ text }) { return <div className="empty-state">{text}</div>; }
-function formatCurrency(value) { return `₹${Number(value ?? 0).toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`; }
-function formatNumber(value) { return Number(value ?? 0).toLocaleString('en-IN'); }
+function formatCurrency(value) { return value==null?'Unavailable':`₹${Number(value).toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`; }
+function formatNumber(value) { return value==null?'Unavailable':Number(value).toLocaleString('en-IN'); }
+const usableStatus=status=>status==='available'||status==='confirmed_zero';
+function metricDisplay(metric){if(!metric)return'Unavailable';if(!usableStatus(metric.status))return ({incomplete_source:'Source incomplete',reconciliation_error:'Does not reconcile',unavailable:'Unavailable'})[metric.status]??'Unavailable';return metric.unit==='percentage'?`${formatNumber(metric.value)}%`:metric.unit==='quantity'?formatNumber(metric.value):formatCurrency(metric.value);}
+function reconciliationBadge(status){return ({available:'Matches Amazon',confirmed_zero:'Matches Amazon',incomplete_source:'Source incomplete',unavailable:'Source unavailable',reconciliation_error:'Does not reconcile'})[status]??'Source unavailable';}
 function csvEscape(value) {
   const text = String(value ?? '').replaceAll('₹', '').replaceAll('—', '').replaceAll('â€”', '').trim();
   return /[",\n]/.test(text) ? `"${text.replaceAll('"', '""')}"` : text;
@@ -196,16 +199,10 @@ function Login({ setSession }) {
 function startOfDay(d) { const x = new Date(d); x.setHours(0, 0, 0, 0); return x; }
 function addDays(d, n) { const x = new Date(d); x.setDate(x.getDate() + n); return x; }
 function formatShort(d) { return d.toLocaleDateString('en-IN', { month: 'short', day: 'numeric' }); }
-// Date picker values are marketplace calendar dates, never browser/UTC midnights.
-// Derive the IANA-zone offset for that date so DST marketplaces remain correct.
-function formatDateParam(date, timeZone='Asia/Kolkata') {
-  const d=startOfDay(date); const y=d.getFullYear(),m=d.getMonth()+1,day=d.getDate();
-  const probe=new Date(Date.UTC(y,m-1,day,12));
-  const parts=Object.fromEntries(new Intl.DateTimeFormat('en-CA',{timeZone,year:'numeric',month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit',second:'2-digit',hourCycle:'h23'}).formatToParts(probe).filter(p=>p.type!=='literal').map(p=>[p.type,Number(p.value)]));
-  const offset=Date.UTC(parts.year,parts.month-1,parts.day,parts.hour,parts.minute,parts.second)-probe.getTime();
-  return new Date(Date.UTC(y,m-1,day)-offset).toISOString();
-}
-function rangeQuery(range) { return `start=${encodeURIComponent(formatDateParam(range.start))}&end=${encodeURIComponent(formatDateParam(addDays(range.end, 1)))}`; }
+// The API resolves these marketplace calendar dates through the connected
+// seller's IANA timezone; the browser never guesses a UTC boundary.
+function localCalendarDate(date){const d=startOfDay(date);return `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`;}
+function rangeQuery(range) { return `localStart=${localCalendarDate(range.start)}&localEndExclusive=${localCalendarDate(addDays(range.end,1))}`; }
 function formatRangeLabel(start, end) {
   const startStr = formatShort(start);
   const endStr = start.getFullYear() === end.getFullYear() ? formatShort(end) : end.toLocaleDateString('en-IN', { month: 'short', day: 'numeric', year: 'numeric' });
@@ -537,7 +534,7 @@ function FeeLeakAudit({tenantId}) {
   const {range}=useContext(DateRangeContext); const [result,setResult]=useState({flags:[],totalOvercharged:0}); const [busy,setBusy]=useState(false); const [error,setError]=useState('');
   async function load(){setResult(await api(`/api/tenants/${tenantId}/fee-leaks?${rangeQuery(range)}`));}
   useEffect(()=>{load().catch(e=>setError(e.message));},[tenantId,range.start,range.end]);
-  async function audit(){setBusy(true);setError('');try{await api(`/api/tenants/${tenantId}/fee-audit`,{method:'POST',body:JSON.stringify({range:{start:formatDateParam(range.start),end:formatDateParam(addDays(range.end,1))},varianceThreshold:5})});await load();}catch(e){setError(e.message)}finally{setBusy(false)}}
+  async function audit(){setBusy(true);setError('');try{await api(`/api/tenants/${tenantId}/fee-audit`,{method:'POST',body:JSON.stringify({localRange:{start:localCalendarDate(range.start),endExclusive:localCalendarDate(addDays(range.end,1))},varianceThreshold:5})});await load();}catch(e){setError(e.message)}finally{setBusy(false)}}
   return <><Card className="fee-audit-hero"><div><span className="live-source">AMAZON FEES ESTIMATE API</span><h2>{formatCurrency(result.totalOvercharged)} potential overcharge</h2><p>Expected Amazon fees compared with itemized fees actually deducted. Slab fallback is clearly identified when used.</p></div><Button onClick={audit} disabled={busy}>{busy?'Auditing…':'Run fee audit'}</Button></Card>{error&&<p className="alert error">{error}</p>}<TableCard title="Flagged fee discrepancies" rows={result.flags} columns={['order_id','sku','source','expected_fee','actual_fee','variance','flagged_at','resolved']} pageSize={15}/></>;
 }
 function DashboardOverview({ data, channelData, tenantId }) {
@@ -545,28 +542,25 @@ function DashboardOverview({ data, channelData, tenantId }) {
   const summary = useMemo(() => buildDashboardSummary(data, range), [data, range]);
   return <>
     <div className="metrics-strip">
-      <DrillMetric to={`/seller?tenantId=${tenantId}&view=metric-detail&metric=netSales`} title="Net Sales" value={formatCurrency(summary.netSales)} hint="Click to see order-value formula" />
-      <DrillMetric to={`/seller?tenantId=${tenantId}&view=metric-detail&metric=netQty`} title="Net Qty" value={summary.netQty==null?'Unavailable':formatNumber(summary.netQty)} hint="Click to see units source" />
-      <DrillMetric to={`/seller?tenantId=${tenantId}&view=metric-detail&metric=orders`} title="Orders Synced" value={formatNumber(summary.ordersCount)} hint="Distinct eligible Amazon order IDs" />
-      <DrillMetric to={`/seller?tenantId=${tenantId}&view=metric-detail&metric=returns`} title="Returns" value={formatNumber(summary.returnQty)} hint="Total returned quantity" />
+      <DrillMetric to={`/seller?tenantId=${tenantId}&view=metric-detail&metric=netSales`} title="Net Sales" value={metricDisplay(data?.dashboardCalculations?.metrics?.netSales)} hint="Click to see source completeness" />
+      <DrillMetric to={`/seller?tenantId=${tenantId}&view=metric-detail&metric=netQty`} title="Net Qty" value={metricDisplay(data?.dashboardCalculations?.metrics?.netQty)} hint="Click to see units source" />
+      <DrillMetric to={`/seller?tenantId=${tenantId}&view=metric-detail&metric=orders`} title="Orders Synced" value={metricDisplay(data?.dashboardCalculations?.metrics?.orders)} hint="Distinct eligible Amazon order IDs" />
+      <DrillMetric to={`/seller?tenantId=${tenantId}&view=metric-detail&metric=returns`} title="Returns" value={metricDisplay(data?.dashboardCalculations?.metrics?.returns)} hint="Total returned quantity" />
     </div>
 
     <Card className="profit-control-card">
       <PanelHeader title="Profit Analysis" subtitle="Clean overview" />
       <div className="profit-kpi-grid">
-        <DrillMetric to={`/seller?tenantId=${tenantId}&view=metric-detail&metric=settled`} title="Settled Amount" value={formatCurrency(summary.settledAmount)} hint="From settlements / finance" />
-        <DrillMetric to={`/seller?tenantId=${tenantId}&view=metric-detail&metric=deductions`} title="Deductions" value={formatCurrency(summary.deductions)} hint="Fees, refunds, charges" />
-        <DrillMetric to={`/seller?tenantId=${tenantId}&view=metric-detail&metric=reimbursements`} title="Reimbursements" value={formatCurrency(summary.reimbursements)} hint="Credits imported" />
-        <DrillMetric to={`/seller?tenantId=${tenantId}&view=metric-detail&metric=drr`} title="DRR" value={formatCurrency(summary.drr)} hint="Daily run rate" />
+        {['settled','deductions','reimbursements','drr'].map(key=><DrillMetric key={key} to={`/seller?tenantId=${tenantId}&view=metric-detail&metric=${key}`} title={({settled:'Settled Amount',deductions:'Deductions',reimbursements:'Reimbursements',drr:'DRR'})[key]} value={metricDisplay(data?.dashboardCalculations?.metrics?.[key])} hint="Open calculation evidence" />)}
       </div>
     </Card>
 
     <ExplanationGrid summary={summary} tenantId={tenantId} />
 
     <Card className="profit-control-card">
-      <PanelHeader title="Amazon Account Activity" subtitle="Matches Amazon statement sections" />
+      <PanelHeader title="Amazon Account Activity" subtitle={reconciliationBadge(data?.dashboardCalculations?.diagnostics?.status)} />
       <div className="profit-kpi-grid account-activity-grid">
-        {['income','expenses','tax','transfers','gst'].map(metric=>{const statement=data?.dashboardCalculations?.statement?.[metric];return <DrillMetric key={metric} to={`/seller?tenantId=${tenantId}&view=metric-detail&metric=${metric}`} title={metric==='gst'?'Goods and Services Tax':metric[0].toUpperCase()+metric.slice(1)} value={statement?.status??formatCurrency(statement?.value)} hint={statement?.status?`Amazon evidence: ${statement.status}`:'Open Amazon source rows and formula'} />})}
+        {['income','expenses','tax','transfers','gst'].map(metric=>{const statement=data?.dashboardCalculations?.statement?.[metric];return <DrillMetric key={metric} to={`/seller?tenantId=${tenantId}&view=metric-detail&metric=${metric}`} title={metric==='gst'?'Goods and Services Tax':metric[0].toUpperCase()+metric.slice(1)} value={metricDisplay(statement)} hint={statement?.reason??'Open Amazon source rows and formula'} />})}
       </div>
     </Card>
 
@@ -682,6 +676,8 @@ function MetricDetail({ metric, tenantId }) {
   const navigate = useNavigate();
   const [details, setDetails] = useState(null);
   const [error, setError] = useState('');
+  const [uploading,setUploading]=useState(false);
+  async function uploadSettlement(event){const file=event.target.files?.[0];if(!file)return;setUploading(true);setError('');try{await api(`/api/tenants/${tenantId}/uploads/settlement`,{method:'POST',body:JSON.stringify({fileName:file.name,content:await file.text()})});const refreshed=await api(`/api/tenants/${tenantId}/calculations/${metric}?${rangeQuery(range)}`);setDetails(refreshed);}catch(e){setError(e.message)}finally{setUploading(false);event.target.value='';}}
   useEffect(() => {
     let active = true; setDetails(null); setError('');
     api(`/api/tenants/${tenantId}/calculations/${metric}?${rangeQuery(range)}`).then(result => { if (active) setDetails(result); }).catch(e => { if (active) setError(e.message); });
@@ -692,11 +688,12 @@ function MetricDetail({ metric, tenantId }) {
   const deductionCategories = new Set(['referral_commission','fulfillment_fee_per_order','fulfillment_fee_per_unit','fulfillment_fee_weight','shipping_fee','storage_fee','chargeback','tax','promotion']);
   return <>
     <Card className="detail-hero">
-      <PanelHeader title={String(metric).replace(/([A-Z])/g, ' $1').trim()} subtitle={details.status??(details.unit==='percentage'?`${formatNumber(details.total)}%`:details.unit==='quantity'?formatNumber(details.total):formatCurrency(details.total))} />
-      <p className="detail-note"><b>Selected range:</b> {String(details.range?.start??range.start)} → {String(details.range?.end??range.end)} (end exclusive)<br/><b>Source:</b> {details.source}<br/><b>Formula:</b> {details.formula}.</p>
-      <div className="calculation-components">{details.components.map(component => <div key={component.category} className={deductionCategories.has(component.category) ? 'negative' : ''}><span>{component.operation} {component.label}</span><small>{formatNumber(component.count)} source rows</small><strong>{component.amount==null?'Unavailable':details.unit==='quantity'||component.category==='days'?formatNumber(component.amount):formatCurrency(component.amount)}</strong></div>)}<div className="total"><span>Total ({details.unit})</span><strong>{details.status??(details.unit==='percentage'?`${formatNumber(details.total)}%`:details.unit==='quantity'?formatNumber(details.total):formatCurrency(details.total))}</strong></div></div>
-      <div className="detail-note"><b>Reconciliation diagnostics:</b> {formatNumber(details.diagnostics?.includedRows)} included · {formatNumber(details.diagnostics?.excludedRows)} excluded by source precedence · {formatNumber(details.diagnostics?.duplicateRows)} duplicates removed.</div>
-      <div className="detail-actions"><Button variant="secondary" onClick={() => navigate(`/seller?tenantId=${tenantId}&view=dashboard`)}>← Back</Button><Button variant="accent" onClick={() => downloadCsv(`${metric}-calculation.csv`, details.rows, details.columns)} disabled={!details.rows.length}>Download calculation CSV</Button></div>
+      <PanelHeader title={String(metric).replace(/([A-Z])/g, ' $1').trim()} subtitle={metricDisplay(details)} />
+      <p className="detail-note"><b>Status:</b> {details.status}<br/>{details.reason&&<><b>Reason:</b> {details.reason}<br/></>}<b>Marketplace timezone:</b> {details.marketplaceTimezone??'Unavailable'}<br/><b>Local range:</b> {details.selectedLocalRange?.start??'—'} → {details.selectedLocalRange?.endExclusive??'—'} (end exclusive)<br/><b>Effective UTC range:</b> {details.effectiveUtcRange?.start??details.range?.start} → {details.effectiveUtcRange?.endExclusive??details.range?.end}<br/><b>Date field:</b> {details.dateField}<br/><b>Source:</b> {details.source}<br/><b>Formula:</b> {details.formula}.</p>
+      <div className="calculation-components">{details.components.map(component => <div key={component.category} className={deductionCategories.has(component.category) ? 'negative' : ''}><span>{component.operation} {component.label}</span><small>{formatNumber(component.count)} source rows</small><strong>{component.amount==null?'Unavailable':details.unit==='quantity'||component.category==='days'?formatNumber(component.amount):formatCurrency(component.amount)}</strong></div>)}<div className="total"><span>Total ({details.unit})</span><strong>{metricDisplay(details)}</strong></div></div>
+      <div className="detail-note"><b>Reconciliation diagnostics:</b> {formatNumber(details.diagnostics?.includedRows)} included · {formatNumber(details.excludedRows?.length)} excluded · {formatNumber(details.duplicateRows?.length)} duplicates · {formatNumber(details.unclassifiedRows?.length)} unclassified.<br/><b>Missing sources:</b> {details.missingSources?.join(', ')||'None'}.</div>
+      {!!details.unclassifiedRows?.length&&<Button variant="secondary" onClick={()=>downloadCsv(`${metric}-unclassified.csv`,details.unclassifiedRows,Object.keys(details.unclassifiedRows[0]))}>Download unclassified CSV</Button>}
+      <div className="detail-actions"><Button variant="secondary" onClick={() => navigate(`/seller?tenantId=${tenantId}&view=dashboard`)}>← Back</Button><Button variant="accent" onClick={() => downloadCsv(`${metric}-calculation.csv`, details.rows, details.columns)} disabled={!details.rows.length}>Download calculation CSV</Button>{details.uploadSupported&&<label className="btn btn-secondary">{uploading?'Uploading…':'Upload Amazon settlement TSV'}<input hidden type="file" accept=".tsv,.txt,.csv,text/tab-separated-values,text/csv" disabled={uploading} onChange={uploadSettlement}/></label>}</div>
     </Card>
     <TableCard title="Actual database rows used" rows={details.rows} columns={details.columns} pageSize={10} />
   </>;
