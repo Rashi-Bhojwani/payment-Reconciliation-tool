@@ -158,7 +158,7 @@ async function saveReturns(tenantId, content) {
         `insert into returns(tenant_id, order_id, return_reason, disposition, status, return_date, quantity, raw)
          values($1,$2,$3,$4,$5,$6,$7,$8)
          on conflict (tenant_id, order_id, return_date, return_reason, disposition) do update set status=excluded.status, quantity=excluded.quantity, raw=excluded.raw`,
-        [tenantId, text(pick(row, ['order-id', 'order id', 'amazon-order-id', 'amazonOrderId'])), text(pick(row, ['reason', 'return-reason', 'return reason', 'returnReason'])), text(pick(row, ['disposition', 'detailed-disposition', 'detailed disposition'])), 'yet_to_receive', text(pick(row, ['return-date', 'return date', 'returnDate', 'date'])) ?? null, integer(pick(row, ['quantity','quantity-returned','return quantity'])) || 1, row]
+        [tenantId, text(pick(row, ['order-id', 'order id', 'amazon-order-id', 'amazonOrderId'])), text(pick(row, ['reason', 'return-reason', 'return reason', 'returnReason'])), text(pick(row, ['disposition', 'detailed-disposition', 'detailed disposition'])), 'yet_to_receive', text(pick(row, ['return-date', 'return date', 'returnDate', 'date'])) ?? null, pick(row, ['quantity','quantity-returned','return quantity']) == null ? null : integer(pick(row, ['quantity','quantity-returned','return quantity'])), row]
       );
     }
   });

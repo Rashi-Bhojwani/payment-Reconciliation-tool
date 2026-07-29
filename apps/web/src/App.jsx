@@ -538,7 +538,7 @@ function DashboardOverview({ data, channelData, tenantId }) {
   return <>
     <div className="metrics-strip">
       <DrillMetric to={`/seller?tenantId=${tenantId}&view=metric-detail&metric=netSales`} title="Net Sales" value={formatCurrency(summary.netSales)} hint="Click to see order-value formula" />
-      <DrillMetric to={`/seller?tenantId=${tenantId}&view=metric-detail&metric=netQty`} title="Net Qty" value={formatNumber(summary.netQty)} hint="Click to see units source" />
+      <DrillMetric to={`/seller?tenantId=${tenantId}&view=metric-detail&metric=netQty`} title="Net Qty" value={summary.netQty==null?'Unavailable':formatNumber(summary.netQty)} hint="Click to see units source" />
       <DrillMetric to={`/seller?tenantId=${tenantId}&view=metric-detail&metric=orders`} title="Orders Synced" value={formatNumber(summary.ordersCount)} hint="Distinct eligible Amazon order IDs" />
       <DrillMetric to={`/seller?tenantId=${tenantId}&view=metric-detail&metric=returns`} title="Returns" value={formatNumber(summary.returnQty)} hint="Total returned quantity" />
     </div>
@@ -575,9 +575,10 @@ function DashboardOverview({ data, channelData, tenantId }) {
 function DrillMetric({ to, title, value, hint }) { return <NavLink to={to} className="mini-metric drill-metric"><span>{title}</span><strong>{value}</strong>{trendHint(hint)}<em>View calculation →</em></NavLink>; }
 function ExplanationGrid({ summary, tenantId }) {
   const cards = [
-    ['Fee impact', `${Number(summary.feeImpact).toLocaleString('en-IN',{maximumFractionDigits:2})}%`, 'Net Amazon fees excluding TCS/TDS as a percentage of gross product sales.', 'feeImpact'],
-    ['Return rate', `${Number(summary.returnRate).toLocaleString('en-IN',{maximumFractionDigits:2})}%`, 'Returned units divided by shipped units.', 'returnRate'],
-    ['GST invoice value', formatCurrency(summary.gstValue), 'Sales-invoice taxable value minus credit-note/refund taxable value.', 'gstValue']
+    ['Fee impact', summary.feeImpact==null?'Unavailable':`${Number(summary.feeImpact).toLocaleString('en-IN',{maximumFractionDigits:2})}%`, 'Net Amazon fees excluding TCS/TDS as a percentage of gross product sales.', 'feeImpact'],
+    ['Return rate', summary.returnRate==null?'Unavailable / source mismatch':`${Number(summary.returnRate).toLocaleString('en-IN',{maximumFractionDigits:2})}%`, 'Physically returned units divided by shipped units.', 'returnRate'],
+    ['Refund value rate', summary.refundValueRate==null?'Unavailable':`${Number(summary.refundValueRate).toLocaleString('en-IN',{maximumFractionDigits:2})}%`, 'Product refund value divided by gross product sales; separate from unit return rate.', 'refundValueRate'],
+    ['GST invoice value', summary.gstValue==null?'Unavailable':formatCurrency(summary.gstValue), 'Sales-invoice taxable value minus credit-note/refund taxable value.', 'gstValue']
   ];
   return <div className="explain-grid">{cards.map(([title, value, copy, target]) => <NavLink key={title} to={`/seller?tenantId=${tenantId}&view=metric-detail&metric=${target}`} className="explain-card"><b>{title}</b><strong>{value}</strong><p>{copy}</p><span>Open calculation →</span></NavLink>)}</div>;
 }
@@ -683,9 +684,10 @@ function MetricDetail({ metric, tenantId }) {
   const deductionCategories = new Set(['referral_commission','fulfillment_fee_per_order','fulfillment_fee_per_unit','fulfillment_fee_weight','shipping_fee','storage_fee','chargeback','tax','promotion']);
   return <>
     <Card className="detail-hero">
-      <PanelHeader title={String(metric).replace(/([A-Z])/g, ' $1').trim()} subtitle={details.unit==='percentage'?`${formatNumber(details.total)}%`:details.unit==='quantity'?formatNumber(details.total):formatCurrency(details.total)} />
-      <p className="detail-note"><b>Formula:</b> {details.formula}. Calculated directly from persisted Amazon rows for the selected period.</p>
-      <div className="calculation-components">{details.components.map(component => <div key={component.category} className={deductionCategories.has(component.category) ? 'negative' : ''}><span>{component.operation} {component.label}</span><small>{formatNumber(component.count)} source rows</small><strong>{details.unit==='quantity'||component.category==='days'?formatNumber(component.amount):formatCurrency(component.amount)}</strong></div>)}<div className="total"><span>Total ({details.unit})</span><strong>{details.unit==='percentage'?`${formatNumber(details.total)}%`:details.unit==='quantity'?formatNumber(details.total):formatCurrency(details.total)}</strong></div></div>
+      <PanelHeader title={String(metric).replace(/([A-Z])/g, ' $1').trim()} subtitle={details.status??(details.unit==='percentage'?`${formatNumber(details.total)}%`:details.unit==='quantity'?formatNumber(details.total):formatCurrency(details.total))} />
+      <p className="detail-note"><b>Selected range:</b> {String(details.range?.start??range.start)} → {String(details.range?.end??range.end)} (end exclusive)<br/><b>Source:</b> {details.source}<br/><b>Formula:</b> {details.formula}.</p>
+      <div className="calculation-components">{details.components.map(component => <div key={component.category} className={deductionCategories.has(component.category) ? 'negative' : ''}><span>{component.operation} {component.label}</span><small>{formatNumber(component.count)} source rows</small><strong>{component.amount==null?'Unavailable':details.unit==='quantity'||component.category==='days'?formatNumber(component.amount):formatCurrency(component.amount)}</strong></div>)}<div className="total"><span>Total ({details.unit})</span><strong>{details.status??(details.unit==='percentage'?`${formatNumber(details.total)}%`:details.unit==='quantity'?formatNumber(details.total):formatCurrency(details.total))}</strong></div></div>
+      <div className="detail-note"><b>Reconciliation diagnostics:</b> {formatNumber(details.diagnostics?.includedRows)} included · {formatNumber(details.diagnostics?.excludedRows)} excluded by source precedence · {formatNumber(details.diagnostics?.duplicateRows)} duplicates removed.</div>
       <div className="detail-actions"><Button variant="secondary" onClick={() => navigate(`/seller?tenantId=${tenantId}&view=dashboard`)}>← Back</Button><Button variant="accent" onClick={() => downloadCsv(`${metric}-calculation.csv`, details.rows, details.columns)} disabled={!details.rows.length}>Download calculation CSV</Button></div>
     </Card>
     <TableCard title="Actual database rows used" rows={details.rows} columns={details.columns} pageSize={10} />
@@ -701,7 +703,7 @@ function buildDashboardSummary(data, range = defaultDateRange()) {
   const orderItems = data?.orderItems ?? [];
   const ordersCount = Number(calculated?.orders?.value??data?.orders?.orders??0);
   const netSales = Number(calculated?.netSales?.value??amazonNetSales(data));
-  const netQty = Number(calculated?.netQty?.value??(products.reduce((sum, product) => sum + Number(product.units ?? 0), 0) || orderItems.reduce((sum, item) => sum + Number(item.quantity_ordered ?? 0), 0)));
+  const netQty = calculated?.netQty ? calculated.netQty.value : (products.reduce((sum, product) => sum + Number(product.units ?? 0), 0) || orderItems.reduce((sum, item) => sum + Number(item.quantity_ordered ?? 0), 0));
   const returnQty = Number(calculated?.returns?.value??returns.length);
   const settledAmount = Number(calculated?.settled?.value??(payments.reduce((sum, payment) => sum + Number(payment.net_amount ?? 0), 0) || Number(data?.kpis?.net_settled??0)));
   const deductions = Number(calculated?.deductions?.value??amazonDeductions(data));
@@ -747,8 +749,8 @@ function buildDashboardSummary(data, range = defaultDateRange()) {
     profitRate,
     drr,
     ordersCount,
-    feeImpact:Number(calculated?.feeImpact?.value??0),returnRate:Number(calculated?.returnRate?.value??0),
-    gstValue: Number(calculated?.gstValue?.value??invoices.reduce((sum, row) => sum + Number(row.taxable_value ?? 0), 0)),
+    feeImpact:calculated?.feeImpact?.value??null,returnRate:calculated?.returnRate?.value??null,refundValueRate:calculated?.refundValueRate?.value??null,
+    gstValue: calculated?.gstValue ? calculated.gstValue.value : null,
     profitRows: [baseRow, totalRow],
     returnRows: [returnSummary, { ...returnSummary, channel: 'Total' }],
     reconcileRows: [
