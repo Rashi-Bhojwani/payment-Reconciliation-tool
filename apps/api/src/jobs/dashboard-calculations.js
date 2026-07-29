@@ -1,22 +1,23 @@
 const num = value => value == null || value === '' ? null : Number(value);
-const amount = row => Number(row?.amount ?? row?.total_amount ?? 0) || 0;
+const minor = row => row?.amount_minor != null ? Number(row.amount_minor) : Math.round((Number(row?.amount ?? row?.total_amount ?? 0)||0)*100);
+const amount = row => minor(row)/100;
 const norm = value => String(value ?? '').toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim();
 const rawField = (raw, names) => { const entries=Object.entries(raw??{}); for(const name of names){const wanted=norm(name).replaceAll(' ','');const hit=entries.find(([key])=>norm(key).replaceAll(' ','')===wanted);if(hit&&hit[1]!==''&&hit[1]!=null)return hit[1];} };
 const text = row => norm(`${row.parent_transaction_type??''} ${row.transaction_type??''} ${row.account_type??''} ${row.amount_type??''} ${row.amount_description??''} ${row.category??''}`);
 const keyOf = row => row.source_row_id ?? row.id ?? `${row.transaction_id??row.settlement_id??''}|${row.order_id??''}|${row.order_item_id??row.sku??''}|${row.category??row.amount_type??''}|${row.amount_description??''}|${row.posted_date??''}|${amount(row)}`;
 function dedupe(rows,key=keyOf){const seen=new Set(),included=[],duplicates=[];for(const row of rows){const keyValue=key(row);(seen.has(keyValue)?duplicates:included).push(row);seen.add(keyValue);}return{included,duplicates};}
 const isSummary=row=>String(row.category??'').startsWith('summary_');
-const isRefund=row=>/refund/.test(text(row));
-const isPrincipal=row=>/principal|item price/.test(norm(`${row.amount_type??''} ${row.amount_description??''} ${row.category??''}`));
-const isPromotion=row=>/promotion|promo rebate/.test(text(row));
-const isWithholding=row=>/\b(tcs|tds)\b/.test(text(row));
-const isReimbursement=row=>/reimburse|safe t|lost|damaged|clawback/.test(text(row));
-const isFee=row=>/fee|commission|closing|storage|shipping label|service|advertis|chargeback|adjustment/.test(text(row))&&!isReimbursement(row)&&!isPrincipal(row)&&!isPromotion(row);
-const isProductGst=row=>/product tax|shipping tax|gift wrap tax|\bgst collected|\bgst refund/.test(text(row))&&!/fee|commission|service/.test(text(row));
-const isGenericTax=row=>/\btax\b/.test(text(row))&&!isProductGst(row)&&!isWithholding(row)&&!isFee(row);
+const isRefund=row=>new Set(['refund','fulfillment fee refund']).has(norm(row.parent_transaction_type??row.transaction_type))||/ refund$/.test(norm(row.amount_description));
+const isPrincipal=row=>new Set(['principal','item price']).has(norm(row.amount_description??row.category));
+const isPromotion=row=>norm(row.amount_type)==='promotion'||new Set(['promotional rebate','promotional rebate refund','promo rebates','shipping discount']).has(norm(row.amount_description??row.category));
+const isWithholding=row=>new Set(['itemtcs','itemtds','tax withheld']).has(norm(row.amount_type).replaceAll(' ',''))||/^(tcs|tds)(\b| )/.test(norm(row.amount_description));
+const isReimbursement=row=>new Set(['safe t reimbursement','fba inventory reimbursement']).has(norm(row.parent_transaction_type??row.amount_type))||new Set(['reimbursement','reversal reimbursement','safe t reimbursement']).has(norm(row.amount_description??row.category));
+const isFee=row=>new Set(['itemfees','amazon fees','item fee adjustment','fba removal order return fee','fba inventory storage fee']).has(norm(row.amount_type))||new Set(['fbafees','cancellation','fulfillment fee refund','servicefee','servicefeerefund']).has(norm(row.parent_transaction_type??row.transaction_type).replaceAll(' ',''))||/^(commission|selling fee|fixed closing fee|fba pick pack fee|fba weight handling fee|refund commission|amazon easy ship|easy ship shipping fee|fee adjustment|order cancellation charge|digital services fee|advertising)/.test(norm(row.amount_description));
+const isProductGst=row=>new Set(['product tax','shipping tax','gift wrap tax','gst collected','gst refund','product tax gst collected','product tax gst refund']).has(norm(row.amount_description??row.category));
+const isGenericTax=row=>new Set(['tax','product tax collected','shipping tax collected','gift wrap tax collected']).has(norm(row.amount_type??row.category))&&!isProductGst(row)&&!isWithholding(row);
 const isTransfer=row=>/transfer|deposit|bank account|withdrawal/.test(text(row));
 const round2=value=>Math.round((Number(value)+Number.EPSILON)*100)/100;
-const signedSum=rows=>round2(rows.reduce((sum,row)=>sum+amount(row),0));
+const signedSum=rows=>rows.reduce((sum,row)=>sum+minor(row),0)/100;
 const component=(category,label,value,rows,operation='+')=>({category,label,amount:value,count:rows.length,operation});
 const utcDate=value=>{const s=String(value??'');const m=s.match(/^(\d{1,2})[./-](\d{1,2})[./-](\d{4})(?:\s+(\d{1,2}):(\d{2}):(\d{2}))?/);return m?new Date(Date.UTC(+m[3],+m[2]-1,+m[1],+(m[4]??0),+(m[5]??0),+(m[6]??0))):new Date(s);};
 const inRange=(value,range)=>{const d=utcDate(value);return !Number.isNaN(d.getTime())&&d>=new Date(range.start)&&d<new Date(range.end);};
@@ -59,10 +60,13 @@ export function calculateDashboardMetrics(input,range){
   const gstImported=(input.gstInvoices??[]).filter(row=>Object.keys(row.raw??{}).length>0&&!/synthetic|order item estimate/.test(norm(`${row.source??''} ${JSON.stringify(row.raw??{})}`)));const gstAudit=dedupe(gstImported,gstKey);
   const gstAvailable=gstAudit.included.length>0;const gstInvoiceValue=gstAvailable?gstAudit.included.reduce((sum,row)=>{const kind=norm(`${rawField(row.raw,['document-type','invoice-type','transaction-type'])??row.document_type??''}`);return sum+(/credit|refund/.test(kind)?-Math.abs(Number(row.taxable_value??0)):Number(row.taxable_value??0));},0):null;
   const productGstRows=financialRows.filter(isProductGst);const genericTaxRows=financialRows.filter(isGenericTax);
-  const incomeRows=financialRows.filter(row=>!isFee(row)&&!isWithholding(row)&&!isProductGst(row)&&!isGenericTax(row)&&!isTransfer(row));
+  const incomeRows=financialRows.filter(row=>isPrincipal(row)||isPromotion(row)||isReimbursement(row)||new Set(['shipping','shipping credits','shipping refund','gift wrap','fba inventory credit']).has(norm(row.amount_description)));
+  const mapped=new Set([...incomeRows,...expenseRows,...productGstRows,...genericTaxRows]);
+  const unmappedRows=financialRows.filter(row=>amount(row)!==0&&!mapped.has(row)&&!isTransfer(row));
   const gst=signedSum(productGstRows),tax=signedSum(genericTaxRows),income=signedSum(incomeRows),expenses=signedSum(expenseRows),transfers=signedSum(transferRows);
   const days=inclusiveDays(range.start,range.end);const unitRate=returnedUnits==null?null:shippedUnits==null||shippedUnits===0?(returnedUnits>0?null:0):returnedUnits/shippedUnits*100;const refundValueRate=grossSales?productRefunds/grossSales*100:null;
-  const diagnostics={sourcePolicy:{financial:`${financialSource} (${settlementComplete?'complete statement takes precedence':'settlement incomplete; Finances fallback'})`,reimbursements:financeReimbursements.length?financialSource:'Reimbursements report fallback',gst:'Imported GST B2B/B2C rows only',settled:'Settlement headers filtered by deposit_date'},includedRows:financialRows.length,excludedRows:(settlementComplete?financeAudit.included.length:settlementAudit.included.length),duplicateRows:financialDuplicates.length+itemAudit.duplicates.length+returnAudit.duplicates.length+gstAudit.duplicates.length,categoryTotals:{grossSales,productRefunds,netPromotions,expenseDebits,expenseCredits,tcsTds,operationalFees,gst,tax,transfers}};
+  const reconciliationStatus=unmappedRows.length?'Does not reconcile':settlementComplete?'Complete':'Incomplete';
+  const diagnostics={status:reconciliationStatus,sourcePolicy:{financial:`${financialSource} (${settlementComplete?'complete statement takes precedence':'settlement incomplete; Finances fallback'})`,reimbursements:financeReimbursements.length?financialSource:'Reimbursements report fallback',gst:'Imported GST B2B/B2C rows only',settled:'Settlement headers filtered by deposit_date'},includedRows:financialRows.length,excludedRows:(settlementComplete?financeAudit.included.length:settlementAudit.included.length),duplicateRows:financialDuplicates.length+itemAudit.duplicates.length+returnAudit.duplicates.length+gstAudit.duplicates.length,unmappedRows:unmappedRows.map(row=>({source_row_id:keyOf(row),transaction_type:row.parent_transaction_type??row.transaction_type,amount_type:row.amount_type,amount_description:row.amount_description,amount:amount(row),reason:'no declarative statement mapping'})),unmappedAmount:signedSum(unmappedRows),categoryTotals:{grossSales,productRefunds,netPromotions,expenseDebits,expenseCredits,tcsTds,operationalFees,gst,tax,transfers}};
   const metric=(value,unit,formula,components,rows,source=financialSource,status=value==null?'Unavailable':null)=>({value,unit,formula,components,rows,source,status,range,diagnostics});
   const metrics={
     netSales:metric(netSales,'amount','Gross product Principal sales − Refund Principal lines − net seller-funded promotions',[component('gross_sales','Gross product sales',grossSales,grossRows),component('product_refunds','Product refunds',-productRefunds,refundPrincipalRows,'−'),component('promotions','Net seller-funded promotions',-netPromotions,promoRows,'−')],[...grossRows,...refundPrincipalRows,...promoRows]),
@@ -79,6 +83,9 @@ export function calculateDashboardMetrics(input,range){
     gstValue:metric(gstInvoiceValue,'amount','Genuine GST sales-invoice taxable value − genuine credit-note/refund taxable value',[component('net_taxable_value','Net taxable invoice value',gstInvoiceValue,gstAudit.included)],gstAudit.included,'Imported GST B2B/B2C reports',gstAvailable?null:'Unavailable')
   };
   const group=rows=>{const map=new Map();for(const row of rows){const name=row.amount_description??row.category??row.transaction_type??'Other';const old=map.get(name)??{category:norm(name).replaceAll(' ','_'),label:name,amount:0,count:0};old.amount+=amount(row);old.count++;map.set(name,old);}return[...map.values()];};
-  const statement={income:metric(income,'amount','Net Amazon Income statement lines',group(incomeRows),incomeRows),expenses:metric(expenses,'amount','Expense debits plus expense refunds/credits; includes TCS/TDS',group(expenseRows),expenseRows),tax:metric(tax,'amount','Amazon generic Tax section only',group(genericTaxRows),genericTaxRows),transfers:metric(transfers,'amount','Signed successful bank transfers by deposit_date',group(transferRows),transferRows,'Settlement headers'),gst:metric(gst,'amount','Product/shipping/gift-wrap GST collected plus GST refunds',group(productGstRows),productGstRows)};
+  const evidence=(rows)=>({debit:Math.abs(signedSum(rows.filter(r=>amount(r)<0))),credit:signedSum(rows.filter(r=>amount(r)>0)),includedRowIds:rows.map(keyOf)});
+  const statementStatus=reconciliationStatus==='Complete'?null:reconciliationStatus;
+  const statement={income:metric(income,'amount','credits − debit magnitudes for Amazon Income lines',group(incomeRows),incomeRows,financialSource,statementStatus),expenses:metric(expenses,'amount','credits − debit magnitudes for Expenses including TCS/TDS',group(expenseRows),expenseRows,financialSource,statementStatus),tax:metric(tax,'amount','credits − debit magnitudes for Amazon separate Tax section',group(genericTaxRows),genericTaxRows,financialSource,statementStatus),transfers:metric(transfers,'amount','credits − debit magnitudes for successful bank transfers by deposit_date',group(transferRows),transferRows,'Settlement headers',statementStatus),gst:metric(gst,'amount','credits − debit magnitudes for product/shipping/gift-wrap GST',group(productGstRows),productGstRows,financialSource,statementStatus)};
+  for(const value of Object.values(statement)) value.evidence={...evidence(value.rows),requestedRange:range,unmappedRows:diagnostics.unmappedRows,completeness:reconciliationStatus};
   return{metrics,statement,diagnostics};
 }

@@ -196,7 +196,15 @@ function Login({ setSession }) {
 function startOfDay(d) { const x = new Date(d); x.setHours(0, 0, 0, 0); return x; }
 function addDays(d, n) { const x = new Date(d); x.setDate(x.getDate() + n); return x; }
 function formatShort(d) { return d.toLocaleDateString('en-IN', { month: 'short', day: 'numeric' }); }
-function formatDateParam(date) { return startOfDay(date).toISOString(); }
+// Date picker values are marketplace calendar dates, never browser/UTC midnights.
+// Derive the IANA-zone offset for that date so DST marketplaces remain correct.
+function formatDateParam(date, timeZone='Asia/Kolkata') {
+  const d=startOfDay(date); const y=d.getFullYear(),m=d.getMonth()+1,day=d.getDate();
+  const probe=new Date(Date.UTC(y,m-1,day,12));
+  const parts=Object.fromEntries(new Intl.DateTimeFormat('en-CA',{timeZone,year:'numeric',month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit',second:'2-digit',hourCycle:'h23'}).formatToParts(probe).filter(p=>p.type!=='literal').map(p=>[p.type,Number(p.value)]));
+  const offset=Date.UTC(parts.year,parts.month-1,parts.day,parts.hour,parts.minute,parts.second)-probe.getTime();
+  return new Date(Date.UTC(y,m-1,day)-offset).toISOString();
+}
 function rangeQuery(range) { return `start=${encodeURIComponent(formatDateParam(range.start))}&end=${encodeURIComponent(formatDateParam(addDays(range.end, 1)))}`; }
 function formatRangeLabel(start, end) {
   const startStr = formatShort(start);
@@ -558,7 +566,7 @@ function DashboardOverview({ data, channelData, tenantId }) {
     <Card className="profit-control-card">
       <PanelHeader title="Amazon Account Activity" subtitle="Matches Amazon statement sections" />
       <div className="profit-kpi-grid account-activity-grid">
-        {['income','expenses','tax','transfers','gst'].map(metric=><DrillMetric key={metric} to={`/seller?tenantId=${tenantId}&view=metric-detail&metric=${metric}`} title={metric==='gst'?'Goods and Services Tax':metric[0].toUpperCase()+metric.slice(1)} value={formatCurrency(data?.dashboardCalculations?.statement?.[metric]?.value)} hint="Open Amazon source rows and formula" />)}
+        {['income','expenses','tax','transfers','gst'].map(metric=>{const statement=data?.dashboardCalculations?.statement?.[metric];return <DrillMetric key={metric} to={`/seller?tenantId=${tenantId}&view=metric-detail&metric=${metric}`} title={metric==='gst'?'Goods and Services Tax':metric[0].toUpperCase()+metric.slice(1)} value={statement?.status??formatCurrency(statement?.value)} hint={statement?.status?`Amazon evidence: ${statement.status}`:'Open Amazon source rows and formula'} />})}
       </div>
     </Card>
 
