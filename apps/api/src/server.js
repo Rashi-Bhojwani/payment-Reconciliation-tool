@@ -112,7 +112,7 @@ async function exchangeAmazonCode(code, redirectUri) {
 }
 
 
-const TENANT_DATA_TABLES = ['orders', 'settlement_rows', 'gst_invoices', 'returns', 'reimbursements', 'inventory_snapshots', 'sales_traffic_daily', 'fee_leak_flags', 'generated_reports', 'order_items', 'finance_transactions', 'finance_transaction_items', 'fee_estimates'];
+const TENANT_DATA_TABLES = ['orders', 'settlement_rows', 'settlement_report_documents', 'gst_invoices', 'returns', 'reimbursements', 'inventory_snapshots', 'sales_traffic_daily', 'fee_leak_flags', 'generated_reports', 'order_items', 'finance_transactions', 'finance_transaction_items', 'fee_estimates'];
 
 async function ensureSellerAuthSchema() {
   await pool.query(`
@@ -564,13 +564,15 @@ function groupCalculationRows(rows) {
 }
 
 async function loadDashboardCalculations(db, tenantId, range) {
+  const schemaWarnings=[];
+  const optionalSourceQuery=async(sql,params,source)=>{try{return await db.query(sql,params);}catch(error){if(!['42P01','42703'].includes(error?.code))throw error;schemaWarnings.push({source,code:error.code,missing:error.column??error.table??'unknown identifier',message:error.message});return{rows:[],rowCount:0};}};
   const [orders,orderItems,returns,settlementRows,settlementHeaders,financeItems,financeTransactions,reimbursements,gstInvoices,reportDocumentsResult]=await Promise.all([
     db.query('select id source_row_id,amazon_order_id,status,order_date,total_amount,raw from orders where tenant_id=$1 and order_date >= $2 and order_date < $3',[tenantId,range.start,range.end]),
     db.query(`select oi.id source_row_id,oi.amazon_order_id,oi.asin,oi.sku,oi.title,oi.quantity_ordered,oi.item_price,oi.promotion_discount,oi.raw,o.status,o.order_date from order_items oi join orders o on o.tenant_id=oi.tenant_id and o.amazon_order_id=oi.amazon_order_id where oi.tenant_id=$1 and o.order_date >= $2 and o.order_date < $3`,[tenantId,range.start,range.end]),
     db.query('select id source_row_id,order_id,return_date,return_reason,disposition,status,quantity,raw from returns where tenant_id=$1 and return_date >= $2::date and return_date < $3::date',[tenantId,range.start,range.end]),
-    db.query(`select id source_row_id,settlement_id,order_id,amount_type,amount_description,amount,amount_minor,currency,posted_date,raw,source_report_id,source_document_id,source_line_id,
+    optionalSourceQuery(`select id source_row_id,settlement_id,order_id,amount_type,amount_description,amount,amount_minor,currency,posted_date,raw,source_report_id,source_document_id,source_line_id,
       coalesce(raw->>'transaction-type',raw->>'transaction type',raw->>'transactionType') parent_transaction_type
-      from settlement_rows where tenant_id=$1 and posted_date >= $2 and posted_date < $3`,[tenantId,range.start,range.end]),
+      from settlement_rows where tenant_id=$1 and posted_date >= $2 and posted_date < $3`,[tenantId,range.start,range.end],'settlement_rows_exact_ledger'),
     db.query(`select settlement_id,coalesce(raw->>'deposit-date',raw->>'deposit date',raw->>'depositDate') deposit_date,coalesce(nullif(raw->>'total-amount',''),nullif(raw->>'total amount',''),nullif(raw->>'totalAmount','')) total_amount,coalesce(raw->>'transaction-type',raw->>'transaction type') transaction_type,raw from settlement_rows where tenant_id=$1 and coalesce(raw->>'deposit-date',raw->>'deposit date',raw->>'depositDate','')<>''`,[tenantId]),
     db.query(`select fi.id source_row_id,fi.transaction_id,fi.order_id,fi.sku,fi.asin,fi.category,fi.amount_description,fi.amount,fi.currency,fi.posted_date,fi.raw,
       ft.transaction_type parent_transaction_type,
@@ -580,10 +582,10 @@ async function loadDashboardCalculations(db, tenantId, range) {
     db.query('select transaction_id,transaction_type,posted_date,total_amount,currency,related_order_id,raw from finance_transactions where tenant_id=$1 and posted_date >= $2 and posted_date < $3',[tenantId,range.start,range.end]),
     db.query('select amount,reason,sku,reimbursement_date from reimbursements where tenant_id=$1 and reimbursement_date >= $2::date and reimbursement_date < $3::date',[tenantId,range.start,range.end]),
     db.query('select id source_row_id,invoice_type,order_id,cgst,sgst,igst,taxable_value,invoice_date,raw from gst_invoices where tenant_id=$1 and invoice_date >= $2::date and invoice_date < $3::date',[tenantId,range.start,range.end]),
-    db.query('select report_id,report_document_id,marketplace_id,data_start_time,data_end_time,created_time,imported_at from settlement_report_documents where tenant_id=$1 and data_end_time>$2 and data_start_time<$3 order by data_start_time',[tenantId,range.start,range.end])
+    optionalSourceQuery('select report_id,report_document_id,marketplace_id,data_start_time,data_end_time,created_time,imported_at from settlement_report_documents where tenant_id=$1 and data_end_time>$2 and data_start_time<$3 order by data_start_time',[tenantId,range.start,range.end],'settlement_report_documents')
   ]);
   const reportDocuments=reportDocumentsResult.rows;
-  return calculateDashboardMetrics({orders:orders.rows,orderItems:orderItems.rows,returns:returns.rows,settlementRows:settlementRows.rows,settlementHeaders:settlementHeaders.rows,financeItems:financeItems.rows,financeTransactions:financeTransactions.rows,reimbursements:reimbursements.rows,gstInvoices:gstInvoices.rows,reportDocuments},range);
+  return calculateDashboardMetrics({orders:orders.rows,orderItems:orderItems.rows,returns:returns.rows,settlementRows:settlementRows.rows,settlementHeaders:settlementHeaders.rows,financeItems:financeItems.rows,financeTransactions:financeTransactions.rows,reimbursements:reimbursements.rows,gstInvoices:gstInvoices.rows,reportDocuments,coverageRequired:true,schemaWarnings},range);
 }
 
 app.get('/api/tenants/:tenantId/calculations/:metric', async request => {
