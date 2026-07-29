@@ -1,4 +1,5 @@
 import cron from 'node-cron';
+import crypto from 'node:crypto';
 import pLimit from 'p-limit';
 import { z } from 'zod';
 import { assertActiveTenant, pool, withTenant } from '@recon/db';
@@ -20,6 +21,12 @@ function text(value) { return value == null ? undefined : String(value).trim() |
 function number(value) { const parsed = Number(String(value ?? '').replace(/[,₹$]/g, '')); return Number.isFinite(parsed) ? parsed : 0; }
 /** @param {unknown} value */
 function integer(value) { return Math.trunc(number(value)); }
+function minorUnits(value) {
+  const cleaned = String(value ?? '0').replace(/[,₹$\s]/g, '');
+  const match = cleaned.match(/^(-?)(\d+)(?:\.(\d{0,2}))?$/);
+  if (!match) throw new Error(`Invalid Amazon money value: ${value}`);
+  return (match[1] === '-' ? -1 : 1) * (BigInt(match[2]) * 100n + BigInt((match[3] ?? '').padEnd(2, '0')));
+}
 function reportDate(value) {
   const input = text(value);
   if (!input) return null;
@@ -118,15 +125,19 @@ function parseReportRows(reportType, content) {
 }
 
 /** @param {string} tenantId @param {string} content */
-async function saveSettlementRows(tenantId, content) {
+async function saveSettlementRows(tenantId, content, source) {
   const rows = z.array(ReportRowSchema).parse(parseReportRows('GET_V2_SETTLEMENT_REPORT_DATA_FLAT_FILE_V2', content));
   await withTenant(tenantId, async client => {
-    for (const row of rows) {
-      const amount = number(pick(row, ['amount']));
+    for (const [index, row] of rows.entries()) {
+      const sourceLineId = crypto.createHash('sha256').update(`${source.reportDocumentId}\n${index + 2}\n${JSON.stringify(row)}`).digest('hex');
+      const sourceAmount = pick(row, ['amount']);
+      const amountMinor = minorUnits(sourceAmount);
       await client.query(
-        `insert into settlement_rows(tenant_id, settlement_id, order_id, amount_type, amount_description, amount, posted_date, raw)
-         values($1,$2,$3,$4,$5,$6,$7,$8) on conflict do nothing`,
-        [tenantId, text(pick(row, ['settlement-id', 'settlement id', 'settlementId'])), text(pick(row, ['order-id', 'order id', 'amazon-order-id', 'amazonOrderId'])), text(pick(row, ['amount-type', 'amount type', 'amountType'])), text(pick(row, ['amount-description', 'amount description', 'amountDescription'])), amount, reportDate(pick(row, ['posted-date', 'posted date', 'postedDate'])), row]
+        `insert into settlement_rows(tenant_id, settlement_id, order_id, amount_type, amount_description, amount, posted_date, raw,
+          source_report_id,source_document_id,source_line_number,source_line_id,amount_minor,currency)
+         values($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
+         on conflict (tenant_id,source_report_id,source_line_id) where source_report_id is not null and source_line_id is not null do nothing`,
+        [tenantId, text(pick(row, ['settlement-id', 'settlement id', 'settlementId'])), text(pick(row, ['order-id', 'order id', 'amazon-order-id', 'amazonOrderId'])), text(pick(row, ['amount-type', 'amount type', 'amountType'])), text(pick(row, ['amount-description', 'amount description', 'amountDescription'])), Number(amountMinor) / 100, reportDate(pick(row, ['posted-date-time', 'posted date time', 'postedDateTime', 'posted-date', 'posted date', 'postedDate'])), row, source.reportId, source.reportDocumentId, index + 2, sourceLineId, amountMinor.toString(), text(pick(row,['currency'])) ?? 'INR']
       );
     }
   });
@@ -221,9 +232,9 @@ async function saveSalesTrafficDaily(tenantId, content, range) {
 }
 
 /** @param {string} tenantId @param {string} reportType @param {string} content */
-async function saveStructuredRows(tenantId, reportType, content, range) {
+async function saveStructuredRows(tenantId, reportType, content, range, source = {}) {
   switch (reportType) {
-    case 'GET_V2_SETTLEMENT_REPORT_DATA_FLAT_FILE_V2': return saveSettlementRows(tenantId, content);
+    case 'GET_V2_SETTLEMENT_REPORT_DATA_FLAT_FILE_V2': return saveSettlementRows(tenantId, content, source);
     case 'GET_GST_MTR_B2B_CUSTOM': return saveGstInvoices(tenantId, content, 'b2b');
     case 'GET_GST_MTR_B2C_CUSTOM': return saveGstInvoices(tenantId, content, 'b2c');
     case 'GET_FBA_FULFILLMENT_CUSTOMER_RETURNS_DATA': return saveReturns(tenantId, content);
@@ -250,8 +261,18 @@ export async function syncReportForTenant(params) {
       if (!seller.rowCount) throw new Error('No connected Amazon seller account');
       const client = new SpApiClient(decryptSecret(seller.rows[0].refresh_token_encrypted), { baseUrl: getSpApiEndpoint(seller.rows[0].marketplace_id) });
       const report = await client.fetchReport(parsed.reportType, parsed.tenantId, range, seller.rows[0].marketplace_id);
-      const s3Key = await putRawReport({ tenantId: parsed.tenantId, reportType: parsed.reportType, reportId: report.reportId, content: report.content });
-      const rowsImported = await saveStructuredRows(parsed.tenantId, parsed.reportType, report.content, range);
+      const documents = report.documents ?? [report];
+      let rowsImported = 0;
+      let s3Key = null;
+      for (const document of documents) {
+        s3Key = await putRawReport({ tenantId: parsed.tenantId, reportType: parsed.reportType, reportId: document.reportId, content: document.content });
+        if (parsed.reportType === 'GET_V2_SETTLEMENT_REPORT_DATA_FLAT_FILE_V2') await withTenant(parsed.tenantId, db => db.query(
+          `insert into settlement_report_documents(tenant_id,report_id,report_document_id,marketplace_id,data_start_time,data_end_time,created_time,raw_key)
+           values($1,$2,$3,$4,$5,$6,$7,$8) on conflict(tenant_id,report_id) do update set report_document_id=excluded.report_document_id,raw_key=excluded.raw_key,imported_at=now()`,
+          [parsed.tenantId,document.reportId,document.reportDocumentId,seller.rows[0].marketplace_id,document.dataStartTime,document.dataEndTime,document.createdTime??null,s3Key]
+        ));
+        rowsImported += await saveStructuredRows(parsed.tenantId, parsed.reportType, document.content, range, document);
+      }
       await pool.query('update sync_jobs set status=$1, completed_at=now(), s3_key=$2 where id=$3', ['completed', s3Key, sync.rows[0].id]);
       return { rowsImported, s3Key };
     } catch (error) {

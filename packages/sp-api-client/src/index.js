@@ -4,11 +4,27 @@ import { z } from 'zod';
 export const SP_API_BASE_URL = 'https://sellingpartnerapi-eu.amazon.com';
 export const INDIA_MARKETPLACE_ID = 'A21TJRUUN4KGV';
 export const MARKETPLACES = Object.freeze({
-  A21TJRUUN4KGV: { country: 'India', region: 'IN', endpoint: 'https://sellingpartnerapi-eu.amazon.com', sellerCentralHost: 'sellercentral.amazon.in' },
-  ATVPDKIKX0DER: { country: 'United States', region: 'NA', endpoint: 'https://sellingpartnerapi-na.amazon.com', sellerCentralHost: 'sellercentral.amazon.com' },
-  A1F83G8C2ARO7P: { country: 'United Kingdom', region: 'EU', endpoint: 'https://sellingpartnerapi-eu.amazon.com', sellerCentralHost: 'sellercentral.amazon.co.uk' }
+  A21TJRUUN4KGV: { country: 'India', region: 'IN', timezone: 'Asia/Kolkata', endpoint: 'https://sellingpartnerapi-eu.amazon.com', sellerCentralHost: 'sellercentral.amazon.in' },
+  ATVPDKIKX0DER: { country: 'United States', region: 'NA', timezone: 'America/Los_Angeles', endpoint: 'https://sellingpartnerapi-na.amazon.com', sellerCentralHost: 'sellercentral.amazon.com' },
+  A1F83G8C2ARO7P: { country: 'United Kingdom', region: 'EU', timezone: 'Europe/London', endpoint: 'https://sellingpartnerapi-eu.amazon.com', sellerCentralHost: 'sellercentral.amazon.co.uk' }
 });
 export function getSpApiEndpoint(marketplaceId = INDIA_MARKETPLACE_ID) { return MARKETPLACES[marketplaceId]?.endpoint ?? SP_API_BASE_URL; }
+export function marketplaceCalendarRange(startDate, endDateExclusive, marketplaceId = INDIA_MARKETPLACE_ID) {
+  const timezone = MARKETPLACES[marketplaceId]?.timezone;
+  if (!timezone) throw new Error(`Unknown marketplace timezone: ${marketplaceId}`);
+  const instant = date => {
+    const [year, month, day] = date.split('-').map(Number);
+    if (!year || !month || !day) throw new Error(`Invalid marketplace calendar date: ${date}`);
+    let candidate = Date.UTC(year, month - 1, day);
+    for (let i = 0; i < 3; i += 1) {
+      const parts = Object.fromEntries(new Intl.DateTimeFormat('en-CA', { timeZone: timezone, year:'numeric',month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit',second:'2-digit',hourCycle:'h23' }).formatToParts(candidate).filter(p=>p.type!=='literal').map(p=>[p.type,Number(p.value)]));
+      const represented = Date.UTC(parts.year,parts.month-1,parts.day,parts.hour,parts.minute,parts.second);
+      candidate += Date.UTC(year,month-1,day)-represented;
+    }
+    return new Date(candidate).toISOString();
+  };
+  return { start: instant(startDate), end: instant(endDateExclusive), timezone, localStart:startDate, localEndExclusive:endDateExclusive };
+}
 export const REPORT_TYPES = Object.freeze([
   'GET_V2_SETTLEMENT_REPORT_DATA_FLAT_FILE_V2',
   'GET_GST_MTR_B2B_CUSTOM',
@@ -141,21 +157,27 @@ export class SpApiClient {
       // reliably be created on demand. Select the latest completed report
       // covering the requested period instead of calling createReport.
       const createdSince = new Date(new Date(parsedRange.start).getTime() - 45 * 864e5).toISOString();
-      const listPath = `/reports/2021-06-30/reports?reportTypes=${encodeURIComponent(parsedReportType)}&processingStatuses=DONE&marketplaceIds=${encodeURIComponent(marketplaceId)}&createdSince=${encodeURIComponent(createdSince)}&pageSize=100`;
-      const list = await this.request(listPath);
-      if (!list.ok) throw new Error(`List settlement reports failed: ${list.status}`);
-      const reports = z.object({ reports: z.array(z.object({ reportId: z.string(), reportDocumentId: z.string().optional(), dataStartTime: z.string().optional(), dataEndTime: z.string().optional(), createdTime: z.string().optional() })).default([]) }).parse(await list.json()).reports;
+      const reports = [];
+      let nextToken;
+      do {
+        const listPath = nextToken
+          ? `/reports/2021-06-30/reports?nextToken=${encodeURIComponent(nextToken)}`
+          : `/reports/2021-06-30/reports?reportTypes=${encodeURIComponent(parsedReportType)}&processingStatuses=DONE&marketplaceIds=${encodeURIComponent(marketplaceId)}&createdSince=${encodeURIComponent(createdSince)}&pageSize=100`;
+        const list = await this.request(listPath);
+        if (!list.ok) throw new Error(`List settlement reports failed: ${list.status}`);
+        const page = z.object({ reports: z.array(z.object({ reportId: z.string(), reportDocumentId: z.string().optional(), dataStartTime: z.string().optional(), dataEndTime: z.string().optional(), createdTime: z.string().optional() })).default([]), nextToken: z.string().optional() }).parse(await list.json());
+        reports.push(...page.reports);
+        nextToken = page.nextToken;
+      } while (nextToken);
       const requestedStart = new Date(parsedRange.start).getTime();
       const requestedEnd = new Date(parsedRange.end).getTime();
       const matchingReports = reports
-        .filter(item => item.reportDocumentId && (!item.dataEndTime || new Date(item.dataEndTime).getTime() >= requestedStart) && (!item.dataStartTime || new Date(item.dataStartTime).getTime() <= requestedEnd))
+        .filter(item => item.reportDocumentId && item.dataStartTime && item.dataEndTime && new Date(item.dataEndTime).getTime() > requestedStart && new Date(item.dataStartTime).getTime() < requestedEnd)
         .sort((a, b) => new Date(b.dataEndTime ?? b.createdTime ?? 0).getTime() - new Date(a.dataEndTime ?? a.createdTime ?? 0).getTime())
-        .slice(0, 10);
       if (!matchingReports.length) throw new Error('No completed Amazon settlement report is available for this date range yet');
       const documents = [];
-      for (const report of matchingReports) documents.push(await this.downloadReportDocument(report.reportDocumentId));
-      const content = documents.map((document, index) => index === 0 ? document.content : document.content.split(/\r?\n/).slice(1).join('\n')).join('\n');
-      return { reportId: matchingReports[0].reportId, reportDocumentId: matchingReports[0].reportDocumentId, content, compressionAlgorithm: 'MERGED_SETTLEMENT_REPORTS', reportsMerged: matchingReports.length };
+      for (const metadata of matchingReports) documents.push({ ...metadata, ...(await this.downloadReportDocument(metadata.reportDocumentId)) });
+      return { reportId: matchingReports[0].reportId, reportDocumentId: matchingReports[0].reportDocumentId, documents, reportsMatched: documents.length };
     }
     const reportOptions = parsedReportType === 'GET_SALES_AND_TRAFFIC_REPORT'
       ? { dateGranularity: 'DAY', asinGranularity: 'CHILD' }
