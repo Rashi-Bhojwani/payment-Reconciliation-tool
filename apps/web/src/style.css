@@ -702,6 +702,8 @@ tbody tr:hover td { background: rgba(115, 87, 232, 0.045); }
   grid-template-columns: repeat(4, 1fr);
   gap: 14px;
 }
+.account-activity-grid { grid-template-columns: repeat(5, minmax(0, 1fr)); }
+.account-activity-grid .mini-metric { min-width: 0; }
 .profit-kpi-grid .stat-card:nth-child(1) { border-bottom: 3px solid var(--emerald); }
 .profit-kpi-grid .stat-card:nth-child(2) { border-bottom: 3px solid var(--danger); }
 .profit-kpi-grid .stat-card:nth-child(3) { border-bottom: 3px solid var(--violet); }
@@ -711,7 +713,7 @@ tbody tr:hover td { background: rgba(115, 87, 232, 0.045); }
 .detailed-dashboard-grid table td { white-space: nowrap; }
 
 @media (max-width: 980px) {
-  .filter-toolbar, .profit-kpi-grid { grid-template-columns: 1fr; }
+  .filter-toolbar, .profit-kpi-grid, .account-activity-grid { grid-template-columns: 1fr; }
 }
 
 /* ---------- Drill-downs and readable report cards ---------- */

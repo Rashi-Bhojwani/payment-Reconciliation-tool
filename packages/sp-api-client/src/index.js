@@ -142,20 +142,37 @@ export class SpApiClient {
       // covering the requested period instead of calling createReport.
       const createdSince = new Date(new Date(parsedRange.start).getTime() - 45 * 864e5).toISOString();
       const listPath = `/reports/2021-06-30/reports?reportTypes=${encodeURIComponent(parsedReportType)}&processingStatuses=DONE&marketplaceIds=${encodeURIComponent(marketplaceId)}&createdSince=${encodeURIComponent(createdSince)}&pageSize=100`;
-      const list = await this.request(listPath);
-      if (!list.ok) throw new Error(`List settlement reports failed: ${list.status}`);
-      const reports = z.object({ reports: z.array(z.object({ reportId: z.string(), reportDocumentId: z.string().optional(), dataStartTime: z.string().optional(), dataEndTime: z.string().optional(), createdTime: z.string().optional() })).default([]) }).parse(await list.json()).reports;
+      const reportSchema = z.object({ reportId: z.string(), reportDocumentId: z.string().optional(), dataStartTime: z.string().optional(), dataEndTime: z.string().optional(), createdTime: z.string().optional() });
+      const reports = [];
+      let nextToken;
+      do {
+        const path = nextToken ? `/reports/2021-06-30/reports?nextToken=${encodeURIComponent(nextToken)}` : listPath;
+        const list = await this.request(path);
+        if (!list.ok) throw new Error(`List settlement reports failed: ${list.status}`);
+        const page = z.object({ reports: z.array(reportSchema).default([]), nextToken: z.string().optional() }).parse(await list.json());
+        reports.push(...page.reports); nextToken = page.nextToken;
+      } while (nextToken);
       const requestedStart = new Date(parsedRange.start).getTime();
       const requestedEnd = new Date(parsedRange.end).getTime();
+      const discoveryStart = requestedStart - 45 * 864e5;
+      const discoveryEnd = requestedEnd + 45 * 864e5;
       const matchingReports = reports
-        .filter(item => item.reportDocumentId && (!item.dataEndTime || new Date(item.dataEndTime).getTime() >= requestedStart) && (!item.dataStartTime || new Date(item.dataStartTime).getTime() <= requestedEnd))
-        .sort((a, b) => new Date(b.dataEndTime ?? b.createdTime ?? 0).getTime() - new Date(a.dataEndTime ?? a.createdTime ?? 0).getTime())
-        .slice(0, 10);
+        // A settlement can contain posted activity before the dashboard period
+        // but deposit during it (or vice versa). Download the bounded surrounding
+        // settlement window, then apply posted_date/deposit_date after parsing.
+        .filter(item => item.reportDocumentId
+          && (!item.dataEndTime || new Date(item.dataEndTime).getTime() >= discoveryStart)
+          && (!item.dataStartTime || new Date(item.dataStartTime).getTime() <= discoveryEnd)
+          && (!item.createdTime || new Date(item.createdTime).getTime() <= discoveryEnd))
+        .sort((a, b) => new Date(b.dataEndTime ?? b.createdTime ?? 0).getTime() - new Date(a.dataEndTime ?? a.createdTime ?? 0).getTime());
       if (!matchingReports.length) throw new Error('No completed Amazon settlement report is available for this date range yet');
-      const documents = [];
-      for (const report of matchingReports) documents.push(await this.downloadReportDocument(report.reportDocumentId));
-      const content = documents.map((document, index) => index === 0 ? document.content : document.content.split(/\r?\n/).slice(1).join('\n')).join('\n');
-      return { reportId: matchingReports[0].reportId, reportDocumentId: matchingReports[0].reportDocumentId, content, compressionAlgorithm: 'MERGED_SETTLEMENT_REPORTS', reportsMerged: matchingReports.length };
+      const reportDocuments = [];
+      for (const report of matchingReports) {
+        const document = await this.downloadReportDocument(report.reportDocumentId);
+        reportDocuments.push({ ...report, documentId: report.reportDocumentId, content: document.content });
+      }
+      const content = reportDocuments.map((document, index) => index === 0 ? document.content : document.content.split(/\r?\n/).slice(1).join('\n')).join('\n');
+      return { reportId: matchingReports[0].reportId, reportDocumentId: matchingReports[0].reportDocumentId, content, reportDocuments, compressionAlgorithm: 'MERGED_SETTLEMENT_REPORTS', reportsMerged: matchingReports.length };
     }
     const reportOptions = parsedReportType === 'GET_SALES_AND_TRAFFIC_REPORT'
       ? { dateGranularity: 'DAY', asinGranularity: 'CHILD' }
