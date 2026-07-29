@@ -389,7 +389,10 @@ function SellerDashboard() {
       const dashboard = await api(`/api/tenants/${tenantId}/dashboard?${rangeQuery(targetRange)}`);
       if (requestId === rangeSyncRef.current.requestId) setData(dashboard);
     } catch (e) {
-      if (requestId === rangeSyncRef.current.requestId) setError(e.message);
+      // Never leave a previous seller/range visible after a failed scoped load.
+      // In particular, a pending migration must not make stale values look like
+      // confirmed zeroes for the newly selected scope.
+      if (requestId === rangeSyncRef.current.requestId) { setData(null); setError(e.message); }
     }
   }
   useEffect(() => {
@@ -422,7 +425,7 @@ function SellerDashboard() {
     {view !== 'dashboard' && !detailView && <SyncLedger tenantId={tenantId} jobs={data?.jobs ?? []} onSynced={load} reportTypes={reportTypes} title={ledgerCopy?.title} subtitle={ledgerCopy?.subtitle} disabled={!connected} />}
 
     {view === 'orderPayments' && <OrderReconciliation tenantId={tenantId} />}
-    {view === 'dashboard' && <DashboardOverview data={data} channelData={channelData} tenantId={tenantId} />}
+    {view === 'dashboard' && (data ? <DashboardOverview data={data} channelData={channelData} tenantId={tenantId} /> : !error && <Empty text="Loading scoped Amazon dashboard data…" />)}
     {view === 'sales' && <SalesAnalytics data={data} channelData={channelData} />}
     {view === 'businessPerformance' && <BusinessPerformanceReport data={data} />}
     {view === 'productPerformance' && <ProductPerformanceReport data={data} />}
@@ -537,21 +540,23 @@ function DashboardOverview({ data, channelData, tenantId }) {
   const [repairing,setRepairing]=useState(false);const [repairError,setRepairError]=useState('');
   const summary = useMemo(() => buildDashboardSummary(data, range), [data, range]);
   async function repairSources(){setRepairing(true);setRepairError('');try{const result=await api(`/api/tenants/${tenantId}/reconcile-sources`,{method:'POST',body:JSON.stringify({range:{start:formatDateParam(range.start),end:formatDateParam(addDays(range.end,1))}})});const failed=result.results?.filter(row=>row.status==='failed');if(failed?.length)throw new Error(failed.map(row=>`${row.source}: ${row.error}`).join(' · '));window.location.reload();}catch(error){setRepairError(error.message)}finally{setRepairing(false)}}
+  async function importSettlement(event){const file=event.target.files?.[0];if(!file)return;setRepairing(true);setRepairError('');try{await api(`/api/tenants/${tenantId}/import/settlement`,{method:'POST',body:JSON.stringify({content:await file.text()})});window.location.reload();}catch(error){setRepairError(error.message)}finally{setRepairing(false);event.target.value='';}}
   return <>
     <div className="metrics-strip">
-      <DrillMetric to={`/seller?tenantId=${tenantId}&view=metric-detail&metric=netSales`} title="Net Sales" value={summary.netSales==null?'Incomplete source data':formatCurrency(summary.netSales)} hint="Click to see order-value formula" />
-      <DrillMetric to={`/seller?tenantId=${tenantId}&view=metric-detail&metric=netQty`} title="Net Qty" value={summary.netQty==null?'Unavailable':formatNumber(summary.netQty)} hint="Click to see units source" />
-      <DrillMetric to={`/seller?tenantId=${tenantId}&view=metric-detail&metric=orders`} title="Orders Synced" value={formatNumber(summary.ordersCount)} hint="Distinct eligible Amazon order IDs" />
-      <DrillMetric to={`/seller?tenantId=${tenantId}&view=metric-detail&metric=returns`} title={summary.returnQty==null?'Return records':'Returned Qty'} value={formatNumber(summary.returnQty??summary.returnRecords)} hint={summary.returnQty==null?'Return quantity unavailable':'Sum of actual returned quantity'} />
+      <DrillMetric to={`/seller?tenantId=${tenantId}&view=metric-detail&metric=netSales`} title="Net Sales" value={metricDisplay(data?.dashboardCalculations?.metrics?.netSales)} hint="Click to see order-value formula" />
+      <DrillMetric to={`/seller?tenantId=${tenantId}&view=metric-detail&metric=netQty`} title="Net Qty" value={metricDisplay(data?.dashboardCalculations?.metrics?.netQty)} hint="Click to see units source" />
+      <DrillMetric to={`/seller?tenantId=${tenantId}&view=metric-detail&metric=orders`} title="Orders Synced" value={metricDisplay(data?.dashboardCalculations?.metrics?.orders)} hint="Distinct eligible Amazon order IDs" />
+      <DrillMetric to={`/seller?tenantId=${tenantId}&view=metric-detail&metric=returnRecords`} title="Return Records" value={metricDisplay(data?.dashboardCalculations?.metrics?.returnRecords)} hint="Separate from returned quantity" />
     </div>
 
     <Card className="profit-control-card">
       <PanelHeader title="Profit Analysis" subtitle="Clean overview" />
       <div className="profit-kpi-grid">
-        <DrillMetric to={`/seller?tenantId=${tenantId}&view=metric-detail&metric=settled`} title="Settled Amount" value={summary.settledAmount==null?'Unavailable':formatCurrency(summary.settledAmount)} hint="Successful deposits by deposit date" />
-        <DrillMetric to={`/seller?tenantId=${tenantId}&view=metric-detail&metric=deductions`} title="Deductions" value={summary.deductions==null?'Incomplete source data':formatCurrency(summary.deductions)} hint="Fees, refunds, charges" />
-        <DrillMetric to={`/seller?tenantId=${tenantId}&view=metric-detail&metric=reimbursements`} title="Reimbursements" value={summary.reimbursements==null?'Incomplete source data':formatCurrency(summary.reimbursements)} hint="Credits imported" />
-        <DrillMetric to={`/seller?tenantId=${tenantId}&view=metric-detail&metric=drr`} title="DRR" value={summary.drr==null?'Incomplete source data':formatCurrency(summary.drr)} hint="Daily run rate" />
+        {[
+          ['grossSales','Gross Product Sales'],['productRefunds','Product Refunds'],['netPromotions','Net Promotions'],
+          ['tcsTds','TCS/TDS'],['operationalFees','Operational Fees'],['returnRecords','Return Records'],['returns','Returned Quantity']
+        ].map(([key,title])=><DrillMetric key={key} to={`/seller?tenantId=${tenantId}&view=metric-detail&metric=${key}`} title={title} value={metricDisplay(data?.dashboardCalculations?.metrics?.[key])} hint="Persisted Amazon source rows" />)}
+        {['settled','deductions','reimbursements','drr'].map(key=><DrillMetric key={key} to={`/seller?tenantId=${tenantId}&view=metric-detail&metric=${key}`} title={({settled:'Settled Amount',deductions:'Deductions',reimbursements:'Reimbursements',drr:'DRR'})[key]} value={metricDisplay(data?.dashboardCalculations?.metrics?.[key])} hint="Persisted Amazon source rows" />)}
       </div>
     </Card>
 
@@ -559,9 +564,9 @@ function DashboardOverview({ data, channelData, tenantId }) {
 
     <Card className="profit-control-card">
       <PanelHeader title="Amazon Account Activity" subtitle="Matches Amazon statement sections" />
-      {data?.dashboardCalculations?.diagnostics?.sourceComplete===false&&<div className="alert error"><b>Reconciliation failed: incomplete settlement source data.</b> Missing or uncontrolled settlement IDs: {(data.dashboardCalculations.diagnostics.missingSettlementIds??[]).join(', ')||'report document metadata unavailable'}.<div className="detail-actions"><Button disabled={repairing} onClick={repairSources}>{repairing?'Re-syncing all sources…':'Retry settlement + missing order items'}</Button></div>{repairError&&<small>{repairError}</small>}</div>}
+      {data?.dashboardCalculations?.diagnostics?.sourceComplete===false&&<div className="alert error"><b>Reconciliation failed: incomplete settlement source data.</b> Missing or uncontrolled settlement IDs: {(data.dashboardCalculations.diagnostics.missingSettlementIds??[]).join(', ')||'report document metadata unavailable'}.<div className="detail-actions"><Button disabled={repairing} onClick={repairSources}>{repairing?'Re-syncing all sources…':'Retry settlement + missing order items'}</Button><label className="button secondary">Import original CSV/TSV<input hidden type="file" accept=".csv,.tsv,text/csv,text/tab-separated-values" disabled={repairing} onChange={importSettlement}/></label></div>{repairError&&<small>{repairError}</small>}</div>}
       <div className="profit-kpi-grid account-activity-grid">
-        {['income','expenses','tax','transfers','gst'].map(metric=>{const detail=data?.dashboardCalculations?.statement?.[metric];return <DrillMetric key={metric} to={`/seller?tenantId=${tenantId}&view=metric-detail&metric=${metric}`} title={metric==='gst'?'Goods and Services Tax':metric[0].toUpperCase()+metric.slice(1)} value={detail?.status??formatCurrency(detail?.value)} hint="Open Amazon source rows and formula" />})}
+        {['income','expenses','tax','transfers','gst'].map(metric=>{const detail=data?.dashboardCalculations?.statement?.[metric];return <DrillMetric key={metric} to={`/seller?tenantId=${tenantId}&view=metric-detail&metric=${metric}`} title={metric==='gst'?'Goods and Services Tax':metric[0].toUpperCase()+metric.slice(1)} value={metricDisplay(detail)} hint="Open Amazon source rows and formula" />})}
       </div>
     </Card>
 
@@ -575,6 +580,7 @@ function DashboardOverview({ data, channelData, tenantId }) {
 }
 
 
+function metricDisplay(metric){if(!metric||metric.status!=='available')return metric?.reason??'Unavailable';if(metric.unit==='percentage')return `${formatNumber(metric.value)}%`;if(metric.unit==='quantity')return formatNumber(metric.value);return formatCurrency(metric.value);}
 function DrillMetric({ to, title, value, hint }) { return <NavLink to={to} className="mini-metric drill-metric"><span>{title}</span><strong>{value}</strong>{trendHint(hint)}<em>View calculation →</em></NavLink>; }
 function ExplanationGrid({ summary, tenantId }) {
   const cards = [
@@ -687,11 +693,11 @@ function MetricDetail({ metric, tenantId }) {
   const deductionCategories = new Set(['referral_commission','fulfillment_fee_per_order','fulfillment_fee_per_unit','fulfillment_fee_weight','shipping_fee','storage_fee','chargeback','tax','promotion']);
   return <>
     <Card className="detail-hero">
-      <PanelHeader title={String(metric).replace(/([A-Z])/g, ' $1').trim()} subtitle={details.status??(details.unit==='percentage'?`${formatNumber(details.total)}%`:details.unit==='quantity'?formatNumber(details.total):formatCurrency(details.total))} />
-      <p className="detail-note"><b>Selected range:</b> {String(details.range?.start??range.start)} → {String(details.range?.end??range.end)} (end exclusive)<br/><b>Source:</b> {details.source}<br/><b>Formula:</b> {details.formula}.</p>
+      <PanelHeader title={String(metric).replace(/([A-Z])/g, ' $1').trim()} subtitle={details.status==='available'?(details.unit==='percentage'?`${formatNumber(details.total)}%`:details.unit==='quantity'?formatNumber(details.total):formatCurrency(details.total)):(details.reason??details.status)} />
+      <p className="detail-note"><b>Seller:</b> {details.effectiveSeller?.sellerId} · <b>Marketplace:</b> {details.effectiveSeller?.marketplaceId}<br/><b>Selected range:</b> {String(details.range?.start??range.start)} → {String(details.range?.end??range.end)} (end exclusive)<br/><b>Business date:</b> {details.dateField}<br/><b>Source:</b> {details.source}<br/><b>Formula:</b> {details.formula}.</p>
       <p className="detail-note"><b>Amazon marketplace range:</b> {details.marketplaceRange?.start} → {details.marketplaceRange?.end} ({details.marketplaceRange?.timeZone}, end exclusive).</p>
       {details.diagnostics?.sourceComplete===false&&<p className="alert error"><b>Incomplete source data.</b> Missing or failed settlement controls: {(details.diagnostics.missingSettlementIds??[]).join(', ')||'report document metadata unavailable'}.</p>}
-      <div className="calculation-components">{details.components.map(component => <div key={component.category} className={deductionCategories.has(component.category) ? 'negative' : ''}><span>{component.operation} {component.label}</span><small>{formatNumber(component.count)} source rows</small><strong>{component.amount==null?'Unavailable':details.unit==='quantity'||component.category==='days'?formatNumber(component.amount):formatCurrency(component.amount)}</strong></div>)}<div className="total"><span>Total ({details.unit})</span><strong>{details.status??(details.unit==='percentage'?`${formatNumber(details.total)}%`:details.unit==='quantity'?formatNumber(details.total):formatCurrency(details.total))}</strong></div></div>
+      <div className="calculation-components">{details.components.map(component => <div key={component.category} className={deductionCategories.has(component.category) ? 'negative' : ''}><span>{component.operation} {component.label}</span><small>{formatNumber(component.count)} source rows</small><strong>{component.amount==null?'Unavailable':details.unit==='quantity'||component.category==='days'?formatNumber(component.amount):formatCurrency(component.amount)}</strong></div>)}<div className="total"><span>Total ({details.unit})</span><strong>{details.status==='available'?(details.unit==='percentage'?`${formatNumber(details.total)}%`:details.unit==='quantity'?formatNumber(details.total):formatCurrency(details.total)):(details.reason??details.status)}</strong></div></div>
       <div className="detail-note"><b>Reconciliation diagnostics:</b> {formatNumber(details.diagnostics?.includedRows)} included · {formatNumber(details.diagnostics?.excludedRows)} excluded by source precedence · {formatNumber(details.diagnostics?.duplicateRows)} duplicates removed.</div>
       {details.diagnostics?.quantity&&<div className="detail-note"><b>Quantity source:</b> {formatNumber(details.diagnostics.quantity.eligibleOrders)} eligible orders · {formatNumber(details.diagnostics.quantity.ordersWithItems)} with items · {formatNumber(details.diagnostics.quantity.ordersWithoutItems)} without items · {formatNumber(details.diagnostics.quantity.eligibleOrderItems)} item rows · {formatNumber(details.diagnostics.quantity.rowsWithQuantity)} with quantity · {formatNumber(details.diagnostics.quantity.rowsMissingQuantity)} missing quantity · shipped {details.diagnostics.quantity.shippedUnits??'Unavailable'} · returned {details.diagnostics.quantity.returnedUnits??'Unavailable'} · {formatNumber(details.diagnostics.quantity.returnRecords)} return records.</div>}
       <div className="detail-actions"><Button variant="secondary" onClick={() => navigate(`/seller?tenantId=${tenantId}&view=dashboard`)}>← Back</Button><Button variant="accent" onClick={() => downloadCsv(`${metric}-calculation.csv`, details.rows, details.columns)} disabled={!details.rows.length}>Download calculation CSV</Button></div>
