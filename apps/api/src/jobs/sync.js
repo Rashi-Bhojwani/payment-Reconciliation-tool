@@ -263,7 +263,7 @@ export async function syncReportForTenant(params) {
       await pool.query('update sync_jobs set status=$1, completed_at=now(), error_message=$2 where id=$3', ['failed', error instanceof Error ? error.message : 'unknown error', sync.rows[0].id]);
       throw error;
     }
-  }, 1);
+  }, parsed.reportType === 'GET_V2_SETTLEMENT_REPORT_DATA_FLAT_FILE_V2' ? 3 : 1);
 }
 
 
@@ -289,6 +289,7 @@ export async function syncRecentApiDataForTenant(tenantId, options = {}) {
   const includeInventory = options.includeInventory ?? true;
   const maxOrderPages = Math.max(1, Math.min(Number(options.maxOrderPages ?? 100), 100));
   const maxOrderItems = Math.max(0, Math.min(Number(options.maxOrderItems ?? 1000), 1000));
+  const refreshOrderItems = options.refreshOrderItems ?? false;
   await assertActiveTenant(parsedTenantId);
   return runJob(`sync:direct-api:${parsedTenantId}`, async () => {
     const sync = await pool.query('insert into sync_jobs(tenant_id, report_type, status, started_at) values($1,$2,$3,now()) returning id', [parsedTenantId, 'DIRECT_SP_API_SYNC', 'running']);
@@ -353,8 +354,8 @@ export async function syncRecentApiDataForTenant(tenantId, options = {}) {
             [parsedTenantId, orderId, order.PurchaseDate ?? order.purchaseDate ?? null, number(order.OrderTotal?.Amount ?? order.orderTotal?.amount), order.OrderStatus ?? order.orderStatus ?? null, order.FulfillmentChannel ?? order.fulfillmentChannel ?? null, order.SalesChannel ?? order.salesChannel ?? null, JSON.stringify(order)]
           );
           ordersImported += 1;
-          const existingItems = await db.query('select 1 from order_items where tenant_id=$1 and amazon_order_id=$2 limit 1', [parsedTenantId, orderId]);
-          if (existingItems.rowCount) {
+          const existingItems = (await db.query('select count(*) count,count(*) filter(where quantity_ordered is null) missing_quantity from order_items where tenant_id=$1 and amazon_order_id=$2', [parsedTenantId, orderId])).rows[0];
+          if (!refreshOrderItems && Number(existingItems.count)>0 && Number(existingItems.missing_quantity)===0) {
             orderItemsSkipped += 1;
             continue;
           }
@@ -375,11 +376,11 @@ export async function syncRecentApiDataForTenant(tenantId, options = {}) {
             }
             const shipping = catalogShippingFacts(catalog);
             await db.query(
-              `insert into order_items(tenant_id, amazon_order_id, asin, sku, title, quantity_ordered, item_price, item_tax, promotion_discount, raw, package_weight, weight_unit, package_dimensions, catalog_raw)
-               values($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
-               on conflict (tenant_id, amazon_order_id, sku, asin) do update set title=excluded.title, quantity_ordered=excluded.quantity_ordered, item_price=excluded.item_price, item_tax=excluded.item_tax, promotion_discount=excluded.promotion_discount, raw=excluded.raw,
+              `insert into order_items(tenant_id, amazon_order_id, amazon_order_item_id, asin, sku, title, quantity_ordered, item_price, item_tax, promotion_discount, raw, package_weight, weight_unit, package_dimensions, catalog_raw)
+               values($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)
+               on conflict (tenant_id, amazon_order_item_id) where amazon_order_item_id is not null do update set title=excluded.title, quantity_ordered=excluded.quantity_ordered, item_price=excluded.item_price, item_tax=excluded.item_tax, promotion_discount=excluded.promotion_discount, raw=excluded.raw,
                  package_weight=excluded.package_weight, weight_unit=excluded.weight_unit, package_dimensions=excluded.package_dimensions, catalog_raw=excluded.catalog_raw`,
-              [parsedTenantId, orderId, asin, item.SellerSKU ?? item.sellerSku ?? null, item.Title ?? item.title ?? null, integer(item.QuantityOrdered ?? item.quantityOrdered), number(item.ItemPrice?.Amount ?? item.itemPrice?.amount), number(item.ItemTax?.Amount ?? item.itemTax?.amount), number(item.PromotionDiscount?.Amount ?? item.promotionDiscount?.amount), item, shipping.weight || null, shipping.weightUnit ?? null, shipping.dimensions, catalog ?? {}]
+              [parsedTenantId, orderId, item.OrderItemId ?? item.orderItemId ?? null, asin, item.SellerSKU ?? item.sellerSku ?? null, item.Title ?? item.title ?? null, item.QuantityOrdered == null && item.quantityOrdered == null ? null : integer(item.QuantityOrdered ?? item.quantityOrdered), number(item.ItemPrice?.Amount ?? item.itemPrice?.amount), number(item.ItemTax?.Amount ?? item.itemTax?.amount), number(item.PromotionDiscount?.Amount ?? item.promotionDiscount?.amount), item, shipping.weight || null, shipping.weightUnit ?? null, shipping.dimensions, catalog ?? {}]
             );
           }
         }

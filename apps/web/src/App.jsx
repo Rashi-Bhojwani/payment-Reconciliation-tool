@@ -534,13 +534,15 @@ function FeeLeakAudit({tenantId}) {
 }
 function DashboardOverview({ data, channelData, tenantId }) {
   const { range } = useContext(DateRangeContext);
+  const [repairing,setRepairing]=useState(false);const [repairError,setRepairError]=useState('');
   const summary = useMemo(() => buildDashboardSummary(data, range), [data, range]);
+  async function repairSources(){setRepairing(true);setRepairError('');try{const result=await api(`/api/tenants/${tenantId}/reconcile-sources`,{method:'POST',body:JSON.stringify({range:{start:formatDateParam(range.start),end:formatDateParam(addDays(range.end,1))}})});const failed=result.results?.filter(row=>row.status==='failed');if(failed?.length)throw new Error(failed.map(row=>`${row.source}: ${row.error}`).join(' · '));window.location.reload();}catch(error){setRepairError(error.message)}finally{setRepairing(false)}}
   return <>
     <div className="metrics-strip">
       <DrillMetric to={`/seller?tenantId=${tenantId}&view=metric-detail&metric=netSales`} title="Net Sales" value={summary.netSales==null?'Incomplete source data':formatCurrency(summary.netSales)} hint="Click to see order-value formula" />
       <DrillMetric to={`/seller?tenantId=${tenantId}&view=metric-detail&metric=netQty`} title="Net Qty" value={summary.netQty==null?'Unavailable':formatNumber(summary.netQty)} hint="Click to see units source" />
       <DrillMetric to={`/seller?tenantId=${tenantId}&view=metric-detail&metric=orders`} title="Orders Synced" value={formatNumber(summary.ordersCount)} hint="Distinct eligible Amazon order IDs" />
-      <DrillMetric to={`/seller?tenantId=${tenantId}&view=metric-detail&metric=returns`} title="Returns" value={formatNumber(summary.returnQty)} hint="Total returned quantity" />
+      <DrillMetric to={`/seller?tenantId=${tenantId}&view=metric-detail&metric=returns`} title={summary.returnQty==null?'Return records':'Returned Qty'} value={formatNumber(summary.returnQty??summary.returnRecords)} hint={summary.returnQty==null?'Return quantity unavailable':'Sum of actual returned quantity'} />
     </div>
 
     <Card className="profit-control-card">
@@ -557,7 +559,7 @@ function DashboardOverview({ data, channelData, tenantId }) {
 
     <Card className="profit-control-card">
       <PanelHeader title="Amazon Account Activity" subtitle="Matches Amazon statement sections" />
-      {data?.dashboardCalculations?.diagnostics?.sourceComplete===false&&<p className="alert error"><b>Reconciliation failed: incomplete settlement source data.</b> Missing or uncontrolled settlement IDs: {(data.dashboardCalculations.diagnostics.missingSettlementIds??[]).join(', ')||'report document metadata unavailable'}. Re-sync the V2 Settlement report for this period.</p>}
+      {data?.dashboardCalculations?.diagnostics?.sourceComplete===false&&<div className="alert error"><b>Reconciliation failed: incomplete settlement source data.</b> Missing or uncontrolled settlement IDs: {(data.dashboardCalculations.diagnostics.missingSettlementIds??[]).join(', ')||'report document metadata unavailable'}.<div className="detail-actions"><Button disabled={repairing} onClick={repairSources}>{repairing?'Re-syncing all sources…':'Retry settlement + missing order items'}</Button></div>{repairError&&<small>{repairError}</small>}</div>}
       <div className="profit-kpi-grid account-activity-grid">
         {['income','expenses','tax','transfers','gst'].map(metric=>{const detail=data?.dashboardCalculations?.statement?.[metric];return <DrillMetric key={metric} to={`/seller?tenantId=${tenantId}&view=metric-detail&metric=${metric}`} title={metric==='gst'?'Goods and Services Tax':metric[0].toUpperCase()+metric.slice(1)} value={detail?.status??formatCurrency(detail?.value)} hint="Open Amazon source rows and formula" />})}
       </div>
@@ -691,9 +693,10 @@ function MetricDetail({ metric, tenantId }) {
       {details.diagnostics?.sourceComplete===false&&<p className="alert error"><b>Incomplete source data.</b> Missing or failed settlement controls: {(details.diagnostics.missingSettlementIds??[]).join(', ')||'report document metadata unavailable'}.</p>}
       <div className="calculation-components">{details.components.map(component => <div key={component.category} className={deductionCategories.has(component.category) ? 'negative' : ''}><span>{component.operation} {component.label}</span><small>{formatNumber(component.count)} source rows</small><strong>{component.amount==null?'Unavailable':details.unit==='quantity'||component.category==='days'?formatNumber(component.amount):formatCurrency(component.amount)}</strong></div>)}<div className="total"><span>Total ({details.unit})</span><strong>{details.status??(details.unit==='percentage'?`${formatNumber(details.total)}%`:details.unit==='quantity'?formatNumber(details.total):formatCurrency(details.total))}</strong></div></div>
       <div className="detail-note"><b>Reconciliation diagnostics:</b> {formatNumber(details.diagnostics?.includedRows)} included · {formatNumber(details.diagnostics?.excludedRows)} excluded by source precedence · {formatNumber(details.diagnostics?.duplicateRows)} duplicates removed.</div>
-      {details.diagnostics?.quantity&&<div className="detail-note"><b>Quantity source:</b> {formatNumber(details.diagnostics.quantity.eligibleOrders)} eligible orders · {formatNumber(details.diagnostics.quantity.eligibleOrderItems)} item rows · {formatNumber(details.diagnostics.quantity.rowsWithQuantity)} with quantity · {formatNumber(details.diagnostics.quantity.rowsMissingQuantity)} missing quantity · shipped {details.diagnostics.quantity.shippedUnits??'Unavailable'} · returned {details.diagnostics.quantity.returnedUnits??'Unavailable'}.</div>}
+      {details.diagnostics?.quantity&&<div className="detail-note"><b>Quantity source:</b> {formatNumber(details.diagnostics.quantity.eligibleOrders)} eligible orders · {formatNumber(details.diagnostics.quantity.ordersWithItems)} with items · {formatNumber(details.diagnostics.quantity.ordersWithoutItems)} without items · {formatNumber(details.diagnostics.quantity.eligibleOrderItems)} item rows · {formatNumber(details.diagnostics.quantity.rowsWithQuantity)} with quantity · {formatNumber(details.diagnostics.quantity.rowsMissingQuantity)} missing quantity · shipped {details.diagnostics.quantity.shippedUnits??'Unavailable'} · returned {details.diagnostics.quantity.returnedUnits??'Unavailable'} · {formatNumber(details.diagnostics.quantity.returnRecords)} return records.</div>}
       <div className="detail-actions"><Button variant="secondary" onClick={() => navigate(`/seller?tenantId=${tenantId}&view=dashboard`)}>← Back</Button><Button variant="accent" onClick={() => downloadCsv(`${metric}-calculation.csv`, details.rows, details.columns)} disabled={!details.rows.length}>Download calculation CSV</Button></div>
     </Card>
+    {!!details.diagnostics?.settlementChecks?.length&&<TableCard title="Settlement completeness investigation" rows={details.diagnostics.settlementChecks} columns={['settlementId','classification','reportDocumentExists','syncStatus','syncError','settlementStartDate','settlementEndDate','depositDate','controlTotal','rowCount','detailTotal','difference','reportDocumentId']} pageSize={20} />}
     <TableCard title="Actual database rows used" rows={details.rows} columns={details.columns} pageSize={10} />
   </>;
 }
@@ -708,7 +711,8 @@ function buildDashboardSummary(data, range = defaultDateRange()) {
   const ordersCount = Number(calculated?.orders?.value??data?.orders?.orders??0);
   const netSales = calculated?.netSales ? calculated.netSales.value : amazonNetSales(data);
   const netQty = calculated?.netQty ? calculated.netQty.value : (products.reduce((sum, product) => sum + Number(product.units ?? 0), 0) || orderItems.reduce((sum, item) => sum + Number(item.quantity_ordered ?? 0), 0));
-  const returnQty = Number(calculated?.returns?.value??returns.length);
+  const returnQty = calculated?.returns ? calculated.returns.value : null;
+  const returnRecords = calculated?.returns?.diagnostics?.quantity?.returnRecords??returns.length;
   const settledAmount = calculated?.settled ? calculated.settled.value : null;
   const deductions = calculated?.deductions ? calculated.deductions.value : null;
   const reimbursementAmount = calculated?.reimbursements ? calculated.reimbursements.value : null;
@@ -746,6 +750,7 @@ function buildDashboardSummary(data, range = defaultDateRange()) {
     netSales,
     netQty,
     returnQty,
+    returnRecords,
     settledAmount,
     deductions,
     reimbursements: reimbursementAmount,

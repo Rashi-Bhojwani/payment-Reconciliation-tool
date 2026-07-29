@@ -154,8 +154,16 @@ export class SpApiClient {
       } while (nextToken);
       const requestedStart = new Date(parsedRange.start).getTime();
       const requestedEnd = new Date(parsedRange.end).getTime();
+      const discoveryStart = requestedStart - 45 * 864e5;
+      const discoveryEnd = requestedEnd + 45 * 864e5;
       const matchingReports = reports
-        .filter(item => item.reportDocumentId && (!item.dataEndTime || new Date(item.dataEndTime).getTime() >= requestedStart) && (!item.dataStartTime || new Date(item.dataStartTime).getTime() <= requestedEnd))
+        // A settlement can contain posted activity before the dashboard period
+        // but deposit during it (or vice versa). Download the bounded surrounding
+        // settlement window, then apply posted_date/deposit_date after parsing.
+        .filter(item => item.reportDocumentId
+          && (!item.dataEndTime || new Date(item.dataEndTime).getTime() >= discoveryStart)
+          && (!item.dataStartTime || new Date(item.dataStartTime).getTime() <= discoveryEnd)
+          && (!item.createdTime || new Date(item.createdTime).getTime() <= discoveryEnd))
         .sort((a, b) => new Date(b.dataEndTime ?? b.createdTime ?? 0).getTime() - new Date(a.dataEndTime ?? a.createdTime ?? 0).getTime());
       if (!matchingReports.length) throw new Error('No completed Amazon settlement report is available for this date range yet');
       const reportDocuments = [];
