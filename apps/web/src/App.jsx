@@ -108,7 +108,7 @@ function readAmazonTokenCache(tenantId) { const cached = JSON.parse(localStorage
 async function getAmazonAccessToken(tenantId) { const cached = readAmazonTokenCache(tenantId); if (cached) return cached; const fresh = await api(`/api/tenants/${tenantId}/amazon/access-token`); localStorage.setItem(`${ACCESS_TOKEN_CACHE_PREFIX}${tenantId}`, JSON.stringify(fresh)); return fresh; }
 async function beginAmazonAuthorization(tenantId) { const { url } = await api(`/api/auth/amazon/start?tenantId=${tenantId}&json=1`); window.location.assign(url); }
 async function syncAmazonSource(tenantId, reportType, range) {
-  const payload = { method: 'POST', body: JSON.stringify({ range: { start: formatDateParam(range.start), end: formatDateParam(addDays(range.end, 1)) } }) };
+  const payload = { method: 'POST', body: JSON.stringify({ startDate: calendarDateParam(range.start), endDateExclusive: calendarDateParam(addDays(range.end, 1)) }) };
   return api(`/api/tenants/${tenantId}/sync/${reportType}`, payload);
 }
 
@@ -197,7 +197,8 @@ function startOfDay(d) { const x = new Date(d); x.setHours(0, 0, 0, 0); return x
 function addDays(d, n) { const x = new Date(d); x.setDate(x.getDate() + n); return x; }
 function formatShort(d) { return d.toLocaleDateString('en-IN', { month: 'short', day: 'numeric' }); }
 function formatDateParam(date) { return startOfDay(date).toISOString(); }
-function rangeQuery(range) { return `start=${encodeURIComponent(formatDateParam(range.start))}&end=${encodeURIComponent(formatDateParam(addDays(range.end, 1)))}`; }
+function calendarDateParam(date) { const d=startOfDay(date);return `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`; }
+function rangeQuery(range) { return `startDate=${calendarDateParam(range.start)}&endDateExclusive=${calendarDateParam(addDays(range.end, 1))}`; }
 function formatRangeLabel(start, end) {
   const startStr = formatShort(start);
   const endStr = start.getFullYear() === end.getFullYear() ? formatShort(end) : end.toLocaleDateString('en-IN', { month: 'short', day: 'numeric', year: 'numeric' });
@@ -558,7 +559,7 @@ function DashboardOverview({ data, channelData, tenantId }) {
     <Card className="profit-control-card">
       <PanelHeader title="Amazon Account Activity" subtitle="Matches Amazon statement sections" />
       <div className="profit-kpi-grid account-activity-grid">
-        {['income','expenses','tax','transfers','gst'].map(metric=><DrillMetric key={metric} to={`/seller?tenantId=${tenantId}&view=metric-detail&metric=${metric}`} title={metric==='gst'?'Goods and Services Tax':metric[0].toUpperCase()+metric.slice(1)} value={formatCurrency(data?.dashboardCalculations?.statement?.[metric]?.value)} hint="Open Amazon source rows and formula" />)}
+        {['income','expenses','tax','transfers','gst'].map(metric=>{const detail=data?.dashboardCalculations?.statement?.[metric];return <DrillMetric key={metric} to={`/seller?tenantId=${tenantId}&view=metric-detail&metric=${metric}`} title={metric==='gst'?'Goods and Services Tax':metric[0].toUpperCase()+metric.slice(1)} value={detail?.status??formatCurrency(detail?.value)} hint={detail?.status?`Evidence status: ${detail.status}`:'Open Amazon source rows and formula'} />})}
       </div>
     </Card>
 
