@@ -10,6 +10,7 @@ import { secrets } from './config/secrets.js';
 import { decryptSecret, encryptSecret } from './config/crypto.js';
 import { buildGstInvoicesFromOrderItems, startScheduler, syncRecentApiDataForTenant, syncReportForTenant } from './jobs/sync.js';
 import { categorizeFinanceLabel } from './jobs/finance-components.js';
+import { calculateDashboardMetrics } from './jobs/dashboard-calculations.js';
 import { runFeeAuditForTenant } from './jobs/fee-audit.js';
 
 const app = Fastify({ logger: { redact: ['req.headers.authorization', 'refresh_token', 'access_token', 'password', 'passwordHash'] }, trustProxy: true });
@@ -569,7 +570,8 @@ app.post('/api/tenants/:tenantId/sync', async request => {
   return { results };
 });
 
-const CalculationParamsSchema = z.object({ tenantId: z.string().uuid(), metric: z.enum(['netSales', 'netQty', 'settled', 'deductions', 'reimbursements', 'drr']) });
+const DASHBOARD_METRICS = ['netSales','netQty','orders','returns','settled','deductions','reimbursements','drr','feeImpact','returnRate','refundValueRate','gstValue','income','expenses','tax','transfers','gst'];
+const CalculationParamsSchema = z.object({ tenantId: z.string().uuid(), metric: z.enum(DASHBOARD_METRICS) });
 const OrderDetailParamsSchema = z.object({ tenantId: z.string().uuid(), orderId: z.string().min(1) });
 const FEE_CATEGORIES = ['referral_commission', 'fulfillment_fee_per_order', 'fulfillment_fee_per_unit', 'fulfillment_fee_weight', 'shipping_fee', 'gift_wrap_fee', 'closing_fee', 'digital_services_fee', 'storage_fee', 'chargeback', 'tax'];
 function requestedRange(query) { const parsed = DashboardQuerySchema.parse(query); return { start: parsed.start ?? new Date(Date.now() - 30 * 864e5).toISOString(), end: parsed.end ?? new Date().toISOString() }; }
@@ -579,30 +581,31 @@ function groupCalculationRows(rows) {
   return [...grouped.values()];
 }
 
+async function loadDashboardCalculations(db, tenantId, range) {
+  const scopedSettlementIds=(await db.query(`select distinct settlement_id from settlement_rows where tenant_id=$1 and settlement_id is not null and posted_date >= $2 and posted_date < $3`,[tenantId,range.start,range.end])).rows.map(row=>row.settlement_id);
+  const [orders,orderItems,returns,settlementRows,settlementHeaders,settlementDocuments,settlementSyncJobs,financeItems,reimbursements,gstInvoices]=await Promise.all([
+    db.query('select id source_row_id,amazon_order_id,status,order_date,total_amount,raw from orders where tenant_id=$1 and order_date >= $2 and order_date < $3',[tenantId,range.start,range.end]),
+    db.query(`select oi.id source_row_id,oi.amazon_order_id,oi.asin,oi.sku,oi.title,oi.quantity_ordered,oi.item_price,oi.promotion_discount,oi.raw,o.status,o.order_date from order_items oi join orders o on o.tenant_id=oi.tenant_id and o.amazon_order_id=oi.amazon_order_id where oi.tenant_id=$1 and o.order_date >= $2 and o.order_date < $3`,[tenantId,range.start,range.end]),
+    db.query('select id source_row_id,order_id,return_date,return_reason,disposition,status,quantity,raw from returns where tenant_id=$1 and return_date >= $2::date and return_date < $3::date',[tenantId,range.start,range.end]),
+    db.query(`select id source_row_id,settlement_id,order_id,amount_type,amount_description,amount,posted_date,raw,report_document_id,source_row_key,coalesce(raw->>'transaction-type',raw->>'transaction type',raw->>'transactionType') parent_transaction_type from settlement_rows where tenant_id=$1 and settlement_id=any($2::text[])`,[tenantId,scopedSettlementIds]),
+    db.query(`select id source_row_id,settlement_id,report_document_id,coalesce(raw->>'deposit-date',raw->>'deposit date',raw->>'depositDate') deposit_date,coalesce(nullif(raw->>'total-amount',''),nullif(raw->>'total amount',''),nullif(raw->>'totalAmount','')) total_amount,coalesce(raw->>'transaction-type',raw->>'transaction type') transaction_type,raw from settlement_rows where tenant_id=$1 and coalesce(raw->>'deposit-date',raw->>'deposit date',raw->>'depositDate','')<>''`,[tenantId]),
+    db.query(`select report_id,report_document_id,data_start_time,data_end_time,imported_at,row_count,settlement_ids from settlement_report_documents where tenant_id=$1 and settlement_ids && $2::text[] order by imported_at desc`,[tenantId,scopedSettlementIds]),
+    db.query(`select status,error_message,started_at,completed_at from sync_jobs where tenant_id=$1 and report_type='GET_V2_SETTLEMENT_REPORT_DATA_FLAT_FILE_V2' and started_at >= $2::timestamptz - interval '60 days' order by started_at desc limit 1`,[tenantId,range.start]),
+    db.query(`select fi.id source_row_id,fi.transaction_id,fi.order_id,fi.sku,fi.asin,fi.category,fi.amount_description,fi.amount,fi.currency,fi.posted_date,fi.raw,ft.transaction_type parent_transaction_type,coalesce(ft.raw->>'accountType',ft.raw->>'AccountType',ft.raw#>>'{sellingPartnerMetadata,accountType}') account_type from finance_transaction_items fi left join finance_transactions ft on ft.tenant_id=fi.tenant_id and ft.transaction_id=fi.transaction_id where fi.tenant_id=$1 and fi.posted_date >= $2 and fi.posted_date < $3`,[tenantId,range.start,range.end]),
+    db.query('select amount,reason,sku,reimbursement_date from reimbursements where tenant_id=$1 and reimbursement_date >= $2::date and reimbursement_date < $3::date',[tenantId,range.start,range.end]),
+    db.query('select id source_row_id,invoice_type,order_id,cgst,sgst,igst,taxable_value,invoice_date,raw from gst_invoices where tenant_id=$1 and invoice_date >= $2::date and invoice_date < $3::date',[tenantId,range.start,range.end])
+  ]);
+  return calculateDashboardMetrics({orders:orders.rows,orderItems:orderItems.rows,returns:returns.rows,scopedSettlementIds,settlementRows:settlementRows.rows,settlementHeaders:settlementHeaders.rows,settlementDocuments:settlementDocuments.rows,settlementSyncJobs:settlementSyncJobs.rows,financeItems:financeItems.rows,reimbursements:reimbursements.rows,gstInvoices:gstInvoices.rows},range);
+}
+
 app.get('/api/tenants/:tenantId/calculations/:metric', async request => {
-  const { tenantId, metric } = CalculationParamsSchema.parse(request.params); const range = requestedRange(request.query);
-  await requireTenantUser(request, tenantId); await assertActiveTenant(tenantId);
-  return withTenant(tenantId, async db => {
-    const salesRows = async () => (await db.query(`select oi.amazon_order_id, o.order_date, oi.asin, oi.sku, oi.title, oi.quantity_ordered,
-      oi.item_price gross_item_price, oi.promotion_discount, oi.item_price-coalesce(oi.promotion_discount,0) net_sales
-      from order_items oi join orders o on o.tenant_id=oi.tenant_id and o.amazon_order_id=oi.amazon_order_id
-      where oi.tenant_id=$1 and o.order_date >= $2 and o.order_date < $3 order by o.order_date desc`, [tenantId,range.start,range.end])).rows;
-    if (metric === 'netSales' || metric === 'netQty' || metric === 'drr') {
-      const rows = await salesRows(); const netSales = rows.reduce((sum,row)=>sum+Number(row.net_sales),0); const qty = rows.reduce((sum,row)=>sum+Number(row.quantity_ordered),0);
-      if (metric === 'drr') return { metric, total: netSales / 30, components: [{ category:'net_sales',label:'Net sales',amount:netSales,count:rows.length},{category:'days',label:'30 days',amount:30,count:30}], rows: [], columns: [] };
-      const total = metric === 'netSales' ? netSales : qty;
-      return { metric, total, components: metric === 'netSales' ? [{category:'gross_item_price',label:'Gross item price',amount:rows.reduce((s,r)=>s+Number(r.gross_item_price),0),count:rows.length},{category:'promotion',label:'Promotion discounts',amount:-rows.reduce((s,r)=>s+Number(r.promotion_discount),0),count:rows.length}] : [{category:'quantity',label:'Quantity ordered',amount:qty,count:rows.length}], rows, columns:['amazon_order_id','order_date','asin','sku','title','quantity_ordered','gross_item_price','promotion_discount','net_sales'] };
-    }
-    let rows = (await db.query("select transaction_id,order_id,sku,asin,category,amount_description,amount,currency,posted_date from finance_transaction_items where tenant_id=$1 and posted_date >= $2 and posted_date < $3 and category not like 'summary_%' order by posted_date desc", [tenantId,range.start,range.end])).rows;
-    let source = 'Finances API';
-    if (!rows.length) { source='Settlement report'; rows=(await db.query('select settlement_id transaction_id,order_id,null::text sku,null::text asin,amount_type,amount_description,amount,\'INR\' currency,posted_date from settlement_rows where tenant_id=$1 and posted_date >= $2 and posted_date < $3 order by posted_date desc',[tenantId,range.start,range.end])).rows.map(row=>({...row,category:categorizeFinanceLabel(`${row.amount_type} ${row.amount_description}`)})); }
-    if (metric === 'deductions') rows=rows.filter(row=>FEE_CATEGORIES.includes(row.category)&&Number(row.amount)<0);
-    if (metric === 'reimbursements') {
-      const preferred=rows.filter(row=>row.category==='reimbursement');
-      if (preferred.length) rows=preferred; else { source='Reimbursements report'; rows=(await db.query('select null transaction_id,null order_id,sku,null asin,\'reimbursement\' category,reason amount_description,amount,\'INR\' currency,reimbursement_date posted_date from reimbursements where tenant_id=$1 and reimbursement_date >= $2::date and reimbursement_date < $3::date',[tenantId,range.start,range.end])).rows; }
-    }
-    const total = metric === 'deductions' ? rows.reduce((sum,row)=>sum+Math.abs(Number(row.amount)),0) : rows.reduce((sum,row)=>sum+Number(row.amount),0);
-    return { metric,total,source,components:groupCalculationRows(rows),rows,columns:['transaction_id','order_id','sku','asin','category','amount_description','amount','currency','posted_date'] };
+  const {tenantId,metric}=CalculationParamsSchema.parse(request.params); const range=requestedRange(request.query);
+  await requireTenantUser(request,tenantId); await assertActiveTenant(tenantId);
+  return withTenant(tenantId,async db=>{
+    const calculated=await loadDashboardCalculations(db,tenantId,range);
+    const detail=calculated.metrics[metric]??calculated.statement[metric];
+    const rows=detail.rows??[];
+    return {metric,total:detail.value,unit:detail.unit,status:detail.status,formula:detail.formula,source:detail.source,range:detail.range,marketplaceRange:detail.marketplaceRange,diagnostics:detail.diagnostics,components:detail.components,rows,columns:rows.length?[...new Set(rows.flatMap(row=>Object.keys(row).filter(key=>key!=='raw')))].slice(0,14):[]};
   });
 });
 
@@ -642,7 +645,30 @@ app.get('/api/tenants/:tenantId/orders-reconciliation', async request => {
         union select related_order_id from finance_transactions where tenant_id=$1 and related_order_id is not null and posted_date >= $2 and posted_date < $3),
       scoped_orders as (select ids.amazon_order_id,o.order_date,coalesce(o.status,'Payment posted') status,o.fulfillment_channel,o.total_amount from scoped_order_ids ids left join orders o on o.tenant_id=$1 and o.amazon_order_id=ids.amazon_order_id),
       item_totals as (select amazon_order_id,sum(item_price) gross_item_price,sum(quantity_ordered) units,string_agg(distinct title,', ') product from order_items where tenant_id=$1 group by amazon_order_id),
-      chosen_transactions as (select distinct on (related_order_id) transaction_id,related_order_id,total_amount,posted_date,transaction_type,raw
+      latest_settlements as (select distinct on (line.order_id) line.order_id,line.settlement_id,
+        header.settlement_start_date,header.settlement_end_date,header.deposit_date,header.settlement_total,header.settlement_currency
+        from settlement_rows line
+        left join lateral (
+          select coalesce(raw->>'settlement-start-date',raw->>'settlement start date',raw->>'settlementStartDate') settlement_start_date,
+            coalesce(raw->>'settlement-end-date',raw->>'settlement end date',raw->>'settlementEndDate') settlement_end_date,
+            coalesce(raw->>'deposit-date',raw->>'deposit date',raw->>'depositDate') deposit_date,
+            coalesce(raw->>'total-amount',raw->>'total amount',raw->>'totalAmount') settlement_total,
+            coalesce(raw->>'currency',raw->>'Currency') settlement_currency
+          from settlement_rows settlement_header
+          where settlement_header.tenant_id=line.tenant_id and settlement_header.settlement_id=line.settlement_id
+            and coalesce(raw->>'deposit-date',raw->>'deposit date',raw->>'depositDate','')<>''
+          limit 1
+        ) header on true
+        where line.tenant_id=$1 and line.order_id is not null and line.settlement_id is not null
+        -- An order can also appear in a different settlement as an Easy Ship or
+        -- adjustment charge. Prefer the settlement containing the actual Order
+        -- proceeds instead of simply choosing the latest charge row.
+        order by line.order_id,
+          case when lower(coalesce(line.raw->>'transaction-type',line.raw->>'transaction type',line.raw->>'transactionType',''))='order' then 0
+               when lower(coalesce(line.amount_type,''))='itemprice' then 0 else 1 end,
+          line.posted_date desc nulls last,line.settlement_id desc),
+      chosen_transactions as (select distinct on (related_order_id) transaction_id,related_order_id,total_amount,posted_date,transaction_type,raw,
+        coalesce(raw->>'transactionStatus',raw->>'TransactionStatus','Unknown') transaction_status
         from finance_transactions where tenant_id=$1 and related_order_id is not null
         order by related_order_id,
           case when regexp_replace(lower(coalesce(transaction_type,'')),'[^a-z]','','g')='orderpayment' then 0 else 1 end,
@@ -663,17 +689,36 @@ app.get('/api/tenants/:tenantId/orders-reconciliation', async request => {
       count(*) filter(where fi.category like 'summary_%') summary_lines,
       sum(fi.amount) filter(where fi.category not like 'summary_%') leaf_total,max(ct.total_amount) transaction_header_total,max(ct.posted_date) transaction_date,
       bool_or(regexp_replace(lower(coalesce(ct.transaction_type,'')),'[^a-z]','','g')='orderpayment') is_order_payment,
+      bool_or(lower(ct.transaction_status)='released') payment_released,
+      max(ct.transaction_status) transaction_status,
+      max(ct.posted_date) filter(where lower(ct.transaction_status)='released') payout_date_time,
       sum(abs(fi.amount)) filter(where fi.amount<0 and fi.category=any($4)) total_deductions
       from finance_transaction_items fi join chosen_transactions ct on ct.transaction_id=fi.transaction_id
       where fi.tenant_id=$1 group by ct.related_order_id)
-      select o.amazon_order_id,o.order_date,f.transaction_date,o.status,o.fulfillment_channel,i.product,coalesce(i.units,0) units,case when coalesce(f.is_order_payment,false) then coalesce(nullif(f.summary_product_charges,0),nullif(f.finance_gross,0),nullif(i.gross_item_price,0),o.total_amount,0) else coalesce(nullif(i.gross_item_price,0),o.total_amount,0) end gross_item_price,
+      select o.amazon_order_id,o.order_date,f.transaction_date,o.status,o.fulfillment_channel,i.product,coalesce(i.units,0) units,
+      s.settlement_id,s.settlement_start_date,s.settlement_end_date,s.deposit_date,s.settlement_total,s.settlement_currency,
+      case when coalesce(f.is_order_payment,false) then coalesce(nullif(f.summary_product_charges,0),nullif(f.finance_gross,0),nullif(i.gross_item_price,0),o.total_amount,0) else coalesce(nullif(i.gross_item_price,0),o.total_amount,0) end gross_item_price,
       abs(coalesce(f.referral_commission,0)) referral_commission,abs(coalesce(f.fulfillment_fee,0)) fulfillment_fee,abs(coalesce(f.shipping_fee,0)) shipping_fee,abs(coalesce(f.closing_fee,0)) closing_fee,abs(coalesce(f.other_fees,0)) other_fees,case when coalesce(f.summary_lines,0)>0 then coalesce(f.summary_promotional_rebates,0) else coalesce(f.promotion,0) end promotion,coalesce(f.refund,0) refund,coalesce(f.reimbursement,0) reimbursement,case when coalesce(f.summary_lines,0)>0 then abs(coalesce(f.summary_amazon_fees,0)) else coalesce(f.total_deductions,0) end total_deductions,
       case when coalesce(f.is_order_payment,false) then coalesce(f.summary_other,f.transaction_header_total-coalesce(nullif(f.summary_product_charges,0),f.finance_gross,0)-coalesce(f.summary_promotional_rebates,f.promotion,0)-coalesce(f.summary_amazon_fees,-f.total_deductions,0)) else 0 end other_amount,f.transaction_header_total,
-      case when coalesce(f.is_order_payment,false) then f.transaction_header_total else null end net_payout,coalesce(f.is_order_payment,false) "hasFeeData"
-      from scoped_orders o left join item_totals i on i.amazon_order_id=o.amazon_order_id left join fees f on f.order_id=o.amazon_order_id order by "hasFeeData" desc,f.transaction_date desc nulls last,o.order_date desc`,[tenantId,range.start,range.end,FEE_CATEGORIES])).rows;
+      case when coalesce(f.is_order_payment,false) then f.transaction_header_total else null end net_payout,coalesce(f.is_order_payment,false) "hasFeeData",
+      (s.deposit_date is not null or coalesce(f.payment_released,false)) payment_received,
+      case when s.deposit_date is not null then 'Deposit initiated by Amazon' when coalesce(f.payment_released,false) then 'Released by Amazon' when coalesce(f.is_order_payment,false) then coalesce(f.transaction_status,'Not released') else 'Awaiting payment data' end payout_status,
+      coalesce(s.deposit_date,f.payout_date_time::text) payout_date_time
+      from scoped_orders o left join item_totals i on i.amazon_order_id=o.amazon_order_id left join fees f on f.order_id=o.amazon_order_id left join latest_settlements s on s.order_id=o.amazon_order_id order by "hasFeeData" desc,f.transaction_date desc nulls last,o.order_date desc`,[tenantId,range.start,range.end,FEE_CATEGORIES])).rows;
     const hasFinanceItems=orders.some(order=>order.hasFeeData);
     if (!hasFinanceItems) {
-      const settlement=(await db.query('select order_id,amount_type,amount_description,amount from settlement_rows where tenant_id=$1 and order_id is not null',[tenantId])).rows;
+      const settlement=(await db.query(`select line.order_id,line.settlement_id,line.amount_type,line.amount_description,line.amount,line.posted_date,
+        coalesce(line.raw->>'transaction-type',line.raw->>'transaction type',line.raw->>'transactionType') transaction_type,
+        metadata.deposit_date
+        from settlement_rows line
+        left join lateral (
+          select coalesce(raw->>'deposit-date',raw->>'deposit date',raw->>'depositDate') deposit_date
+          from settlement_rows header
+          where header.tenant_id=line.tenant_id and header.settlement_id=line.settlement_id
+            and coalesce(raw->>'deposit-date',raw->>'deposit date',raw->>'depositDate','')<>''
+          limit 1
+        ) metadata on true
+        where line.tenant_id=$1 and line.order_id is not null`,[tenantId])).rows;
       const byOrder=new Map(); for(const row of settlement){const list=byOrder.get(row.order_id)??[];list.push({...row,category:categorizeFinanceLabel(`${row.amount_type} ${row.amount_description}`)});byOrder.set(row.order_id,list);}
       for (const order of orders) {
         const lines=byOrder.get(order.amazon_order_id)??[]; if(!lines.length) continue;
@@ -687,7 +732,13 @@ app.get('/api/tenants/:tenantId/orders-reconciliation', async request => {
         order.total_deductions=lines.filter(line=>FEE_CATEGORIES.includes(line.category)&&Number(line.amount)<0).reduce((total,line)=>total+Math.abs(Number(line.amount)),0);
         const settlementGross=sum(line=>['item_price','shipping_charge','gift_wrap'].includes(line.category)&&Number(line.amount)>0); if(settlementGross) order.gross_item_price=settlementGross;
         order.net_payout=lines.reduce((total,line)=>total+Number(line.amount),0); order.other_amount=order.net_payout-Number(order.gross_item_price)-Number(order.promotion)+order.total_deductions;
+        const payoutLine=lines.find(line=>String(line.transaction_type??'').toLowerCase()==='order'||String(line.amount_type??'').toLowerCase()==='itemprice')??lines[0];
+        const payoutSettlementId=payoutLine?.settlement_id??order.settlement_id??null;
+        const depositDate=lines.find(line=>line.settlement_id===payoutSettlementId&&line.deposit_date)?.deposit_date??null;
+        order.settlement_id=payoutSettlementId;
         order.hasFeeData=true; order.feeSource='Settlement report';
+        order.payment_received=Boolean(depositDate); order.payout_date_time=depositDate??null;
+        order.payout_status=depositDate?'Deposit initiated by Amazon':'Settlement recorded; deposit date unavailable';
       }
     }
     return {orders,source:hasFinanceItems?'Finances API':'Settlement report fallback'};
@@ -851,7 +902,7 @@ app.get('/api/tenants/:tenantId/dashboard', async request => {
       group by o.amazon_order_id, o.order_date, o.status, o.total_amount, o.fulfillment_channel, o.sales_channel
       order by o.order_date desc nulls last limit 250`, [tenantId, start, end])).rows;
     const inventory = (await client.query('select sku, fulfillable_quantity, snapshot_date from inventory_snapshots where tenant_id=$1 and snapshot_date >= $2::date and snapshot_date < $3::date order by snapshot_date desc, fulfillable_quantity desc nulls last limit 50', [tenantId, start, end])).rows;
-    const returns = (await client.query('select order_id, return_reason, disposition, status, return_date from returns where tenant_id=$1 and return_date >= $2::date and return_date < $3::date order by return_date desc nulls last limit 50', [tenantId, start, end])).rows;
+    const returns = (await client.query('select order_id, return_reason, disposition, status, return_date, quantity from returns where tenant_id=$1 and return_date >= $2::date and return_date < $3::date order by return_date desc nulls last limit 50', [tenantId, start, end])).rows;
     const reimbursements = (await client.query('select sku, amount, reason, reimbursement_date from reimbursements where tenant_id=$1 and reimbursement_date >= $2::date and reimbursement_date < $3::date order by reimbursement_date desc nulls last limit 50', [tenantId, start, end])).rows;
     const invoices = (await client.query('select invoice_type, order_id, taxable_value, cgst, sgst, igst, invoice_date from gst_invoices where tenant_id=$1 and invoice_date >= $2::date and invoice_date < $3::date order by invoice_date desc nulls last limit 50', [tenantId, start, end])).rows;
     const orderItems = (await client.query('select oi.amazon_order_id, oi.asin, oi.sku, oi.title, oi.quantity_ordered, oi.item_price, oi.item_tax, oi.promotion_discount from order_items oi join orders o on o.tenant_id=oi.tenant_id and o.amazon_order_id=oi.amazon_order_id where oi.tenant_id=$1 and o.order_date >= $2 and o.order_date < $3 order by oi.quantity_ordered desc nulls last limit 50', [tenantId, start, end])).rows;
@@ -872,8 +923,9 @@ app.get('/api/tenants/:tenantId/dashboard', async request => {
       summary[order.fulfillment === 'FBA' ? 'fbaReceivable' : order.fulfillment === 'FBM' ? 'fbmReceivable' : 'otherReceivable'] += Number(order.seller_receivable ?? 0);
       return summary;
     }, { grossSales: 0, deductions: 0, sellerReceivable: 0, fbaReceivable: 0, fbmReceivable: 0, otherReceivable: 0 });
+    const dashboardCalculations=await loadDashboardCalculations(client,tenantId,{start:start.toISOString(),end:end.toISOString()});
     const hasImportedData = Number(orders.orders ?? 0) > 0 || Number(kpis.net_settled ?? 0) !== 0 || products.length > 0 || payments.length > 0 || inventory.length > 0;
-    return { seller, amazonAuth, hasImportedData, kpis, orders, orderRows, orderPayments, paymentComponents, paymentSummary, businessReportRows, products, trend, payments, settlementLines, financialComponents, financialSummary, jobs, inventory, returns, reimbursements, invoices, orderItems, financeTransactions };
+    return { seller, amazonAuth, hasImportedData, kpis, orders, orderRows, orderPayments, paymentComponents, paymentSummary, dashboardCalculations, businessReportRows, products, trend, payments, settlementLines, financialComponents, financialSummary, jobs, inventory, returns, reimbursements, invoices, orderItems, financeTransactions };
   });
 });
 

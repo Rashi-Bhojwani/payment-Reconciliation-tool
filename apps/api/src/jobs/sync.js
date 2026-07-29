@@ -118,17 +118,21 @@ function parseReportRows(reportType, content) {
 }
 
 /** @param {string} tenantId @param {string} content */
-async function saveSettlementRows(tenantId, content) {
+async function saveSettlementRows(tenantId, content, document = {}) {
   const rows = z.array(ReportRowSchema).parse(parseReportRows('GET_V2_SETTLEMENT_REPORT_DATA_FLAT_FILE_V2', content));
   await withTenant(tenantId, async client => {
-    for (const row of rows) {
+    for (const [index,row] of rows.entries()) {
       const amount = number(pick(row, ['amount']));
+      const sourceRowKey = `${index + 1}:${text(pick(row,['settlement-id','settlementId'])) ?? ''}:${text(pick(row,['order-id','orderId'])) ?? ''}:${text(pick(row,['amount-type','amountType'])) ?? ''}`;
+      const raw = {...row,_reportId:document.reportId,_reportDocumentId:document.documentId,_sourceRowNumber:index+1};
       await client.query(
-        `insert into settlement_rows(tenant_id, settlement_id, order_id, amount_type, amount_description, amount, posted_date, raw)
-         values($1,$2,$3,$4,$5,$6,$7,$8) on conflict do nothing`,
-        [tenantId, text(pick(row, ['settlement-id', 'settlement id', 'settlementId'])), text(pick(row, ['order-id', 'order id', 'amazon-order-id', 'amazonOrderId'])), text(pick(row, ['amount-type', 'amount type', 'amountType'])), text(pick(row, ['amount-description', 'amount description', 'amountDescription'])), amount, reportDate(pick(row, ['posted-date', 'posted date', 'postedDate'])), row]
+        `insert into settlement_rows(tenant_id, settlement_id, order_id, amount_type, amount_description, amount, posted_date, raw, report_document_id, source_row_key)
+         values($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) on conflict do nothing`,
+        [tenantId, text(pick(row, ['settlement-id', 'settlement id', 'settlementId'])), text(pick(row, ['order-id', 'order id', 'amazon-order-id', 'amazonOrderId'])), text(pick(row, ['amount-type', 'amount type', 'amountType'])), text(pick(row, ['amount-description', 'amount description', 'amountDescription'])), amount, reportDate(pick(row, ['posted-date-time','posted date time','postedDateTime','posted-date', 'posted date', 'postedDate'])), raw, document.documentId??null, sourceRowKey]
       );
     }
+    if(document.documentId) await client.query(`insert into settlement_report_documents(tenant_id,report_id,report_document_id,data_start_time,data_end_time,row_count,settlement_ids)
+      values($1,$2,$3,$4,$5,$6,$7) on conflict(tenant_id,report_document_id) do update set imported_at=now(),row_count=excluded.row_count,settlement_ids=excluded.settlement_ids`,[tenantId,document.reportId,document.documentId,document.dataStartTime??null,document.dataEndTime??null,rows.length,[...new Set(rows.map(row=>text(pick(row,['settlement-id','settlementId']))).filter(Boolean))]]);
   });
   return rows.length;
 }
@@ -139,10 +143,10 @@ async function saveGstInvoices(tenantId, content, invoiceType) {
   await withTenant(tenantId, async client => {
     for (const row of rows) {
       await client.query(
-        `insert into gst_invoices(tenant_id, invoice_type, order_id, cgst, sgst, igst, taxable_value, invoice_date)
-         values($1,$2,$3,$4,$5,$6,$7,$8)
-         on conflict (tenant_id, invoice_type, order_id, invoice_date) do update set cgst=excluded.cgst, sgst=excluded.sgst, igst=excluded.igst, taxable_value=excluded.taxable_value`,
-        [tenantId, invoiceType, text(pick(row, ['order-id', 'order id', 'amazon-order-id', 'amazonOrderId'])), number(pick(row, ['cgst', 'cgst tax', 'cgst amount'])), number(pick(row, ['sgst', 'sgst tax', 'sgst amount'])), number(pick(row, ['igst', 'igst tax', 'igst amount'])), number(pick(row, ['taxable-value', 'taxable value', 'taxableValue', 'taxable amount'])), text(pick(row, ['invoice-date', 'invoice date', 'invoiceDate', 'transaction-date', 'transaction date'])) ?? null]
+        `insert into gst_invoices(tenant_id, invoice_type, order_id, cgst, sgst, igst, taxable_value, invoice_date, raw)
+         values($1,$2,$3,$4,$5,$6,$7,$8,$9)
+         on conflict (tenant_id, invoice_type, order_id, invoice_date) do update set cgst=excluded.cgst, sgst=excluded.sgst, igst=excluded.igst, taxable_value=excluded.taxable_value, raw=excluded.raw`,
+        [tenantId, invoiceType, text(pick(row, ['order-id', 'order id', 'amazon-order-id', 'amazonOrderId'])), number(pick(row, ['cgst', 'cgst tax', 'cgst amount'])), number(pick(row, ['sgst', 'sgst tax', 'sgst amount'])), number(pick(row, ['igst', 'igst tax', 'igst amount'])), number(pick(row, ['taxable-value', 'taxable value', 'taxableValue', 'taxable amount'])), text(pick(row, ['invoice-date', 'invoice date', 'invoiceDate', 'transaction-date', 'transaction date'])) ?? null, row]
       );
     }
   });
@@ -155,10 +159,10 @@ async function saveReturns(tenantId, content) {
   await withTenant(tenantId, async client => {
     for (const row of rows) {
       await client.query(
-        `insert into returns(tenant_id, order_id, return_reason, disposition, status, return_date)
-         values($1,$2,$3,$4,$5,$6)
-         on conflict (tenant_id, order_id, return_date, return_reason, disposition) do update set status=excluded.status`,
-        [tenantId, text(pick(row, ['order-id', 'order id', 'amazon-order-id', 'amazonOrderId'])), text(pick(row, ['reason', 'return-reason', 'return reason', 'returnReason'])), text(pick(row, ['disposition', 'detailed-disposition', 'detailed disposition'])), 'yet_to_receive', text(pick(row, ['return-date', 'return date', 'returnDate', 'date'])) ?? null]
+        `insert into returns(tenant_id, order_id, return_reason, disposition, status, return_date, quantity, raw)
+         values($1,$2,$3,$4,$5,$6,$7,$8)
+         on conflict (tenant_id, order_id, return_date, return_reason, disposition) do update set status=excluded.status, quantity=excluded.quantity, raw=excluded.raw`,
+        [tenantId, text(pick(row, ['order-id', 'order id', 'amazon-order-id', 'amazonOrderId'])), text(pick(row, ['reason', 'return-reason', 'return reason', 'returnReason'])), text(pick(row, ['disposition', 'detailed-disposition', 'detailed disposition'])), 'yet_to_receive', text(pick(row, ['return-date', 'return date', 'returnDate', 'date'])) ?? null, pick(row, ['quantity','quantity-returned','return quantity']) == null ? null : integer(pick(row, ['quantity','quantity-returned','return quantity'])), row]
       );
     }
   });
@@ -221,9 +225,9 @@ async function saveSalesTrafficDaily(tenantId, content, range) {
 }
 
 /** @param {string} tenantId @param {string} reportType @param {string} content */
-async function saveStructuredRows(tenantId, reportType, content, range) {
+async function saveStructuredRows(tenantId, reportType, content, range, metadata) {
   switch (reportType) {
-    case 'GET_V2_SETTLEMENT_REPORT_DATA_FLAT_FILE_V2': return saveSettlementRows(tenantId, content);
+    case 'GET_V2_SETTLEMENT_REPORT_DATA_FLAT_FILE_V2': return saveSettlementRows(tenantId, content, metadata);
     case 'GET_GST_MTR_B2B_CUSTOM': return saveGstInvoices(tenantId, content, 'b2b');
     case 'GET_GST_MTR_B2C_CUSTOM': return saveGstInvoices(tenantId, content, 'b2c');
     case 'GET_FBA_FULFILLMENT_CUSTOMER_RETURNS_DATA': return saveReturns(tenantId, content);
@@ -250,8 +254,9 @@ export async function syncReportForTenant(params) {
       if (!seller.rowCount) throw new Error('No connected Amazon seller account');
       const client = new SpApiClient(decryptSecret(seller.rows[0].refresh_token_encrypted), { baseUrl: getSpApiEndpoint(seller.rows[0].marketplace_id) });
       const report = await client.fetchReport(parsed.reportType, parsed.tenantId, range, seller.rows[0].marketplace_id);
-      const s3Key = await putRawReport({ tenantId: parsed.tenantId, reportType: parsed.reportType, reportId: report.reportId, content: report.content });
-      const rowsImported = await saveStructuredRows(parsed.tenantId, parsed.reportType, report.content, range);
+      const documents=report.reportDocuments??[{reportId:report.reportId,documentId:report.reportDocumentId,content:report.content}];
+      let rowsImported=0; let s3Key;
+      for(const document of documents){s3Key=await putRawReport({tenantId:parsed.tenantId,reportType:parsed.reportType,reportId:document.reportId??report.reportId,content:document.content});rowsImported+=await saveStructuredRows(parsed.tenantId,parsed.reportType,document.content,range,document);}
       await pool.query('update sync_jobs set status=$1, completed_at=now(), s3_key=$2 where id=$3', ['completed', s3Key, sync.rows[0].id]);
       return { rowsImported, s3Key };
     } catch (error) {
