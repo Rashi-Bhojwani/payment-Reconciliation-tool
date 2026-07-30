@@ -83,7 +83,7 @@ function breakdownAmount(value) {
 
 function summaryCategory(label) {
   const value = String(label ?? '').replace(/[^a-z0-9]/gi, '').toLowerCase();
-  if (/totalproductcharge|productcharge/.test(value)) return 'summary_product_charges';
+  if (/totalproductcharge|productcharge|sellerfulfilledproductsales|fbaproductsales/.test(value)) return 'summary_product_charges';
   if (/promotionalrebate|promotion/.test(value)) return 'summary_promotional_rebates';
   if (/amazonfees|sellingfees/.test(value)) return 'summary_amazon_fees';
   if (/^other$|othertransactions|otheramount/.test(value)) return 'summary_other';
@@ -93,9 +93,9 @@ function summaryCategory(label) {
 function sectionSummaryCategory(label) {
   const value = compact(label);
   if (/^(income|sales)$/.test(value)) return 'summary_income';
+  if (/^(goodsandservicestax|gst)$/.test(value)) return 'summary_gst';
   if (/^(expenses?|deductions?)$/.test(value)) return 'summary_expenses';
   if (/^refunds?$/.test(value)) return 'summary_refunds';
-  if (/^(goodsandservicestax|gst)$/.test(value)) return 'summary_gst';
   if (/^tax(es)?$/.test(value)) return 'summary_tax';
   return null;
 }

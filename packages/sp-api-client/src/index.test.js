@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { normalizeReportRange, reportRequestRange } from './index.js';
+import { completedReportCoversRequest, normalizeReportRange, reportRequestRange } from './index.js';
 
 test('caps a future exclusive report end before the current time', () => {
   const now = Date.parse('2026-07-27T12:00:00.000Z');
@@ -40,4 +40,17 @@ test('converts the half-open UI range to an inclusive Sales and Traffic date ran
       coverageEnd: '2026-07-08T18:30:00.000Z'
     }
   );
+});
+
+test('accepts GST report coverage reported as marketplace calendar dates', () => {
+  assert.equal(completedReportCoversRequest(
+    'GET_GST_MTR_B2C_CUSTOM',
+    {
+      start: '2026-07-20T18:30:00.000Z',
+      end: '2026-07-29T18:30:00.000Z'
+    },
+    '2026-07-21T00:00:00+05:30',
+    '2026-07-29T23:59:59+05:30',
+    'A21TJRUUN4KGV'
+  ), true);
 });
