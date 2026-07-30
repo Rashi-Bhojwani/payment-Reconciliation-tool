@@ -509,14 +509,6 @@ app.post('/api/tenants/:tenantId/sync/:reportType', async request => {
     await recordSyntheticReportSync(params.tenantId, params.reportType);
     return { reportType: params.reportType, status: 'completed', fallback: 'DIRECT_SP_API_SYNC', ...fallback };
   }
-  if (params.reportType === 'GET_GST_MTR_B2B_CUSTOM' || params.reportType === 'GET_GST_MTR_B2C_CUSTOM') {
-    const invoiceType = params.reportType === 'GET_GST_MTR_B2B_CUSTOM' ? 'b2b' : 'b2c';
-    const rowsImported = await buildGstInvoicesFromOrderItems(params.tenantId, invoiceType);
-    if (rowsImported > 0) {
-      await recordSyntheticReportSync(params.tenantId, params.reportType, 'fallback://order-items-gst-estimate');
-      return { reportType: params.reportType, status: 'completed', fallback: 'ORDER_ITEMS_GST_ESTIMATE', rowsImported };
-    }
-  }
   try {
     const result = await syncReportForTenant({ ...params, range: body.range });
     return { reportType: params.reportType, status: 'completed', ...result };
@@ -589,7 +581,7 @@ async function loadDashboardCalculations(db, tenantId, range) {
     db.query(`select id source_row_id,settlement_id,order_id,amount_type,amount_description,amount,posted_date,raw,
       coalesce(raw->>'transaction-type',raw->>'transaction type',raw->>'transactionType') parent_transaction_type
       from settlement_rows where tenant_id=$1 and posted_date >= $2 and posted_date < $3`,[tenantId,range.start,range.end]),
-    db.query(`select settlement_id,coalesce(raw->>'deposit-date',raw->>'deposit date',raw->>'depositDate') deposit_date,coalesce(nullif(raw->>'total-amount',''),nullif(raw->>'total amount',''),nullif(raw->>'totalAmount','')) total_amount,coalesce(raw->>'transaction-type',raw->>'transaction type') transaction_type,raw from settlement_rows where tenant_id=$1 and coalesce(raw->>'deposit-date',raw->>'deposit date',raw->>'depositDate','')<>''`,[tenantId]),
+    db.query(`select settlement_id,coalesce(raw->>'deposit-date',raw->>'deposit date',raw->>'depositDate') deposit_date,coalesce(raw->>'settlement-start-date',raw->>'settlement start date',raw->>'settlementStartDate') settlement_start_date,coalesce(raw->>'settlement-end-date',raw->>'settlement end date',raw->>'settlementEndDate') settlement_end_date,coalesce(nullif(raw->>'total-amount',''),nullif(raw->>'total amount',''),nullif(raw->>'totalAmount','')) total_amount,coalesce(raw->>'transaction-type',raw->>'transaction type') transaction_type,raw from settlement_rows where tenant_id=$1 and (coalesce(raw->>'deposit-date',raw->>'deposit date',raw->>'depositDate','')<>'' or coalesce(raw->>'settlement-start-date',raw->>'settlement start date',raw->>'settlementStartDate','')<>'')`,[tenantId]),
     db.query(`select fi.id source_row_id,fi.transaction_id,fi.order_id,fi.sku,fi.asin,fi.category,fi.amount_description,fi.amount,fi.currency,fi.posted_date,fi.raw,
       ft.transaction_type parent_transaction_type,
       coalesce(ft.raw->>'accountType',ft.raw->>'AccountType',ft.raw#>>'{sellingPartnerMetadata,accountType}') account_type
