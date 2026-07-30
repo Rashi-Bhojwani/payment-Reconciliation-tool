@@ -14,7 +14,21 @@ export function encryptSecret(value) {
 /** @param {string} value */
 export function decryptSecret(value) {
   const [ivB64, tagB64, encryptedB64] = value.split('.');
-  const decipher = crypto.createDecipheriv('aes-256-gcm', key, Buffer.from(ivB64, 'base64'));
-  decipher.setAuthTag(Buffer.from(tagB64, 'base64'));
-  return Buffer.concat([decipher.update(Buffer.from(encryptedB64, 'base64')), decipher.final()]).toString('utf8');
+  try {
+    const decipher = crypto.createDecipheriv('aes-256-gcm', key, Buffer.from(ivB64, 'base64'));
+    decipher.setAuthTag(Buffer.from(tagB64, 'base64'));
+    return Buffer.concat([decipher.update(Buffer.from(encryptedB64, 'base64')), decipher.final()]).toString('utf8');
+  } catch (error) {
+    // Node's raw AES-GCM error ("Unsupported state or unable to authenticate
+    // data") only ever means the key used to decrypt differs from the key
+    // used to encrypt. In practice that means SESSION_SECRET was unset (so a
+    // fresh random key was minted on every process start — see secrets.js)
+    // or was changed after this value was stored. Surface the fix, not the
+    // OpenSSL internals, since this is the #1 cause of every-sync-fails.
+    throw new Error(
+      `Stored credential could not be decrypted — SESSION_SECRET is different from when it was saved `
+      + `(commonly because SESSION_SECRET is unset/"HEHE" and a new random key was generated on this restart). `
+      + `Set a stable SESSION_SECRET in .env and reconnect the Amazon account. Original error: ${error instanceof Error ? error.message : error}`
+    );
+  }
 }

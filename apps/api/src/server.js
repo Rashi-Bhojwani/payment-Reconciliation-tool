@@ -480,13 +480,17 @@ app.post('/api/tenants/:tenantId/sync/:reportType', async request => {
   await requireTenantUser(request, params.tenantId);
   await assertActiveTenant(params.tenantId);
   if (params.reportType === 'DIRECT_SP_API_SYNC') {
-    const result = await syncRecentApiDataForTenant(params.tenantId, { range: body.range, maxOrderPages: 100 });
-    return {
-      reportType: params.reportType,
-      status: result.coverageComplete ? 'completed' : 'failed',
-      error: result.coverageError ?? undefined,
-      ...result
-    };
+    try {
+      const result = await syncRecentApiDataForTenant(params.tenantId, { range: body.range, maxOrderPages: 100 });
+      return {
+        reportType: params.reportType,
+        status: result.coverageComplete ? 'completed' : 'failed',
+        error: result.coverageError ?? undefined,
+        ...result
+      };
+    } catch (error) {
+      return { reportType: params.reportType, status: 'failed', error: error instanceof Error ? error.message : 'Direct API sync failed' };
+    }
   }
   try {
     const result = await syncReportForTenant({ ...params, range: body.range });

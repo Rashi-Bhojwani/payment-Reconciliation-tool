@@ -287,7 +287,7 @@ export class SpApiClient {
   }
 
   async fetchSettlementReports(range, marketplaceId) {
-    const createdSince = new Date(new Date(range.start).getTime() - 90 * 864e5).toISOString();
+    const createdSince = new Date(new Date(range.start).getTime() - 30 * 864e5).toISOString();
     const reportListing = await this.listReports({
       reportTypes: 'GET_V2_SETTLEMENT_REPORT_DATA_FLAT_FILE_V2',
       processingStatuses: 'DONE',

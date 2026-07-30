@@ -36,10 +36,8 @@ const CODE_COLOR_KEY = { API: 'api', STL: 'stl', 'S&T': 'st', B2B: 'b2b', B2C: '
 function codeClass(code) { return `code-${CODE_COLOR_KEY[code] ?? code.toLowerCase().replace(/[^a-z0-9]/gi, '')}`; }
 
 // Which report(s) power each sidebar page. Each page now syncs only what it
-// needs instead of showing every report side-by-side everywhere.
-// Dashboard is deliberately absent here — it's an overview page and no
-// longer shows any sync controls at all. Every other sidebar page gets only
-// the report(s) it actually depends on.
+// needs instead of showing every report side-by-side everywhere. Dashboard
+// depends on all of them since it aggregates every KPI (see below).
 
 const NAV_ITEMS = [
   { view: 'dashboard', label: 'Dashboard', icon: '▦' },
@@ -59,6 +57,12 @@ const NAV_ITEMS = [
 ];
 
 const VIEW_REPORT_TYPES = {
+  // The Dashboard aggregates every KPI, so it depends on every source. Until
+  // each of these has complete coverage for the selected range, the related
+  // card stays "Unavailable" — this is a policy in dashboard-calculations.js,
+  // not a data error. Dashboard used to have no sync controls at all, which
+  // made a freshly connected account look broken.
+  dashboard: REPORTS.map(r => r.type),
   orderPayments: ['DIRECT_SP_API_SYNC', 'GET_V2_SETTLEMENT_REPORT_DATA_FLAT_FILE_V2'],
   sales: ['GET_SALES_AND_TRAFFIC_REPORT'],
   inventory: ['GET_FBA_MYI_UNSUPPRESSED_INVENTORY_DATA'],
@@ -74,6 +78,7 @@ const VIEW_REPORT_TYPES = {
   rawData: REPORTS.map(r => r.type)
 };
 const VIEW_LEDGER_COPY = {
+  dashboard: { title: 'Sync every dashboard source', subtitle: 'Every card above needs its source synced for the selected range before it can show a number' },
   orderPayments: { title: 'Real payment data sync', subtitle: 'Orders API + Finances API + final settlement report' },
   sales: { title: 'Sales & traffic sync', subtitle: 'Powers this page only' },
   inventory: { title: 'Inventory sync', subtitle: 'This page only' },
@@ -318,7 +323,7 @@ function SyncLedger({ tenantId, jobs = [], onSynced, reportTypes, title, subtitl
               <span className={`ledger-code ${codeClass(report.code)}`}>{report.code}</span>
               <div className="ledger-meta">
                 <b>{report.label}</b>
-                <small>{local?.error ?? local?.summary ?? (job?.completed_at ? `Last synced ${timeAgo(job.completed_at)}` : report.hint)}</small>
+                <small>{local?.error ?? local?.summary ?? (job?.status === 'failed' && job?.error_message ? job.error_message : job?.completed_at ? `Last synced ${timeAgo(job.completed_at)}` : report.hint)}</small>
               </div>
               <span className={`pill status-${statusLabel}`}>{statusLabel}</span>
               <Button variant="secondary" disabled={disabled || busy} onClick={() => syncOne(report.type)}>{busy ? 'Syncing…' : 'Sync'}</Button>
@@ -415,7 +420,7 @@ function SellerDashboard() {
     {amazonError && <p className="alert warning">Amazon connection issue: {amazonError}</p>}
     {error && <p className="alert warning">{error}</p>}
     {(view === 'dashboard' || view === 'orderPayments') && !connected && data && <p className="alert warning">Connect your Amazon account to start pulling real payment data — nothing syncs until then.</p>}
-    {view !== 'dashboard' && !detailView && <SyncLedger tenantId={tenantId} jobs={data?.jobs ?? []} onSynced={load} reportTypes={reportTypes} title={ledgerCopy?.title} subtitle={ledgerCopy?.subtitle} disabled={!connected} />}
+    {!detailView && <SyncLedger tenantId={tenantId} jobs={data?.jobs ?? []} onSynced={load} reportTypes={reportTypes} title={ledgerCopy?.title} subtitle={ledgerCopy?.subtitle} disabled={!connected} />}
 
     {view === 'orderPayments' && <OrderReconciliation tenantId={tenantId} />}
     {view === 'dashboard' && <DashboardOverview data={data} channelData={channelData} tenantId={tenantId} />}

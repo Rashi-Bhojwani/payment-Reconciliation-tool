@@ -20,7 +20,8 @@
     "concurrently": "^8.2.2"
   },
   "dependencies": {
-    "dotenv": "^17.4.2"
+    "dotenv": "^17.4.2",
+    "psql": "^0.0.1"
   },
   "optionalDependencies": {
     "@rollup/rollup-linux-x64-gnu": "^4.62.2"
