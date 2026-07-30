@@ -540,7 +540,7 @@ function DashboardOverview({ data, channelData, tenantId }) {
       <DrillMetric to={`/seller?tenantId=${tenantId}&view=metric-detail&metric=netSales`} title="Net Sales" value={formatCurrency(summary.netSales)} hint="Click to see order-value formula" />
       <DrillMetric to={`/seller?tenantId=${tenantId}&view=metric-detail&metric=netQty`} title="Net Qty" value={summary.netQty==null?'Unavailable':formatNumber(summary.netQty)} hint="Click to see units source" />
       <DrillMetric to={`/seller?tenantId=${tenantId}&view=metric-detail&metric=orders`} title="Orders Synced" value={formatNumber(summary.ordersCount)} hint="Distinct eligible Amazon order IDs" />
-      <DrillMetric to={`/seller?tenantId=${tenantId}&view=metric-detail&metric=returns`} title="Returns" value={formatNumber(summary.returnQty)} hint="Total returned quantity" />
+      <DrillMetric to={`/seller?tenantId=${tenantId}&view=metric-detail&metric=returns`} title="Returns" value={summary.returnQty==null?'Unavailable':formatNumber(summary.returnQty)} hint="Total returned quantity" />
     </div>
 
     <Card className="profit-control-card">
@@ -560,6 +560,7 @@ function DashboardOverview({ data, channelData, tenantId }) {
       <div className="profit-kpi-grid account-activity-grid">
         {['income','expenses','tax','transfers','gst'].map(metric=><DrillMetric key={metric} to={`/seller?tenantId=${tenantId}&view=metric-detail&metric=${metric}`} title={metric==='gst'?'Goods and Services Tax':metric[0].toUpperCase()+metric.slice(1)} value={formatCurrency(data?.dashboardCalculations?.statement?.[metric]?.value)} hint="Open Amazon source rows and formula" />)}
       </div>
+      <p className="detail-note"><b>Reconciliation control:</b> Income + Expenses + Tax + GST + Transfers = {formatCurrency(data?.dashboardCalculations?.reconciliation?.value)} · {data?.dashboardCalculations?.reconciliation?.balanced?'Balanced':'Review source rows'}</p>
     </Card>
 
     <SalesAnalytics data={data} channelData={channelData} />
@@ -704,7 +705,7 @@ function buildDashboardSummary(data, range = defaultDateRange()) {
   const ordersCount = Number(calculated?.orders?.value??data?.orders?.orders??0);
   const netSales = Number(calculated?.netSales?.value??amazonNetSales(data));
   const netQty = calculated?.netQty ? calculated.netQty.value : (products.reduce((sum, product) => sum + Number(product.units ?? 0), 0) || orderItems.reduce((sum, item) => sum + Number(item.quantity_ordered ?? 0), 0));
-  const returnQty = Number(calculated?.returns?.value??returns.length);
+  const returnQty = calculated?.returns ? calculated.returns.value : returns.length;
   const settledAmount = Number(calculated?.settled?.value??(payments.reduce((sum, payment) => sum + Number(payment.net_amount ?? 0), 0) || Number(data?.kpis?.net_settled??0)));
   const deductions = Number(calculated?.deductions?.value??amazonDeductions(data));
   const reimbursementAmount = Number(calculated?.reimbursements?.value??reimbursements.reduce((sum, row) => sum + Number(row.amount ?? 0), 0));
@@ -716,7 +717,7 @@ function buildDashboardSummary(data, range = defaultDateRange()) {
   const baseRow = {
     view: 'Amazon-India',
     net_qty: formatNumber(netQty),
-    return_qty: formatNumber(returnQty),
+    return_qty: returnQty==null?'Unavailable':formatNumber(returnQty),
     net_asp: formatCurrency(netAsp),
     net_sales: formatCurrency(netSales),
     ad_spend: formatCurrency(0),
@@ -736,7 +737,7 @@ function buildDashboardSummary(data, range = defaultDateRange()) {
     yet_to_receive: formatNumber(returnBuckets.yet_to_receive ?? 0),
     received_not_in_hand: formatNumber(returnBuckets.received_not_in_hand ?? 0),
     received: formatNumber(returnBuckets.received ?? 0),
-    total: formatNumber(returnQty)
+    total: returnQty==null?'Unavailable':formatNumber(returnQty)
   };
   return {
     netSales,
@@ -757,7 +758,7 @@ function buildDashboardSummary(data, range = defaultDateRange()) {
       { area: 'Orders', count: formatNumber(ordersCount), amount: formatCurrency(netSales), status: ordersCount ? 'Synced' : 'Waiting' },
       { area: 'Payouts', count: formatNumber(payments.length), amount: formatCurrency(settledAmount), status: payments.length ? 'Matched' : 'Needs sync' },
       { area: 'GST invoices', count: formatNumber(invoices.length), amount: formatCurrency(invoices.reduce((sum, row) => sum + Number(row.taxable_value ?? 0), 0)), status: invoices.length ? 'Imported' : 'No GST rows' },
-      { area: 'Returns', count: formatNumber(returnQty), amount: formatCurrency(0), status: returnQty ? 'Action needed' : 'Clean' }
+      { area: 'Returns', count: returnQty==null?'Unavailable':formatNumber(returnQty), amount: returnQty==null?'Unavailable':formatCurrency(0), status: returnQty==null?'Missing completed Returns report':returnQty?'Action needed':'Clean' }
     ]
   };
 }

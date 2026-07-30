@@ -28,9 +28,71 @@ test('matches the MINDCIRCUS Amazon Account Activity fixture without constants',
 });
 test('uses current status only and preserves identical-SKU lines with stable item IDs',()=>{const r=calculateDashboardMetrics(mindcircusFixture(),range);assert.equal(r.metrics.netQty.value,3);assert.equal(r.metrics.orders.value,1);assert.equal(r.metrics.returnRate.value,40);});
 test('negative Principal is a refund through parent transaction metadata',()=>{const input=mindcircusFixture();const refund=input.settlementRows.find(x=>x.source_row_id==='sf-refund');delete refund.transaction_type;assert.equal(calculateDashboardMetrics(input,range).metrics.netSales.value,154522.8);});
-test('missing return quantity makes quantity KPIs unavailable instead of guessing one',()=>{const input=mindcircusFixture();input.returns[0].quantity=null;const r=calculateDashboardMetrics(input,range);assert.equal(r.metrics.returns.value,null);assert.equal(r.metrics.netQty.value,null);assert.equal(r.metrics.returnRate.value,null);assert.equal(r.metrics.returnRate.status,'Unavailable / source mismatch');});
+test('missing return quantity makes quantity KPIs unavailable instead of guessing one',()=>{const input=mindcircusFixture();input.returns[0].quantity=null;const r=calculateDashboardMetrics(input,range);assert.equal(r.metrics.returns.value,null);assert.equal(r.metrics.netQty.value,null);assert.equal(r.metrics.returnRate.value,null);assert.match(r.metrics.returnRate.status,/source mismatch/);});
 test('positive returns with unavailable shipped source never report zero percent',()=>{const input=mindcircusFixture();input.orderItems=[];const r=calculateDashboardMetrics(input,range);assert.equal(r.metrics.returnRate.value,null);assert.match(r.metrics.returnRate.status,/source mismatch/);});
 test('removes duplicate reports and finance summary rows, and uses one reimbursement source',()=>{const input=mindcircusFixture();input.settlementRows.push({...input.settlementRows[0],source_row_id:'duplicate-db-id'});input.financeItems.push({transaction_id:'x',category:'summary_amazon_fees',amount:-999,posted_date:'2026-07-10'});const r=calculateDashboardMetrics(input,range);assert.equal(r.metrics.netSales.value,154522.8);assert.equal(r.metrics.reimbursements.value,196.72);assert.ok(r.diagnostics.duplicateRows>0);});
 test('GST invoice value uses genuine documents, credit notes, mixed rates and stable document keys',()=>{const input=mindcircusFixture();input.gstInvoices=[{source_row_id:'1',taxable_value:100,raw:{'document-number':'INV1','line-item-id':'1','document-type':'Invoice','gst-rate':18}},{source_row_id:'dup',taxable_value:100,raw:{'document-number':'INV1','line-item-id':'1','document-type':'Invoice','gst-rate':18}},{source_row_id:'2',taxable_value:40,raw:{'document-number':'CN1','line-item-id':'1','document-type':'Credit Note','gst-rate':5}},{source_row_id:'synthetic',taxable_value:999,raw:{}}];assert.equal(calculateDashboardMetrics(input,range).metrics.gstValue.value,60);});
 test('GST invoice value is unavailable without genuine imported invoices',()=>{const r=calculateDashboardMetrics({...mindcircusFixture(),gstInvoices:[{taxable_value:381909.1,raw:{}}]},range);assert.equal(r.metrics.gstValue.value,null);assert.equal(r.metrics.gstValue.status,'Unavailable');});
 test('derives half-open range days and excludes failed/out-of-range deposits',()=>{const input=mindcircusFixture();input.settlementHeaders.push({settlement_id:'outside',deposit_date:'2026-07-27T00:00:00Z',total_amount:1000});const r=calculateDashboardMetrics(input,range);assert.equal(inclusiveDays(range.start,range.end),30);assert.equal(r.metrics.settled.value,131801.69);});
+
+test('reconciles the supplied 21–29 July Amazon statement from component rows',()=>{
+  const fixtureRange={start:'2026-07-20T18:30:00.000Z',end:'2026-07-29T18:30:00.000Z'};
+  const input={
+    orders:[{amazon_order_id:'fixture-order',status:'Shipped',order_date:'2026-07-21T04:30:00.000Z'}],
+    orderItems:[],returns:[],coverage:{returnsComplete:false},reimbursements:[],gstInvoices:[],financeItems:[],
+    settlementRows:[
+      line('small-sale','Principal',567.60,'Order'),
+      line('small-refund','Principal',-141.90,'Refund'),
+      line('small-other-fee','Other transaction fee',-4.72,'ServiceFee'),
+      line('small-service-fee','Service fee',-259.60,'ServiceFee'),
+      line('small-tcs','TCS-IGST',-2.13,'Withholding'),
+      line('small-fee-refund','Other transaction fee refund',66.08,'ServiceFeeRefund'),
+      line('small-gst','Product Tax GST collected',21.30,'Order')
+    ],
+    settlementHeaders:[{settlement_id:'small-transfer',deposit_date:'2026-07-29T12:00:00.000Z',total_amount:246.63}]
+  };
+  const result=calculateDashboardMetrics(input,fixtureRange);
+  assert.equal(result.diagnostics.categoryTotals.grossSales,567.60);
+  assert.equal(result.diagnostics.categoryTotals.productRefunds,141.90);
+  assert.equal(result.metrics.netSales.value,425.70);
+  assert.equal(result.statement.income.value,425.70);
+  assert.equal(result.diagnostics.categoryTotals.expenseDebits,266.45);
+  assert.equal(result.diagnostics.categoryTotals.expenseCredits,66.08);
+  assert.equal(result.statement.expenses.value,-200.37);
+  assert.equal(result.metrics.deductions.value,200.37);
+  assert.equal(result.diagnostics.categoryTotals.tcsTds,2.13);
+  assert.equal(result.diagnostics.categoryTotals.operationalFees,198.24);
+  assert.equal(result.metrics.settled.value,246.63);
+  assert.equal(result.metrics.reimbursements.value,0);
+  assert.equal(inclusiveDays(fixtureRange.start,fixtureRange.end),9);
+  assert.equal(result.metrics.drr.value,47.30);
+  assert.equal(Number(result.metrics.feeImpact.value.toFixed(2)),34.93);
+  assert.equal(Number(result.metrics.refundValueRate.value.toFixed(2)),25);
+  assert.equal(result.statement.tax.value,0);
+  assert.equal(result.statement.transfers.value,-246.63);
+  assert.equal(result.statement.gst.value,21.30);
+  assert.equal(result.metrics.orders.value,1);
+  assert.equal(result.metrics.returnRate.value,null);
+  assert.match(result.metrics.returnRate.status,/missing Orders API item quantities or GET_FBA_FULFILLMENT_CUSTOMER_RETURNS_DATA coverage/);
+  assert.equal(result.metrics.netQty.value,null);
+  assert.equal(result.metrics.gstValue.value,null);
+  assert.match(result.metrics.gstValue.status,/Unavailable/);
+  assert.deepEqual(result.statement.income.rows.map(row=>row.source_row_id),['small-sale','small-refund']);
+  assert.deepEqual(result.statement.expenses.rows.map(row=>row.source_row_id),['small-other-fee','small-service-fee','small-tcs','small-fee-refund']);
+  assert.deepEqual(result.metrics.netSales.rows.map(row=>row.source_row_id),['small-sale','small-refund']);
+  assert.deepEqual(result.metrics.deductions.rows.map(row=>row.source_row_id),['small-other-fee','small-service-fee','small-tcs','small-fee-refund']);
+  assert.deepEqual(result.metrics.refundValueRate.rows.map(row=>row.source_row_id),['small-refund','small-sale']);
+  assert.deepEqual(result.metrics.settled.rows.map(row=>row.settlement_id),['small-transfer']);
+  assert.deepEqual(result.reconciliation,{value:0,balanced:true,formula:'Income + Expenses + Tax + GST + Transfers',components:{income:425.70,expenses:-200.37,tax:0,gst:21.30,transfers:-246.63}});
+});
+
+test('reports zero returns only after genuine Returns report coverage is complete',()=>{
+  const input=mindcircusFixture();input.returns=[];input.coverage={returnsComplete:false};
+  let result=calculateDashboardMetrics(input,range);
+  assert.equal(result.metrics.returns.value,null);
+  assert.match(result.metrics.returns.status,/GET_FBA_FULFILLMENT_CUSTOMER_RETURNS_DATA/);
+  input.coverage.returnsComplete=true;
+  result=calculateDashboardMetrics(input,range);
+  assert.equal(result.metrics.returns.value,0);
+  assert.equal(result.metrics.returnRate.value,0);
+});

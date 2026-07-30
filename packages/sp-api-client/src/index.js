@@ -189,7 +189,13 @@ export class SpApiClient {
         reportDocumentId = body.reportDocumentId;
         break;
       }
-      if (['CANCELLED', 'FATAL'].includes(body.processingStatus)) throw new Error(`Report ${reportId} ${body.processingStatus}`);
+      // Amazon uses CANCELLED when a report has no rows to generate (a normal
+      // result for new or low-volume sellers). Treat that as a successful,
+      // empty report so callers can finish the sync without inventing data.
+      if (body.processingStatus === 'CANCELLED') {
+        return { reportId, reportDocumentId: null, content: '', empty: true, processingStatus: body.processingStatus };
+      }
+      if (body.processingStatus === 'FATAL') throw new Error(`Report ${reportId} ${body.processingStatus}`);
       await new Promise(resolve => setTimeout(resolve, REPORT_POLL_INTERVAL_MS));
     }
     if (!reportDocumentId) throw new Error(`Report ${reportId} timed out for tenant ${parsedTenant}`);
