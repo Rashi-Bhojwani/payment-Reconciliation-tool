@@ -99,8 +99,8 @@ export function completedReportCoversRequest(reportType, requestRange, reportedS
       ? dateInTimeZone(new Date(new Date(requestEnd).getTime() - 1), timeZone)
       : String(requestRange.end).slice(0, 10);
     return (
-      String(reportedStart).slice(0, 10) <= requestRange.start
-      && String(reportedEnd).slice(0, 10) >= requestRange.end
+      String(reportedStart).slice(0, 10) <= String(requestRange.start).slice(0, 10)
+      && String(reportedEnd).slice(0, 10) >= String(requestRange.end).slice(0, 10)
     ) || (
       String(reportedStart).slice(0, 10) <= requestedStartDate
       && String(reportedEnd).slice(0, 10) >= requestedEndDate
@@ -424,7 +424,7 @@ export class SpApiClient {
       // result for new or low-volume sellers). Treat that as a successful,
       // empty report so callers can finish the sync without inventing data.
       if (body.processingStatus === 'CANCELLED') {
-        return { reportId, reportDocumentId: null, content: '', empty: true, processingStatus: body.processingStatus };
+        return { reportId, reportDocumentId: null, content: '', empty: true, processingStatus: body.processingStatus, dataStartTime: applicationRange.start, dataEndTime: applicationRange.end, reportedDataStartTime, reportedDataEndTime, coverageComplete: true, cancelledNoData: true };
       }
       if (body.processingStatus === 'FATAL') throw new Error(`Report ${reportId} ${body.processingStatus}`);
       await new Promise(resolve => setTimeout(resolve, REPORT_POLL_INTERVAL_MS));

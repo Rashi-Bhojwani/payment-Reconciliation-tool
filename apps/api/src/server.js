@@ -609,14 +609,14 @@ function groupCalculationRows(rows) {
 }
 
 async function loadDashboardCalculations(db, tenantId, range) {
-  const [orders,orderItems,returns,settlementRows,settlementHeaders,financeItems,financeTransactions,reimbursements,gstInvoices,returnsCoverage]=await Promise.all([
+  const [orders,orderItems,returns,settlementRows,settlementHeaders,financeItems,financeTransactions,reimbursements,gstInvoices,returnsCoverage,settlementsCoverage,financeCoverage,gstB2bCoverage,gstB2cCoverage]=await Promise.all([
     db.query('select id source_row_id,amazon_order_id,status,order_date,total_amount,raw from orders where tenant_id=$1 and order_date >= $2 and order_date < $3',[tenantId,range.start,range.end]),
     db.query(`select oi.id source_row_id,oi.amazon_order_id,oi.asin,oi.sku,oi.title,oi.quantity_ordered,oi.item_price,oi.promotion_discount,oi.raw,o.status,o.order_date from order_items oi join orders o on o.tenant_id=oi.tenant_id and o.amazon_order_id=oi.amazon_order_id where oi.tenant_id=$1 and o.order_date >= $2 and o.order_date < $3`,[tenantId,range.start,range.end]),
     db.query('select id source_row_id,order_id,return_date,return_reason,disposition,status,quantity,raw from returns where tenant_id=$1 and return_date >= $2::date and return_date < $3::date',[tenantId,range.start,range.end]),
     db.query(`select id source_row_id,settlement_id,order_id,amount_type,amount_description,amount,posted_date,raw,
       coalesce(raw->>'transaction-type',raw->>'transaction type',raw->>'transactionType') parent_transaction_type
       from settlement_rows where tenant_id=$1 and posted_date >= $2 and posted_date < $3`,[tenantId,range.start,range.end]),
-    db.query(`select settlement_id,coalesce(raw->>'deposit-date',raw->>'deposit date',raw->>'depositDate') deposit_date,coalesce(nullif(raw->>'total-amount',''),nullif(raw->>'total amount',''),nullif(raw->>'totalAmount','')) total_amount,coalesce(raw->>'transaction-type',raw->>'transaction type') transaction_type,raw from settlement_rows where tenant_id=$1 and coalesce(raw->>'deposit-date',raw->>'deposit date',raw->>'depositDate','')<>''`,[tenantId]),
+    db.query(`select settlement_id,deposit_date,total_amount,raw from settlement_statements where tenant_id=$1 and deposit_date is not null`,[tenantId]),
     db.query(`select fi.id source_row_id,fi.transaction_id,fi.order_id,fi.sku,fi.asin,fi.category,fi.amount_description,fi.amount,fi.currency,fi.posted_date,fi.raw,
       ft.transaction_type parent_transaction_type,
       coalesce(ft.raw->>'accountType',ft.raw->>'AccountType',ft.raw#>>'{sellingPartnerMetadata,accountType}') account_type
@@ -625,9 +625,13 @@ async function loadDashboardCalculations(db, tenantId, range) {
     db.query('select transaction_id,transaction_type,posted_date,total_amount,currency,related_order_id,raw from finance_transactions where tenant_id=$1 and posted_date >= $2 and posted_date < $3',[tenantId,range.start,range.end]),
     db.query('select amount,reason,sku,reimbursement_date from reimbursements where tenant_id=$1 and reimbursement_date >= $2::date and reimbursement_date < $3::date',[tenantId,range.start,range.end]),
     db.query('select id source_row_id,invoice_type,order_id,cgst,sgst,igst,taxable_value,invoice_date,raw from gst_invoices where tenant_id=$1 and invoice_date >= $2::date and invoice_date < $3::date',[tenantId,range.start,range.end]),
-    db.query(`select exists(select 1 from sync_jobs where tenant_id=$1 and report_type='GET_FBA_FULFILLMENT_CUSTOMER_RETURNS_DATA' and status='completed' and coalesce(s3_key,'') not like 'fallback://%') complete`,[tenantId])
+    db.query(`select exists(select 1 from sync_jobs where tenant_id=$1 and report_type='GET_FBA_FULFILLMENT_CUSTOMER_RETURNS_DATA' and status='completed' and coalesce(s3_key,'') not like 'fallback://%') complete`,[tenantId]),
+    db.query(`select exists(select 1 from sync_jobs where tenant_id=$1 and report_type='GET_V2_SETTLEMENT_REPORT_DATA_FLAT_FILE_V2' and status='completed' and coalesce(coverage_complete,true)=true and data_start_time <= $2 and data_end_time >= $3) complete`,[tenantId,range.start,range.end]),
+    db.query(`select exists(select 1 from sync_jobs where tenant_id=$1 and report_type='DIRECT_SP_API_SYNC' and status='completed' and coalesce(coverage_complete,true)=true and data_start_time <= $2 and data_end_time >= $3) complete`,[tenantId,range.start,range.end]),
+    db.query(`select exists(select 1 from sync_jobs where tenant_id=$1 and report_type='GET_GST_MTR_B2B_CUSTOM' and status='completed' and coalesce(s3_key,'') not like 'fallback://%' and coalesce(coverage_complete,true)=true and data_start_time <= $2 and data_end_time >= $3) complete`,[tenantId,range.start,range.end]),
+    db.query(`select exists(select 1 from sync_jobs where tenant_id=$1 and report_type='GET_GST_MTR_B2C_CUSTOM' and status='completed' and coalesce(s3_key,'') not like 'fallback://%' and coalesce(coverage_complete,true)=true and data_start_time <= $2 and data_end_time >= $3) complete`,[tenantId,range.start,range.end])
   ]);
-  return calculateDashboardMetrics({orders:orders.rows,orderItems:orderItems.rows,returns:returns.rows,settlementRows:settlementRows.rows,settlementHeaders:settlementHeaders.rows,financeItems:financeItems.rows,financeTransactions:financeTransactions.rows,reimbursements:reimbursements.rows,gstInvoices:gstInvoices.rows,coverage:{returnsComplete:returnsCoverage.rows[0]?.complete===true}},range);
+  return calculateDashboardMetrics({orders:orders.rows,orderItems:orderItems.rows,returns:returns.rows,settlementRows:settlementRows.rows,settlementHeaders:settlementHeaders.rows,financeItems:financeItems.rows,financeTransactions:financeTransactions.rows,reimbursements:reimbursements.rows,gstInvoices:gstInvoices.rows,coverage:{returnsComplete:returnsCoverage.rows[0]?.complete===true,settlementsComplete:settlementsCoverage.rows[0]?.complete===true,financeComplete:financeCoverage.rows[0]?.complete===true,gstB2bComplete:gstB2bCoverage.rows[0]?.complete===true,gstB2cComplete:gstB2cCoverage.rows[0]?.complete===true}},range);
 }
 
 app.get('/api/tenants/:tenantId/calculations/:metric', async request => {
