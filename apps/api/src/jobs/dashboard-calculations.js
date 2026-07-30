@@ -69,6 +69,16 @@ const isExpenseSection = row => accountSection(row).startsWith('expense');
 const isIncomeSection = row => accountSection(row).startsWith('income');
 const isGstSection = row => accountSection(row) === 'gst';
 const isTaxSection = row => accountSection(row) === 'tax';
+const financeStatus = row => compact(
+  row.transaction_status
+  ?? row.transactionStatus
+  ?? row.raw?.transactionStatus
+  ?? row.raw?.TransactionStatus
+);
+const isReleasedFinanceRow = row => {
+  const status = financeStatus(row);
+  return !status || status === 'released' || status === 'deferredreleased';
+};
 
 const toPaise = value => Math.round((Number(value) || 0) * 100);
 const fromPaise = value => value / 100;
@@ -141,38 +151,71 @@ export function calculateDashboardMetrics(input, range) {
   const orderAudit = dedupe(input.orders ?? [], row => row.amazon_order_id);
   const eligibleOrders = orderAudit.included.filter(row => statusEligible(row.status));
   const eligibleIds = new Set(eligibleOrders.map(row => row.amazon_order_id));
+  const ordersComplete = input.coverage?.ordersComplete ?? true;
   const itemAudit = dedupe(
     (input.orderItems ?? []).filter(row => eligibleIds.has(row.amazon_order_id)),
     row => orderItemKey(row) ?? keyOf(row)
   );
   const returnAudit = dedupe(input.returns ?? [], returnKey);
 
-  const shippedAvailable = itemAudit.included.length > 0
+  const salesTrafficAudit = dedupe(input.salesTrafficDaily ?? [], row => row.date);
+  const salesTrafficQuantityAvailable = input.coverage?.salesTrafficComplete === true
+    && salesTrafficAudit.included.every(row => (
+      num(row.units_ordered) != null && num(row.units_refunded) != null
+    ));
+  const allEligibleOrdersAreFba = eligibleOrders.length > 0 && eligibleOrders.every(
+    order => ['afn', 'amazon'].includes(compact(order.fulfillment_channel ?? order.fulfilled_by))
+  );
+  const shippedAvailable = ordersComplete
+    && allEligibleOrdersAreFba
+    && itemAudit.included.length > 0
     && itemAudit.included.every(row => num(row.quantity_ordered) != null);
   const returnQuantitiesAvailable = returnAudit.included.every(row => num(row.quantity) != null);
-  const returnsCoverageDeclared = typeof input.coverage?.returnsComplete === 'boolean';
-  const returnsAvailable = returnsCoverageDeclared
-    ? input.coverage.returnsComplete && returnQuantitiesAvailable
-    : returnAudit.included.length > 0 && returnQuantitiesAvailable;
-  const shippedUnits = shippedAvailable
-    ? itemAudit.included.reduce((sum, row) => sum + num(row.quantity_ordered), 0)
-    : null;
-  const returnedUnits = returnsAvailable
-    ? returnAudit.included.reduce((sum, row) => sum + num(row.quantity), 0)
-    : null;
+  const fbaReturnsAvailable = input.coverage?.returnsComplete === true
+    && returnQuantitiesAvailable;
+  const shippedUnits = salesTrafficQuantityAvailable
+    ? salesTrafficAudit.included.reduce((sum, row) => sum + num(row.units_ordered), 0)
+    : shippedAvailable
+      ? itemAudit.included.reduce((sum, row) => sum + num(row.quantity_ordered), 0)
+      : null;
+  const returnedUnits = salesTrafficQuantityAvailable
+    ? salesTrafficAudit.included.reduce((sum, row) => sum + num(row.units_refunded), 0)
+    : fbaReturnsAvailable && allEligibleOrdersAreFba
+      ? returnAudit.included.reduce((sum, row) => sum + num(row.quantity), 0)
+      : null;
+  const quantityRows = salesTrafficQuantityAvailable
+    ? salesTrafficAudit.included
+    : [...itemAudit.included, ...returnAudit.included];
+  const quantitySource = salesTrafficQuantityAvailable
+    ? 'GET_SALES_AND_TRAFFIC_REPORT date aggregates'
+    : 'FBA Orders item quantities + FBA Customer Returns report';
   const netQty = shippedUnits == null || returnedUnits == null
     ? null
     : shippedUnits - returnedUnits;
 
-  const financeAudit = dedupe((input.financeItems ?? []).filter(row => !isSummary(row)), financialKey);
+  const financeAudit = dedupe(
+    (input.financeItems ?? []).filter(row => !isSummary(row) && isReleasedFinanceRow(row)),
+    financialKey
+  );
   const settlementAudit = dedupe(input.settlementRows ?? [], financialKey);
-  const inferredSettlementComplete = settlementAudit.included.some(isPrincipal)
-    && settlementAudit.included.some(row => isFee(row) || isWithholding(row))
-    && settlementAudit.included.some(isProductGst);
-  const settlementComplete = input.coverage?.settlementsComplete === true || inferredSettlementComplete;
-  const financialRows = settlementComplete ? settlementAudit.included : financeAudit.included;
-  const financialDuplicates = settlementComplete ? settlementAudit.duplicates : financeAudit.duplicates;
-  const financialSource = settlementComplete ? 'Amazon Settlement report' : 'Amazon Finances API';
+  const settlementComplete = input.coverage?.settlementsComplete === true;
+  const financeComplete = input.coverage?.financeComplete ?? true;
+  const financialAvailable = settlementComplete || financeComplete;
+  const financialRows = settlementComplete
+    ? settlementAudit.included
+    : financeComplete
+      ? financeAudit.included
+      : [];
+  const financialDuplicates = settlementComplete
+    ? settlementAudit.duplicates
+    : financeComplete
+      ? financeAudit.duplicates
+      : [];
+  const financialSource = settlementComplete
+    ? 'Amazon Settlement report'
+    : financeComplete
+      ? 'Amazon Finances API'
+      : 'Unavailable — complete Settlement or Finances coverage is required';
 
   const principalRows = financialRows.filter(isPrincipal);
   const grossRows = principalRows.filter(row => amount(row) > 0);
@@ -206,7 +249,9 @@ export function calculateDashboardMetrics(input, range) {
   // Income/Expenses/GST classification comes from the transaction breakdown
   // ancestry, reconstructed from finance_transactions.raw.
   const financeSectionAudit = dedupe(
-    settlementComplete ? [] : extractFinanceSectionRows(input.financeTransactions ?? []),
+    settlementComplete || !financeComplete
+      ? []
+      : extractFinanceSectionRows((input.financeTransactions ?? []).filter(isReleasedFinanceRow)),
     keyOf
   );
   const sectionedTransactionIds = new Set(
@@ -241,9 +286,13 @@ export function calculateDashboardMetrics(input, range) {
 
   const financeReimbursements = financialRows.filter(isReimbursement);
   const reportReimbursementAudit = dedupe(input.reimbursements ?? []);
-  const reimbursementRows = financeReimbursements.length
+  const reimbursementsReportComplete = input.coverage?.reimbursementsComplete ?? true;
+  const reimbursementsAvailable = financialAvailable || reimbursementsReportComplete;
+  const reimbursementRows = financialAvailable
     ? financeReimbursements
-    : reportReimbursementAudit.included;
+    : reimbursementsReportComplete
+      ? reportReimbursementAudit.included
+      : [];
   const reimbursements = signedSum(reimbursementRows);
 
   const headerAudit = dedupe(
@@ -252,16 +301,21 @@ export function calculateDashboardMetrics(input, range) {
   );
   const transferRows = headerAudit.included.map(row => ({
     ...row,
-    amount: -Math.abs(Number(row.total_amount ?? row.amount ?? 0))
+    // A positive statement total is money paid to the seller and therefore a
+    // negative transfer out of Amazon Account Activity. A negative statement
+    // total is the reverse; preserving that sign keeps the statement balanced.
+    amount: -Number(row.total_amount ?? row.amount ?? 0)
   }));
-  const settled = Math.abs(signedSum(transferRows));
+  const settled = -signedSum(transferRows);
+  const transfersAvailable = input.coverage?.settlementsComplete ?? true;
 
   const gstImported = (input.gstInvoices ?? []).filter(row => (
     Object.keys(row.raw ?? {}).length > 0
     && !/synthetic|order item estimate/.test(norm(`${row.source ?? ''} ${JSON.stringify(row.raw ?? {})}`))
   ));
   const gstAudit = dedupe(gstImported, gstKey);
-  const gstAvailable = gstAudit.included.length > 0;
+  const gstAvailable = (input.coverage?.gstB2bComplete ?? true)
+    && (input.coverage?.gstB2cComplete ?? true);
   const gstInvoiceValue = gstAvailable
     ? fromPaise(gstAudit.included.reduce((sum, row) => {
       const kind = norm(`${rawField(row.raw, ['document-type', 'invoice-type', 'transaction-type']) ?? row.document_type ?? ''}`);
@@ -285,13 +339,24 @@ export function calculateDashboardMetrics(input, range) {
 
   const diagnostics = {
     sourcePolicy: {
-      financial: `${financialSource} (${settlementComplete ? 'complete statement takes precedence' : 'settlement incomplete; Finances fallback'})`,
+      financial: settlementComplete
+        ? `${financialSource} (complete statement takes precedence)`
+        : financeComplete
+          ? `${financialSource} (settlement incomplete; Finances fallback)`
+          : financialSource,
       accountSections: financeSectionAudit.included.length
         ? 'Finances transaction breakdown hierarchy'
         : `${financialSource} leaf classification fallback`,
-      reimbursements: financeReimbursements.length ? financialSource : 'Reimbursements report fallback',
-      gst: 'Imported GST B2B/B2C rows only',
-      settled: 'Settlement headers filtered by deposit_date'
+      reimbursements: financialAvailable
+        ? financialSource
+        : reimbursementsReportComplete
+          ? 'Reimbursements report fallback'
+          : 'Unavailable — source coverage incomplete',
+      gst: gstAvailable ? 'Complete imported GST B2B/B2C reports' : 'Unavailable — GST report coverage incomplete',
+      settled: transfersAvailable
+        ? 'Settlement statements filtered by deposit_date'
+        : 'Unavailable — Settlement-report coverage incomplete',
+      quantity: quantitySource
     },
     includedRows: financialRows.length,
     excludedRows: settlementComplete ? financeAudit.included.length : settlementAudit.included.length,
@@ -326,7 +391,7 @@ export function calculateDashboardMetrics(input, range) {
 
   const metrics = {
     netSales: metric(
-      netSales,
+      financialAvailable ? netSales : null,
       'amount',
       'Gross product Principal sales − Refund Principal lines − net seller-funded promotions',
       [
@@ -334,47 +399,68 @@ export function calculateDashboardMetrics(input, range) {
         component('product_refunds', 'Product refunds', -productRefunds, refundPrincipalRows, '−'),
         component('promotions', 'Net seller-funded promotions', -netPromotions, promoRows, '−')
       ],
-      [...grossRows, ...refundPrincipalRows, ...promoRows]
+      [...grossRows, ...refundPrincipalRows, ...promoRows],
+      financialSource,
+      financialAvailable ? null : 'Unavailable — sync a complete Settlement report or Finances API range'
     ),
     netQty: metric(
       netQty,
       'quantity',
-      'Shipped units − physically returned units; cancelled, pending/unshipped, unfulfillable, and replacement statuses excluded',
+      salesTrafficQuantityAvailable
+        ? 'Sales & Traffic units ordered − units refunded'
+        : 'FBA shipped order-item units − FBA units received back at a fulfillment center',
       [
-        component('shipped_units', 'Shipped units', shippedUnits, itemAudit.included),
-        component('returned_units', 'Returned units', returnedUnits == null ? null : -returnedUnits, returnAudit.included, '−')
+        component(
+          'shipped_units',
+          salesTrafficQuantityAvailable ? 'Units ordered' : 'FBA shipped units',
+          shippedUnits,
+          salesTrafficQuantityAvailable ? salesTrafficAudit.included : itemAudit.included
+        ),
+        component(
+          'returned_units',
+          salesTrafficQuantityAvailable ? 'Units refunded' : 'FBA returned units',
+          returnedUnits == null ? null : -returnedUnits,
+          salesTrafficQuantityAvailable ? salesTrafficAudit.included : returnAudit.included,
+          '−'
+        )
       ],
-      [...itemAudit.included, ...returnAudit.included],
-      'Orders API item quantities + Returns report quantities',
-      netQty == null ? 'Unavailable / source mismatch — missing Orders API item quantities or completed Returns-report coverage' : null
+      quantityRows,
+      quantitySource,
+      netQty == null
+        ? 'Unavailable — sync complete Sales & Traffic data, or use FBA-only Orders and Customer Returns coverage'
+        : null
     ),
     orders: metric(
-      eligibleOrders.length,
+      ordersComplete ? eligibleOrders.length : null,
       'quantity',
       'Distinct eligible Amazon order IDs by order_date; cancelled, pending/unshipped, unfulfillable, and replacement statuses excluded',
       [component('eligible_orders', 'Eligible distinct orders', eligibleOrders.length, eligibleOrders)],
       eligibleOrders,
-      'Orders API'
+      'Orders API',
+      ordersComplete ? null : 'Unavailable — the selected Orders API range is not completely paginated'
     ),
     returns: metric(
       returnedUnits,
       'quantity',
-      'Sum of Amazon return quantity; zero requires completed Amazon Returns-report coverage',
-      [component('returned_units', 'Returned quantity', returnedUnits, returnAudit.included)],
-      returnAudit.included,
-      'GET_FBA_FULFILLMENT_CUSTOMER_RETURNS_DATA',
-      returnedUnits == null ? 'Unavailable — completed Returns-report coverage is missing' : null
+      salesTrafficQuantityAvailable
+        ? 'Sum of Sales & Traffic units refunded'
+        : 'Sum of FBA return quantity received at Amazon fulfillment centers',
+      [component('returned_units', 'Returned/refunded quantity', returnedUnits, salesTrafficQuantityAvailable ? salesTrafficAudit.included : returnAudit.included)],
+      salesTrafficQuantityAvailable ? salesTrafficAudit.included : returnAudit.included,
+      quantitySource,
+      returnedUnits == null ? 'Unavailable — complete quantity-source coverage is missing or the order set mixes FBA and FBM' : null
     ),
     settled: metric(
-      settled,
+      transfersAvailable ? settled : null,
       'amount',
-      'Absolute value of successful bank deposits with deposit_date in the selected range',
-      [component('successful_transfers', 'Successful bank transfers', settled, headerAudit.included)],
+      'Net settlement statement totals with deposit_date in the selected range',
+      [component('successful_transfers', 'Net bank transfers', settled, headerAudit.included)],
       headerAudit.included,
-      'Settlement headers'
+      'Settlement statements',
+      transfersAvailable ? null : 'Unavailable — complete Settlement-report coverage is missing'
     ),
     deductions: metric(
-      deductions,
+      financialAvailable ? deductions : null,
       'amount',
       'Gross expense debits − expense refunds/credits (includes TCS/TDS)',
       [
@@ -384,57 +470,71 @@ export function calculateDashboardMetrics(input, range) {
         component('operational_fees', 'Operational fees excluding TCS/TDS', operationalFees, expenseRows.filter(row => !isWithholding(row)))
       ],
       expenseRows,
-      financeSectionAudit.included.length ? 'Amazon Finances API breakdown hierarchy' : financialSource
+      financeSectionAudit.included.length ? 'Amazon Finances API breakdown hierarchy' : financialSource,
+      financialAvailable ? null : 'Unavailable — sync a complete Settlement report or Finances API range'
     ),
     reimbursements: metric(
-      reimbursements,
+      reimbursementsAvailable ? reimbursements : null,
       'amount',
       'Reimbursement credits − reimbursement reversals',
       [component('net_reimbursements', 'Net reimbursements', reimbursements, reimbursementRows)],
       reimbursementRows,
-      financeReimbursements.length ? financialSource : 'Reimbursements report'
+      financialAvailable ? financialSource : 'Reimbursements report',
+      reimbursementsAvailable ? null : 'Unavailable — complete Finances or Reimbursements-report coverage is missing'
     ),
     drr: metric(
-      round2(netSales / days),
+      financialAvailable ? round2(netSales / days) : null,
       'amount',
       `Net Sales ÷ ${days} calendar days derived from the selected half-open range`,
       [
         component('net_sales', 'Net Sales', netSales, []),
         component('days', 'Calendar days', days, [])
       ],
-      []
+      [],
+      financialSource,
+      financialAvailable ? null : 'Unavailable — Net Sales source coverage is incomplete'
     ),
     feeImpact: metric(
-      grossSales ? operationalFees / grossSales * 100 : null,
+      financialAvailable && grossSales ? operationalFees / grossSales * 100 : null,
       'percentage',
       'Operational Amazon fees excluding TCS/TDS ÷ gross product sales × 100',
       [
         component('operational_fees', 'Operational fees', operationalFees, expenseRows.filter(row => !isWithholding(row))),
         component('gross_sales', 'Gross product sales', grossSales, grossRows)
       ],
-      expenseRows
+      expenseRows,
+      financialSource,
+      financialAvailable
+        ? (grossSales ? null : 'Unavailable — no gross product sales in the selected range')
+        : 'Unavailable — financial source coverage is incomplete'
     ),
     returnRate: metric(
       unitRate,
       'percentage',
-      'Physically returned units ÷ shipped units × 100',
+      salesTrafficQuantityAvailable
+        ? 'Sales & Traffic units refunded ÷ units ordered × 100'
+        : 'FBA units received back ÷ FBA shipped order-item units × 100',
       [
-        component('returned_units', 'Returned units', returnedUnits, returnAudit.included),
-        component('shipped_units', 'Shipped units', shippedUnits, itemAudit.included)
+        component('returned_units', salesTrafficQuantityAvailable ? 'Units refunded' : 'FBA returned units', returnedUnits, salesTrafficQuantityAvailable ? salesTrafficAudit.included : returnAudit.included),
+        component('shipped_units', salesTrafficQuantityAvailable ? 'Units ordered' : 'FBA shipped units', shippedUnits, salesTrafficQuantityAvailable ? salesTrafficAudit.included : itemAudit.included)
       ],
-      [...returnAudit.included, ...itemAudit.included],
-      'Orders API item quantities + GET_FBA_FULFILLMENT_CUSTOMER_RETURNS_DATA',
-      unitRate == null ? 'Unavailable / source mismatch — shipped quantity or completed Returns-report coverage is missing' : null
+      quantityRows,
+      quantitySource,
+      unitRate == null ? 'Unavailable / source mismatch — complete comparable quantity sources are missing' : null
     ),
     refundValueRate: metric(
-      refundValueRate,
+      financialAvailable ? refundValueRate : null,
       'percentage',
       'Product refund Principal value ÷ gross product Principal sales × 100',
       [
         component('product_refunds', 'Product refunds', productRefunds, refundPrincipalRows),
         component('gross_sales', 'Gross product sales', grossSales, grossRows)
       ],
-      [...refundPrincipalRows, ...grossRows]
+      [...refundPrincipalRows, ...grossRows],
+      financialSource,
+      financialAvailable
+        ? (refundValueRate == null ? 'Unavailable — no gross product sales in the selected range' : null)
+        : 'Unavailable — financial source coverage is incomplete'
     ),
     gstValue: metric(
       gstInvoiceValue,
@@ -470,20 +570,23 @@ export function calculateDashboardMetrics(input, range) {
   const accountActivitySource = financeSectionAudit.included.length
     ? 'Amazon Finances API breakdown hierarchy'
     : financialSource;
+  const financialStatus = financialAvailable ? null : 'Unavailable — financial source coverage is incomplete';
   const statement = {
-    income: metric(income, 'amount', 'Net Amazon Income statement lines', group(incomeRows), incomeRows, accountActivitySource),
-    expenses: metric(expenses, 'amount', 'Expense debits plus expense refunds/credits; includes TCS/TDS', group(expenseRows), expenseRows, accountActivitySource),
-    tax: metric(tax, 'amount', 'Amazon generic Tax section only', group(genericTaxRows), genericTaxRows, accountActivitySource),
-    transfers: metric(transfers, 'amount', 'Signed successful bank transfers by deposit_date', group(transferRows), transferRows, 'Settlement headers'),
-    gst: metric(gst, 'amount', 'Product/shipping/gift-wrap GST collected plus GST refunds', group(productGstRows), productGstRows, accountActivitySource)
+    income: metric(financialAvailable ? income : null, 'amount', 'Net Amazon Income statement lines', group(incomeRows), incomeRows, accountActivitySource, financialStatus),
+    expenses: metric(financialAvailable ? expenses : null, 'amount', 'Expense debits plus expense refunds/credits; includes TCS/TDS', group(expenseRows), expenseRows, accountActivitySource, financialStatus),
+    tax: metric(financialAvailable ? tax : null, 'amount', 'Amazon generic Tax section only', group(genericTaxRows), genericTaxRows, accountActivitySource, financialStatus),
+    transfers: metric(transfersAvailable ? transfers : null, 'amount', 'Signed successful bank transfers by deposit_date', group(transferRows), transferRows, 'Settlement statements', transfersAvailable ? null : 'Unavailable — Settlement-report coverage is incomplete'),
+    gst: metric(financialAvailable ? gst : null, 'amount', 'Product/shipping/gift-wrap GST collected plus GST refunds', group(productGstRows), productGstRows, accountActivitySource, financialStatus)
   };
 
-  const reconciliationValue = fromPaise(
+  const rawReconciliationValue = fromPaise(
     [income, expenses, tax, gst, transfers].reduce((sum, value) => sum + toPaise(value), 0)
   );
+  const reconciliationAvailable = financialAvailable && transfersAvailable;
   const reconciliation = {
-    value: reconciliationValue,
-    balanced: reconciliationValue === 0,
+    value: reconciliationAvailable ? rawReconciliationValue : null,
+    balanced: reconciliationAvailable ? rawReconciliationValue === 0 : null,
+    status: reconciliationAvailable ? null : 'Unavailable — financial and Settlement-report coverage must both be complete',
     formula: 'Income + Expenses + Tax + GST + Transfers',
     components: { income, expenses, tax, gst, transfers }
   };

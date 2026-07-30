@@ -118,7 +118,7 @@ export function flattenFinanceTransaction(transaction) {
     ['ORDER_ID', 'AMAZON_ORDER_ID']
   );
   const rows = [];
-  function walk(value, context, path = []) {
+  function walk(value, context, path = [], indexPath = []) {
     if (!value || typeof value !== 'object') return;
     const label = breakdownLabel(value);
     const amountNode = breakdownAmount(value);
@@ -136,23 +136,44 @@ export function flattenFinanceTransaction(transaction) {
       currency: amountNode?.currencyCode ?? amountNode?.CurrencyCode ?? currency,
       postedDate,
       breakdownPath: nextPath.join(' > '),
+      accountSection: sectionFromPath(nextPath, transaction),
       raw: value
     };
-    if (amountNode != null && summary) rows.push({ ...common, category: summary, description: String(label), amount: money(amountNode) });
-    if (amountNode != null && label && !hasChildren) rows.push({ ...common, category: categorizeFinanceLabel(label), description: String(label), amount: money(amountNode) });
-    for (const child of childBreakdowns) walk(child, context, nextPath);
+    if (amountNode != null && summary) rows.push({
+      ...common,
+      category: summary,
+      description: String(label),
+      amount: money(amountNode),
+      isSummary: true,
+      sourceKey: `finance:${transactionId}:${context.itemKey ?? 'transaction'}:${indexPath.join('.')}:summary`
+    });
+    if (amountNode != null && label && !hasChildren) rows.push({
+      ...common,
+      category: categorizeFinanceLabel(label),
+      description: String(label),
+      amount: money(amountNode),
+      isSummary: false,
+      sourceKey: `finance:${transactionId}:${context.itemKey ?? 'transaction'}:${indexPath.join('.')}:leaf`
+    });
+    childBreakdowns.forEach((child, childIndex) => walk(child, context, nextPath, [...indexPath, childIndex]));
   }
 
   if (Array.isArray(items) && items.length) {
-    for (const item of items) {
+    items.forEach((item, itemIndex) => {
       const details = item.productDetails ?? item.ProductDetails ?? item.productContext ?? item.ProductContext ?? productContext(item);
+      const amazonItemKey = namedIdentifier(item.relatedIdentifiers ?? item.RelatedIdentifiers, ['ORDER_ITEM_ID', 'AMAZON_ORDER_ITEM_ID'])
+        ?? details.sku
+        ?? details.Sku
+        ?? 'item';
       const context = {
         orderId: namedIdentifier(item.relatedIdentifiers ?? item.RelatedIdentifiers, ['ORDER_ID', 'AMAZON_ORDER_ID']) ?? transactionOrderId,
         sku: details.sku ?? details.Sku ?? details.sellerSku ?? details.SellerSKU,
-        asin: details.asin ?? details.ASIN
+        asin: details.asin ?? details.ASIN,
+        // Keep same-SKU lines distinct when Amazon omits an order-item ID.
+        itemKey: `${amazonItemKey}:${itemIndex}`
       };
-      for (const entry of breakdownsOf(item)) walk(entry, context);
-    }
+      breakdownsOf(item).forEach((entry, entryIndex) => walk(entry, context, [], [entryIndex]));
+    });
 
     // Item leaves are the granular source used by product KPIs. The
     // transaction-level roots are still needed for Amazon Account Activity,
@@ -174,6 +195,9 @@ export function flattenFinanceTransaction(transaction) {
           currency: amountNode?.currencyCode ?? amountNode?.CurrencyCode ?? currency,
           postedDate,
           breakdownPath: String(label),
+          accountSection: category?.replace('summary_', '') ?? null,
+          isSummary: true,
+          sourceKey: `finance:${transactionId}:transaction:${compact(label)}:section`,
           raw: root
         });
       }
@@ -186,7 +210,7 @@ export function flattenFinanceTransaction(transaction) {
     const contextNode = (transaction?.contexts ?? transaction?.Contexts ?? [])[0] ?? {};
     const details = contextNode.productContext ?? contextNode.ProductContext ?? contextNode;
     const context = { orderId: transactionOrderId, sku: details.sku ?? details.Sku, asin: details.asin ?? details.ASIN };
-    for (const entry of breakdownsOf(transaction)) walk(entry, context);
+    breakdownsOf(transaction).forEach((entry, entryIndex) => walk(entry, context, [], [entryIndex]));
   }
   if (!rows.length) rows.push({
     transactionId,
@@ -194,13 +218,19 @@ export function flattenFinanceTransaction(transaction) {
     sku: namedIdentifier(transaction?.relatedIdentifiers ?? transaction?.RelatedIdentifiers, ['SKU', 'SELLER_SKU']),
     asin: undefined,
     category: categorizeFinanceLabel(transaction?.transactionType ?? transaction?.TransactionType),
-    description: transaction?.transactionType ?? transaction?.TransactionType ?? 'Transaction total',
+    description: transaction?.description ?? transaction?.Description ?? transaction?.transactionType ?? transaction?.TransactionType ?? 'Transaction total',
     amount: money(transaction?.totalAmount ?? transaction?.TotalAmount),
     currency,
     postedDate,
+    accountSection: null,
+    breakdownPath: 'Transaction total',
+    isSummary: false,
+    sourceKey: `finance:${transactionId}:transaction:total`,
     raw: transaction
   });
-  return rows.filter(row => row.transactionId);
+  return rows
+    .filter(row => row.transactionId)
+    .map(({ itemKey: _itemKey, ...row }) => row);
 }
 
 function sectionFromPath(path, transaction) {

@@ -8,7 +8,11 @@ export const MARKETPLACES = Object.freeze({
   ATVPDKIKX0DER: { country: 'United States', region: 'NA', timeZone: 'America/Los_Angeles', endpoint: 'https://sellingpartnerapi-na.amazon.com', sellerCentralHost: 'sellercentral.amazon.com' },
   A1F83G8C2ARO7P: { country: 'United Kingdom', region: 'EU', timeZone: 'Europe/London', endpoint: 'https://sellingpartnerapi-eu.amazon.com', sellerCentralHost: 'sellercentral.amazon.co.uk' }
 });
-export function getSpApiEndpoint(marketplaceId = INDIA_MARKETPLACE_ID) { return MARKETPLACES[marketplaceId]?.endpoint ?? SP_API_BASE_URL; }
+
+export function getSpApiEndpoint(marketplaceId = INDIA_MARKETPLACE_ID) {
+  return MARKETPLACES[marketplaceId]?.endpoint ?? SP_API_BASE_URL;
+}
+
 export const REPORT_TYPES = Object.freeze([
   'GET_V2_SETTLEMENT_REPORT_DATA_FLAT_FILE_V2',
   'GET_GST_MTR_B2B_CUSTOM',
@@ -22,18 +26,25 @@ export const REPORT_TYPES = Object.freeze([
 const GST_REPORTS = new Set(['GET_GST_MTR_B2B_CUSTOM', 'GET_GST_MTR_B2C_CUSTOM']);
 const DateRangeSchema = z.object({ start: z.string().datetime(), end: z.string().datetime() });
 const REPORT_DATA_LAG_MS = 2 * 60 * 1000;
-const REPORT_POLL_INTERVAL_MS = 15_000;
-const REPORT_POLL_ATTEMPTS = 20;
+const REPORT_POLL_INTERVAL_MS = Number(process.env.SP_API_REPORT_POLL_INTERVAL_MS ?? 15_000);
+const REPORT_POLL_ATTEMPTS = Number(process.env.SP_API_REPORT_POLL_ATTEMPTS ?? 40);
+const REQUEST_TIMEOUT_MS = Number(process.env.SP_API_REQUEST_TIMEOUT_MS ?? 30_000);
+
+export class SpApiError extends Error {
+  constructor(message, { status, code, details, requestId, path } = {}) {
+    super(message);
+    this.name = 'SpApiError';
+    this.status = status;
+    this.code = code;
+    this.details = details;
+    this.requestId = requestId;
+    this.path = path;
+  }
+}
 
 /**
- * Amazon rejects report requests whose dataEndTime is in the future. The web
- * app deliberately sends an exclusive end date (the day after the selected
- * date), so a range ending today would otherwise send tomorrow at midnight.
- * Keep the requested start, but cap the exclusive end at Amazon's safe API
- * boundary and retain a valid interval for same-day reports.
- *
- * @param {{ start: string, end: string }} range
- * @param {number} [now]
+ * The UI supplies a half-open interval. Cap it at Amazon's latest safe data
+ * boundary while keeping that half-open contract for calculations and coverage.
  */
 export function normalizeReportRange(range, now = Date.now()) {
   const parsed = DateRangeSchema.parse(range);
@@ -47,273 +58,555 @@ export function normalizeReportRange(range, now = Date.now()) {
   return { start: start.toISOString(), end: end.toISOString() };
 }
 
+function dateInTimeZone(value, timeZone) {
+  const parts = new Intl.DateTimeFormat('en-CA', {
+    timeZone,
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit'
+  }).formatToParts(value);
+  const part = name => parts.find(item => item.type === name)?.value;
+  return `${part('year')}-${part('month')}-${part('day')}`;
+}
+
+/**
+ * Sales & Traffic accepts date components and treats dataEndTime as inclusive.
+ * Convert the app's exclusive end to the previous marketplace calendar date.
+ */
+export function reportRequestRange(reportType, range, marketplaceId = INDIA_MARKETPLACE_ID, now = Date.now()) {
+  const normalized = normalizeReportRange(range, now);
+  if (reportType !== 'GET_SALES_AND_TRAFFIC_REPORT') return normalized;
+  const timeZone = MARKETPLACES[marketplaceId]?.timeZone ?? 'UTC';
+  const inclusiveEnd = new Date(new Date(normalized.end).getTime() - 1);
+  return {
+    start: dateInTimeZone(new Date(normalized.start), timeZone),
+    end: dateInTimeZone(inclusiveEnd, timeZone),
+    coverageStart: normalized.start,
+    coverageEnd: normalized.end
+  };
+}
+
+function completedReportCoversRequest(reportType, requestRange, reportedStart, reportedEnd) {
+  if (!reportedStart || !reportedEnd) return false;
+  if (reportType === 'GET_SALES_AND_TRAFFIC_REPORT') {
+    return String(reportedStart).slice(0, 10) <= requestRange.start
+      && String(reportedEnd).slice(0, 10) >= requestRange.end;
+  }
+  const actualStart = new Date(reportedStart).getTime();
+  const actualEnd = new Date(reportedEnd).getTime();
+  return Number.isFinite(actualStart)
+    && Number.isFinite(actualEnd)
+    && actualStart <= new Date(requestRange.start).getTime()
+    && actualEnd >= new Date(requestRange.end).getTime();
+}
+
 const SP_API_RATE_LIMITS = Object.freeze([
-  { pattern: /^\/orders\//, intervalMs: 2200 },
-  { pattern: /^\/reports\//, intervalMs: 5000 },
-  { pattern: /^\/finances\//, intervalMs: 5000 },
-  { pattern: /^\/fba\/inventory\//, intervalMs: 5000 },
-  { pattern: /^\/tokens\//, intervalMs: 5000 },
-  { pattern: /^\/products\/fees\//, intervalMs: 2200 },
-  { pattern: /^\/catalog\//, intervalMs: 2200 }
+  { pattern: /^\/orders\//, intervalMs: 2_200 },
+  { pattern: /^\/reports\//, intervalMs: 5_000 },
+  { pattern: /^\/finances\//, intervalMs: 5_000 },
+  { pattern: /^\/fba\/inventory\//, intervalMs: 5_000 },
+  { pattern: /^\/tokens\//, intervalMs: 5_000 },
+  { pattern: /^\/products\/fees\//, intervalMs: 2_200 },
+  { pattern: /^\/catalog\//, intervalMs: 2_200 }
 ]);
-const DEFAULT_SP_API_INTERVAL_MS = 3000;
+const DEFAULT_SP_API_INTERVAL_MS = 3_000;
 const rateLimitState = new Map();
 let globalNextAvailableAt = Date.now();
 
-/** @param {string} path */
 function rateLimitBucket(path) {
   const limit = SP_API_RATE_LIMITS.find(item => item.pattern.test(path));
   const family = path.split('/').filter(Boolean)[0] ?? 'default';
   return { key: family, intervalMs: limit?.intervalMs ?? DEFAULT_SP_API_INTERVAL_MS };
 }
 
-/** @param {string} path */
 async function waitForSpApiSlot(path) {
   const { key, intervalMs } = rateLimitBucket(path);
   const now = Date.now();
   const nextAvailableAt = Math.max(rateLimitState.get(key) ?? now, globalNextAvailableAt);
   const waitMs = Math.max(0, nextAvailableAt - now);
-  const reservedAt = now + waitMs + intervalMs;
-  rateLimitState.set(key, reservedAt);
+  rateLimitState.set(key, now + waitMs + intervalMs);
   globalNextAvailableAt = now + waitMs + 750;
   if (waitMs > 0) await new Promise(resolve => setTimeout(resolve, waitMs));
 }
 
+function queryPath(path, values) {
+  const query = new URLSearchParams();
+  for (const [key, value] of Object.entries(values ?? {})) {
+    if (value == null || value === '') continue;
+    query.set(key, Array.isArray(value) ? value.join(',') : String(value));
+  }
+  const encoded = query.toString();
+  return encoded ? `${path}?${encoded}` : path;
+}
+
+async function responseError(response, path) {
+  const requestId = response.headers.get('x-amzn-requestid') ?? response.headers.get('x-amz-request-id');
+  const raw = await response.text().catch(() => '');
+  let body;
+  try { body = raw ? JSON.parse(raw) : {}; } catch { body = { message: raw }; }
+  const first = body?.errors?.[0] ?? body?.error ?? body;
+  return new SpApiError(
+    first?.message ?? `SP-API request failed with HTTP ${response.status}`,
+    {
+      status: response.status,
+      code: first?.code,
+      details: first?.details ?? body,
+      requestId,
+      path
+    }
+  );
+}
+
+function responsePayload(body) {
+  return body?.payload ?? body;
+}
+
 export class SpApiClient {
-  /** @param {string} refreshToken @param {{ clientId?: string, clientSecret?: string }} [cfg] */
   constructor(refreshToken, cfg = {}) {
     this.refreshToken = z.string().min(1).parse(refreshToken);
-    this.cfg = { clientId: cfg.clientId ?? process.env.LWA_CLIENT_ID, clientSecret: cfg.clientSecret ?? process.env.LWA_CLIENT_SECRET, baseUrl: cfg.baseUrl ?? SP_API_BASE_URL };
+    const clientId = cfg.clientId ?? process.env.LWA_CLIENT_ID;
+    const clientSecret = cfg.clientSecret ?? process.env.LWA_CLIENT_SECRET;
+    if (!clientId || !clientSecret || clientId === 'HEHE' || clientSecret === 'HEHE') {
+      throw new SpApiError('LWA_CLIENT_ID and LWA_CLIENT_SECRET are not configured', { code: 'SP_API_CONFIGURATION' });
+    }
+    this.cfg = {
+      clientId,
+      clientSecret,
+      baseUrl: cfg.baseUrl ?? SP_API_BASE_URL
+    };
     this.cachedToken = null;
   }
 
   async getAccessToken() {
     if (this.cachedToken && Date.now() < this.cachedToken.expiresAt - 60_000) return this.cachedToken;
-    const res = await fetch('https://api.amazon.com/auth/o2/token', {
+    const response = await fetch('https://api.amazon.com/auth/o2/token', {
       method: 'POST',
+      signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
       headers: { 'content-type': 'application/x-www-form-urlencoded' },
-      body: new URLSearchParams({ grant_type: 'refresh_token', refresh_token: this.refreshToken, client_id: this.cfg.clientId ?? '', client_secret: this.cfg.clientSecret ?? '' })
+      body: new URLSearchParams({
+        grant_type: 'refresh_token',
+        refresh_token: this.refreshToken,
+        client_id: this.cfg.clientId ?? '',
+        client_secret: this.cfg.clientSecret ?? ''
+      })
     });
-    if (!res.ok) throw new Error(`LWA token exchange failed: ${res.status}`);
-    const body = z.object({ access_token: z.string().min(1), expires_in: z.number().default(3600) }).parse(await res.json());
-    this.cachedToken = { accessToken: body.access_token, expiresIn: body.expires_in, expiresAt: Date.now() + body.expires_in * 1000 };
+    if (!response.ok) throw await responseError(response, '/auth/o2/token');
+    const body = z.object({
+      access_token: z.string().min(1),
+      expires_in: z.number().default(3600)
+    }).parse(await response.json());
+    this.cachedToken = {
+      accessToken: body.access_token,
+      expiresIn: body.expires_in,
+      expiresAt: Date.now() + body.expires_in * 1000
+    };
     return this.cachedToken;
   }
 
-  /** @param {string} path @param {RequestInit} [init] @param {string} [token] */
-  async request(path, init = {}, token) {
-    let accessToken = token ?? (await this.getAccessToken()).accessToken;
-    for (let attempt = 0; attempt < 5; attempt += 1) {
+  async request(path, init = {}, restrictedToken) {
+    let accessToken = restrictedToken ?? (await this.getAccessToken()).accessToken;
+    let lastResponse;
+    let lastNetworkError;
+    for (let attempt = 0; attempt < 6; attempt += 1) {
       await waitForSpApiSlot(path);
-      const res = await fetch(`${this.cfg.baseUrl}${path}`, {
-        ...init,
-        headers: { 'content-type': 'application/json', 'x-amz-access-token': accessToken, ...(init.headers ?? {}) }
-      });
-      const rateLimit = Number(res.headers.get('x-amzn-RateLimit-Limit') ?? '0.5');
-      if (![429, 503].includes(res.status)) return res;
-      const retryAfter = Number(res.headers.get('retry-after'));
-      const backoffMs = Number.isFinite(retryAfter) && retryAfter > 0 ? retryAfter * 1000 : (1000 / Math.max(rateLimit, 0.05)) * 2 ** attempt;
-      await new Promise(resolve => setTimeout(resolve, Math.min(120_000, backoffMs)));
-      accessToken = token ?? (await this.getAccessToken()).accessToken;
+      let response;
+      try {
+        response = await fetch(`${this.cfg.baseUrl}${path}`, {
+          ...init,
+          signal: init.signal ?? AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+          headers: {
+            ...(init.body === undefined ? {} : { 'content-type': 'application/json' }),
+            'x-amz-access-token': accessToken,
+            ...(init.headers ?? {})
+          }
+        });
+      } catch (error) {
+        lastNetworkError = error;
+        if (attempt === 5) break;
+        await new Promise(resolve => setTimeout(resolve, Math.min(30_000, 1_000 * 2 ** attempt)));
+        continue;
+      }
+      lastResponse = response;
+
+      if (response.status === 401 && !restrictedToken && attempt === 0) {
+        this.cachedToken = null;
+        accessToken = (await this.getAccessToken()).accessToken;
+        continue;
+      }
+      if (![429, 500, 502, 503, 504].includes(response.status)) return response;
+
+      const rateLimit = Number(response.headers.get('x-amzn-RateLimit-Limit') ?? '0.5');
+      const retryAfter = Number(response.headers.get('retry-after'));
+      const backoffMs = Number.isFinite(retryAfter) && retryAfter > 0
+        ? retryAfter * 1000
+        : (1_000 / Math.max(rateLimit, 0.05)) * 2 ** attempt;
+      await new Promise(resolve => setTimeout(resolve, Math.min(60_000, backoffMs)));
     }
-    throw new Error(`SP-API request failed after retries: ${path}`);
+    if (lastResponse) throw await responseError(lastResponse, path);
+    throw new SpApiError(
+      `SP-API network request failed after retries: ${lastNetworkError instanceof Error ? lastNetworkError.message : 'unknown network error'}`,
+      { code: 'NETWORK_ERROR', details: lastNetworkError, path }
+    );
   }
 
-  /** @param {string} documentId */
+  async json(path, init = {}, restrictedToken) {
+    const response = await this.request(path, init, restrictedToken);
+    if (!response.ok) throw await responseError(response, path);
+    return response.json();
+  }
+
   async restrictedDataToken(documentId) {
     const id = z.string().min(1).parse(documentId);
-    const path = `/reports/2021-06-30/documents/${id}`;
-    const res = await this.request('/tokens/2021-03-01/restrictedDataToken', {
+    const path = `/reports/2021-06-30/documents/${encodeURIComponent(id)}`;
+    const body = responsePayload(await this.json('/tokens/2021-03-01/restrictedDataToken', {
       method: 'POST',
-      body: JSON.stringify({ restrictedResources: [{ method: 'GET', path, dataElements: ['taxInvoiceDataAccess'] }] })
-    });
-    if (!res.ok) throw new Error(`RDT request failed: ${res.status}`);
-    return z.object({ restrictedDataToken: z.string().min(1) }).parse(await res.json()).restrictedDataToken;
+      // dataElements is valid only for restricted Orders resources. A report
+      // document RDT needs the exact method and path only.
+      body: JSON.stringify({ restrictedResources: [{ method: 'GET', path }] })
+    }));
+    return z.object({ restrictedDataToken: z.string().min(1) }).parse(body).restrictedDataToken;
   }
 
-  /** @param {string} reportType @param {string} tenantId @param {{ start: string, end: string }} range @param {string} [marketplaceId] */
+  async listReports(query, maxPages = 100) {
+    const reports = [];
+    let path = queryPath('/reports/2021-06-30/reports', query);
+    const seen = new Set();
+    let unconsumedNextToken;
+    for (let page = 0; page < maxPages; page += 1) {
+      const body = responsePayload(await this.json(path));
+      reports.push(...(body.reports ?? []));
+      const nextToken = body.nextToken;
+      unconsumedNextToken = nextToken;
+      if (!nextToken) break;
+      if (seen.has(nextToken)) break;
+      seen.add(nextToken);
+      // Reports API requires the next token to be the only query parameter.
+      path = queryPath('/reports/2021-06-30/reports', { nextToken });
+    }
+    return { reports, nextToken: unconsumedNextToken };
+  }
+
+  async fetchSettlementReports(range, marketplaceId) {
+    const createdSince = new Date(new Date(range.start).getTime() - 90 * 864e5).toISOString();
+    const reportListing = await this.listReports({
+      reportTypes: 'GET_V2_SETTLEMENT_REPORT_DATA_FLAT_FILE_V2',
+      processingStatuses: 'DONE',
+      marketplaceIds: marketplaceId,
+      createdSince,
+      pageSize: 100
+    });
+    if (reportListing.nextToken) {
+      throw new SpApiError('Settlement report listing was not completely paginated', {
+        code: 'INCOMPLETE_REPORT_LIST'
+      });
+    }
+    const reports = reportListing.reports;
+    const requestedStart = new Date(range.start).getTime();
+    const requestedEnd = new Date(range.end).getTime();
+
+    const latestByWindow = new Map();
+    for (const report of reports) {
+      if (!report.reportDocumentId) continue;
+      const start = new Date(report.dataStartTime ?? report.createdTime ?? 0).getTime();
+      const end = new Date(report.dataEndTime ?? report.createdTime ?? 0).getTime();
+      if (!(start < requestedEnd && end >= requestedStart)) continue;
+      const key = `${report.dataStartTime ?? ''}|${report.dataEndTime ?? ''}`;
+      const previous = latestByWindow.get(key);
+      if (!previous || new Date(report.createdTime ?? 0) > new Date(previous.createdTime ?? 0)) {
+        latestByWindow.set(key, report);
+      }
+    }
+    const matchingReports = [...latestByWindow.values()].sort(
+      (left, right) => new Date(left.dataStartTime ?? 0) - new Date(right.dataStartTime ?? 0)
+    );
+    if (!matchingReports.length) {
+      throw new SpApiError('No completed Amazon settlement report overlaps this date range yet', { code: 'NO_SETTLEMENT_REPORT' });
+    }
+
+    const documents = [];
+    for (const report of matchingReports) {
+      documents.push({ report, ...(await this.downloadReportDocument(report.reportDocumentId)) });
+    }
+    const content = documents
+      .map((document, index) => index === 0 ? document.content : document.content.split(/\r?\n/).slice(1).join('\n'))
+      .filter(Boolean)
+      .join('\n');
+    const coverageStart = Math.min(...matchingReports.map(report => new Date(report.dataStartTime ?? range.start).getTime()));
+    const coverageEnd = Math.max(...matchingReports.map(report => new Date(report.dataEndTime ?? range.end).getTime()));
+    let coverageCursor = requestedStart;
+    let coverageComplete = true;
+    for (const report of matchingReports) {
+      if (!report.dataStartTime || !report.dataEndTime) {
+        coverageComplete = false;
+        continue;
+      }
+      const reportStart = new Date(report.dataStartTime).getTime();
+      const reportEnd = new Date(report.dataEndTime).getTime();
+      if (reportEnd < coverageCursor) continue;
+      if (reportStart > coverageCursor) {
+        coverageComplete = false;
+        break;
+      }
+      coverageCursor = Math.max(coverageCursor, reportEnd);
+      if (coverageCursor >= requestedEnd) break;
+    }
+    coverageComplete = coverageComplete && coverageCursor >= requestedEnd;
+    return {
+      reportId: matchingReports.map(report => report.reportId).join(','),
+      reportDocumentId: matchingReports.map(report => report.reportDocumentId).join(','),
+      sourceReports: matchingReports,
+      content,
+      compressionAlgorithm: matchingReports.length > 1 ? 'MERGED_SETTLEMENT_REPORTS' : documents[0].compressionAlgorithm,
+      reportsMerged: matchingReports.length,
+      dataStartTime: new Date(coverageStart).toISOString(),
+      dataEndTime: new Date(coverageEnd).toISOString(),
+      coverageComplete
+    };
+  }
+
   async fetchReport(reportType, tenantId, range, marketplaceId = INDIA_MARKETPLACE_ID) {
     const parsedReportType = z.enum(REPORT_TYPES).parse(reportType);
-    const parsedRange = normalizeReportRange(range);
+    const applicationRange = normalizeReportRange(range);
+    const requestRange = reportRequestRange(parsedReportType, range, marketplaceId);
     const parsedTenant = z.string().uuid().parse(tenantId);
     if (parsedReportType === 'GET_V2_SETTLEMENT_REPORT_DATA_FLAT_FILE_V2') {
-      // Settlement reports are generated by Amazon on a schedule and cannot
-      // reliably be created on demand. Select the latest completed report
-      // covering the requested period instead of calling createReport.
-      const createdSince = new Date(new Date(parsedRange.start).getTime() - 45 * 864e5).toISOString();
-      const listPath = `/reports/2021-06-30/reports?reportTypes=${encodeURIComponent(parsedReportType)}&processingStatuses=DONE&marketplaceIds=${encodeURIComponent(marketplaceId)}&createdSince=${encodeURIComponent(createdSince)}&pageSize=100`;
-      const list = await this.request(listPath);
-      if (!list.ok) throw new Error(`List settlement reports failed: ${list.status}`);
-      const reports = z.object({ reports: z.array(z.object({ reportId: z.string(), reportDocumentId: z.string().optional(), dataStartTime: z.string().optional(), dataEndTime: z.string().optional(), createdTime: z.string().optional() })).default([]) }).parse(await list.json()).reports;
-      const requestedStart = new Date(parsedRange.start).getTime();
-      const requestedEnd = new Date(parsedRange.end).getTime();
-      const matchingReports = reports
-        .filter(item => item.reportDocumentId && (!item.dataEndTime || new Date(item.dataEndTime).getTime() >= requestedStart) && (!item.dataStartTime || new Date(item.dataStartTime).getTime() <= requestedEnd))
-        .sort((a, b) => new Date(b.dataEndTime ?? b.createdTime ?? 0).getTime() - new Date(a.dataEndTime ?? a.createdTime ?? 0).getTime())
-        .slice(0, 10);
-      if (!matchingReports.length) throw new Error('No completed Amazon settlement report is available for this date range yet');
-      const documents = [];
-      for (const report of matchingReports) documents.push(await this.downloadReportDocument(report.reportDocumentId));
-      const content = documents.map((document, index) => index === 0 ? document.content : document.content.split(/\r?\n/).slice(1).join('\n')).join('\n');
-      const coverageStart = Math.min(...matchingReports.map(report => new Date(report.dataStartTime ?? parsedRange.start).getTime()));
-      const coverageEnd = Math.max(...matchingReports.map(report => new Date(report.dataEndTime ?? parsedRange.end).getTime()));
-      return {
-        reportId: matchingReports[0].reportId,
-        reportDocumentId: matchingReports[0].reportDocumentId,
-        content,
-        compressionAlgorithm: 'MERGED_SETTLEMENT_REPORTS',
-        reportsMerged: matchingReports.length,
-        dataStartTime: new Date(coverageStart).toISOString(),
-        dataEndTime: new Date(coverageEnd).toISOString(),
-        coverageComplete: coverageStart <= requestedStart && coverageEnd >= requestedEnd
-      };
+      return this.fetchSettlementReports(applicationRange, marketplaceId);
     }
+
     const reportOptions = parsedReportType === 'GET_SALES_AND_TRAFFIC_REPORT'
       ? { dateGranularity: 'DAY', asinGranularity: 'CHILD' }
       : undefined;
-    const createReportBody = {
+    const createBody = {
       reportType: parsedReportType,
       marketplaceIds: [marketplaceId],
-      dataStartTime: parsedRange.start,
-      dataEndTime: parsedRange.end,
+      dataStartTime: requestRange.start,
+      dataEndTime: requestRange.end,
       ...(reportOptions ? { reportOptions } : {})
     };
-    let rangeApplied = true;
-    let create = await this.request('/reports/2021-06-30/reports', {
+    const create = responsePayload(await this.json('/reports/2021-06-30/reports', {
       method: 'POST',
-      body: JSON.stringify(createReportBody)
-    });
-    if (!create.ok && create.status === 400) {
-      rangeApplied = false;
-      create = await this.request('/reports/2021-06-30/reports', {
-        method: 'POST',
-        body: JSON.stringify({ reportType: parsedReportType, marketplaceIds: [marketplaceId] })
-      });
-    }
-    if (!create.ok) throw new Error(`Create report failed: ${create.status}`);
-    const { reportId } = z.object({ reportId: z.string().min(1) }).parse(await create.json());
+      body: JSON.stringify(createBody)
+    }));
+    const { reportId } = z.object({ reportId: z.string().min(1) }).parse(create);
 
     let reportDocumentId = '';
     let reportedDataStartTime;
     let reportedDataEndTime;
+    let cancelledNoData = false;
     for (let attempt = 0; attempt < REPORT_POLL_ATTEMPTS; attempt += 1) {
-      const poll = await this.request(`/reports/2021-06-30/reports/${reportId}`);
-      if (!poll.ok) throw new Error(`Poll report failed: ${poll.status}`);
       const body = z.object({
         processingStatus: z.string(),
         reportDocumentId: z.string().optional(),
         dataStartTime: z.string().optional(),
         dataEndTime: z.string().optional()
-      }).parse(await poll.json());
+      }).parse(responsePayload(await this.json(`/reports/2021-06-30/reports/${reportId}`)));
+      reportedDataStartTime = body.dataStartTime ?? reportedDataStartTime;
+      reportedDataEndTime = body.dataEndTime ?? reportedDataEndTime;
       if (body.processingStatus === 'DONE' && body.reportDocumentId) {
         reportDocumentId = body.reportDocumentId;
-        reportedDataStartTime = body.dataStartTime;
-        reportedDataEndTime = body.dataEndTime;
         break;
       }
-      if (['CANCELLED', 'FATAL'].includes(body.processingStatus)) throw new Error(`Report ${reportId} ${body.processingStatus}`);
+      // Amazon uses CANCELLED when a valid request has no data. Record an empty,
+      // completed source so zero-row report coverage is still authoritative.
+      if (body.processingStatus === 'CANCELLED') {
+        cancelledNoData = true;
+        break;
+      }
+      if (body.processingStatus === 'FATAL') {
+        throw new SpApiError(`Report ${reportId} failed`, { code: 'REPORT_FATAL' });
+      }
       await new Promise(resolve => setTimeout(resolve, REPORT_POLL_INTERVAL_MS));
     }
-    if (!reportDocumentId) throw new Error(`Report ${reportId} timed out for tenant ${parsedTenant}`);
+    if (!reportDocumentId && !cancelledNoData) {
+      throw new SpApiError(`Report ${reportId} timed out for tenant ${parsedTenant}`, { code: 'REPORT_TIMEOUT' });
+    }
 
-    const documentToken = GST_REPORTS.has(parsedReportType) ? await this.restrictedDataToken(reportDocumentId) : undefined;
-    const downloaded = await this.downloadReportDocument(reportDocumentId, documentToken);
-    const dataStartTime = reportedDataStartTime ?? parsedRange.start;
-    const dataEndTime = reportedDataEndTime ?? parsedRange.end;
-    const hasAuthoritativeCoverage = rangeApplied || Boolean(reportedDataStartTime && reportedDataEndTime);
-    const coverageComplete = hasAuthoritativeCoverage
-      && new Date(dataStartTime).getTime() <= new Date(parsedRange.start).getTime()
-      && new Date(dataEndTime).getTime() >= new Date(parsedRange.end).getTime();
+    const downloaded = cancelledNoData
+      ? { content: '', compressionAlgorithm: undefined }
+      : await this.downloadReportDocument(
+        reportDocumentId,
+        GST_REPORTS.has(parsedReportType) ? await this.restrictedDataToken(reportDocumentId) : undefined
+      );
+
     return {
       reportId,
-      reportDocumentId,
+      reportDocumentId: reportDocumentId || null,
       ...downloaded,
-      dataStartTime,
-      dataEndTime,
-      coverageComplete
+      dataStartTime: applicationRange.start,
+      dataEndTime: applicationRange.end,
+      reportedDataStartTime,
+      reportedDataEndTime,
+      coverageComplete: cancelledNoData || completedReportCoversRequest(
+        parsedReportType,
+        requestRange,
+        reportedDataStartTime,
+        reportedDataEndTime
+      ),
+      cancelledNoData
     };
   }
 
-  async downloadReportDocument(reportDocumentId, token) {
-    const document = await this.request(`/reports/2021-06-30/documents/${encodeURIComponent(reportDocumentId)}`, {}, token);
-    if (!document.ok) throw new Error(`Document lookup failed: ${document.status}`);
-    const { url, compressionAlgorithm } = z.object({ url: z.string().url(), compressionAlgorithm: z.string().optional() }).parse(await document.json());
-    const download = await fetch(url);
-    if (!download.ok) throw new Error(`Document download failed: ${download.status}`);
+  async downloadReportDocument(reportDocumentId, restrictedToken) {
+    const id = z.string().min(1).parse(reportDocumentId);
+    const document = responsePayload(await this.json(
+      `/reports/2021-06-30/documents/${encodeURIComponent(id)}`,
+      {},
+      restrictedToken
+    ));
+    const { url, compressionAlgorithm } = z.object({
+      url: z.string().url(),
+      compressionAlgorithm: z.string().optional()
+    }).parse(document);
+    const download = await fetch(url, { signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS * 4) });
+    if (!download.ok) throw await responseError(download, url);
     const buffer = Buffer.from(await download.arrayBuffer());
-    let content = buffer.toString('utf8');
-    if (compressionAlgorithm === 'GZIP') {
-      try { content = gunzipSync(buffer).toString('utf8'); } catch { content = buffer.toString('utf8'); }
-    }
+    const content = compressionAlgorithm === 'GZIP'
+      ? gunzipSync(buffer).toString('utf8')
+      : buffer.toString('utf8');
     return { content, compressionAlgorithm };
   }
 
-  /** @param {string} sellerSku @param {unknown} body */
   async estimateListingFees(sellerSku, body) {
     const sku = z.string().min(1).parse(sellerSku);
-    const res = await this.request(`/products/fees/v0/listings/${encodeURIComponent(sku)}/feesEstimate`, { method: 'POST', body: JSON.stringify(body) });
-    if (!res.ok) throw new Error(`Fees estimate failed: ${res.status}`);
-    return res.json();
+    return this.json(
+      `/products/fees/v0/listings/${encodeURIComponent(sku)}/feesEstimate`,
+      { method: 'POST', body: JSON.stringify(body) }
+    );
   }
 
-  /** @param {string} createdAfter @param {string} [marketplaceId] @param {string} [createdBefore] */
-  async listOrders(createdAfter, marketplaceId = INDIA_MARKETPLACE_ID, createdBefore) {
-    const date = z.string().datetime().parse(createdAfter);
-    const before = createdBefore ? z.string().datetime().parse(createdBefore) : null;
-    const beforeQuery = before ? `&CreatedBefore=${encodeURIComponent(before)}` : '';
-    const res = await this.request(`/orders/v0/orders?MarketplaceIds=${marketplaceId}&CreatedAfter=${encodeURIComponent(date)}${beforeQuery}`);
-    if (!res.ok) throw new Error(`List orders failed: ${res.status}`);
-    return res.json();
+  /**
+   * Orders v2026-01-01 includes order items in each result. Every pagination
+   * request retains the original filters as required by Amazon.
+   */
+  async searchOrders(options) {
+    const schema = z.object({
+      marketplaceId: z.string().min(1),
+      createdAfter: z.string().datetime().optional(),
+      createdBefore: z.string().datetime().optional(),
+      lastUpdatedAfter: z.string().datetime().optional(),
+      lastUpdatedBefore: z.string().datetime().optional(),
+      maxPages: z.number().int().min(1).max(100).default(100)
+    }).refine(value => Boolean(value.createdAfter) !== Boolean(value.lastUpdatedAfter), {
+      message: 'Provide exactly one of createdAfter and lastUpdatedAfter'
+    });
+    const parsed = schema.parse(options);
+    const parameters = {
+      marketplaceIds: parsed.marketplaceId,
+      createdAfter: parsed.createdAfter,
+      createdBefore: parsed.createdBefore,
+      lastUpdatedAfter: parsed.lastUpdatedAfter,
+      lastUpdatedBefore: parsed.lastUpdatedBefore,
+      maxResultsPerPage: 100,
+      includedData: ['PROCEEDS', 'PROMOTION', 'FULFILLMENT', 'TAX']
+    };
+    const orders = [];
+    const seen = new Set();
+    let nextToken;
+    let pagesFetched = 0;
+    for (let page = 0; page < parsed.maxPages; page += 1) {
+      const body = responsePayload(await this.json(queryPath('/orders/2026-01-01/orders', {
+        ...parameters,
+        paginationToken: nextToken
+      })));
+      orders.push(...(body.orders ?? []));
+      pagesFetched += 1;
+      nextToken = body.pagination?.nextToken ?? body.nextToken;
+      if (!nextToken || seen.has(nextToken)) break;
+      seen.add(nextToken);
+    }
+    return { orders, pagesFetched, nextToken };
   }
 
-  /** @param {string} nextToken */
-  async listOrdersByNextToken(nextToken) {
-    const token = z.string().min(1).parse(nextToken);
-    const res = await this.request(`/orders/v0/orders?NextToken=${encodeURIComponent(token)}`);
-    if (!res.ok) throw new Error(`List orders page failed: ${res.status}`);
-    return res.json();
-  }
-
-  /** @param {string} orderId */
-  async listOrderItems(orderId) {
+  async getOrder(orderId, includedData = ['PROCEEDS', 'PROMOTION', 'FULFILLMENT', 'TAX']) {
     const id = z.string().min(1).parse(orderId);
-    const res = await this.request(`/orders/v0/orders/${encodeURIComponent(id)}/orderItems`);
-    if (!res.ok) throw new Error(`List order items failed: ${res.status}`);
-    return res.json();
+    return responsePayload(await this.json(queryPath(
+      `/orders/2026-01-01/orders/${encodeURIComponent(id)}`,
+      { includedData }
+    )));
   }
 
-  /** Fetches Amazon's catalog attributes used for package weight and dimensions. */
   async getCatalogItem(asin, marketplaceId = INDIA_MARKETPLACE_ID) {
     const parsedAsin = z.string().min(1).parse(asin);
-    const path = `/catalog/2022-04-01/items/${encodeURIComponent(parsedAsin)}?marketplaceIds=${encodeURIComponent(marketplaceId)}&includedData=attributes,dimensions,productTypes,summaries,classifications`;
-    const res = await this.request(path);
-    if (!res.ok) throw new Error(`Catalog item lookup failed: ${res.status}`);
-    const raw = await res.json();
-    const category = raw?.summaries?.[0]?.websiteDisplayGroup ?? raw?.classifications?.[0]?.classifications?.[0]?.displayName ?? raw?.productTypes?.[0]?.productType ?? null;
+    const path = queryPath(`/catalog/2022-04-01/items/${encodeURIComponent(parsedAsin)}`, {
+      marketplaceIds: marketplaceId,
+      includedData: 'attributes,dimensions,productTypes,summaries,classifications'
+    });
+    const raw = await this.json(path);
+    const category = raw?.summaries?.[0]?.websiteDisplayGroup
+      ?? raw?.classifications?.[0]?.classifications?.[0]?.displayName
+      ?? raw?.productTypes?.[0]?.productType
+      ?? null;
     const weightNode = raw?.dimensions?.[0]?.package?.weight ?? raw?.dimensions?.[0]?.item?.weight ?? null;
     return { ...raw, category, weightNode, raw };
   }
 
-
-  /** @param {string} [marketplaceId] */
-  async listInventorySummaries(marketplaceId = INDIA_MARKETPLACE_ID) {
-    const res = await this.request(`/fba/inventory/v1/summaries?details=true&granularityType=Marketplace&granularityId=${encodeURIComponent(marketplaceId)}&marketplaceIds=${encodeURIComponent(marketplaceId)}`);
-    if (!res.ok) throw new Error(`Inventory summaries failed: ${res.status}`);
-    return res.json();
+  async listInventorySummaries(marketplaceId = INDIA_MARKETPLACE_ID, maxPages = 100) {
+    const base = {
+      details: true,
+      granularityType: 'Marketplace',
+      granularityId: marketplaceId,
+      marketplaceIds: marketplaceId
+    };
+    const inventorySummaries = [];
+    const seen = new Set();
+    let nextToken;
+    let pagesFetched = 0;
+    for (let page = 0; page < maxPages; page += 1) {
+      const body = responsePayload(await this.json(queryPath('/fba/inventory/v1/summaries', {
+        ...base,
+        nextToken
+      })));
+      inventorySummaries.push(...(body.inventorySummaries ?? []));
+      pagesFetched += 1;
+      nextToken = body.pagination?.nextToken ?? body.nextToken;
+      if (!nextToken || seen.has(nextToken)) break;
+      seen.add(nextToken);
+    }
+    return { inventorySummaries, pagesFetched, nextToken };
   }
 
-  /** @param {string} postedAfter @param {string} [postedBefore] */
   async listFinanceTransactions(postedAfter, postedBefore, nextToken) {
-    if (nextToken) {
-      const res = await this.request(`/finances/2024-06-19/transactions?nextToken=${encodeURIComponent(z.string().min(1).parse(nextToken))}`);
-      if (!res.ok) throw new Error(`Finance transactions page failed: ${res.status}`);
-      return res.json();
+    const after = z.string().datetime().parse(postedAfter);
+    const before = postedBefore ? z.string().datetime().parse(postedBefore) : undefined;
+    const path = queryPath('/finances/2024-06-19/transactions', {
+      postedAfter: after,
+      postedBefore: before,
+      nextToken
+    });
+    return this.json(path);
+  }
+
+  async listAllFinanceTransactions(postedAfter, postedBefore, maxPages = 100) {
+    const start = new Date(z.string().datetime().parse(postedAfter));
+    const end = new Date(z.string().datetime().parse(postedBefore));
+    if (start >= end) throw new Error('Finance transaction range must start before it ends');
+    const transactions = [];
+    let pagesFetched = 0;
+    let unconsumedNextToken;
+    // listTransactions accepts at most 180 days. Use 179-day half-open
+    // windows so long dashboard ranges remain valid without boundary overlap.
+    for (let windowStart = start; windowStart < end;) {
+      const windowEnd = new Date(Math.min(end.getTime(), windowStart.getTime() + 179 * 864e5));
+      const seen = new Set();
+      let nextToken;
+      for (let page = 0; page < maxPages; page += 1) {
+        const body = responsePayload(await this.listFinanceTransactions(
+          windowStart.toISOString(),
+          windowEnd.toISOString(),
+          nextToken
+        ));
+        transactions.push(...(body.transactions ?? body.Transactions ?? []));
+        pagesFetched += 1;
+        nextToken = body.nextToken ?? body.NextToken;
+        if (!nextToken || seen.has(nextToken)) break;
+        seen.add(nextToken);
+      }
+      if (nextToken) {
+        unconsumedNextToken = nextToken;
+        break;
+      }
+      windowStart = windowEnd;
     }
-    const date = z.string().datetime().parse(postedAfter);
-    const before = postedBefore ? z.string().datetime().parse(postedBefore) : null;
-    const beforeQuery = before ? `&postedBefore=${encodeURIComponent(before)}` : '';
-    const res = await this.request(`/finances/2024-06-19/transactions?postedAfter=${encodeURIComponent(date)}${beforeQuery}`);
-    if (!res.ok) throw new Error(`Finance transactions failed: ${res.status}`);
-    return res.json();
+    return { transactions, pagesFetched, nextToken: unconsumedNextToken };
   }
 }

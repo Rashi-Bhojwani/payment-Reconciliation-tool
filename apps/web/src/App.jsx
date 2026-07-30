@@ -1,7 +1,7 @@
 import React, { createContext, useContext, useEffect, useMemo, useRef, useState } from 'react';
 import { createRoot } from 'react-dom/client';
 import { BrowserRouter, Navigate, NavLink, Route, Routes, useLocation, useNavigate, useSearchParams } from 'react-router-dom';
-import { Bar, BarChart, CartesianGrid, Cell, Line, LineChart, Pie, PieChart, ResponsiveContainer, Tooltip, XAxis, YAxis } from 'recharts';
+import { Bar, BarChart, CartesianGrid, Line, LineChart, ResponsiveContainer, Tooltip, XAxis, YAxis } from 'recharts';
 import './style.css';
 
 const API = import.meta.env.VITE_API_URL ?? 'http://localhost:4000';
@@ -19,8 +19,8 @@ const REPORTS = [
   { type: 'GET_FBA_FULFILLMENT_CUSTOMER_RETURNS_DATA', code: 'RTN', label: 'Customer returns', hint: 'Return reasons & disposition' }
 ];
 const REPORT_DETAIL_MAP = {
-  DIRECT_SP_API_SYNC: { source: 'orderItems', title: 'Orders & finance detail', columns: ['amazon_order_id', 'asin', 'sku', 'title', 'quantity_ordered', 'item_price'], explanation: 'Shows the Amazon order item rows imported directly through SP-API. Net sales and quantity totals are built from these rows when sales reports are not present.' },
-  GET_V2_SETTLEMENT_REPORT_DATA_FLAT_FILE_V2: { source: 'payments', title: 'Settlement report detail', columns: ['posted_date', 'settlement_id', 'net_amount', 'lines'], explanation: 'Shows payout batches and settlement totals. Settled amount is the sum of net_amount across these rows.' },
+  DIRECT_SP_API_SYNC: { source: 'orderItems', title: 'Orders & finance detail', columns: ['amazon_order_id', 'asin', 'sku', 'title', 'quantity_ordered', 'item_price'], explanation: 'Shows order-item rows imported with Orders v2026-01-01. Financial KPIs use separately imported, released Finances transactions; incomplete pagination is never treated as a complete total.' },
+  GET_V2_SETTLEMENT_REPORT_DATA_FLAT_FILE_V2: { source: 'settlementLines', title: 'Settlement report detail', columns: ['posted_date', 'settlement_id', 'order_id', 'transaction_type', 'amount_type', 'amount_description', 'amount', 'currency'], explanation: 'Shows monetary settlement lines only. Statement headers and deposit dates are stored separately and drive the Settled Amount metric.' },
   GET_SALES_AND_TRAFFIC_REPORT: { source: 'products', title: 'Sales & traffic report detail', columns: ['asin', 'units', 'sales', 'buy_box'], explanation: 'Shows ASIN-level sales, units, and Buy Box metrics from Amazon sales and traffic data.' },
   GET_GST_MTR_B2B_CUSTOM: { source: 'invoices', title: 'GST B2B invoice detail', columns: ['invoice_type', 'order_id', 'taxable_value', 'cgst', 'sgst', 'igst', 'invoice_date'], explanation: 'Shows imported business invoice tax rows in readable columns.' },
   GET_GST_MTR_B2C_CUSTOM: { source: 'invoices', title: 'GST B2C invoice detail', columns: ['invoice_type', 'order_id', 'taxable_value', 'cgst', 'sgst', 'igst', 'invoice_date'], explanation: 'Shows imported consumer invoice tax rows in readable columns.' },
@@ -28,7 +28,6 @@ const REPORT_DETAIL_MAP = {
   GET_FBA_REIMBURSEMENTS_DATA: { source: 'reimbursements', title: 'Reimbursement report detail', columns: ['sku', 'amount', 'reason', 'reimbursement_date'], explanation: 'Shows Amazon reimbursement credits with SKU, reason and amount.' },
   GET_FBA_FULFILLMENT_CUSTOMER_RETURNS_DATA: { source: 'returns', title: 'Customer returns report detail', columns: ['order_id', 'return_reason', 'disposition', 'status', 'return_date'], explanation: 'Shows return rows with reason, disposition and current status.' }
 };
-const COLORS = ['#1668e8', '#7c3aed', '#22a65a', '#94a3b8'];
 
 // Maps each report code to a stable CSS class so the Sync Ledger and Reports
 // grid can color-code report families (each is a genuinely distinct SP-API
@@ -103,9 +102,6 @@ async function api(path, options = {}) {
   if (!res.ok) throw new Error((await res.json().catch(() => ({}))).error ?? 'Request failed');
   return res.json();
 }
-const ACCESS_TOKEN_CACHE_PREFIX = 'amazon_spapi_access_token:';
-function readAmazonTokenCache(tenantId) { const cached = JSON.parse(localStorage.getItem(`${ACCESS_TOKEN_CACHE_PREFIX}${tenantId}`) ?? 'null'); return cached?.accessToken && cached?.expiresAt && Date.now() < cached.expiresAt - 60_000 ? cached : null; }
-async function getAmazonAccessToken(tenantId) { const cached = readAmazonTokenCache(tenantId); if (cached) return cached; const fresh = await api(`/api/tenants/${tenantId}/amazon/access-token`); localStorage.setItem(`${ACCESS_TOKEN_CACHE_PREFIX}${tenantId}`, JSON.stringify(fresh)); return fresh; }
 async function beginAmazonAuthorization(tenantId) { const { url } = await api(`/api/auth/amazon/start?tenantId=${tenantId}&json=1`); window.location.assign(url); }
 async function syncAmazonSource(tenantId, reportType, range) {
   const payload = { method: 'POST', body: JSON.stringify({ range: { start: formatDateParam(range.start), end: formatDateParam(addDays(range.end, 1)) } }) };
@@ -118,6 +114,8 @@ function Card({ children, className = '' }) { return <section className={`card $
 function Empty({ text }) { return <div className="empty-state">{text}</div>; }
 function formatCurrency(value) { return `₹${Number(value ?? 0).toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`; }
 function formatNumber(value) { return Number(value ?? 0).toLocaleString('en-IN'); }
+function currencyOrUnavailable(value) { return value == null ? 'Unavailable' : formatCurrency(value); }
+function numberOrUnavailable(value) { return value == null ? 'Unavailable' : formatNumber(value); }
 function csvEscape(value) {
   const text = String(value ?? '').replaceAll('₹', '').replaceAll('—', '').replaceAll('â€”', '').trim();
   return /[",\n]/.test(text) ? `"${text.replaceAll('"', '""')}"` : text;
@@ -150,7 +148,7 @@ function timeAgo(iso) {
 // Login only — account creation is admin-only now (see AdminDashboard's
 // "Create seller account" card), so there is no self-serve signup here.
 function Login({ setSession }) {
-  const [form, setForm] = useState({ email: 'admin@reconcile.local', password: 'Admin12345!' });
+  const [form, setForm] = useState({ email: '', password: '' });
   const [error, setError] = useState('');
   const navigate = useNavigate();
   async function submit(event) {
@@ -182,7 +180,6 @@ function Login({ setSession }) {
         <Button>Login</Button>
         {error && <p className="alert error">{error}</p>}
         <p className="muted small">Don't have an account? Ask your admin to create one for you.</p>
-        <p className="muted small">Default dev admin: admin@reconcile.local / Admin12345!</p>
       </form>
     </Card>
   </main>;
@@ -349,7 +346,6 @@ function AmazonConnectionPanel({ tenantId, seller, onChange, setError }) {
     setBusy(true);
     try {
       await api(`/api/tenants/${tenantId}/amazon/disconnect`, { method: 'POST' });
-      localStorage.removeItem(`${ACCESS_TOKEN_CACHE_PREFIX}${tenantId}`);
       await onChange();
     } catch (e) { setError(e.message); }
     finally { setBusy(false); }
@@ -399,10 +395,10 @@ function SellerDashboard() {
   }, [tenantId, range.start, range.end]);
 
   const channelData = useMemo(() => [
-    { name: 'Order value', value: Number(data?.orders?.order_value ?? 0) },
-    { name: 'Settlement earnings', value: Number(data?.kpis?.earnings ?? 0) },
-    { name: 'Settlement deductions', value: Math.abs(Number(data?.kpis?.deductions ?? 0)) }
-  ].filter(item => item.value > 0), [data]);
+    { name: 'Net sales', value: data?.dashboardCalculations?.metrics?.netSales?.value },
+    { name: 'Deductions', value: data?.dashboardCalculations?.metrics?.deductions?.value },
+    { name: 'Reimbursements', value: data?.dashboardCalculations?.metrics?.reimbursements?.value }
+  ].filter(item => item.value != null && Number(item.value) > 0).map(item => ({ ...item, value: Number(item.value) })), [data]);
   const reportTypes = VIEW_REPORT_TYPES[view];
   const ledgerCopy = VIEW_LEDGER_COPY[view];
   const detailView = view === 'report-detail' || view === 'metric-detail';
@@ -481,7 +477,7 @@ const MONEY_LABELS = {
 function friendlyMoneyLabel(row) { return MONEY_LABELS[row.category] ?? String(row.amount_description ?? row.category).replaceAll('_', ' '); }
 function OrderMoneyDetails({ order, detail }) {
   const leafLines = detail.fees.filter(row => !String(row.category).startsWith('summary_'));
-  const deductions = leafLines.filter(row => Number(row.amount) < 0 && !['promotion', 'refund'].includes(row.category));
+  const deductions = leafLines.filter(row => Number(row.amount) < 0);
   const additions = leafLines.filter(row => Number(row.amount) > 0 && row.category !== 'item_price');
   return <div className="money-explainer">
     <h4>Your money journey</h4>
@@ -494,8 +490,9 @@ function OrderMoneyDetails({ order, detail }) {
 function OrderReconciliation({ tenantId }) {
   const { range } = useContext(DateRangeContext);
   const [orders, setOrders] = useState([]); const [transactions,setTransactions]=useState([]); const [source,setSource]=useState(''); const [flags, setFlags] = useState([]); const [openId, setOpenId] = useState(''); const [details, setDetails] = useState({}); const [error, setError] = useState('');
+  const [coverageComplete,setCoverageComplete]=useState(null);
   const [orderSearch,setOrderSearch]=useState(''); const [orderView,setOrderView]=useState('matched'); const [orderPage,setOrderPage]=useState(0); const [ledgerFilters,setLedgerFilters]=useState({account:'',type:'',status:'',orderId:''});
-  useEffect(() => { let active=true; setError(''); Promise.all([api(`/api/tenants/${tenantId}/orders-reconciliation?${rangeQuery(range)}`),api(`/api/tenants/${tenantId}/transactions?${rangeQuery(range)}`),api(`/api/tenants/${tenantId}/fee-leaks?${rangeQuery(range)}`)]).then(([result,ledger,leaks])=>{if(active){setOrders(result.orders);setTransactions(ledger.transactions);setSource(result.source);setFlags(leaks.flags);}}).catch(e=>{if(active)setError(e.message)}); return()=>{active=false}; },[tenantId,range.start,range.end]);
+  useEffect(() => { let active=true; setError(''); setCoverageComplete(null); Promise.all([api(`/api/tenants/${tenantId}/orders-reconciliation?${rangeQuery(range)}`),api(`/api/tenants/${tenantId}/transactions?${rangeQuery(range)}`),api(`/api/tenants/${tenantId}/fee-leaks?${rangeQuery(range)}`)]).then(([result,ledger,leaks])=>{if(active){setOrders(result.orders);setTransactions(ledger.transactions);setSource(result.source);setCoverageComplete(result.coverageComplete===true);setFlags(leaks.flags);}}).catch(e=>{if(active)setError(e.message)}); return()=>{active=false}; },[tenantId,range.start,range.end]);
   async function toggle(orderId) { if(openId===orderId){setOpenId('');return;} setOpenId(orderId); if(!details[orderId]) { try { const detail=await api(`/api/tenants/${tenantId}/orders-reconciliation/${encodeURIComponent(orderId)}`); setDetails(value=>({...value,[orderId]:detail})); } catch(e){setError(e.message);} } }
   const flagByOrder=new Map(flags.map(flag=>[flag.order_id,flag]));
   const counts = { reconciled: orders.filter(order=>order.hasFeeData).length, awaiting: orders.filter(order=>!order.hasFeeData&&!/cancel/i.test(order.status??'')).length, cancelled: orders.filter(order=>/cancel/i.test(order.status??'')).length };
@@ -506,7 +503,7 @@ function OrderReconciliation({ tenantId }) {
   const filteredTransactions=transactions.filter(row=>(!ledgerFilters.account||row.account_type===ledgerFilters.account)&&(!ledgerFilters.type||row.transaction_type===ledgerFilters.type)&&(!ledgerFilters.status||row.transaction_status===ledgerFilters.status)&&String(row.order_id??'').toLowerCase().includes(ledgerFilters.orderId.trim().toLowerCase()));
   function statusBadge(order, flag) {
     if (flag) return <span className="overcharge-badge">Overcharged {formatCurrency(flag.variance)}</span>;
-    if (order.hasFeeData) return <span className="pill status-completed">Payment matched</span>;
+    if (order.hasFeeData) return <span className="pill status-completed">Amazon money posted</span>;
     if (/cancel/i.test(order.status??'')) return <span className="pill status-idle">Cancelled · no payout</span>;
     if (/pending|unshipped/i.test(order.status??'')) return <span className="pill status-idle">Not shipped yet</span>;
     return <span className="pill status-idle">Awaiting Amazon payment</span>;
@@ -519,7 +516,7 @@ function OrderReconciliation({ tenantId }) {
       day:'2-digit',month:'short',year:'numeric',hour:'2-digit',minute:'2-digit',second:'2-digit',hourCycle:'h23',timeZone:'UTC',timeZoneName:'short'
     }).format(parsed);
   };
-  const reconciliationTable = <Card className="table-card"><PanelHeader title="Order-wise gross → fees → payout" subtitle={source||'Loading Amazon money lines'} /><div className="reconciliation-summary"><button type="button" className={orderView==='matched'?'active':''} onClick={()=>setOrderView('matched')}><strong>{formatNumber(counts.reconciled)}</strong><span>Payments posted in this period</span></button><button type="button" className={orderView==='awaiting'?'active':''} onClick={()=>setOrderView('awaiting')}><strong>{formatNumber(counts.awaiting)}</strong><span>Recent orders awaiting Amazon</span></button><button type="button" className={orderView==='cancelled'?'active':''} onClick={()=>setOrderView('cancelled')}><strong>{formatNumber(counts.cancelled)}</strong><span>Cancelled — no payout expected</span></button><button type="button" className={orderView==='all'?'active':''} onClick={()=>setOrderView('all')}><strong>{formatNumber(orders.length)}</strong><span>All orders</span></button></div><p className="reconciliation-note">The payout columns use the Finances API transaction status and posted timestamp. Settlement ID and deposit-date data come from Amazon's settlement report. “Yes” means Amazon released or initiated the payout; SP-API cannot confirm when the seller's bank actually credited it.</p><div className="order-search"><Input value={orderSearch} onChange={event=>setOrderSearch(event.target.value)} placeholder="Search order ID…"/><span>{formatNumber(filteredOrders.length)} matching orders</span></div>{error&&<p className="alert error">{error}</p>}{filteredOrders.length?<><div className="table-wrap"><table><thead><tr>{['Order','Settlement ID','Amazon status','Transaction date','Product charges','Promotions','Referral','Fulfillment','Amazon fees','Other','Net payout','Money released?','Released / deposit time','Payout status','Reconciliation',''].map(label=><th key={label}>{label}</th>)}</tr></thead><tbody>{visibleOrders.map(order=>{const flag=flagByOrder.get(order.amazon_order_id);const detail=details[order.amazon_order_id];return <React.Fragment key={order.amazon_order_id}><tr><td>{order.amazon_order_id}</td><td>{order.settlement_id??'—'}</td><td>{order.status??'—'}</td><td>{String(order.transaction_date??order.order_date??'').slice(0,10)}</td><td>{Number(order.gross_item_price)?formatCurrency(order.gross_item_price):'Items pending'}</td><td>{order.hasFeeData?formatCurrency(order.promotion):'—'}</td><td>{order.hasFeeData?formatCurrency(order.referral_commission):'—'}</td><td>{order.hasFeeData?formatCurrency(order.fulfillment_fee):'—'}</td><td>{order.hasFeeData?formatCurrency(order.total_deductions):'—'}</td><td>{order.hasFeeData?formatCurrency(order.other_amount):'—'}</td><td><b>{order.hasFeeData?formatCurrency(order.net_payout):'—'}</b></td><td><span className={`pill ${order.payment_received?'status-completed':'status-idle'}`}>{order.payment_received?'Yes':'No'}</span></td><td>{payoutTime(order)}</td><td>{order.payout_status??'Awaiting payment data'}</td><td>{statusBadge(order,flag)}</td><td><Button variant="ghost" onClick={()=>toggle(order.amazon_order_id)}>{openId===order.amazon_order_id?'Hide':'Details'}</Button></td></tr>{openId===order.amazon_order_id&&<tr className="order-detail-row"><td colSpan="16">{detail?<div className="order-detail-grid"><div><h4>Items</h4>{detail.items.length?detail.items.map((item,index)=><p key={index}><b>{item.title}</b><br/>{item.sku} · {formatNumber(item.quantity_ordered)} × {formatCurrency(item.item_price)}{item.package_weight?` · ${item.package_weight} ${item.weight_unit??''}`:''}</p>):<p className="muted">Order items have not been returned by Amazon yet. Run Orders & finance sync again after the order is confirmed.</p>}</div><OrderMoneyDetails order={order} detail={detail} /></div>:<Empty text="Loading order details…" />}</td></tr>}</React.Fragment>})}</tbody></table></div>{orderTotalPages>1&&<div className="pager"><Button variant="ghost" disabled={safeOrderPage===0} onClick={()=>setOrderPage(page=>Math.max(0,page-1))}>← Previous</Button><span>Page {safeOrderPage+1} of {orderTotalPages} · {formatNumber(filteredOrders.length)} orders</span><Button variant="ghost" disabled={safeOrderPage>=orderTotalPages-1} onClick={()=>setOrderPage(page=>Math.min(orderTotalPages-1,page+1))}>Next →</Button></div>}</>:<Empty text="No synced orders in this period."/>}</Card>;
+  const reconciliationTable = <Card className="table-card"><PanelHeader title="Order-wise gross → fees → payout" subtitle={source||'Loading Amazon money lines'} /><div className="reconciliation-summary"><button type="button" className={orderView==='matched'?'active':''} onClick={()=>setOrderView('matched')}><strong>{formatNumber(counts.reconciled)}</strong><span>Payments posted in this period</span></button><button type="button" className={orderView==='awaiting'?'active':''} onClick={()=>setOrderView('awaiting')}><strong>{formatNumber(counts.awaiting)}</strong><span>Recent orders awaiting Amazon</span></button><button type="button" className={orderView==='cancelled'?'active':''} onClick={()=>setOrderView('cancelled')}><strong>{formatNumber(counts.cancelled)}</strong><span>Cancelled — no payout expected</span></button><button type="button" className={orderView==='all'?'active':''} onClick={()=>setOrderView('all')}><strong>{formatNumber(orders.length)}</strong><span>All orders</span></button></div><p className="reconciliation-note">The payout columns use the Finances API transaction status and posted timestamp. Settlement ID and deposit-date data come from Amazon's settlement report. “Yes” means Amazon released or initiated the payout; SP-API cannot confirm when the seller's bank actually credited it.</p>{coverageComplete===false&&<p className="alert warning">This range is only partially synced. The rows remain available for inspection, but counts and totals are not complete until Orders and either Finances or Settlements have complete coverage.</p>}<div className="order-search"><Input value={orderSearch} onChange={event=>setOrderSearch(event.target.value)} placeholder="Search order ID…"/><span>{formatNumber(filteredOrders.length)} matching orders</span></div>{error&&<p className="alert error">{error}</p>}{filteredOrders.length?<><div className="table-wrap"><table><thead><tr>{['Order','Settlement ID','Amazon status','Transaction date','Product charges','Promotions','Referral','Fulfillment','Amazon fees','Other','Net payout','Money released?','Released / deposit time','Payout status','Reconciliation',''].map(label=><th key={label}>{label}</th>)}</tr></thead><tbody>{visibleOrders.map(order=>{const flag=flagByOrder.get(order.amazon_order_id);const detail=details[order.amazon_order_id];return <React.Fragment key={order.amazon_order_id}><tr><td>{order.amazon_order_id}</td><td>{order.settlement_id??'—'}</td><td>{order.status??'—'}</td><td>{String(order.transaction_date??order.order_date??'').slice(0,10)}</td><td>{Number(order.gross_item_price)?formatCurrency(order.gross_item_price):'Items pending'}</td><td>{order.hasFeeData?formatCurrency(order.promotion):'—'}</td><td>{order.hasFeeData?formatCurrency(order.referral_commission):'—'}</td><td>{order.hasFeeData?formatCurrency(order.fulfillment_fee):'—'}</td><td>{order.hasFeeData?formatCurrency(order.total_deductions):'—'}</td><td>{order.hasFeeData?formatCurrency(order.other_amount):'—'}</td><td><b>{order.hasFeeData?formatCurrency(order.net_payout):'—'}</b></td><td><span className={`pill ${order.payment_received?'status-completed':'status-idle'}`}>{order.payment_received?'Yes':'No'}</span></td><td>{payoutTime(order)}</td><td>{order.payout_status??'Awaiting payment data'}</td><td>{statusBadge(order,flag)}</td><td><Button variant="ghost" onClick={()=>toggle(order.amazon_order_id)}>{openId===order.amazon_order_id?'Hide':'Details'}</Button></td></tr>{openId===order.amazon_order_id&&<tr className="order-detail-row"><td colSpan="16">{detail?<div className="order-detail-grid"><div><h4>Items</h4>{detail.items.length?detail.items.map((item,index)=><p key={index}><b>{item.title}</b><br/>{item.sku} · {formatNumber(item.quantity_ordered)} × {formatCurrency(item.item_price)}{item.package_weight?` · ${item.package_weight} ${item.weight_unit??''}`:''}</p>):<p className="muted">Order items have not been returned by Amazon yet. Run Orders & finance sync again after the order is confirmed.</p>}</div><OrderMoneyDetails order={order} detail={detail} /></div>:<Empty text="Loading order details…" />}</td></tr>}</React.Fragment>})}</tbody></table></div>{orderTotalPages>1&&<div className="pager"><Button variant="ghost" disabled={safeOrderPage===0} onClick={()=>setOrderPage(page=>Math.max(0,page-1))}>← Previous</Button><span>Page {safeOrderPage+1} of {orderTotalPages} · {formatNumber(filteredOrders.length)} orders</span><Button variant="ghost" disabled={safeOrderPage>=orderTotalPages-1} onClick={()=>setOrderPage(page=>Math.min(orderTotalPages-1,page+1))}>Next →</Button></div>}</>:<Empty text="No synced orders in this period."/>}</Card>;
   const ledgerColumns=['posted_date','transaction_status','account_type','transaction_type','order_id','product_details','product_charges','promotional_rebates','amazon_fees','other','total'];
   const ledgerRows=filteredTransactions.map(row=>({...row,posted_date:String(row.posted_date??'').slice(0,10),product_charges:formatCurrency(row.product_charges),promotional_rebates:formatCurrency(row.promotional_rebates),amazon_fees:formatCurrency(row.amazon_fees),other:formatCurrency(row.other),total:formatCurrency(row.total)}));
   return <>{reconciliationTable}<Card className="transaction-ledger-intro"><div><span className="live-source">MATCHES SELLER CENTRAL TRANSACTION VIEW</span><h2>All Amazon transactions</h2><p>This includes Order Payments, refunds, Easy Ship charges, service fees, tax withheld, and standalone transactions—not only orders that have a payout.</p></div><div className="transaction-ledger-actions"><strong>{formatNumber(filteredTransactions.length)} of {formatNumber(transactions.length)} transactions</strong><Button variant="secondary" disabled={!ledgerRows.length} onClick={()=>downloadCsv('amazon-transactions.csv',ledgerRows,ledgerColumns)}>Download filtered CSV</Button></div></Card><Card className="transaction-filters"><div><label>Account type<select className="input" value={ledgerFilters.account} onChange={event=>setLedgerFilters(value=>({...value,account:event.target.value}))}><option value="">All account types</option>{uniqueValues('account_type').map(value=><option key={value}>{value}</option>)}</select></label><label>Transaction type<select className="input" value={ledgerFilters.type} onChange={event=>setLedgerFilters(value=>({...value,type:event.target.value}))}><option value="">All transaction types</option>{uniqueValues('transaction_type').map(value=><option key={value}>{value}</option>)}</select></label><label>Transaction status<select className="input" value={ledgerFilters.status} onChange={event=>setLedgerFilters(value=>({...value,status:event.target.value}))}><option value="">All statuses</option>{uniqueValues('transaction_status').map(value=><option key={value}>{value}</option>)}</select></label><label>Order ID<Input value={ledgerFilters.orderId} onChange={event=>setLedgerFilters(value=>({...value,orderId:event.target.value}))} placeholder="Enter order ID…"/></label></div><Button variant="ghost" onClick={()=>setLedgerFilters({account:'',type:'',status:'',orderId:''})}>Clear filters</Button></Card><TableCard title="Complete Amazon transaction ledger" rows={ledgerRows} columns={ledgerColumns} pageSize={10}/></>;
@@ -537,19 +534,19 @@ function DashboardOverview({ data, channelData, tenantId }) {
   const summary = useMemo(() => buildDashboardSummary(data, range), [data, range]);
   return <>
     <div className="metrics-strip">
-      <DrillMetric to={`/seller?tenantId=${tenantId}&view=metric-detail&metric=netSales`} title="Net Sales" value={formatCurrency(summary.netSales)} hint="Click to see order-value formula" />
-      <DrillMetric to={`/seller?tenantId=${tenantId}&view=metric-detail&metric=netQty`} title="Net Qty" value={summary.netQty==null?'Unavailable':formatNumber(summary.netQty)} hint="Click to see units source" />
-      <DrillMetric to={`/seller?tenantId=${tenantId}&view=metric-detail&metric=orders`} title="Orders Synced" value={formatNumber(summary.ordersCount)} hint="Distinct eligible Amazon order IDs" />
-      <DrillMetric to={`/seller?tenantId=${tenantId}&view=metric-detail&metric=returns`} title="Returns" value={summary.returnQty==null?'Unavailable':formatNumber(summary.returnQty)} hint="Zero requires complete Returns-report coverage" />
+      <DrillMetric to={`/seller?tenantId=${tenantId}&view=metric-detail&metric=netSales`} title="Net Sales" value={currencyOrUnavailable(summary.netSales)} hint="Click to see source coverage and formula" />
+      <DrillMetric to={`/seller?tenantId=${tenantId}&view=metric-detail&metric=netQty`} title="Net Qty" value={numberOrUnavailable(summary.netQty)} hint="Click to see units source" />
+      <DrillMetric to={`/seller?tenantId=${tenantId}&view=metric-detail&metric=orders`} title="Orders Synced" value={numberOrUnavailable(summary.ordersCount)} hint="Requires a completely paginated Orders range" />
+      <DrillMetric to={`/seller?tenantId=${tenantId}&view=metric-detail&metric=returns`} title="Returns" value={numberOrUnavailable(summary.returnQty)} hint="Zero requires complete Returns-report coverage" />
     </div>
 
     <Card className="profit-control-card">
-      <PanelHeader title="Profit Analysis" subtitle="Clean overview" />
+      <PanelHeader title="Amazon Financial Overview" subtitle="Reconciled SP-API activity" />
       <div className="profit-kpi-grid">
-        <DrillMetric to={`/seller?tenantId=${tenantId}&view=metric-detail&metric=settled`} title="Settled Amount" value={formatCurrency(summary.settledAmount)} hint="From settlements / finance" />
-        <DrillMetric to={`/seller?tenantId=${tenantId}&view=metric-detail&metric=deductions`} title="Deductions" value={formatCurrency(summary.deductions)} hint="Fees, refunds, charges" />
-        <DrillMetric to={`/seller?tenantId=${tenantId}&view=metric-detail&metric=reimbursements`} title="Reimbursements" value={formatCurrency(summary.reimbursements)} hint="Credits imported" />
-        <DrillMetric to={`/seller?tenantId=${tenantId}&view=metric-detail&metric=drr`} title="DRR" value={formatCurrency(summary.drr)} hint="Daily run rate" />
+        <DrillMetric to={`/seller?tenantId=${tenantId}&view=metric-detail&metric=settled`} title="Settled Amount" value={currencyOrUnavailable(summary.settledAmount)} hint="Complete settlement statements only" />
+        <DrillMetric to={`/seller?tenantId=${tenantId}&view=metric-detail&metric=deductions`} title="Deductions" value={currencyOrUnavailable(summary.deductions)} hint="Fees, refunds, charges" />
+        <DrillMetric to={`/seller?tenantId=${tenantId}&view=metric-detail&metric=reimbursements`} title="Reimbursements" value={currencyOrUnavailable(summary.reimbursements)} hint="Credits imported" />
+        <DrillMetric to={`/seller?tenantId=${tenantId}&view=metric-detail&metric=drr`} title="DRR" value={currencyOrUnavailable(summary.drr)} hint="Daily run rate" />
       </div>
     </Card>
 
@@ -558,7 +555,7 @@ function DashboardOverview({ data, channelData, tenantId }) {
     <Card className="profit-control-card">
       <PanelHeader title="Amazon Account Activity" subtitle="Matches Amazon statement sections" />
       <div className="profit-kpi-grid account-activity-grid">
-        {['income','expenses','tax','transfers','gst'].map(metric=><DrillMetric key={metric} to={`/seller?tenantId=${tenantId}&view=metric-detail&metric=${metric}`} title={metric==='gst'?'Goods and Services Tax':metric[0].toUpperCase()+metric.slice(1)} value={formatCurrency(data?.dashboardCalculations?.statement?.[metric]?.value)} hint="Open Amazon source rows and formula" />)}
+        {['income','expenses','tax','transfers','gst'].map(metric=><DrillMetric key={metric} to={`/seller?tenantId=${tenantId}&view=metric-detail&metric=${metric}`} title={metric==='gst'?'Goods and Services Tax':metric[0].toUpperCase()+metric.slice(1)} value={currencyOrUnavailable(data?.dashboardCalculations?.statement?.[metric]?.value)} hint="Open Amazon source rows and formula" />)}
       </div>
     </Card>
 
@@ -576,7 +573,7 @@ function DrillMetric({ to, title, value, hint }) { return <NavLink to={to} class
 function ExplanationGrid({ summary, tenantId }) {
   const cards = [
     ['Fee impact', summary.feeImpact==null?'Unavailable':`${Number(summary.feeImpact).toLocaleString('en-IN',{maximumFractionDigits:2})}%`, 'Net Amazon fees excluding TCS/TDS as a percentage of gross product sales.', 'feeImpact'],
-    ['Return rate', summary.returnRate==null?'Unavailable / source mismatch':`${Number(summary.returnRate).toLocaleString('en-IN',{maximumFractionDigits:2})}%`, 'Physically returned units divided by shipped units.', 'returnRate'],
+    ['Return rate', summary.returnRate==null?'Unavailable / source mismatch':`${Number(summary.returnRate).toLocaleString('en-IN',{maximumFractionDigits:2})}%`, 'Amazon units refunded divided by units ordered; the FBA fallback uses received returns divided by shipped order-item units.', 'returnRate'],
     ['Refund value rate', summary.refundValueRate==null?'Unavailable':`${Number(summary.refundValueRate).toLocaleString('en-IN',{maximumFractionDigits:2})}%`, 'Product refund value divided by gross product sales; separate from unit return rate.', 'refundValueRate'],
     ['GST invoice value', summary.gstValue==null?'Unavailable':formatCurrency(summary.gstValue), 'Sales-invoice taxable value minus credit-note/refund taxable value.', 'gstValue']
   ];
@@ -587,6 +584,9 @@ function InsightCards({ title, cards }) { return <Card><PanelHeader title={title
 function getReportRows(data, reportType) {
   const detail = REPORT_DETAIL_MAP[reportType];
   const rows = data?.[detail.source] ?? [];
+  if (reportType === 'GET_SALES_AND_TRAFFIC_REPORT') {
+    return rows.filter(row => row.source === 'Sales & Traffic report');
+  }
   if (reportType === 'GET_GST_MTR_B2B_CUSTOM') return rows.filter(row => String(row.invoice_type ?? '').toUpperCase().includes('B2B'));
   if (reportType === 'GET_GST_MTR_B2C_CUSTOM') return rows.filter(row => String(row.invoice_type ?? '').toUpperCase().includes('B2C'));
   return rows;
@@ -644,30 +644,7 @@ function ReportDetail({ data, reportType }) {
   </>;
 }
 
-function componentAmount(data, categories) {
-  const summary = data?.financialSummary ?? {};
-  return categories.reduce((sum, category) => sum + Number(summary[category] ?? 0), 0);
-}
-function hasFinancialComponents(data) { return (data?.financialComponents ?? []).length > 0; }
 function amazonBusinessReportRows(data) { return data?.businessReportRows ?? []; }
-function amazonNetSales(data) {
-  const businessSales = amazonBusinessReportRows(data).reduce((sum, row) => sum + Number(row.ordered_product_sales ?? 0), 0);
-  if (businessSales) return businessSales;
-  const productSales = (data?.products ?? []).reduce((sum, product) => sum + Number(product.sales ?? 0), 0);
-  if (productSales) return productSales;
-  const itemSales = (data?.orderItems ?? []).reduce((sum, item) => sum + Number(item.item_price ?? 0) - Number(item.promotion_discount ?? 0), 0);
-  return itemSales || Number(data?.orders?.order_value ?? 0);
-}
-function amazonDeductions(data) {
-  if (hasFinancialComponents(data)) return Math.abs(componentAmount(data, ['commission', 'fba_fee', 'other_fee', 'tax', 'shipping_tax', 'gift_wrap_tax']));
-  return Math.abs(Number(data?.kpis?.deductions ?? 0));
-}
-function formulaTreeRows(rows) { return rows.map(([label, amount, sign, source]) => ({ component: label, sign, amount, source })); }
-function FormulaTree({ rows, total }) {
-  return <div className="calculation-tree"><div className="tree-total"><span>Total</span><strong>{formatCurrency(total)}</strong></div>{rows.map(row => <div className="tree-row" key={row.component}><span>{row.sign}</span><b>{row.component}</b><strong>{formatCurrency(row.amount)}</strong><small>{row.source}</small></div>)}</div>;
-}
-
-function moneyRows(rows, mapper) { return rows.map((row, index) => ({ line: index + 1, ...mapper(row) })); }
 function sumRows(rows, key) { return rows.reduce((sum, row) => sum + Number(row[key] ?? 0), 0); }
 function MetricDetail({ metric, tenantId }) {
   const { range } = useContext(DateRangeContext);
@@ -693,54 +670,21 @@ function MetricDetail({ metric, tenantId }) {
     <TableCard title="Actual database rows used" rows={details.rows} columns={details.columns} pageSize={10} />
   </>;
 }
-function buildDashboardSummary(data, range = defaultDateRange()) {
+function buildDashboardSummary(data) {
   const calculated=data?.dashboardCalculations?.metrics;
-  const products = data?.products ?? [];
-  const returns = data?.returns ?? [];
   const payments = data?.payments ?? [];
-  const reimbursements = data?.reimbursements ?? [];
   const invoices = data?.invoices ?? [];
-  const orderItems = data?.orderItems ?? [];
-  const ordersCount = Number(calculated?.orders?.value??data?.orders?.orders??0);
-  const netSales = Number(calculated?.netSales?.value??amazonNetSales(data));
-  const netQty = calculated?.netQty ? calculated.netQty.value : (products.reduce((sum, product) => sum + Number(product.units ?? 0), 0) || orderItems.reduce((sum, item) => sum + Number(item.quantity_ordered ?? 0), 0));
-  // Preserve the calculator's null. Converting it through Number/nullish
-  // fallback incorrectly displayed "0 returns" when report coverage was
-  // actually unknown.
-  const returnQty = calculated?.returns ? calculated.returns.value : returns.length;
-  const settledAmount = Number(calculated?.settled?.value??(payments.reduce((sum, payment) => sum + Number(payment.net_amount ?? 0), 0) || Number(data?.kpis?.net_settled??0)));
-  const deductions = Number(calculated?.deductions?.value??amazonDeductions(data));
-  const reimbursementAmount = Number(calculated?.reimbursements?.value??reimbursements.reduce((sum, row) => sum + Number(row.amount ?? 0), 0));
-  const estimatedProfit = settledAmount || Math.max(0, netSales - deductions + reimbursementAmount);
-  const profitRate = netSales ? Math.round((estimatedProfit / netSales) * 100) : 0;
-  const selectedDays = Math.max(1, Math.round((startOfDay(range.end) - startOfDay(range.start)) / 864e5) + 1);
-  const drr = Number(calculated?.drr?.value??netSales/selectedDays);
-  const netAsp = netQty ? netSales / netQty : 0;
-  const baseRow = {
-    view: 'Amazon-India',
-    net_qty: netQty == null ? 'Unavailable' : formatNumber(netQty),
-    return_qty: returnQty == null ? 'Unavailable' : formatNumber(returnQty),
-    net_asp: netQty == null ? 'Unavailable' : formatCurrency(netAsp),
-    net_sales: formatCurrency(netSales),
-    ad_spend: formatCurrency(0),
-    profit: formatCurrency(estimatedProfit),
-    settled_amount: formatCurrency(settledAmount),
-    profit_percent: `${profitRate}%`,
-    drr: formatCurrency(drr)
-  };
-  const totalRow = { ...baseRow, view: 'Total' };
-  const returnBuckets = returns.reduce((acc, row) => {
-    const status = row.status ?? 'yet_to_receive';
-    acc[status] = (acc[status] ?? 0) + 1;
-    return acc;
-  }, {});
-  const returnSummary = {
-    channel: 'Amazon-India',
-    yet_to_receive: formatNumber(returnBuckets.yet_to_receive ?? 0),
-    received_not_in_hand: formatNumber(returnBuckets.received_not_in_hand ?? 0),
-    received: formatNumber(returnBuckets.received ?? 0),
-    total: returnQty == null ? 'Unavailable' : formatNumber(returnQty)
-  };
+  // Never turn missing coverage into zero or fall back to a different report
+  // grain. The server calculator is the sole source for dashboard KPI values.
+  const ordersCount = calculated?.orders?.value ?? null;
+  const netSales = calculated?.netSales?.value ?? null;
+  const netQty = calculated?.netQty?.value ?? null;
+  const returnQty = calculated?.returns?.value ?? null;
+  const settledAmount = calculated?.settled?.value ?? null;
+  const deductions = calculated?.deductions?.value ?? null;
+  const reimbursementAmount = calculated?.reimbursements?.value ?? null;
+  const drr = calculated?.drr?.value ?? null;
+  const gstValue = calculated?.gstValue?.value ?? null;
   return {
     netSales,
     netQty,
@@ -748,29 +692,25 @@ function buildDashboardSummary(data, range = defaultDateRange()) {
     settledAmount,
     deductions,
     reimbursements: reimbursementAmount,
-    estimatedProfit,
-    profitRate,
     drr,
     ordersCount,
     feeImpact:calculated?.feeImpact?.value??null,returnRate:calculated?.returnRate?.value??null,refundValueRate:calculated?.refundValueRate?.value??null,
-    gstValue: calculated?.gstValue ? calculated.gstValue.value : null,
-    profitRows: [baseRow, totalRow],
-    returnRows: [returnSummary, { ...returnSummary, channel: 'Total' }],
+    gstValue,
     reconcileRows: [
-      { area: 'Orders', count: formatNumber(ordersCount), amount: formatCurrency(netSales), status: ordersCount ? 'Synced' : 'Waiting' },
-      { area: 'Payouts', count: formatNumber(payments.length), amount: formatCurrency(settledAmount), status: payments.length ? 'Matched' : 'Needs sync' },
-      { area: 'GST invoices', count: formatNumber(invoices.length), amount: formatCurrency(invoices.reduce((sum, row) => sum + Number(row.taxable_value ?? 0), 0)), status: invoices.length ? 'Imported' : 'No GST rows' },
+      { area: 'Orders', count: numberOrUnavailable(ordersCount), amount: currencyOrUnavailable(netSales), status: ordersCount == null ? 'Coverage missing' : 'Synced' },
+      { area: 'Payouts', count: settledAmount == null ? 'Unavailable' : formatNumber(payments.length), amount: currencyOrUnavailable(settledAmount), status: settledAmount == null ? 'Coverage missing' : 'Reconciled' },
+      { area: 'GST invoices', count: gstValue == null ? 'Unavailable' : formatNumber(invoices.length), amount: currencyOrUnavailable(gstValue), status: gstValue == null ? 'Coverage missing' : 'Imported' },
       {
         area: 'Returns',
         count: returnQty == null ? 'Unavailable' : formatNumber(returnQty),
-        amount: formatCurrency(0),
+        amount: 'Not applicable',
         status: returnQty == null ? 'Coverage missing' : returnQty ? 'Action needed' : 'Clean'
       }
     ]
   };
 }
 function readableTrend(data) {
-  return (data?.trend ?? []).map(row => ({ ...row, label: new Date(row.date).toLocaleDateString('en-IN', { day: '2-digit', month: 'short' }) }));
+  return (data?.trend ?? []).map(row => ({ ...row, label: new Date(row.date).toLocaleDateString('en-IN', { day: '2-digit', month: 'short', timeZone: 'UTC' }) }));
 }
 
 function readableBusinessReportRows(data) {
@@ -816,7 +756,7 @@ function SalesAnalytics({ data, channelData }) {
   const trend = readableTrend(data);
   return <>
     <div className="dashboard-grid">
-      <Card className="panel"><PanelHeader title="Amazon Value Distribution" />{channelData.length ? <><ResponsiveContainer width="100%" height={220}><PieChart><Pie data={channelData} innerRadius={62} outerRadius={92} dataKey="value">{channelData.map((_, i) => <Cell key={i} fill={COLORS[i % COLORS.length]} />)}</Pie><Tooltip formatter={value => formatCurrency(value)} /></PieChart></ResponsiveContainer><Legend items={channelData} /></> : <Empty text="No synced sales or settlement totals yet." />}</Card>
+      <Card className="panel"><PanelHeader title="Reconciled Amount Comparison" />{channelData.length ? <ResponsiveContainer width="100%" height={220}><BarChart data={channelData}><CartesianGrid strokeDasharray="3 3" vertical={false} /><XAxis dataKey="name" /><YAxis tickFormatter={value => `₹${Number(value) / 1000}k`} /><Tooltip formatter={value => formatCurrency(value)} /><Bar dataKey="value" name="Amount" fill="#5b9bd5" /></BarChart></ResponsiveContainer> : <Empty text="Complete source coverage is required before amount comparisons are shown." />}</Card>
       <Card className="panel wide"><PanelHeader title={`Simple Sales Trend (${range.label})`} subtitle="date wise net sales" />{trend.length ? <ResponsiveContainer width="100%" height={280}><LineChart data={trend} margin={{ top: 12, right: 20, bottom: 8, left: 0 }}><CartesianGrid strokeDasharray="3 3" vertical={false} /><XAxis dataKey="label" tick={{ fontSize: 12 }} /><YAxis tickFormatter={value => `₹${Number(value) / 1000}k`} /><Tooltip labelFormatter={label => `Date: ${label}`} formatter={value => [formatCurrency(value), 'Net sales']} /><Line type="monotone" dataKey="sales" name="Net sales" stroke="#159a82" strokeWidth={3} dot={{ r: 4 }} activeDot={{ r: 7 }} /></LineChart></ResponsiveContainer> : <Empty text="No imported sales trend yet. Use the Sync above to pull SP-API reports." />}</Card>
     </div>
     <BusinessReportDetailTable data={data} />
@@ -826,65 +766,118 @@ function SalesAnalytics({ data, channelData }) {
 
 
 
-function getQuarterMonths() {
-  const now = new Date();
-  const quarterStart = Math.floor(now.getMonth() / 3) * 3;
-  return [0, 1, 2].map(offset => new Date(now.getFullYear(), quarterStart + offset, 1).toLocaleDateString('en-IN', { month: 'long' }));
+function sumAvailable(rows, key) {
+  const values = rows
+    .map(row => row[key])
+    .filter(value => value !== null && value !== undefined && value !== '')
+    .map(Number)
+    .filter(Number.isFinite);
+  return values.length ? values.reduce((sum, value) => sum + value, 0) : null;
 }
+function availableNumber(value) { return value == null ? 'Unavailable' : formatNumber(value); }
+function availableCurrency(value) { return value == null ? 'Unavailable' : formatCurrency(value); }
 function buildReportAnalysis(data) {
   const summary = buildDashboardSummary(data);
-  const trend = readableTrend(data);
   const products = data?.products ?? [];
-  const returns = data?.returns ?? [];
-  const months = getQuarterMonths();
-  const fallbackSales = summary.netSales / 3;
-  const monthly = months.map((month, i) => {
-    const trendRow = trend[i];
-    const sales = Number(trendRow?.sales ?? fallbackSales * (0.85 + i * 0.15));
-    const units = Math.round((summary.netQty / 3) * (0.8 + i * 0.2));
-    const sessions = Math.round((products.reduce((sum, p) => sum + Number(p.sessions ?? p.page_views ?? 0), 0) || summary.ordersCount * 18 || units * 60) / 3 * (0.85 + i * 0.18));
-    const pageViews = Math.round(sessions * 1.45);
-    const refunded = Math.round((returns.length / 3) * (0.7 + i * 0.3));
-    return { month: trendRow?.label ?? month, sales, units, pageViews, sessions, refunded };
-  });
-  const productRows = (products.length ? products : (data?.orderItems ?? []).map(item => ({ asin: item.title || item.asin, sessions: 0, units: item.quantity_ordered, sales: item.item_price, buy_box: false })))
-    .map(row => ({ product: row.title ?? row.product ?? row.asin ?? row.sku ?? 'Product', sessions: Number(row.sessions ?? row.page_views ?? 0), units: Number(row.units ?? row.quantity_ordered ?? 0), sales: Number(row.sales ?? row.item_price ?? 0), buy_box: row.buy_box }))
-    .sort((a, b) => b.sales - a.sales)
-    .slice(0, 8);
-  const totalSessions = monthly.reduce((sum, row) => sum + row.sessions, 0);
-  const totalPageViews = monthly.reduce((sum, row) => sum + row.pageViews, 0);
-  const totalRefunded = monthly.reduce((sum, row) => sum + row.refunded, 0) || returns.length;
-  return { summary, monthly, productRows, totalSessions, totalPageViews, totalRefunded };
+  const dailySource = (data?.businessReportRows ?? []).length
+    ? data.businessReportRows.map(row => ({
+        date: row.date,
+        sales: row.ordered_product_sales,
+        units: row.units_ordered,
+        sessions: row.sessions,
+        pageViews: row.page_views,
+        refunded: row.units_refunded
+      }))
+    : (data?.trend ?? []).map(row => ({
+        date: row.date,
+        sales: row.sales,
+        units: row.units,
+        sessions: row.sessions,
+        pageViews: row.page_views,
+        refunded: row.units_refunded
+      }));
+  const grouped = new Map();
+  for (const row of dailySource) {
+    const date = new Date(row.date);
+    if (Number.isNaN(date.getTime())) continue;
+    const key = `${date.getUTCFullYear()}-${String(date.getUTCMonth() + 1).padStart(2, '0')}`;
+    const month = date.toLocaleDateString('en-IN', { month: 'short', year: 'numeric', timeZone: 'UTC' });
+    const current = grouped.get(key) ?? { key, month, rows: [] };
+    current.rows.push(row);
+    grouped.set(key, current);
+  }
+  const monthly = [...grouped.values()]
+    .sort((left, right) => left.key.localeCompare(right.key))
+    .map(group => ({
+      month: group.month,
+      sales: sumAvailable(group.rows, 'sales'),
+      units: sumAvailable(group.rows, 'units'),
+      sessions: sumAvailable(group.rows, 'sessions'),
+      pageViews: sumAvailable(group.rows, 'pageViews'),
+      refunded: sumAvailable(group.rows, 'refunded')
+    }));
+  const allProductRows = products
+    .map(row => ({
+      product: row.title ?? row.product ?? row.asin ?? row.sku ?? 'Product',
+      sessions: row.sessions == null ? null : Number(row.sessions),
+      pageViews: row.page_views == null ? null : Number(row.page_views),
+      units: row.units == null ? null : Number(row.units),
+      sales: row.sales == null ? null : Number(row.sales),
+      buy_box: row.buy_box,
+      source: row.source
+    }))
+    .sort((a, b) => Number(b.sales ?? 0) - Number(a.sales ?? 0));
+  const productRows = allProductRows.slice(0, 8);
+  const totalSessions = sumAvailable(monthly, 'sessions');
+  const totalPageViews = sumAvailable(monthly, 'pageViews');
+  const totalRefunded = sumAvailable(monthly, 'refunded');
+  return { summary, monthly, productRows, allProductRows, totalSessions, totalPageViews, totalRefunded };
 }
 function ReportTable({ title, columns, rows }) {
   return <div className="excel-block"><div className="excel-title">{title}</div><table className="excel-table"><thead><tr>{columns.map(column => <th key={column.key}>{column.label}</th>)}</tr></thead><tbody>{rows.map((row, i) => <tr key={i}>{columns.map(column => <td key={column.key}>{column.format ? column.format(row[column.key], row) : row[column.key]}</td>)}</tr>)}</tbody></table></div>;
 }
 function BusinessPerformanceReport({ data }) {
   const { summary, monthly, totalSessions, totalPageViews, totalRefunded } = buildReportAnalysis(data);
-  const totals = monthly.reduce((acc, row) => ({ sales: acc.sales + row.sales, units: acc.units + row.units, pageViews: acc.pageViews + row.pageViews, sessions: acc.sessions + row.sessions, refunded: acc.refunded + row.refunded }), { sales: 0, units: 0, pageViews: 0, sessions: 0, refunded: 0 });
+  const totals = {
+    sales: sumAvailable(monthly, 'sales'),
+    units: sumAvailable(monthly, 'units'),
+    pageViews: totalPageViews,
+    sessions: totalSessions,
+    refunded: totalRefunded
+  };
   const rows = [
     { metric: 'Ordered Product Sales (₹)', ...Object.fromEntries(monthly.map(m => [m.month, m.sales])), total: totals.sales },
     { metric: 'Units Ordered', ...Object.fromEntries(monthly.map(m => [m.month, m.units])), total: totals.units },
-    { metric: 'Average Selling Price (₹)', ...Object.fromEntries(monthly.map(m => [m.month, m.units ? m.sales / m.units : 0])), total: totals.units ? totals.sales / totals.units : 0 },
+    { metric: 'Average Selling Price (₹)', ...Object.fromEntries(monthly.map(m => [m.month, m.units ? m.sales / m.units : null])), total: totals.units ? totals.sales / totals.units : null },
     { metric: 'Page Views', ...Object.fromEntries(monthly.map(m => [m.month, m.pageViews])), total: totalPageViews },
     { metric: 'Sessions', ...Object.fromEntries(monthly.map(m => [m.month, m.sessions])), total: totalSessions },
     { metric: 'Units Refunded', ...Object.fromEntries(monthly.map(m => [m.month, m.refunded])), total: totalRefunded },
-    { metric: 'Refund Rate', ...Object.fromEntries(monthly.map(m => [m.month, m.units ? m.refunded / m.units : 0])), total: totals.units ? totalRefunded / totals.units : 0 }
+    { metric: 'Refund Rate', ...Object.fromEntries(monthly.map(m => [m.month, m.units && m.refunded != null ? m.refunded / m.units : null])), total: totals.units && totalRefunded != null ? totalRefunded / totals.units : null }
   ];
-  const columns = [{ key: 'metric', label: 'Metric' }, ...monthly.map(m => ({ key: m.month, label: m.month, format: (value, row) => row.metric.includes('₹') || row.metric.includes('Price') ? formatCurrency(value) : row.metric.includes('Rate') ? `${Math.round(value * 100)}%` : formatNumber(value) })), { key: 'total', label: 'Quarter Total / Avg', format: (value, row) => row.metric.includes('₹') || row.metric.includes('Price') ? formatCurrency(value) : row.metric.includes('Rate') ? `${Math.round(value * 100)}%` : formatNumber(value) }];
-  return <div className="excel-report"><div className="excel-report-title">Business Performance Report</div><div className="excel-kpi-grid"><StatCard title="Total Ordered Sales" value={formatCurrency(summary.netSales || totals.sales)} /><StatCard title="Total Units Ordered" value={formatNumber(summary.netQty || totals.units)} /><StatCard title="Total Page Views" value={formatNumber(totalPageViews)} /><StatCard title="Total Sessions" value={formatNumber(totalSessions)} /><StatCard title="Average Selling Price" value={formatCurrency((summary.netQty || totals.units) ? (summary.netSales || totals.sales) / (summary.netQty || totals.units) : 0)} /><StatCard title="Total Units Refunded" value={formatNumber(totalRefunded)} /></div><ReportTable title="Quarter Metrics" columns={columns} rows={rows} /><div className="excel-chart-grid"><ReportChart type="line" title="Monthly Ordered Product Sales" data={monthly} dataKey="sales" /><ReportChart type="bar" title="Page Views vs Sessions" data={monthly} keys={[['pageViews', 'Page Views'], ['sessions', 'Sessions']]} /><ReportChart type="bar" title="Units Ordered vs Units Refunded" data={monthly} keys={[['units', 'Units Ordered'], ['refunded', 'Units Refunded']]} /></div></div>;
+  const cell = (value, row) => value == null
+    ? 'Unavailable'
+    : row.metric.includes('₹') || row.metric.includes('Price')
+      ? formatCurrency(value)
+      : row.metric.includes('Rate')
+        ? `${Math.round(value * 10000) / 100}%`
+        : formatNumber(value);
+  const columns = [{ key: 'metric', label: 'Metric' }, ...monthly.map(m => ({ key: m.month, label: m.month, format: cell })), { key: 'total', label: 'Selected range total / avg', format: cell }];
+  return <div className="excel-report"><div className="excel-report-title">Business Performance Report</div><div className="excel-kpi-grid"><StatCard title="Total Ordered Sales" value={availableCurrency(totals.sales)} /><StatCard title="Total Units Ordered" value={availableNumber(totals.units)} /><StatCard title="Total Page Views" value={availableNumber(totalPageViews)} /><StatCard title="Total Sessions" value={availableNumber(totalSessions)} /><StatCard title="Average Selling Price" value={availableCurrency(totals.units ? totals.sales / totals.units : null)} /><StatCard title="Total Units Refunded" value={availableNumber(totalRefunded)} /></div><ReportTable title="Amazon source metrics" columns={columns} rows={rows} />{monthly.length ? <div className="excel-chart-grid"><ReportChart type="line" title="Monthly Ordered Product Sales" data={monthly} dataKey="sales" /><ReportChart type="bar" title="Page Views vs Sessions" data={monthly} keys={[['pageViews', 'Page Views'], ['sessions', 'Sessions']]} /><ReportChart type="bar" title="Units Ordered vs Units Refunded" data={monthly} keys={[['units', 'Units Ordered'], ['refunded', 'Units Refunded']]} /></div> : <Empty text="No Amazon Sales & Traffic rows are available for this range." />}</div>;
 }
 function ProductPerformanceReport({ data }) {
-  const { summary, productRows, totalSessions, totalPageViews, totalRefunded } = buildReportAnalysis(data);
+  const { productRows, allProductRows, totalSessions, totalPageViews, totalRefunded } = buildReportAnalysis(data);
   const best = productRows[0];
-  return <div className="excel-report"><div className="excel-report-title">Product Performance Analysis Report</div><ReportTable title="Metric Summary" columns={[{ key: 'metric', label: 'Metric' }, { key: 'value', label: 'Value' }]} rows={[{ metric: 'Total Products with Sales', value: formatNumber(productRows.length) }, { metric: 'Total Sessions', value: formatNumber(totalSessions) }, { metric: 'Total Page Views', value: formatNumber(totalPageViews) }, { metric: 'Total Units Ordered', value: formatNumber(summary.netQty) }, { metric: 'Total Product Sales (₹)', value: formatCurrency(summary.netSales) }, { metric: 'Average Unit Session %', value: totalSessions ? `${Math.round((summary.netQty / totalSessions) * 1000) / 10}%` : '0%' }, { metric: 'Overall Refund Rate', value: summary.netQty ? `${Math.round((totalRefunded / summary.netQty) * 100)}%` : '0%' }, { metric: 'Highest Selling Product', value: best?.product ?? '—' }]} /><ReportTable title="Top Performing Products" columns={[{ key: 'product', label: 'Product' }, { key: 'sessions', label: 'Sessions', format: formatNumber }, { key: 'units', label: 'Units Sold', format: formatNumber }, { key: 'sales', label: 'Sales (₹)', format: formatCurrency }]} rows={productRows} /><div className="excel-summary"><div><b>{best?.product ?? 'Top product'}</b> emerged as the highest revenue-generating product, contributing {formatCurrency(best?.sales ?? 0)} in sales.</div><div>High-session products show the strongest discovery opportunities. Prioritize listings where traffic is high but unit conversion is lower.</div><div>Products with low refunds and steady sales indicate healthy customer satisfaction and stable catalog performance.</div><div>Overall, the catalog demonstrates a mix of high-traffic and high-conversion products supporting business growth.</div></div></div>;
+  const totalUnits = sumAvailable(allProductRows, 'units');
+  const totalSales = sumAvailable(allProductRows, 'sales');
+  const conversion = totalSessions && totalUnits != null ? totalUnits / totalSessions * 100 : null;
+  const refundRate = totalUnits && totalRefunded != null ? totalRefunded / totalUnits * 100 : null;
+  return <div className="excel-report"><div className="excel-report-title">Product Performance Analysis Report</div><ReportTable title="Metric Summary" columns={[{ key: 'metric', label: 'Metric' }, { key: 'value', label: 'Value' }]} rows={[{ metric: 'Total Products with Sales', value: formatNumber(allProductRows.length) }, { metric: 'Total Sessions', value: availableNumber(totalSessions) }, { metric: 'Total Page Views', value: availableNumber(totalPageViews) }, { metric: 'Total Units Ordered', value: availableNumber(totalUnits) }, { metric: 'Total Product Sales (₹)', value: availableCurrency(totalSales) }, { metric: 'Average Unit Session %', value: conversion == null ? 'Unavailable' : `${conversion.toLocaleString('en-IN',{maximumFractionDigits:2})}%` }, { metric: 'Overall Refund Rate', value: refundRate == null ? 'Unavailable' : `${refundRate.toLocaleString('en-IN',{maximumFractionDigits:2})}%` }, { metric: 'Highest Selling Product', value: best?.product ?? 'Unavailable' }]} /><ReportTable title="Top Performing Products" columns={[{ key: 'product', label: 'Product' }, { key: 'sessions', label: 'Sessions', format: availableNumber }, { key: 'units', label: 'Units Sold', format: availableNumber }, { key: 'sales', label: 'Sales (₹)', format: availableCurrency }, { key: 'source', label: 'Source' }]} rows={productRows} /><div className="excel-summary"><div>{best ? <><b>{best.product}</b> has the highest imported revenue in this range at {formatCurrency(best.sales)}.</> : 'No product rows are available for this range.'}</div><div>{totalSessions == null ? 'Session and conversion analysis is unavailable until an ASIN-level Sales & Traffic report covers this range.' : `Imported traffic totals ${formatNumber(totalSessions)} sessions; conversion is calculated only from those Amazon rows.`}</div><div>{totalRefunded == null ? 'Refund-rate analysis is unavailable for this source range.' : `Amazon reported ${formatNumber(totalRefunded)} refunded units for the selected period.`}</div></div></div>;
 }
 function ReportChart({ title, data, type, dataKey, keys }) {
   return <Card className="excel-chart"><PanelHeader title={title} subtitle="analysed graph" /><ResponsiveContainer width="100%" height={230}>{type === 'line' ? <LineChart data={data}><CartesianGrid strokeDasharray="3 3" vertical={false} /><XAxis dataKey="month" /><YAxis tickFormatter={v => `₹${Number(v) / 1000}k`} /><Tooltip formatter={value => formatCurrency(value)} /><Line type="monotone" dataKey={dataKey} stroke="#2f80ed" strokeWidth={3} label={{ formatter: value => formatCurrency(value), fontSize: 10 }} /></LineChart> : <BarChart data={data}><CartesianGrid strokeDasharray="3 3" vertical={false} /><XAxis dataKey="month" /><YAxis /><Tooltip formatter={(value, name) => [formatNumber(value), name]} />{keys.map(([key, name], i) => <Bar key={key} dataKey={key} name={name} fill={i ? '#f07f2f' : '#5b9bd5'} label={{ position: 'top', fontSize: 10 }} />)}</BarChart>}</ResponsiveContainer></Card>;
 }
 
 function PanelHeader({ title, subtitle }) { const { range } = useContext(DateRangeContext); return <div className="panel-header"><h2>{title}</h2><span>{subtitle ?? range.label}</span></div>; }
-function Legend({ items }) { return <div className="legend-list">{items.map((item, i) => <div key={item.name}><span style={{ background: COLORS[i % COLORS.length] }} />{item.name}<b>{formatCurrency(item.value)}</b></div>)}</div>; }
 function TableCard({ title, rows = [], columns, pageSize = 6 }) {
   const [page, setPage] = useState(0);
   const totalPages = Math.max(1, Math.ceil(rows.length / pageSize));

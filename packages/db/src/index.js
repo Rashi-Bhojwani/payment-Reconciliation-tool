@@ -1,11 +1,19 @@
 import pg from 'pg';
 
 const { Pool } = pg;
-const databaseUrl = "postgresql://reconciliation:Rashib123@reconciliation-db.cvi6iwyo0o2r.ap-south-1.rds.amazonaws.com:5432/postgres";
+const databaseUrl = process.env.DATABASE_URL;
 export const databaseUrlConfigured = Boolean(databaseUrl && databaseUrl !== 'HEHE');
+const databaseSslCa = process.env.DATABASE_SSL_CA && process.env.DATABASE_SSL_CA !== 'HEHE'
+  ? process.env.DATABASE_SSL_CA.replaceAll('\\n', '\n')
+  : undefined;
 export const pool = new Pool({
   connectionString: databaseUrlConfigured ? databaseUrl : undefined,
-  ssl: databaseUrlConfigured ? { rejectUnauthorized: false } : false
+  ssl: databaseUrlConfigured && process.env.DATABASE_SSL !== 'false'
+    ? {
+        rejectUnauthorized: process.env.DATABASE_SSL_REJECT_UNAUTHORIZED !== 'false',
+        ...(databaseSslCa ? { ca: databaseSslCa } : {})
+      }
+    : false
 });
 
 /**

@@ -10,3 +10,4 @@ coverage
 *.tsbuildinfo
 /storage/*
 /api/storage
+/apps/api/storage/raw-reports/

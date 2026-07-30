@@ -4,7 +4,7 @@ import { calculateDashboardMetrics, inclusiveDays } from './dashboard-calculatio
 const range={start:'2026-06-27T00:00:00Z',end:'2026-07-27T00:00:00Z'};
 const line=(id,description,amount,parent='Order',extra={})=>({settlement_id:'statement',source_row_id:id,amount_description:description,amount,parent_transaction_type:parent,posted_date:'2026-07-10T00:00:00Z',...extra});
 function mindcircusFixture(){return{
-  orders:[{amazon_order_id:'shipped',status:'Shipped',raw:{history:'was Unshipped and Pending'}},{amazon_order_id:'cancelled',status:'Cancelled'},{amazon_order_id:'replacement',status:'Replacement'}],
+  orders:[{amazon_order_id:'shipped',status:'Shipped',fulfillment_channel:'AFN',raw:{history:'was Unshipped and Pending'}},{amazon_order_id:'cancelled',status:'Cancelled',fulfillment_channel:'AFN'},{amazon_order_id:'replacement',status:'Replacement',fulfillment_channel:'AFN'}],
   orderItems:[{source_row_id:'db1',amazon_order_id:'shipped',sku:'same',asin:'a',quantity_ordered:2,raw:{orderItemId:'item-1'}},{source_row_id:'db2',amazon_order_id:'shipped',sku:'same',asin:'a',quantity_ordered:3,raw:{orderItemId:'item-2'}}],
   returns:[{source_row_id:'ret1',order_id:'shipped',sku:'same',return_date:'2026-07-12',quantity:2,raw:{eventId:'event-1'}}],
   settlementRows:[
@@ -14,6 +14,7 @@ function mindcircusFixture(){return{
     line('gst-collected','Product Tax GST collected',38146.06),line('gst-refund','Product Tax GST refund',-10194.50,'Refund')
   ],
   financeItems:[line('partial','Principal',999,'Order')],
+  coverage:{settlementsComplete:true,returnsComplete:true,ordersComplete:true,financeComplete:true,gstB2bComplete:false,gstB2cComplete:false},
   settlementHeaders:[{settlement_id:'transfer',deposit_date:'2026-07-20T00:00:00Z',total_amount:131801.69},{settlement_id:'failed',deposit_date:'2026-07-21T00:00:00Z',total_amount:500,transaction_type:'Failed transfer'}],
   reimbursements:[{sku:'duplicate-fallback',amount:999,reimbursement_date:'2026-07-10'}]
 };}
@@ -31,9 +32,10 @@ test('negative Principal is a refund through parent transaction metadata',()=>{c
 test('missing return quantity makes quantity KPIs unavailable instead of guessing one',()=>{const input=mindcircusFixture();input.returns[0].quantity=null;const r=calculateDashboardMetrics(input,range);assert.equal(r.metrics.returns.value,null);assert.equal(r.metrics.netQty.value,null);assert.equal(r.metrics.returnRate.value,null);assert.match(r.metrics.returnRate.status,/source mismatch/);});
 test('positive returns with unavailable shipped source never report zero percent',()=>{const input=mindcircusFixture();input.orderItems=[];const r=calculateDashboardMetrics(input,range);assert.equal(r.metrics.returnRate.value,null);assert.match(r.metrics.returnRate.status,/source mismatch/);});
 test('removes duplicate reports and finance summary rows, and uses one reimbursement source',()=>{const input=mindcircusFixture();input.settlementRows.push({...input.settlementRows[0],source_row_id:'duplicate-db-id'});input.financeItems.push({transaction_id:'x',category:'summary_amazon_fees',amount:-999,posted_date:'2026-07-10'});const r=calculateDashboardMetrics(input,range);assert.equal(r.metrics.netSales.value,154522.8);assert.equal(r.metrics.reimbursements.value,196.72);assert.ok(r.diagnostics.duplicateRows>0);});
-test('GST invoice value uses genuine documents, credit notes, mixed rates and stable document keys',()=>{const input=mindcircusFixture();input.gstInvoices=[{source_row_id:'1',taxable_value:100,raw:{'document-number':'INV1','line-item-id':'1','document-type':'Invoice','gst-rate':18}},{source_row_id:'dup',taxable_value:100,raw:{'document-number':'INV1','line-item-id':'1','document-type':'Invoice','gst-rate':18}},{source_row_id:'2',taxable_value:40,raw:{'document-number':'CN1','line-item-id':'1','document-type':'Credit Note','gst-rate':5}},{source_row_id:'synthetic',taxable_value:999,raw:{}}];assert.equal(calculateDashboardMetrics(input,range).metrics.gstValue.value,60);});
+test('GST invoice value uses genuine documents, credit notes, mixed rates and stable document keys',()=>{const input=mindcircusFixture();input.coverage.gstB2bComplete=true;input.coverage.gstB2cComplete=true;input.gstInvoices=[{source_row_id:'1',taxable_value:100,raw:{'document-number':'INV1','line-item-id':'1','document-type':'Invoice','gst-rate':18}},{source_row_id:'dup',taxable_value:100,raw:{'document-number':'INV1','line-item-id':'1','document-type':'Invoice','gst-rate':18}},{source_row_id:'2',taxable_value:40,raw:{'document-number':'CN1','line-item-id':'1','document-type':'Credit Note','gst-rate':5}},{source_row_id:'synthetic',taxable_value:999,raw:{}}];assert.equal(calculateDashboardMetrics(input,range).metrics.gstValue.value,60);});
 test('GST invoice value is unavailable without genuine imported invoices',()=>{const r=calculateDashboardMetrics({...mindcircusFixture(),gstInvoices:[{taxable_value:381909.1,raw:{}}]},range);assert.equal(r.metrics.gstValue.value,null);assert.equal(r.metrics.gstValue.status,'Unavailable');});
 test('derives half-open range days and excludes failed/out-of-range deposits',()=>{const input=mindcircusFixture();input.settlementHeaders.push({settlement_id:'outside',deposit_date:'2026-07-27T00:00:00Z',total_amount:1000});const r=calculateDashboardMetrics(input,range);assert.equal(inclusiveDays(range.start,range.end),30);assert.equal(r.metrics.settled.value,131801.69);});
+test('preserves negative settlement totals as bank debits',()=>{const input=mindcircusFixture();input.settlementHeaders.push({settlement_id:'debit',deposit_date:'2026-07-22T00:00:00Z',total_amount:-100});const r=calculateDashboardMetrics(input,range);assert.equal(r.metrics.settled.value,131701.69);assert.equal(r.statement.transfers.value,-131701.69);});
 
 function wellsureFixture(returnsComplete = false) {
   const postedDate = '2026-07-21T12:00:00Z';
@@ -90,10 +92,10 @@ function wellsureFixture(returnsComplete = false) {
   };
 
   return {
-    orders: [{ amazon_order_id: 'order-1', status: 'Shipped', order_date: postedDate }],
+    orders: [{ amazon_order_id: 'order-1', status: 'Shipped', fulfillment_channel: 'AFN', order_date: postedDate }],
     orderItems: [],
     returns: [],
-    coverage: { returnsComplete },
+    coverage: { returnsComplete, ordersComplete: true, financeComplete: true, gstB2bComplete: false, gstB2cComplete: false },
     financeItems: [
       financeLine('sale', 'Principal', 567.60, 'item_price'),
       financeLine('sale', 'Marketplace operating cost', -263.50),
@@ -191,4 +193,76 @@ test('keeps fallback rows from legacy transactions alongside parsed breakdown se
   const result = calculateDashboardMetrics(input, selectedRange);
   assert.equal(result.metrics.reimbursements.value, 10);
   assert.equal(result.statement.income.value, 435.70);
+});
+
+test('excludes deferred Finances transactions until Amazon releases them', () => {
+  const input = wellsureFixture(false);
+  input.financeItems.push({
+    transaction_id: 'deferred',
+    transaction_status: 'DEFERRED',
+    order_id: 'order-1',
+    amount_description: 'Principal',
+    category: 'item_price',
+    amount: 999,
+    posted_date: '2026-07-23T12:00:00Z'
+  });
+  input.financeTransactions.push({
+    transaction_id: 'deferred',
+    transaction_status: 'DEFERRED',
+    transaction_type: 'Shipment',
+    posted_date: '2026-07-23T12:00:00Z',
+    raw: {
+      transactionId: 'deferred',
+      transactionStatus: 'DEFERRED',
+      transactionType: 'Shipment',
+      description: 'Order Payment',
+      postedDate: '2026-07-23T12:00:00Z',
+      breakdowns: [{ breakdownType: 'Sales', breakdownAmount: { currencyAmount: 999, currencyCode: 'INR' } }]
+    }
+  });
+  assert.equal(calculateDashboardMetrics(input, {
+    start: '2026-07-20T18:30:00.000Z',
+    end: '2026-07-29T18:30:00.000Z'
+  }).metrics.netSales.value, 425.70);
+});
+
+test('uses completed Sales and Traffic quantities instead of mixing FBA returns with FBM orders', () => {
+  const input = wellsureFixture(false);
+  input.orders.push({
+    amazon_order_id: 'fbm-order',
+    status: 'Shipped',
+    fulfillment_channel: 'MFN',
+    order_date: '2026-07-21T12:00:00Z'
+  });
+  input.salesTrafficDaily = [{
+    date: '2026-07-21',
+    units_ordered: 10,
+    units_refunded: 2
+  }];
+  input.coverage.salesTrafficComplete = true;
+  const result = calculateDashboardMetrics(input, {
+    start: '2026-07-20T18:30:00.000Z',
+    end: '2026-07-29T18:30:00.000Z'
+  });
+  assert.equal(result.metrics.netQty.value, 8);
+  assert.equal(result.metrics.returns.value, 2);
+  assert.equal(result.metrics.returnRate.value, 20);
+  assert.match(result.metrics.netQty.source, /SALES_AND_TRAFFIC/);
+});
+
+test('does not publish plausible totals from an incompletely paginated direct sync', () => {
+  const input = wellsureFixture(true);
+  input.coverage.ordersComplete = false;
+  input.coverage.financeComplete = false;
+  input.coverage.settlementsComplete = false;
+  const result = calculateDashboardMetrics(input, {
+    start: '2026-07-20T18:30:00.000Z',
+    end: '2026-07-29T18:30:00.000Z'
+  });
+  assert.equal(result.metrics.orders.value, null);
+  assert.equal(result.metrics.netSales.value, null);
+  assert.equal(result.metrics.deductions.value, null);
+  assert.equal(result.metrics.drr.value, null);
+  assert.equal(result.statement.income.value, null);
+  assert.match(result.metrics.netSales.status, /complete/);
 });
