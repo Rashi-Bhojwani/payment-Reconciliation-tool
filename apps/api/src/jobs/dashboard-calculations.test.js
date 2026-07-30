@@ -28,9 +28,167 @@ test('matches the MINDCIRCUS Amazon Account Activity fixture without constants',
 });
 test('uses current status only and preserves identical-SKU lines with stable item IDs',()=>{const r=calculateDashboardMetrics(mindcircusFixture(),range);assert.equal(r.metrics.netQty.value,3);assert.equal(r.metrics.orders.value,1);assert.equal(r.metrics.returnRate.value,40);});
 test('negative Principal is a refund through parent transaction metadata',()=>{const input=mindcircusFixture();const refund=input.settlementRows.find(x=>x.source_row_id==='sf-refund');delete refund.transaction_type;assert.equal(calculateDashboardMetrics(input,range).metrics.netSales.value,154522.8);});
-test('missing return quantity makes quantity KPIs unavailable instead of guessing one',()=>{const input=mindcircusFixture();input.returns[0].quantity=null;const r=calculateDashboardMetrics(input,range);assert.equal(r.metrics.returns.value,null);assert.equal(r.metrics.netQty.value,null);assert.equal(r.metrics.returnRate.value,null);assert.equal(r.metrics.returnRate.status,'Unavailable / source mismatch');});
+test('missing return quantity makes quantity KPIs unavailable instead of guessing one',()=>{const input=mindcircusFixture();input.returns[0].quantity=null;const r=calculateDashboardMetrics(input,range);assert.equal(r.metrics.returns.value,null);assert.equal(r.metrics.netQty.value,null);assert.equal(r.metrics.returnRate.value,null);assert.match(r.metrics.returnRate.status,/source mismatch/);});
 test('positive returns with unavailable shipped source never report zero percent',()=>{const input=mindcircusFixture();input.orderItems=[];const r=calculateDashboardMetrics(input,range);assert.equal(r.metrics.returnRate.value,null);assert.match(r.metrics.returnRate.status,/source mismatch/);});
 test('removes duplicate reports and finance summary rows, and uses one reimbursement source',()=>{const input=mindcircusFixture();input.settlementRows.push({...input.settlementRows[0],source_row_id:'duplicate-db-id'});input.financeItems.push({transaction_id:'x',category:'summary_amazon_fees',amount:-999,posted_date:'2026-07-10'});const r=calculateDashboardMetrics(input,range);assert.equal(r.metrics.netSales.value,154522.8);assert.equal(r.metrics.reimbursements.value,196.72);assert.ok(r.diagnostics.duplicateRows>0);});
 test('GST invoice value uses genuine documents, credit notes, mixed rates and stable document keys',()=>{const input=mindcircusFixture();input.gstInvoices=[{source_row_id:'1',taxable_value:100,raw:{'document-number':'INV1','line-item-id':'1','document-type':'Invoice','gst-rate':18}},{source_row_id:'dup',taxable_value:100,raw:{'document-number':'INV1','line-item-id':'1','document-type':'Invoice','gst-rate':18}},{source_row_id:'2',taxable_value:40,raw:{'document-number':'CN1','line-item-id':'1','document-type':'Credit Note','gst-rate':5}},{source_row_id:'synthetic',taxable_value:999,raw:{}}];assert.equal(calculateDashboardMetrics(input,range).metrics.gstValue.value,60);});
 test('GST invoice value is unavailable without genuine imported invoices',()=>{const r=calculateDashboardMetrics({...mindcircusFixture(),gstInvoices:[{taxable_value:381909.1,raw:{}}]},range);assert.equal(r.metrics.gstValue.value,null);assert.equal(r.metrics.gstValue.status,'Unavailable');});
 test('derives half-open range days and excludes failed/out-of-range deposits',()=>{const input=mindcircusFixture();input.settlementHeaders.push({settlement_id:'outside',deposit_date:'2026-07-27T00:00:00Z',total_amount:1000});const r=calculateDashboardMetrics(input,range);assert.equal(inclusiveDays(range.start,range.end),30);assert.equal(r.metrics.settled.value,131801.69);});
+
+function wellsureFixture(returnsComplete = false) {
+  const postedDate = '2026-07-21T12:00:00Z';
+  const financeLine = (transactionId, description, value, category = 'other', parent = 'Order Payment') => ({
+    transaction_id: transactionId,
+    order_id: 'order-1',
+    amount_description: description,
+    amount: value,
+    category,
+    parent_transaction_type: parent,
+    posted_date: postedDate
+  });
+  const currency = currencyAmount => ({ currencyAmount, currencyCode: 'INR' });
+  const breakdown = (breakdownType, value, breakdowns = []) => ({
+    breakdownType,
+    breakdownAmount: currency(value),
+    breakdowns
+  });
+  const sale = {
+    transactionId: 'sale',
+    transactionType: 'Shipment',
+    description: 'Order Payment',
+    postedDate,
+    relatedIdentifiers: [{ relatedIdentifierName: 'ORDER_ID', relatedIdentifierValue: 'order-1' }],
+    sellingPartnerMetadata: { accountType: 'Standard Orders' },
+    breakdowns: [
+      breakdown('Sales', 567.60, [
+        breakdown('Product Charges', 567.60, [breakdown('Principal', 567.60)])
+      ]),
+      breakdown('Expenses', -266.45, [
+        breakdown('Marketplace operating cost', -263.50),
+        breakdown('TCS/TDS withholding', -2.95)
+      ]),
+      breakdown('Goods and Services Tax', 28.40)
+    ]
+  };
+  const refund = {
+    transactionId: 'refund',
+    transactionType: 'Refund',
+    description: 'Refund Order',
+    postedDate: '2026-07-22T12:00:00Z',
+    relatedIdentifiers: [{ relatedIdentifierName: 'ORDER_ID', relatedIdentifierValue: 'order-1' }],
+    sellingPartnerMetadata: { accountType: 'Standard Orders' },
+    breakdowns: [
+      breakdown('Refunds', -82.92, [
+        breakdown('Product Charges', -141.90, [breakdown('Principal', -141.90)]),
+        breakdown('Expenses', 66.08, [
+          breakdown('Marketplace operating cost refund', 65.26),
+          breakdown('TCS/TDS withholding refund', 0.82)
+        ]),
+        breakdown('Goods and Services Tax', -7.10)
+      ])
+    ]
+  };
+
+  return {
+    orders: [{ amazon_order_id: 'order-1', status: 'Shipped', order_date: postedDate }],
+    orderItems: [],
+    returns: [],
+    coverage: { returnsComplete },
+    financeItems: [
+      financeLine('sale', 'Principal', 567.60, 'item_price'),
+      financeLine('sale', 'Marketplace operating cost', -263.50),
+      financeLine('sale', 'TCS/TDS withholding', -2.95),
+      financeLine('sale', 'Product Tax', 28.40, 'tax'),
+      financeLine('refund', 'Principal', -141.90, 'item_price', 'Refund Order'),
+      financeLine('refund', 'Marketplace operating cost refund', 65.26, 'other', 'Refund Order'),
+      financeLine('refund', 'TCS/TDS withholding refund', 0.82, 'other', 'Refund Order'),
+      financeLine('refund', 'Product Tax GST refund', -7.10, 'tax', 'Refund Order')
+    ],
+    financeTransactions: [
+      { transaction_id: 'sale', transaction_type: 'Shipment', posted_date: postedDate, raw: sale },
+      { transaction_id: 'refund', transaction_type: 'Refund', posted_date: refund.postedDate, raw: refund }
+    ],
+    settlementRows: [],
+    settlementHeaders: [{
+      settlement_id: 'transfer',
+      deposit_date: '2026-07-29T12:00:00Z',
+      total_amount: 246.63
+    }],
+    reimbursements: [],
+    gstInvoices: [],
+    marketplaceTimeZone: 'Asia/Kolkata'
+  };
+}
+
+test('matches the WELLSURE reconciliation values from Finances breakdown sections', () => {
+  const selectedRange = {
+    start: '2026-07-20T18:30:00.000Z',
+    end: '2026-07-29T18:30:00.000Z'
+  };
+  const result = calculateDashboardMetrics(wellsureFixture(false), selectedRange);
+
+  assert.equal(result.metrics.netSales.value, 425.70);
+  assert.equal(result.metrics.netQty.value, null);
+  assert.equal(result.metrics.orders.value, 1);
+  assert.equal(result.metrics.returns.value, null);
+  assert.equal(result.metrics.settled.value, 246.63);
+  assert.equal(result.metrics.deductions.value, 200.37);
+  assert.equal(result.metrics.reimbursements.value, 0);
+  assert.equal(result.metrics.drr.value, 47.30);
+  assert.equal(Number(result.metrics.feeImpact.value.toFixed(2)), 34.93);
+  assert.equal(result.metrics.returnRate.value, null);
+  assert.equal(Number(result.metrics.refundValueRate.value.toFixed(2)), 25);
+  assert.equal(result.metrics.gstValue.value, null);
+  assert.equal(result.statement.income.value, 425.70);
+  assert.equal(result.statement.expenses.value, -200.37);
+  assert.equal(result.statement.tax.value, 0);
+  assert.equal(result.statement.transfers.value, -246.63);
+  assert.equal(result.statement.gst.value, 21.30);
+  assert.equal(result.reconciliation.value, 0);
+  assert.equal(result.reconciliation.balanced, true);
+  assert.equal(result.diagnostics.categoryTotals.tcsTds, 2.13);
+  assert.equal(result.diagnostics.categoryTotals.operationalFees, 198.24);
+});
+
+test('reports zero returns only when the selected range has completed Returns-report coverage', () => {
+  const selectedRange = {
+    start: '2026-07-20T18:30:00.000Z',
+    end: '2026-07-29T18:30:00.000Z'
+  };
+  const withoutCoverage = calculateDashboardMetrics(wellsureFixture(false), selectedRange);
+  const withCoverage = calculateDashboardMetrics(wellsureFixture(true), selectedRange);
+  assert.equal(withoutCoverage.metrics.returns.value, null);
+  assert.equal(withCoverage.metrics.returns.value, 0);
+  assert.equal(withCoverage.metrics.returnRate.value, null);
+});
+
+test('keeps fallback rows from legacy transactions alongside parsed breakdown sections', () => {
+  const selectedRange = {
+    start: '2026-07-20T18:30:00.000Z',
+    end: '2026-07-29T18:30:00.000Z'
+  };
+  const input = wellsureFixture(false);
+  input.financeItems.push({
+    transaction_id: 'legacy-reimbursement',
+    amount_description: 'SAFE-T Reimbursement',
+    category: 'reimbursement',
+    amount: 10,
+    posted_date: '2026-07-23T12:00:00Z'
+  });
+  input.financeTransactions.push({
+    transaction_id: 'legacy-reimbursement',
+    transaction_type: 'Reimbursement',
+    posted_date: '2026-07-23T12:00:00Z',
+    raw: {
+      transactionId: 'legacy-reimbursement',
+      transactionType: 'Reimbursement',
+      description: 'SAFE-T Reimbursement',
+      postedDate: '2026-07-23T12:00:00Z',
+      totalAmount: { currencyAmount: 10, currencyCode: 'INR' }
+    }
+  });
+
+  const result = calculateDashboardMetrics(input, selectedRange);
+  assert.equal(result.metrics.reimbursements.value, 10);
+  assert.equal(result.statement.income.value, 435.70);
+});

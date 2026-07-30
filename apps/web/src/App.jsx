@@ -540,7 +540,7 @@ function DashboardOverview({ data, channelData, tenantId }) {
       <DrillMetric to={`/seller?tenantId=${tenantId}&view=metric-detail&metric=netSales`} title="Net Sales" value={formatCurrency(summary.netSales)} hint="Click to see order-value formula" />
       <DrillMetric to={`/seller?tenantId=${tenantId}&view=metric-detail&metric=netQty`} title="Net Qty" value={summary.netQty==null?'Unavailable':formatNumber(summary.netQty)} hint="Click to see units source" />
       <DrillMetric to={`/seller?tenantId=${tenantId}&view=metric-detail&metric=orders`} title="Orders Synced" value={formatNumber(summary.ordersCount)} hint="Distinct eligible Amazon order IDs" />
-      <DrillMetric to={`/seller?tenantId=${tenantId}&view=metric-detail&metric=returns`} title="Returns" value={formatNumber(summary.returnQty)} hint="Total returned quantity" />
+      <DrillMetric to={`/seller?tenantId=${tenantId}&view=metric-detail&metric=returns`} title="Returns" value={summary.returnQty==null?'Unavailable':formatNumber(summary.returnQty)} hint="Zero requires complete Returns-report coverage" />
     </div>
 
     <Card className="profit-control-card">
@@ -704,7 +704,10 @@ function buildDashboardSummary(data, range = defaultDateRange()) {
   const ordersCount = Number(calculated?.orders?.value??data?.orders?.orders??0);
   const netSales = Number(calculated?.netSales?.value??amazonNetSales(data));
   const netQty = calculated?.netQty ? calculated.netQty.value : (products.reduce((sum, product) => sum + Number(product.units ?? 0), 0) || orderItems.reduce((sum, item) => sum + Number(item.quantity_ordered ?? 0), 0));
-  const returnQty = Number(calculated?.returns?.value??returns.length);
+  // Preserve the calculator's null. Converting it through Number/nullish
+  // fallback incorrectly displayed "0 returns" when report coverage was
+  // actually unknown.
+  const returnQty = calculated?.returns ? calculated.returns.value : returns.length;
   const settledAmount = Number(calculated?.settled?.value??(payments.reduce((sum, payment) => sum + Number(payment.net_amount ?? 0), 0) || Number(data?.kpis?.net_settled??0)));
   const deductions = Number(calculated?.deductions?.value??amazonDeductions(data));
   const reimbursementAmount = Number(calculated?.reimbursements?.value??reimbursements.reduce((sum, row) => sum + Number(row.amount ?? 0), 0));
@@ -715,9 +718,9 @@ function buildDashboardSummary(data, range = defaultDateRange()) {
   const netAsp = netQty ? netSales / netQty : 0;
   const baseRow = {
     view: 'Amazon-India',
-    net_qty: formatNumber(netQty),
-    return_qty: formatNumber(returnQty),
-    net_asp: formatCurrency(netAsp),
+    net_qty: netQty == null ? 'Unavailable' : formatNumber(netQty),
+    return_qty: returnQty == null ? 'Unavailable' : formatNumber(returnQty),
+    net_asp: netQty == null ? 'Unavailable' : formatCurrency(netAsp),
     net_sales: formatCurrency(netSales),
     ad_spend: formatCurrency(0),
     profit: formatCurrency(estimatedProfit),
@@ -736,7 +739,7 @@ function buildDashboardSummary(data, range = defaultDateRange()) {
     yet_to_receive: formatNumber(returnBuckets.yet_to_receive ?? 0),
     received_not_in_hand: formatNumber(returnBuckets.received_not_in_hand ?? 0),
     received: formatNumber(returnBuckets.received ?? 0),
-    total: formatNumber(returnQty)
+    total: returnQty == null ? 'Unavailable' : formatNumber(returnQty)
   };
   return {
     netSales,
@@ -757,7 +760,12 @@ function buildDashboardSummary(data, range = defaultDateRange()) {
       { area: 'Orders', count: formatNumber(ordersCount), amount: formatCurrency(netSales), status: ordersCount ? 'Synced' : 'Waiting' },
       { area: 'Payouts', count: formatNumber(payments.length), amount: formatCurrency(settledAmount), status: payments.length ? 'Matched' : 'Needs sync' },
       { area: 'GST invoices', count: formatNumber(invoices.length), amount: formatCurrency(invoices.reduce((sum, row) => sum + Number(row.taxable_value ?? 0), 0)), status: invoices.length ? 'Imported' : 'No GST rows' },
-      { area: 'Returns', count: formatNumber(returnQty), amount: formatCurrency(0), status: returnQty ? 'Action needed' : 'Clean' }
+      {
+        area: 'Returns',
+        count: returnQty == null ? 'Unavailable' : formatNumber(returnQty),
+        amount: formatCurrency(0),
+        status: returnQty == null ? 'Coverage missing' : returnQty ? 'Action needed' : 'Clean'
+      }
     ]
   };
 }

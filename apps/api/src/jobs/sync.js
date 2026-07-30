@@ -244,7 +244,11 @@ export async function syncReportForTenant(params) {
   // The SP-API client already retries throttled HTTP calls, so execute each
   // user-triggered report job only once.
   return runJob(`sync:${parsed.reportType}:${parsed.tenantId}`, async () => {
-    const sync = await pool.query('insert into sync_jobs(tenant_id, report_type, status, started_at) values($1,$2,$3,now()) returning id', [parsed.tenantId, parsed.reportType, 'running']);
+    const sync = await pool.query(
+      `insert into sync_jobs(tenant_id, report_type, status, started_at, data_start_time, data_end_time)
+       values($1,$2,$3,now(),$4,$5) returning id`,
+      [parsed.tenantId, parsed.reportType, 'running', range.start, range.end]
+    );
     try {
       const seller = await pool.query("select refresh_token_encrypted, marketplace_id from sellers where tenant_id = $1 and auth_status = 'authorized' order by connected_at desc limit 1", [parsed.tenantId]);
       if (!seller.rowCount) throw new Error('No connected Amazon seller account');
@@ -252,7 +256,21 @@ export async function syncReportForTenant(params) {
       const report = await client.fetchReport(parsed.reportType, parsed.tenantId, range, seller.rows[0].marketplace_id);
       const s3Key = await putRawReport({ tenantId: parsed.tenantId, reportType: parsed.reportType, reportId: report.reportId, content: report.content });
       const rowsImported = await saveStructuredRows(parsed.tenantId, parsed.reportType, report.content, range);
-      await pool.query('update sync_jobs set status=$1, completed_at=now(), s3_key=$2 where id=$3', ['completed', s3Key, sync.rows[0].id]);
+      await pool.query(
+        `update sync_jobs
+         set status=$1, completed_at=now(), s3_key=$2, data_start_time=$4, data_end_time=$5,
+             rows_imported=$6, coverage_complete=$7
+         where id=$3`,
+        [
+          'completed',
+          s3Key,
+          sync.rows[0].id,
+          report.dataStartTime ?? range.start,
+          report.dataEndTime ?? range.end,
+          rowsImported,
+          report.coverageComplete === true
+        ]
+      );
       return { rowsImported, s3Key };
     } catch (error) {
       await pool.query('update sync_jobs set status=$1, completed_at=now(), error_message=$2 where id=$3', ['failed', error instanceof Error ? error.message : 'unknown error', sync.rows[0].id]);

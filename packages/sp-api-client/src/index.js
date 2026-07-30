@@ -4,9 +4,9 @@ import { z } from 'zod';
 export const SP_API_BASE_URL = 'https://sellingpartnerapi-eu.amazon.com';
 export const INDIA_MARKETPLACE_ID = 'A21TJRUUN4KGV';
 export const MARKETPLACES = Object.freeze({
-  A21TJRUUN4KGV: { country: 'India', region: 'IN', endpoint: 'https://sellingpartnerapi-eu.amazon.com', sellerCentralHost: 'sellercentral.amazon.in' },
-  ATVPDKIKX0DER: { country: 'United States', region: 'NA', endpoint: 'https://sellingpartnerapi-na.amazon.com', sellerCentralHost: 'sellercentral.amazon.com' },
-  A1F83G8C2ARO7P: { country: 'United Kingdom', region: 'EU', endpoint: 'https://sellingpartnerapi-eu.amazon.com', sellerCentralHost: 'sellercentral.amazon.co.uk' }
+  A21TJRUUN4KGV: { country: 'India', region: 'IN', timeZone: 'Asia/Kolkata', endpoint: 'https://sellingpartnerapi-eu.amazon.com', sellerCentralHost: 'sellercentral.amazon.in' },
+  ATVPDKIKX0DER: { country: 'United States', region: 'NA', timeZone: 'America/Los_Angeles', endpoint: 'https://sellingpartnerapi-na.amazon.com', sellerCentralHost: 'sellercentral.amazon.com' },
+  A1F83G8C2ARO7P: { country: 'United Kingdom', region: 'EU', timeZone: 'Europe/London', endpoint: 'https://sellingpartnerapi-eu.amazon.com', sellerCentralHost: 'sellercentral.amazon.co.uk' }
 });
 export function getSpApiEndpoint(marketplaceId = INDIA_MARKETPLACE_ID) { return MARKETPLACES[marketplaceId]?.endpoint ?? SP_API_BASE_URL; }
 export const REPORT_TYPES = Object.freeze([
@@ -155,7 +155,18 @@ export class SpApiClient {
       const documents = [];
       for (const report of matchingReports) documents.push(await this.downloadReportDocument(report.reportDocumentId));
       const content = documents.map((document, index) => index === 0 ? document.content : document.content.split(/\r?\n/).slice(1).join('\n')).join('\n');
-      return { reportId: matchingReports[0].reportId, reportDocumentId: matchingReports[0].reportDocumentId, content, compressionAlgorithm: 'MERGED_SETTLEMENT_REPORTS', reportsMerged: matchingReports.length };
+      const coverageStart = Math.min(...matchingReports.map(report => new Date(report.dataStartTime ?? parsedRange.start).getTime()));
+      const coverageEnd = Math.max(...matchingReports.map(report => new Date(report.dataEndTime ?? parsedRange.end).getTime()));
+      return {
+        reportId: matchingReports[0].reportId,
+        reportDocumentId: matchingReports[0].reportDocumentId,
+        content,
+        compressionAlgorithm: 'MERGED_SETTLEMENT_REPORTS',
+        reportsMerged: matchingReports.length,
+        dataStartTime: new Date(coverageStart).toISOString(),
+        dataEndTime: new Date(coverageEnd).toISOString(),
+        coverageComplete: coverageStart <= requestedStart && coverageEnd >= requestedEnd
+      };
     }
     const reportOptions = parsedReportType === 'GET_SALES_AND_TRAFFIC_REPORT'
       ? { dateGranularity: 'DAY', asinGranularity: 'CHILD' }
@@ -167,11 +178,13 @@ export class SpApiClient {
       dataEndTime: parsedRange.end,
       ...(reportOptions ? { reportOptions } : {})
     };
+    let rangeApplied = true;
     let create = await this.request('/reports/2021-06-30/reports', {
       method: 'POST',
       body: JSON.stringify(createReportBody)
     });
     if (!create.ok && create.status === 400) {
+      rangeApplied = false;
       create = await this.request('/reports/2021-06-30/reports', {
         method: 'POST',
         body: JSON.stringify({ reportType: parsedReportType, marketplaceIds: [marketplaceId] })
@@ -181,12 +194,21 @@ export class SpApiClient {
     const { reportId } = z.object({ reportId: z.string().min(1) }).parse(await create.json());
 
     let reportDocumentId = '';
+    let reportedDataStartTime;
+    let reportedDataEndTime;
     for (let attempt = 0; attempt < REPORT_POLL_ATTEMPTS; attempt += 1) {
       const poll = await this.request(`/reports/2021-06-30/reports/${reportId}`);
       if (!poll.ok) throw new Error(`Poll report failed: ${poll.status}`);
-      const body = z.object({ processingStatus: z.string(), reportDocumentId: z.string().optional() }).parse(await poll.json());
+      const body = z.object({
+        processingStatus: z.string(),
+        reportDocumentId: z.string().optional(),
+        dataStartTime: z.string().optional(),
+        dataEndTime: z.string().optional()
+      }).parse(await poll.json());
       if (body.processingStatus === 'DONE' && body.reportDocumentId) {
         reportDocumentId = body.reportDocumentId;
+        reportedDataStartTime = body.dataStartTime;
+        reportedDataEndTime = body.dataEndTime;
         break;
       }
       if (['CANCELLED', 'FATAL'].includes(body.processingStatus)) throw new Error(`Report ${reportId} ${body.processingStatus}`);
@@ -196,7 +218,20 @@ export class SpApiClient {
 
     const documentToken = GST_REPORTS.has(parsedReportType) ? await this.restrictedDataToken(reportDocumentId) : undefined;
     const downloaded = await this.downloadReportDocument(reportDocumentId, documentToken);
-    return { reportId, reportDocumentId, ...downloaded };
+    const dataStartTime = reportedDataStartTime ?? parsedRange.start;
+    const dataEndTime = reportedDataEndTime ?? parsedRange.end;
+    const hasAuthoritativeCoverage = rangeApplied || Boolean(reportedDataStartTime && reportedDataEndTime);
+    const coverageComplete = hasAuthoritativeCoverage
+      && new Date(dataStartTime).getTime() <= new Date(parsedRange.start).getTime()
+      && new Date(dataEndTime).getTime() >= new Date(parsedRange.end).getTime();
+    return {
+      reportId,
+      reportDocumentId,
+      ...downloaded,
+      dataStartTime,
+      dataEndTime,
+      coverageComplete
+    };
   }
 
   async downloadReportDocument(reportDocumentId, token) {
