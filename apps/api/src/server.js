@@ -474,11 +474,25 @@ app.get('/api/tenants/:tenantId/amazon/access-token', async request => {
 app.get('/api/admin/tenants', async request => {
   await requireAdmin(request);
   const result = await pool.query(`select t.id, t.company_name, t.owner_email, t.login_email, t.status, t.plan, t.created_at, t.approved_at,
-      s.seller_name, s.amazon_seller_id, s.marketplace_id, s.auth_status, s.connected_at as amazon_connected_at, s.last_token_refresh_at, exists(select 1 from sellers s2 where s2.tenant_id = t.id) as amazon_connected,
+      s.seller_name, s.amazon_seller_id, s.marketplace_id, s.auth_status, s.connected_at as amazon_connected_at, s.last_token_refresh_at, (s.id is not null) as amazon_connected,
       (select max(completed_at) from sync_jobs sj where sj.tenant_id = t.id and sj.status = 'completed') as last_successful_sync,
       (select count(*) from users u where u.tenant_id = t.id and u.status='active') as user_count
-    from tenants t left join lateral (select * from sellers s where s.tenant_id=t.id order by connected_at desc limit 1) s on true order by t.created_at desc`);
+    from tenants t left join lateral (
+      select * from sellers s
+      where s.tenant_id=t.id and s.auth_status='authorized'
+      order by connected_at desc limit 1
+    ) s on true order by t.created_at desc`);
   return { tenants: result.rows };
+});
+
+app.post('/api/tenants/:tenantId/amazon/disconnect', async request => {
+  const { tenantId } = TenantParamsSchema.parse(request.params);
+  await requireTenantUser(request, tenantId);
+  const result = await pool.query(`update sellers
+    set auth_status='revoked', disconnected_at=now()
+    where tenant_id=$1 and auth_status='authorized'
+    returning id`, [tenantId]);
+  return { disconnected: result.rowCount > 0 };
 });
 
 app.post('/api/admin/tenants/:tenantId/grant-access', async request => { await requireAdmin(request); const { tenantId } = TenantParamsSchema.parse(request.params); return (await pool.query("update tenants set status='active', approved_at=now(), approved_by_admin_id=$2 where id=$1 returning id,status,approved_at", [tenantId, adminId])).rows[0]; });
