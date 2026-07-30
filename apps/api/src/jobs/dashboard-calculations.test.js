@@ -57,3 +57,12 @@ test('matches Amazon Custom Unified Account Activity buckets from settlement API
   assert.equal(r.statement.gst.value,21.30);
   assert.equal(r.statement.transfers.value,-246.63);
 });
+
+
+test('uses Amazon settlement header period and date formats for transfers',()=>{
+  const base={orders:[],orderItems:[],returns:[],financeItems:[],reimbursements:[],gstInvoices:[],settlementRows:[line('sale','Principal',10,'Order',{amount_type:'ItemPrice'})]};
+  const withIndianDeposit=calculateDashboardMetrics({...base,settlementHeaders:[{settlement_id:'dd-mm',deposit_date:'29.07.2026 23:59 GMT+5:30',total_amount:246.63}]},{start:'2026-07-21T00:00:00Z',end:'2026-07-30T00:00:00Z'});
+  assert.equal(withIndianDeposit.statement.transfers.value,-246.63);
+  const withStatementPeriod=calculateDashboardMetrics({...base,settlementHeaders:[{settlement_id:'period',settlement_start_date:'27.06.2026 00:00:00 UTC',settlement_end_date:'26.07.2026 23:59:59 UTC',total_amount:131801.69}]},{start:'2026-06-27T00:00:00Z',end:'2026-07-27T00:00:00Z'});
+  assert.equal(withStatementPeriod.statement.transfers.value,-131801.69);
+});

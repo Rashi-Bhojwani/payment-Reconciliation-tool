@@ -18,8 +18,15 @@ const isTransfer=row=>/transfer|deposit|bank account|withdrawal/.test(text(row))
 const round2=value=>Math.round((Number(value)+Number.EPSILON)*100)/100;
 const signedSum=rows=>round2(rows.reduce((sum,row)=>sum+amount(row),0));
 const component=(category,label,value,rows,operation='+')=>({category,label,amount:value,count:rows.length,operation});
-const utcDate=value=>{const s=String(value??'');const m=s.match(/^(\d{1,2})[./-](\d{1,2})[./-](\d{4})(?:\s+(\d{1,2}):(\d{2}):(\d{2}))?/);return m?new Date(Date.UTC(+m[3],+m[2]-1,+m[1],+(m[4]??0),+(m[5]??0),+(m[6]??0))):new Date(s);};
-const inRange=(value,range)=>{const d=utcDate(value);return !Number.isNaN(d.getTime())&&d>=new Date(range.start)&&d<new Date(range.end);};
+const utcDate=value=>{
+  const s=String(value??'').trim();
+  const m=s.match(/^(\d{1,2})[./-](\d{1,2})[./-](\d{4})(?:\s+(\d{1,2}):(\d{2})(?::(\d{2}))?)?/);
+  if(m)return new Date(Date.UTC(+m[3],+m[2]-1,+m[1],+(m[4]??0),+(m[5]??0),+(m[6]??0)));
+  return new Date(s);
+};
+const rangeDates=range=>({start:new Date(range.start),end:new Date(range.end)});
+const inRange=(value,range)=>{const d=utcDate(value);const r=rangeDates(range);return !Number.isNaN(d.getTime())&&d>=r.start&&d<r.end;};
+const overlapsRange=(start,end,range)=>{const r=rangeDates(range);const a=utcDate(start),b=utcDate(end??start);return !Number.isNaN(a.getTime())&& !Number.isNaN(b.getTime()) && a<r.end && b>=r.start;};
 const statusEligible=status=>!new Set(['cancelled','canceled','pending','unshipped','replacement']).has(norm(status).replaceAll(' ',''));
 const orderItemKey=row=>rawField(row.raw,['order-item-id','orderItemId','order-item-code','amazon-order-item-id'])??row.order_item_id??row.source_row_id??row.id;
 const returnKey=row=>rawField(row.raw,['return-event-id','event-id','rma-id'])??`${row.order_id??''}|${rawField(row.raw,['order-item-id','orderItemId'])??row.order_item_id??''}|${row.sku??''}|${row.return_date??''}|${row.quantity??''}`;
@@ -53,7 +60,7 @@ export function calculateDashboardMetrics(input,range){
   const financeReimbursements=financialRows.filter(isReimbursement);const reportReimbursementAudit=dedupe(input.reimbursements??[]);
   const reimbursementRows=financeReimbursements.length?financeReimbursements:reportReimbursementAudit.included;const reimbursements=signedSum(reimbursementRows);
 
-  const headerAudit=dedupe((input.settlementHeaders??[]).filter(row=>row.deposit_date&&inRange(row.deposit_date,range)&&!/failed/.test(text(row))),row=>row.settlement_id??keyOf(row));
+  const headerAudit=dedupe((input.settlementHeaders??[]).filter(row=>!/failed/.test(text(row))&&((row.deposit_date&&inRange(row.deposit_date,range))||overlapsRange(row.settlement_start_date,row.settlement_end_date,range))),row=>row.settlement_id??keyOf(row));
   const transferRows=headerAudit.included.map(row=>({...row,amount:-Math.abs(Number(row.total_amount??row.amount??0))}));const settled=Math.abs(signedSum(transferRows));
 
   const gstImported=(input.gstInvoices??[]).filter(row=>Object.keys(row.raw??{}).length>0&&!/synthetic|order item estimate/.test(norm(`${row.source??''} ${JSON.stringify(row.raw??{})}`)));const gstAudit=dedupe(gstImported,gstKey);
