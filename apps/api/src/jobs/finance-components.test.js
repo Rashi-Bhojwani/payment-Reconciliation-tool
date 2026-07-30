@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { categorizeFinanceLabel, flattenFinanceTransaction } from './finance-components.js';
+import { categorizeFinanceLabel, extractFinanceSectionRows, flattenFinanceTransaction } from './finance-components.js';
 import { computeSlabFees, computeWeightFee, FASHION_JEWELLERY_SLAB } from '../config/fee-slabs.js';
 
 test('categorizes Amazon fee labels', () => {
@@ -18,6 +18,53 @@ test('flattens item breakdowns and resolves array identifiers', () => {
 test('supports 2024 transaction-level plural breakdowns and contexts', () => {
   const rows = flattenFinanceTransaction({ transactionId:'tx-2', relatedIdentifiers:[{relatedIdentifierName:'ORDER_ID',relatedIdentifierValue:'order-2'}], contexts:[{sku:'sku-2',asin:'asin-2'}], breakdowns:[{breakdownType:'FBAWeightBasedFee',breakdownAmount:{currencyAmount:-75,currencyCode:'INR'}}] });
   assert.deepEqual(rows.map(row=>[row.orderId,row.sku,row.category,row.amount]),[['order-2','sku-2','fulfillment_fee_weight',-75]]);
+});
+
+test('supports the official 2024 item contexts, Principle label, and account section hierarchy', () => {
+  const transaction = {
+    transactionId: 'tx-official',
+    relatedIdentifiers: [{ relatedIdentifierName: 'ORDER_ID', relatedIdentifierValue: 'order-official' }],
+    transactionType: 'Shipment',
+    description: 'Order Payment',
+    postedDate: '2026-07-21T00:00:00Z',
+    items: [{
+      contexts: [{ contextType: 'ProductContext', sku: 'sku-official', asin: 'asin-official' }],
+      breakdowns: [{
+        breakdownType: 'Product Charges',
+        breakdownAmount: { currencyAmount: 100 },
+        breakdowns: [{ breakdownType: 'Principle', breakdownAmount: { currencyAmount: 100 } }]
+      }]
+    }],
+    breakdowns: [
+      {
+        breakdownType: 'Sales',
+        breakdownAmount: { currencyAmount: 100 },
+        breakdowns: [{
+          breakdownType: 'Product Charges',
+          breakdownAmount: { currencyAmount: 100 },
+          breakdowns: [{ breakdownType: 'Principle', breakdownAmount: { currencyAmount: 100 } }]
+        }]
+      },
+      {
+        breakdownType: 'Expenses',
+        breakdownAmount: { currencyAmount: -20 },
+        breakdowns: [{ breakdownType: 'Marketplace operating cost', breakdownAmount: { currencyAmount: -20 } }]
+      }
+    ]
+  };
+
+  const itemRows = flattenFinanceTransaction(transaction);
+  const principal = itemRows.find(row => row.category === 'item_price');
+  assert.deepEqual(
+    [principal.orderId, principal.sku, principal.asin, principal.amount],
+    ['order-official', 'sku-official', 'asin-official', 100]
+  );
+  assert.equal(itemRows.find(row => row.category === 'summary_income').amount, 100);
+  assert.equal(itemRows.find(row => row.category === 'summary_expenses').amount, -20);
+
+  const sectionRows = extractFinanceSectionRows([{ transaction_id: 'tx-official', raw: transaction }]);
+  assert.equal(sectionRows.filter(row => row.account_section === 'income').reduce((sum, row) => sum + row.amount, 0), 100);
+  assert.equal(sectionRows.filter(row => row.account_section === 'expenses').reduce((sum, row) => sum + row.amount, 0), -20);
 });
 
 test('does not double-count parent totals that contain child breakdowns', () => {

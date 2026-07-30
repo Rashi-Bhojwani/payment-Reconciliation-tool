@@ -1,43 +1,64 @@
-# Amazon Seller Reconciliation & Business Intelligence Platform
+# Amazon Seller Payment Reconciliation
 
-Working local/dev **plain JavaScript** monorepo for Amazon India seller reconciliation. This version intentionally uses only the credentials in `.env.example`: Amazon SP-API/LWA, the test seller token, AWS RDS Postgres, AWS S3, and app auth/origin settings. It does **not** include Docker, MinIO, Redis, BullMQ, TypeScript, Ads API, Stripe, AI narrative generation, or unused environment variables.
+A JavaScript monorepo that connects an Amazon seller account through SP-API, imports authoritative orders, financial transactions, settlements, GST documents, returns, reimbursements, inventory, and Sales & Traffic data, then exposes an explainable reconciliation dashboard.
 
-## Apps and packages
+## Repository layout
 
-- `apps/api` — Fastify API, Amazon OAuth routes, admin approval workflow, in-process node-cron scheduler, and sync jobs, all in ES modules.
-- `apps/web` — React/Vite JavaScript SPA with seller and admin dashboard shell.
-- `packages/db` — shared Postgres client and RLS tenant context helper.
-- `packages/sp-api-client` — reusable SP-API client, Reports API flow, GST RDT, fees, orders, and finances helpers.
+- `apps/api` — Fastify API, Amazon OAuth, sync jobs, report parsers, reconciliation calculations, and scheduler.
+- `apps/web` — React/Vite seller and administrator dashboards.
+- `packages/db` — PostgreSQL pool, migrations, and tenant row-level-security helpers.
+- `packages/sp-api-client` — LWA authentication plus current Orders, Finances, Reports, Inventory, Catalog, and Fees API clients.
 
-## Quick start
+## Setup
 
-1. Copy `.env.example` to `.env` and replace `HEHE` values with real RDS, S3, and Amazon credentials. The API now loads `.env` automatically, but `DATABASE_URL` must be present there (or exported in your shell) for `npm run dev`.
-2. Run database migrations against your RDS database:
+1. Copy `.env.example` to `.env` and replace every `HEHE` placeholder.
+
+   Required production values include `DATABASE_URL`, `JWT_SECRET`, `SESSION_SECRET`, `ADMIN_EMAIL`, `ADMIN_PASSWORD`, the LWA/SP-API application values, and a registered `SP_API_REDIRECT_URI`.
+   For RDS, provide its trusted PEM bundle in `DATABASE_SSL_CA` and keep `DATABASE_SSL_REJECT_UNAUTHORIZED=true`.
+
+2. Install dependencies and apply every migration in order:
 
 ```bash
-export DATABASE_URL="postgresql://reconciliation:YOUR_PASSWORD@YOUR_RDS_HOST:5432/postgres"
-for file in packages/db/migrations/*.sql; do psql "$DATABASE_URL" -f "$file"; done
+npm ci
+npm run db:migrate
 ```
 
-3. Install dependencies and start API + web directly:
+Migration `012_sp_api_reconciliation_integrity.sql` is required by the current importers. It adds idempotent source keys, separates settlement statements from monetary lines, adds GST/reimbursement/return fields, and separates ASIN-level Sales & Traffic aggregates.
+
+3. Start the API and web app:
 
 ```bash
-npm install
 npm run dev
 ```
 
-4. Open `http://localhost:5173`.
-5. Use **Bootstrap Test Seller** to create a pending tenant from `TEST_SELLER_REFRESH_TOKEN`, then use the Admin Dashboard section to grant access before seller data endpoints are available.
-6. Trigger `GET_V2_SETTLEMENT_REPORT_DATA_FLAT_FILE_V2` from the dashboard to fetch the settlement report, store the raw file in S3, and upsert settlement rows into Postgres.
+4. Open `http://localhost:5173`, sign in with the administrator configured in `.env`, create a seller account, then let that seller authorize the application in Seller Central.
 
-## Dashboard flow
+## Source and calculation rules
 
-The Seller Dashboard lets you connect Amazon, bootstrap a test seller, enter a tenant ID, refresh tenant metrics, view a Payment Report built from Settlement Report rows, and view Sales & Traffic chart data when imported. The Admin Dashboard lists tenants, grants/rejects/revokes access, and triggers settlement sync for active tenants. Seller data APIs are denied until the tenant is `active`, so the dashboard remains gated behind admin approval.
+- The app uses Orders API `v2026-01-01`. Order items arrive with each order, and incremental sync uses `lastUpdatedAfter` so status changes are not missed.
+- Finances API `v2024-06-19` is fully paginated with the original range retained on every next-token request. `DEFERRED` transactions are stored for audit but excluded from released-money KPIs.
+- Settlement reports are listed rather than requested because Amazon generates them automatically. Statement headers are stored in `settlement_statements`; only monetary rows go into `settlement_rows`.
+- All report importers use deterministic source keys. Re-syncing the same report updates existing rows instead of multiplying totals.
+- Source coverage merges adjacent and overlapping successful sync intervals. A real gap, failed report, or unconsumed pagination token still makes the affected metric unavailable.
+- A truncated report document is retained as raw audit evidence but does not overwrite the last verified normalized snapshot.
+- Sales & Traffic date totals and ASIN totals are stored separately. The dashboard uses a complete Sales & Traffic range when available and otherwise labels Orders data as a fallback; it never takes the larger of two sources.
+- Quantity KPIs use complete Sales & Traffic `unitsOrdered`/`unitsRefunded`. The fallback is allowed only for an FBA-only order set with complete FBA Customer Returns coverage.
+- GST values come only from imported Amazon GST documents. The app does not synthesize tax invoices from order items.
+- Unavailable sessions, page views, refund counts, or quantities remain unavailable. The UI does not fabricate estimates.
 
-## Runtime validation
+## Validation
 
-There is no TypeScript build step. Financial and route-facing code uses `zod` schemas plus JSDoc comments to validate key shapes at runtime, including route params, report types, date ranges, raw report storage inputs, and settlement import rows.
+```bash
+npm test
+npm run build
+```
 
-## Deferred by design
+The test suite covers locale-sensitive amounts and dates, settlement idempotency, official GST and reimbursement mappings, FBA return semantics, Sales & Traffic separation, finance component classification, deferred transactions, gap-free multi-job coverage, source precedence, and date-range behavior.
 
-AI narrative generation, Ads API, Stripe billing automation, Docker/containerization, TypeScript, and external queues are intentionally excluded from this phase. The job runner is wrapped in `runJob(jobName, fn)` and storage is isolated in `storage/s3.js` so future infrastructure can be added later without rewriting the sync logic.
+## Security notes
+
+- SP-API access and refresh tokens remain server-side. The browser never receives an LWA access token.
+- Database credentials are read only from `DATABASE_URL`; no connection string is embedded in source.
+- Raw downloaded reports are ignored under `apps/api/storage/raw-reports/` and must not be committed.
+- `JWT_SECRET` and `SESSION_SECRET` are mandatory when `NODE_ENV=production`.
+- If a secret was ever committed, rotate it and remove it from Git history; deleting it from the current source tree is not sufficient.

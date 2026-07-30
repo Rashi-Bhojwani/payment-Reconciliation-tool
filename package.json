@@ -13,14 +13,15 @@
     "start": "npm --workspace @recon/api start",
     "build": "npm --workspace @recon/web run build",
     "test": "npm run check",
-    "check": "node --check apps/api/src/server.js && node --check apps/api/src/jobs/sync.js && node --check apps/api/src/jobs/fee-audit.js && node --check apps/api/src/jobs/finance-components.js && node --check apps/api/src/jobs/dashboard-calculations.js && node --check packages/sp-api-client/src/index.js && node --check packages/db/src/index.js && node --test apps/api/src/jobs/finance-components.test.js apps/api/src/jobs/dashboard-calculations.test.js packages/sp-api-client/src/index.test.js",
+    "check": "node --check apps/api/src/server.js && node --check apps/api/src/jobs/sync.js && node --check apps/api/src/jobs/report-normalization.js && node --check apps/api/src/jobs/source-coverage.js && node --check apps/api/src/jobs/fee-audit.js && node --check apps/api/src/jobs/finance-components.js && node --check apps/api/src/jobs/dashboard-calculations.js && node --check packages/sp-api-client/src/index.js && node --check packages/db/src/index.js && node --test apps/api/src/jobs/report-normalization.test.js apps/api/src/jobs/source-coverage.test.js apps/api/src/jobs/finance-components.test.js apps/api/src/jobs/dashboard-calculations.test.js packages/sp-api-client/src/index.test.js",
     "db:migrate": "npm --workspace @recon/db run migrate"
   },
   "devDependencies": {
     "concurrently": "^8.2.2"
   },
   "dependencies": {
-    "dotenv": "^17.4.2"
+    "dotenv": "^17.4.2",
+    "psql": "^0.0.1"
   },
   "optionalDependencies": {
     "@rollup/rollup-linux-x64-gnu": "^4.62.2"

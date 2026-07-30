@@ -5,13 +5,14 @@ import rateLimit from '@fastify/rate-limit';
 import jwt from '@fastify/jwt';
 import { z } from 'zod';
 import { assertActiveTenant, databaseUrlConfigured, pool, withTenant } from '@recon/db';
-import { getSpApiEndpoint, MARKETPLACES, REPORT_TYPES, SpApiClient } from '@recon/sp-api-client';
+import { MARKETPLACES, REPORT_TYPES } from '@recon/sp-api-client';
 import { secrets } from './config/secrets.js';
-import { decryptSecret, encryptSecret } from './config/crypto.js';
-import { buildGstInvoicesFromOrderItems, startScheduler, syncRecentApiDataForTenant, syncReportForTenant } from './jobs/sync.js';
+import { encryptSecret } from './config/crypto.js';
+import { startScheduler, syncRecentApiDataForTenant, syncReportForTenant } from './jobs/sync.js';
 import { categorizeFinanceLabel } from './jobs/finance-components.js';
 import { calculateDashboardMetrics } from './jobs/dashboard-calculations.js';
 import { runFeeAuditForTenant } from './jobs/fee-audit.js';
+import { loadSourceCoverage } from './jobs/source-coverage.js';
 
 const app = Fastify({ logger: { redact: ['req.headers.authorization', 'refresh_token', 'access_token', 'password', 'passwordHash'] }, trustProxy: true });
 
@@ -27,15 +28,14 @@ const TenantParamsSchema = z.object({ tenantId: z.string().uuid() });
 const SyncParamsSchema = z.object({ tenantId: z.string().uuid(), reportType: z.enum(REPORT_TYPES) });
 const SellerSyncParamsSchema = z.object({ tenantId: z.string().uuid(), reportType: z.enum([...REPORT_TYPES, 'DIRECT_SP_API_SYNC']) });
 const AmazonCallbackSchema = z.object({ spapi_oauth_code: z.string().optional(), code: z.string().optional(), selling_partner_id: z.string().optional(), state: z.string().optional(), amazon_state: z.string().optional(), redirect_uri: z.string().url().optional(), error: z.string().optional(), error_description: z.string().optional() });
-const AmazonAccessTokenSchema = z.object({ sellerId: z.string().optional() });
 const DateRangeSchema = z.object({ start: z.string().datetime(), end: z.string().datetime() });
 const DashboardQuerySchema = z.object({ start: z.string().datetime().optional(), end: z.string().datetime().optional() });
 const SellerSyncSchema = z.object({ reportTypes: z.array(z.enum(REPORT_TYPES)).default(['GET_SALES_AND_TRAFFIC_REPORT', 'GET_V2_SETTLEMENT_REPORT_DATA_FLAT_FILE_V2']), range: DateRangeSchema.optional() });
 const RegisterSchema = z.object({ companyName: z.string().min(2), ownerEmail: z.string().email(), password: z.string().min(8), marketplaceId: z.string().default('A21TJRUUN4KGV') });
 const LoginSchema = z.object({ email: z.string().email(), password: z.string().min(1) });
 const adminId = '00000000-0000-0000-0000-000000000001';
-const defaultAdminEmail = process.env.ADMIN_EMAIL ?? 'admin@reconcile.local';
-const defaultAdminPassword = process.env.ADMIN_PASSWORD ?? 'Admin12345!';
+const configuredAdminEmail = process.env.ADMIN_EMAIL && process.env.ADMIN_EMAIL !== 'HEHE' ? process.env.ADMIN_EMAIL : null;
+const configuredAdminPassword = process.env.ADMIN_PASSWORD && process.env.ADMIN_PASSWORD !== 'HEHE' ? process.env.ADMIN_PASSWORD : null;
 
 function hashPassword(password, salt = crypto.randomBytes(16).toString('hex')) {
   const hash = crypto.pbkdf2Sync(password, salt, 120_000, 32, 'sha256').toString('hex');
@@ -112,7 +112,7 @@ async function exchangeAmazonCode(code, redirectUri) {
 }
 
 
-const TENANT_DATA_TABLES = ['orders', 'settlement_rows', 'gst_invoices', 'returns', 'reimbursements', 'inventory_snapshots', 'sales_traffic_daily', 'fee_leak_flags', 'generated_reports', 'order_items', 'finance_transactions', 'finance_transaction_items', 'fee_estimates'];
+const TENANT_DATA_TABLES = ['orders', 'settlement_rows', 'settlement_statements', 'gst_invoices', 'returns', 'reimbursements', 'inventory_snapshots', 'sales_traffic_daily', 'sales_traffic_asin', 'fee_leak_flags', 'generated_reports', 'order_items', 'finance_transactions', 'finance_transaction_items', 'fee_estimates'];
 
 async function ensureSellerAuthSchema() {
   await pool.query(`
@@ -185,6 +185,7 @@ function isAggregateComponent(label) {
 
 function componentCategory(label) {
   const normalized = String(label ?? '').toLowerCase().replace(/[^a-z0-9]/g, '');
+  if ((normalized.includes('refund') || normalized.includes('return')) && ['principal', 'itemprice', 'productcharges', 'productcharge', 'itemcharge'].some(key => normalized.includes(key))) return 'refund';
   if (['principal', 'itemprice', 'productcharges', 'productcharge', 'itemcharge'].some(key => normalized.includes(key))) return 'principal';
   if (normalized.includes('shipping') && normalized.includes('tax')) return 'shipping_tax';
   if (normalized.includes('shipping')) return 'shipping';
@@ -241,9 +242,9 @@ function settlementComponentRows(rows) {
     related_order_id: row.order_id,
     transaction_type: row.amount_type,
     component: row.amount_description ?? row.amount_type ?? 'Settlement amount',
-    category: componentCategory(`${row.amount_type ?? ''} ${row.amount_description ?? ''}`),
+    category: componentCategory(`${row.transaction_type ?? ''} ${row.amount_type ?? ''} ${row.amount_description ?? ''}`),
     amount: Number(row.amount ?? 0),
-    currency: 'INR',
+    currency: row.currency ?? 'INR',
     source: 'Settlement report'
   }));
 }
@@ -316,14 +317,6 @@ function queueInitialSellerSync(tenantId) {
 }
 
 
-async function recordSyntheticReportSync(tenantId, reportType, s3Key = 'fallback://direct-sp-api') {
-  await pool.query(
-    `insert into sync_jobs(tenant_id, report_type, status, started_at, completed_at, s3_key)
-     values($1,$2,'completed',now(),now(),$3)`,
-    [tenantId, reportType, s3Key]
-  );
-}
-
 function requestLog(request, error) {
   request.log.error({ error }, 'Unhandled API error');
 }
@@ -368,7 +361,7 @@ app.post('/api/auth/register-seller', async request => {
   }
 });
 
-app.post('/api/auth/login', async request => {
+app.post('/api/auth/login', { config: { rateLimit: { max: 10, timeWindow: '1 minute' } } }, async request => {
   const body = LoginSchema.parse(request.body);
   const result = await pool.query('select id, tenant_id, email, password_hash, role, status from users where lower(email)=lower($1)', [body.email]);
   const user = result.rows[0];
@@ -380,23 +373,15 @@ app.post('/api/auth/login', async request => {
 
 app.get('/api/auth/me', async request => ({ user: await requireAuth(request) }));
 
-app.post('/api/dev/bootstrap', async () => {
-  const tenant = await pool.query("insert into tenants(company_name, owner_email, login_email, status) values('Demo Seller','demo@example.com','demo@example.com','pending') returning id, company_name, status, plan");
-  const tenantId = tenant.rows[0].id;
-  await pool.query("insert into users(tenant_id,email,password_hash,role,status) values($1,$2,$3,'user','active') on conflict(email) do nothing", [tenantId, `demo+${tenantId}@example.com`, hashPassword('password123')]);
-  if (process.env.TEST_SELLER_REFRESH_TOKEN && process.env.TEST_SELLER_REFRESH_TOKEN !== 'HEHE') {
-    await pool.query('insert into sellers(tenant_id, amazon_seller_id, marketplace_id, refresh_token_encrypted) values($1,$2,$3,$4)', [tenantId, process.env.TEST_SELLER_ID ?? 'TEST', process.env.TEST_MARKETPLACE_ID ?? 'A21TJRUUN4KGV', encryptSecret(process.env.TEST_SELLER_REFRESH_TOKEN)]);
-  }
-  return tenant.rows[0];
-});
-
 app.get('/api/auth/amazon/start', async (request, reply) => {
   const user = await requireAuth(request);
   const query = z.object({ tenantId: z.string().uuid(), json: z.coerce.boolean().default(false) }).parse(request.query);
   await requireTenantUser(request, query.tenantId);
   const tenant = (await pool.query('select default_marketplace_id from tenants where id=$1', [query.tenantId])).rows[0];
   if (!tenant) throw Object.assign(new Error('Tenant not found'), { statusCode: 404 });
-  if (!secrets.spApiAppId || !secrets.lwaClientId || !secrets.lwaClientSecret) throw Object.assign(new Error('Amazon SP-API credentials are not configured'), { statusCode: 503 });
+  if (!secrets.spApiAppId || !secrets.lwaClientId || !secrets.lwaClientSecret || !secrets.encryptionKeyConfigured) {
+    throw Object.assign(new Error('Amazon SP-API credentials and SESSION_SECRET are not configured'), { statusCode: 503 });
+  }
   const state = signAmazonState({ tenantId: query.tenantId, userId: user.sub, nonce: crypto.randomUUID(), createdAt: Date.now() });
   const redirectUri = validateAmazonRedirectUrl(amazonCallbackUrl(request));
   const url = new URL(`https://${amazonConsentHost(tenant.default_marketplace_id)}/apps/authorize/consent`);
@@ -427,8 +412,11 @@ async function handleAmazonCallback(request, reply) {
     return reply.redirect(`${secrets.frontendOrigin}/seller?tenantId=${state.tenantId}&amazon=error&message=${encodeURIComponent(message)}`);
   }
 
+  if (!query.selling_partner_id) {
+    return reply.redirect(`${secrets.frontendOrigin}/seller?tenantId=${state.tenantId}&amazon=error&message=${encodeURIComponent('Amazon did not return a selling partner ID')}`);
+  }
   const marketplace = tenant.default_marketplace_id ?? 'A21TJRUUN4KGV';
-  const sellerId = query.selling_partner_id ?? `SELLER-${state.tenantId}`;
+  const sellerId = query.selling_partner_id;
   const sellerName = tenant.company_name;
   const client = await pool.connect();
   try {
@@ -457,28 +445,28 @@ app.route({
 });
 
 
-app.get('/api/tenants/:tenantId/amazon/access-token', async request => {
-  const { tenantId } = TenantParamsSchema.parse(request.params);
-  const query = AmazonAccessTokenSchema.parse(request.query);
-  await requireTenantUser(request, tenantId);
-  await assertActiveTenant(tenantId);
-  const seller = (await pool.query(`select id, amazon_seller_id, marketplace_id, refresh_token_encrypted from sellers
-    where tenant_id=$1 and auth_status='authorized' and ($2::text is null or amazon_seller_id=$2) order by connected_at desc limit 1`, [tenantId, query.sellerId ?? null])).rows[0];
-  if (!seller) throw Object.assign(new Error('Amazon seller is not connected'), { statusCode: 404 });
-  const client = new SpApiClient(decryptSecret(seller.refresh_token_encrypted), { clientId: secrets.lwaClientId, clientSecret: secrets.lwaClientSecret, baseUrl: getSpApiEndpoint(seller.marketplace_id) });
-  const token = await client.getAccessToken();
-  await pool.query('update sellers set last_token_refresh_at=now() where id=$1', [seller.id]);
-  return { accessToken: token.accessToken, expiresAt: token.expiresAt, expiresIn: token.expiresIn, sellerId: seller.amazon_seller_id, marketplaceId: seller.marketplace_id };
-});
-
 app.get('/api/admin/tenants', async request => {
   await requireAdmin(request);
   const result = await pool.query(`select t.id, t.company_name, t.owner_email, t.login_email, t.status, t.plan, t.created_at, t.approved_at,
-      s.seller_name, s.amazon_seller_id, s.marketplace_id, s.auth_status, s.connected_at as amazon_connected_at, s.last_token_refresh_at, exists(select 1 from sellers s2 where s2.tenant_id = t.id) as amazon_connected,
+      s.seller_name, s.amazon_seller_id, s.marketplace_id, s.auth_status, s.connected_at as amazon_connected_at, s.last_token_refresh_at, (s.id is not null) as amazon_connected,
       (select max(completed_at) from sync_jobs sj where sj.tenant_id = t.id and sj.status = 'completed') as last_successful_sync,
       (select count(*) from users u where u.tenant_id = t.id and u.status='active') as user_count
-    from tenants t left join lateral (select * from sellers s where s.tenant_id=t.id order by connected_at desc limit 1) s on true order by t.created_at desc`);
+    from tenants t left join lateral (
+      select * from sellers s
+      where s.tenant_id=t.id and s.auth_status='authorized'
+      order by connected_at desc limit 1
+    ) s on true order by t.created_at desc`);
   return { tenants: result.rows };
+});
+
+app.post('/api/tenants/:tenantId/amazon/disconnect', async request => {
+  const { tenantId } = TenantParamsSchema.parse(request.params);
+  await requireTenantUser(request, tenantId);
+  const result = await pool.query(`update sellers
+    set auth_status='revoked', disconnected_at=now()
+    where tenant_id=$1 and auth_status='authorized'
+    returning id`, [tenantId]);
+  return { disconnected: result.rowCount > 0 };
 });
 
 app.post('/api/admin/tenants/:tenantId/grant-access', async request => { await requireAdmin(request); const { tenantId } = TenantParamsSchema.parse(request.params); return (await pool.query("update tenants set status='active', approved_at=now(), approved_by_admin_id=$2 where id=$1 returning id,status,approved_at", [tenantId, adminId])).rows[0]; });
@@ -532,7 +520,12 @@ app.post('/api/tenants/:tenantId/sync/:reportType', async request => {
   }
   try {
     const result = await syncReportForTenant({ ...params, range: body.range });
-    return { reportType: params.reportType, status: 'completed', ...result };
+    return {
+      reportType: params.reportType,
+      status: result.coverageComplete ? 'completed' : 'failed',
+      error: result.coverageError ?? undefined,
+      ...result
+    };
   } catch (error) {
     if (params.reportType === 'GET_GST_MTR_B2B_CUSTOM' || params.reportType === 'GET_GST_MTR_B2C_CUSTOM') {
       const invoiceType = params.reportType === 'GET_GST_MTR_B2B_CUSTOM' ? 'b2b' : 'b2c';
@@ -569,8 +562,13 @@ app.post('/api/tenants/:tenantId/sync', async request => {
   const body = SellerSyncSchema.parse(request.body ?? {});
   const results = [];
   try {
-    const result = await syncRecentApiDataForTenant(tenantId, { range: body.range, maxOrderPages: 2, maxOrderItems: 20 });
-    results.push({ reportType: 'DIRECT_SP_API_SYNC', status: 'completed', ...result });
+    const result = await syncRecentApiDataForTenant(tenantId, { range: body.range, maxOrderPages: 100 });
+    results.push({
+      reportType: 'DIRECT_SP_API_SYNC',
+      status: result.coverageComplete ? 'completed' : 'failed',
+      error: result.coverageError ?? undefined,
+      ...result
+    });
   } catch (error) {
     await recordSyntheticReportSync(tenantId, 'DIRECT_SP_API_SYNC', 'fallback://empty-direct-api');
     results.push({ reportType: 'DIRECT_SP_API_SYNC', status: 'completed', empty: true, ordersImported: 0, transactionsImported: 0, inventoryImported: 0, reimbursementsImported: 0, warning: error instanceof Error ? error.message : 'Direct Amazon sync returned no data' });
@@ -578,7 +576,12 @@ app.post('/api/tenants/:tenantId/sync', async request => {
   for (const reportType of body.reportTypes) {
     try {
       const result = await syncReportForTenant({ tenantId, reportType, range: body.range });
-      results.push({ reportType, status: 'completed', ...result });
+      results.push({
+        reportType,
+        status: result.coverageComplete ? 'completed' : 'failed',
+        error: result.coverageError ?? undefined,
+        ...result
+      });
     } catch (error) {
       if (reportType === 'GET_GST_MTR_B2B_CUSTOM' || reportType === 'GET_GST_MTR_B2C_CUSTOM') {
         const invoiceType = reportType === 'GET_GST_MTR_B2B_CUSTOM' ? 'b2b' : 'b2c';
@@ -597,7 +600,7 @@ app.post('/api/tenants/:tenantId/sync', async request => {
 const DASHBOARD_METRICS = ['netSales','netQty','orders','returns','settled','deductions','reimbursements','drr','feeImpact','returnRate','refundValueRate','gstValue','income','expenses','tax','transfers','gst'];
 const CalculationParamsSchema = z.object({ tenantId: z.string().uuid(), metric: z.enum(DASHBOARD_METRICS) });
 const OrderDetailParamsSchema = z.object({ tenantId: z.string().uuid(), orderId: z.string().min(1) });
-const FEE_CATEGORIES = ['referral_commission', 'fulfillment_fee_per_order', 'fulfillment_fee_per_unit', 'fulfillment_fee_weight', 'shipping_fee', 'gift_wrap_fee', 'closing_fee', 'digital_services_fee', 'storage_fee', 'chargeback', 'tax'];
+const FEE_CATEGORIES = ['referral_commission', 'refund_commission', 'fulfillment_fee_per_order', 'fulfillment_fee_per_unit', 'fulfillment_fee_weight', 'shipping_fee', 'gift_wrap_fee', 'closing_fee', 'digital_services_fee', 'storage_fee', 'chargeback', 'tax'];
 function requestedRange(query) { const parsed = DashboardQuerySchema.parse(query); return { start: parsed.start ?? new Date(Date.now() - 30 * 864e5).toISOString(), end: parsed.end ?? new Date().toISOString() }; }
 function groupCalculationRows(rows) {
   const grouped = new Map();
@@ -642,7 +645,7 @@ app.get('/api/tenants/:tenantId/transactions', async request => {
   const { tenantId }=TenantParamsSchema.parse(request.params); const range=requestedRange(request.query); await requireTenantUser(request,tenantId); await assertActiveTenant(tenantId);
   return withTenant(tenantId,async db=>{
     const rows=(await db.query(`with item_titles as (select amazon_order_id,string_agg(distinct title,', ') product_details from order_items where tenant_id=$1 group by amazon_order_id), components as (
-      select transaction_id,count(*) filter(where category like 'summary_%') summary_lines,
+      select transaction_id,
         sum(amount) filter(where category='summary_product_charges') summary_product_charges,
         sum(amount) filter(where category='summary_promotional_rebates') summary_promotional_rebates,
         sum(amount) filter(where category='summary_amazon_fees') summary_amazon_fees,
@@ -652,13 +655,13 @@ app.get('/api/tenants/:tenantId/transactions', async request => {
         sum(amount) filter(where amount<0 and category=any($4)) leaf_amazon_fees,
         sum(amount) filter(where category not like 'summary_%') leaf_total
       from finance_transaction_items where tenant_id=$1 group by transaction_id)
-      select ft.transaction_id,ft.posted_date,coalesce(ft.raw->>'transactionStatus',ft.raw->>'TransactionStatus','Unknown') transaction_status,
-        coalesce(ft.raw->>'accountType',ft.raw->>'AccountType',ft.raw#>>'{sellingPartnerMetadata,accountType}','Amazon transactions') account_type,
-        ft.transaction_type,coalesce(ft.related_order_id,'---') order_id,coalesce(it.product_details,ft.raw->>'description',ft.transaction_type) product_details,
-        case when coalesce(c.summary_lines,0)>0 then coalesce(c.summary_product_charges,0) else coalesce(c.leaf_product_charges,0) end product_charges,
-        case when coalesce(c.summary_lines,0)>0 then coalesce(c.summary_promotional_rebates,0) else coalesce(c.leaf_promotions,0) end promotional_rebates,
-        case when coalesce(c.summary_lines,0)>0 then coalesce(c.summary_amazon_fees,0) else coalesce(c.leaf_amazon_fees,0) end amazon_fees,
-        coalesce(c.summary_other,coalesce(ft.total_amount,0)-case when coalesce(c.summary_lines,0)>0 then coalesce(c.summary_product_charges,0) else coalesce(c.leaf_product_charges,0) end-case when coalesce(c.summary_lines,0)>0 then coalesce(c.summary_promotional_rebates,0) else coalesce(c.leaf_promotions,0) end-case when coalesce(c.summary_lines,0)>0 then coalesce(c.summary_amazon_fees,0) else coalesce(c.leaf_amazon_fees,0) end) other,
+      select ft.transaction_id,ft.posted_date,coalesce(ft.transaction_status,'Unknown') transaction_status,
+        coalesce(ft.account_type,'Amazon transactions') account_type,
+        ft.transaction_type,coalesce(ft.related_order_id,'---') order_id,coalesce(it.product_details,ft.description,ft.transaction_type) product_details,
+        coalesce(c.summary_product_charges,c.leaf_product_charges,0) product_charges,
+        coalesce(c.summary_promotional_rebates,c.leaf_promotions,0) promotional_rebates,
+        coalesce(c.summary_amazon_fees,c.leaf_amazon_fees,0) amazon_fees,
+        coalesce(c.summary_other,coalesce(ft.total_amount,0)-coalesce(c.summary_product_charges,c.leaf_product_charges,0)-coalesce(c.summary_promotional_rebates,c.leaf_promotions,0)-coalesce(c.summary_amazon_fees,c.leaf_amazon_fees,0)) other,
         coalesce(ft.total_amount,c.leaf_total,0) total
       from finance_transactions ft left join components c on c.transaction_id=ft.transaction_id left join item_titles it on it.amazon_order_id=ft.related_order_id
       where ft.tenant_id=$1 and ft.posted_date >= $2 and ft.posted_date < $3 order by ft.posted_date desc,ft.transaction_id`,[tenantId,range.start,range.end,FEE_CATEGORIES])).rows;
@@ -675,102 +678,140 @@ app.get('/api/tenants/:tenantId/orders-reconciliation', async request => {
       scoped_orders as (select ids.amazon_order_id,o.order_date,coalesce(o.status,'Payment posted') status,o.fulfillment_channel,o.total_amount from scoped_order_ids ids left join orders o on o.tenant_id=$1 and o.amazon_order_id=ids.amazon_order_id),
       item_totals as (select amazon_order_id,sum(item_price) gross_item_price,sum(quantity_ordered) units,string_agg(distinct title,', ') product from order_items where tenant_id=$1 group by amazon_order_id),
       latest_settlements as (select distinct on (line.order_id) line.order_id,line.settlement_id,
-        header.settlement_start_date,header.settlement_end_date,header.deposit_date,header.settlement_total,header.settlement_currency
+        statement.settlement_start_date,statement.settlement_end_date,statement.deposit_date,
+        statement.total_amount settlement_total,statement.currency settlement_currency
         from settlement_rows line
-        left join lateral (
-          select coalesce(raw->>'settlement-start-date',raw->>'settlement start date',raw->>'settlementStartDate') settlement_start_date,
-            coalesce(raw->>'settlement-end-date',raw->>'settlement end date',raw->>'settlementEndDate') settlement_end_date,
-            coalesce(raw->>'deposit-date',raw->>'deposit date',raw->>'depositDate') deposit_date,
-            coalesce(raw->>'total-amount',raw->>'total amount',raw->>'totalAmount') settlement_total,
-            coalesce(raw->>'currency',raw->>'Currency') settlement_currency
-          from settlement_rows settlement_header
-          where settlement_header.tenant_id=line.tenant_id and settlement_header.settlement_id=line.settlement_id
-            and coalesce(raw->>'deposit-date',raw->>'deposit date',raw->>'depositDate','')<>''
-          limit 1
-        ) header on true
+        left join settlement_statements statement
+          on statement.tenant_id=line.tenant_id and statement.settlement_id=line.settlement_id
         where line.tenant_id=$1 and line.order_id is not null and line.settlement_id is not null
-        -- An order can also appear in a different settlement as an Easy Ship or
-        -- adjustment charge. Prefer the settlement containing the actual Order
-        -- proceeds instead of simply choosing the latest charge row.
         order by line.order_id,
-          case when lower(coalesce(line.raw->>'transaction-type',line.raw->>'transaction type',line.raw->>'transactionType',''))='order' then 0
+          case when lower(coalesce(line.transaction_type,''))='order' then 0
                when lower(coalesce(line.amount_type,''))='itemprice' then 0 else 1 end,
           line.posted_date desc nulls last,line.settlement_id desc),
-      chosen_transactions as (select distinct on (related_order_id) transaction_id,related_order_id,total_amount,posted_date,transaction_type,raw,
-        coalesce(raw->>'transactionStatus',raw->>'TransactionStatus','Unknown') transaction_status
-        from finance_transactions where tenant_id=$1 and related_order_id is not null
-        order by related_order_id,
-          case when regexp_replace(lower(coalesce(transaction_type,'')),'[^a-z]','','g')='orderpayment' then 0 else 1 end,
-          case when lower(coalesce(raw->>'transactionStatus',raw->>'TransactionStatus',''))='released' then 0 else 1 end,
-          posted_date desc),
-      -- The transaction header is Amazon's authoritative order association. Some
-      -- item breakdown nodes omit order_id, so filtering on fi.order_id can drop
-      -- otherwise valid Order Payment summary lines and produce a mixed payout.
-      fees as (select ct.related_order_id order_id,count(*) fee_lines,
-      sum(fi.amount) filter(where fi.category='referral_commission' and fi.amount<0) referral_commission,sum(fi.amount) filter(where fi.category like 'fulfillment_fee%' and fi.amount<0) fulfillment_fee,sum(fi.amount) filter(where fi.category='shipping_fee' and fi.amount<0) shipping_fee,sum(fi.amount) filter(where fi.category='closing_fee' and fi.amount<0) closing_fee,
-      sum(fi.amount) filter(where fi.category in ('gift_wrap_fee','digital_services_fee','storage_fee','chargeback','adjustment','other') and fi.amount<0) other_fees,sum(fi.amount) filter(where fi.category='promotion') promotion,sum(fi.amount) filter(where fi.category='refund') refund,sum(fi.amount) filter(where fi.category='reimbursement') reimbursement,
-      sum(fi.amount) filter(where fi.category='shipping_charge') shipping_charge,sum(fi.amount) filter(where fi.category='tax') tax,
-      sum(fi.amount) filter(where fi.category in ('item_price','shipping_charge','gift_wrap') and fi.amount>0) finance_gross,
-      sum(fi.amount) filter(where fi.category='summary_product_charges') summary_product_charges,
-      sum(fi.amount) filter(where fi.category='summary_promotional_rebates') summary_promotional_rebates,
-      sum(fi.amount) filter(where fi.category='summary_amazon_fees') summary_amazon_fees,
-      sum(fi.amount) filter(where fi.category='summary_other') summary_other,
-      count(*) filter(where fi.category like 'summary_%') summary_lines,
-      sum(fi.amount) filter(where fi.category not like 'summary_%') leaf_total,max(ct.total_amount) transaction_header_total,max(ct.posted_date) transaction_date,
-      bool_or(regexp_replace(lower(coalesce(ct.transaction_type,'')),'[^a-z]','','g')='orderpayment') is_order_payment,
-      bool_or(lower(ct.transaction_status)='released') payment_released,
-      max(ct.transaction_status) transaction_status,
-      max(ct.posted_date) filter(where lower(ct.transaction_status)='released') payout_date_time,
-      sum(abs(fi.amount)) filter(where fi.amount<0 and fi.category=any($4)) total_deductions
-      from finance_transaction_items fi join chosen_transactions ct on ct.transaction_id=fi.transaction_id
-      where fi.tenant_id=$1 group by ct.related_order_id)
+      released_transactions as (
+        select * from finance_transactions
+        where tenant_id=$1 and related_order_id is not null
+          and lower(coalesce(transaction_status,'released')) in ('released','deferred_released','deferredreleased')
+      ),
+      transaction_totals as (
+        select related_order_id order_id,count(*) transaction_count,sum(total_amount) transaction_header_total,
+          max(posted_date) transaction_date,
+          bool_or(
+            regexp_replace(lower(coalesce(description,'')),'[^a-z]','','g')='orderpayment'
+            or lower(coalesce(transaction_type,''))='shipment'
+          ) is_order_payment,
+          bool_or(
+            regexp_replace(lower(coalesce(description,'')),'[^a-z]','','g')='orderpayment'
+            or lower(coalesce(transaction_type,''))='shipment'
+          ) payment_released,
+          string_agg(distinct coalesce(transaction_status,'RELEASED'),', ') transaction_status,
+          max(posted_date) filter(where
+            regexp_replace(lower(coalesce(description,'')),'[^a-z]','','g')='orderpayment'
+            or lower(coalesce(transaction_type,''))='shipment'
+          ) payout_date_time
+        from released_transactions group by related_order_id
+      ),
+      components as (
+        select ft.related_order_id order_id,count(*) filter(where not fi.is_summary) fee_lines,
+          sum(fi.amount) filter(where not fi.is_summary and fi.category in ('referral_commission','refund_commission')) referral_commission,
+          sum(fi.amount) filter(where not fi.is_summary and fi.category like 'fulfillment_fee%') fulfillment_fee,
+          sum(fi.amount) filter(where not fi.is_summary and fi.category='shipping_fee') shipping_fee,
+          sum(fi.amount) filter(where not fi.is_summary and fi.category='closing_fee') closing_fee,
+          sum(fi.amount) filter(where not fi.is_summary and fi.category in ('gift_wrap_fee','digital_services_fee','storage_fee','chargeback','adjustment','other')) other_fees,
+          sum(fi.amount) filter(where not fi.is_summary and fi.category='promotion') promotion,
+          sum(fi.amount) filter(where not fi.is_summary and fi.category='item_price' and fi.amount<0) refund,
+          sum(fi.amount) filter(where not fi.is_summary and fi.category='reimbursement') reimbursement,
+          sum(fi.amount) filter(where not fi.is_summary and fi.category='shipping_charge') shipping_charge,
+          sum(fi.amount) filter(where not fi.is_summary and fi.category='tax') tax,
+          sum(fi.amount) filter(where not fi.is_summary and fi.category in ('item_price','shipping_charge','gift_wrap') and fi.amount>0) finance_gross,
+          sum(fi.amount) filter(where not fi.is_summary and fi.category=any($4)) net_fee_amount
+        from finance_transaction_items fi
+        join released_transactions ft on ft.transaction_id=fi.transaction_id
+        where fi.tenant_id=$1
+        group by ft.related_order_id
+      )
       select o.amazon_order_id,o.order_date,f.transaction_date,o.status,o.fulfillment_channel,i.product,coalesce(i.units,0) units,
       s.settlement_id,s.settlement_start_date,s.settlement_end_date,s.deposit_date,s.settlement_total,s.settlement_currency,
-      case when coalesce(f.is_order_payment,false) then coalesce(nullif(f.summary_product_charges,0),nullif(f.finance_gross,0),nullif(i.gross_item_price,0),o.total_amount,0) else coalesce(nullif(i.gross_item_price,0),o.total_amount,0) end gross_item_price,
-      abs(coalesce(f.referral_commission,0)) referral_commission,abs(coalesce(f.fulfillment_fee,0)) fulfillment_fee,abs(coalesce(f.shipping_fee,0)) shipping_fee,abs(coalesce(f.closing_fee,0)) closing_fee,abs(coalesce(f.other_fees,0)) other_fees,case when coalesce(f.summary_lines,0)>0 then coalesce(f.summary_promotional_rebates,0) else coalesce(f.promotion,0) end promotion,coalesce(f.refund,0) refund,coalesce(f.reimbursement,0) reimbursement,case when coalesce(f.summary_lines,0)>0 then abs(coalesce(f.summary_amazon_fees,0)) else coalesce(f.total_deductions,0) end total_deductions,
-      case when coalesce(f.is_order_payment,false) then coalesce(f.summary_other,f.transaction_header_total-coalesce(nullif(f.summary_product_charges,0),f.finance_gross,0)-coalesce(f.summary_promotional_rebates,f.promotion,0)-coalesce(f.summary_amazon_fees,-f.total_deductions,0)) else 0 end other_amount,f.transaction_header_total,
-      case when coalesce(f.is_order_payment,false) then f.transaction_header_total else null end net_payout,coalesce(f.is_order_payment,false) "hasFeeData",
+      coalesce(nullif(c.finance_gross,0),nullif(i.gross_item_price,0),o.total_amount,0) gross_item_price,
+      greatest(0,-coalesce(c.referral_commission,0)) referral_commission,
+      greatest(0,-coalesce(c.fulfillment_fee,0)) fulfillment_fee,
+      greatest(0,-coalesce(c.shipping_fee,0)) shipping_fee,
+      greatest(0,-coalesce(c.closing_fee,0)) closing_fee,
+      greatest(0,-coalesce(c.other_fees,0)) other_fees,
+      coalesce(c.promotion,0) promotion,
+      abs(coalesce(c.refund,0)) refund,
+      coalesce(c.reimbursement,0) reimbursement,
+      abs(least(coalesce(c.net_fee_amount,0),0))+abs(coalesce(c.refund,0))+abs(least(coalesce(c.promotion,0),0)) total_deductions,
+      case when coalesce(f.transaction_count,0)>0 then
+        f.transaction_header_total-coalesce(nullif(c.finance_gross,0),nullif(i.gross_item_price,0),o.total_amount,0)
+        +abs(least(coalesce(c.net_fee_amount,0),0))+abs(coalesce(c.refund,0))+abs(least(coalesce(c.promotion,0),0))
+        else 0 end other_amount,
+      f.transaction_header_total,
+      f.transaction_header_total net_payout,
+      (coalesce(f.transaction_count,0)>0) "hasFeeData",
       (s.deposit_date is not null or coalesce(f.payment_released,false)) payment_received,
-      case when s.deposit_date is not null then 'Deposit initiated by Amazon' when coalesce(f.payment_released,false) then 'Released by Amazon' when coalesce(f.is_order_payment,false) then coalesce(f.transaction_status,'Not released') else 'Awaiting payment data' end payout_status,
-      coalesce(s.deposit_date,f.payout_date_time::text) payout_date_time
-      from scoped_orders o left join item_totals i on i.amazon_order_id=o.amazon_order_id left join fees f on f.order_id=o.amazon_order_id left join latest_settlements s on s.order_id=o.amazon_order_id order by "hasFeeData" desc,f.transaction_date desc nulls last,o.order_date desc`,[tenantId,range.start,range.end,FEE_CATEGORIES])).rows;
+      case when s.deposit_date is not null then 'Deposit initiated by Amazon'
+           when coalesce(f.payment_released,false) then 'Released by Amazon'
+           else 'Awaiting payment data' end payout_status,
+      coalesce(s.deposit_date,f.payout_date_time) payout_date_time
+      from scoped_orders o
+      left join item_totals i on i.amazon_order_id=o.amazon_order_id
+      left join transaction_totals f on f.order_id=o.amazon_order_id
+      left join components c on c.order_id=o.amazon_order_id
+      left join latest_settlements s on s.order_id=o.amazon_order_id
+      order by "hasFeeData" desc,f.transaction_date desc nulls last,o.order_date desc`,
+      [tenantId,range.start,range.end,FEE_CATEGORIES])).rows;
     const hasFinanceItems=orders.some(order=>order.hasFeeData);
-    if (!hasFinanceItems) {
-      const settlement=(await db.query(`select line.order_id,line.settlement_id,line.amount_type,line.amount_description,line.amount,line.posted_date,
-        coalesce(line.raw->>'transaction-type',line.raw->>'transaction type',line.raw->>'transactionType') transaction_type,
-        metadata.deposit_date
-        from settlement_rows line
-        left join lateral (
-          select coalesce(raw->>'deposit-date',raw->>'deposit date',raw->>'depositDate') deposit_date
-          from settlement_rows header
-          where header.tenant_id=line.tenant_id and header.settlement_id=line.settlement_id
-            and coalesce(raw->>'deposit-date',raw->>'deposit date',raw->>'depositDate','')<>''
-          limit 1
-        ) metadata on true
-        where line.tenant_id=$1 and line.order_id is not null`,[tenantId])).rows;
-      const byOrder=new Map(); for(const row of settlement){const list=byOrder.get(row.order_id)??[];list.push({...row,category:categorizeFinanceLabel(`${row.amount_type} ${row.amount_description}`)});byOrder.set(row.order_id,list);}
-      for (const order of orders) {
-        const lines=byOrder.get(order.amazon_order_id)??[]; if(!lines.length) continue;
-        const sum=predicate=>lines.filter(predicate).reduce((total,line)=>total+Number(line.amount),0);
-        order.referral_commission=Math.abs(sum(line=>line.category==='referral_commission'&&Number(line.amount)<0));
-        order.fulfillment_fee=Math.abs(sum(line=>line.category.startsWith('fulfillment_fee')&&Number(line.amount)<0));
-        order.shipping_fee=Math.abs(sum(line=>line.category==='shipping_fee'&&Number(line.amount)<0));
-        order.closing_fee=Math.abs(sum(line=>line.category==='closing_fee'&&Number(line.amount)<0));
-        order.other_fees=Math.abs(sum(line=>['gift_wrap_fee','digital_services_fee','storage_fee','chargeback','adjustment','other'].includes(line.category)&&Number(line.amount)<0));
-        order.promotion=sum(line=>line.category==='promotion'); order.refund=sum(line=>line.category==='refund'); order.reimbursement=sum(line=>line.category==='reimbursement');
-        order.total_deductions=lines.filter(line=>FEE_CATEGORIES.includes(line.category)&&Number(line.amount)<0).reduce((total,line)=>total+Math.abs(Number(line.amount)),0);
-        const settlementGross=sum(line=>['item_price','shipping_charge','gift_wrap'].includes(line.category)&&Number(line.amount)>0); if(settlementGross) order.gross_item_price=settlementGross;
-        order.net_payout=lines.reduce((total,line)=>total+Number(line.amount),0); order.other_amount=order.net_payout-Number(order.gross_item_price)-Number(order.promotion)+order.total_deductions;
-        const payoutLine=lines.find(line=>String(line.transaction_type??'').toLowerCase()==='order'||String(line.amount_type??'').toLowerCase()==='itemprice')??lines[0];
-        const payoutSettlementId=payoutLine?.settlement_id??order.settlement_id??null;
-        const depositDate=lines.find(line=>line.settlement_id===payoutSettlementId&&line.deposit_date)?.deposit_date??null;
-        order.settlement_id=payoutSettlementId;
-        order.hasFeeData=true; order.feeSource='Settlement report';
-        order.payment_received=Boolean(depositDate); order.payout_date_time=depositDate??null;
-        order.payout_status=depositDate?'Deposit initiated by Amazon':'Settlement recorded; deposit date unavailable';
-      }
+    const settlement=(await db.query(`select line.order_id,line.settlement_id,line.amount_type,line.amount_description,line.amount,line.posted_date,
+      line.transaction_type,statement.deposit_date
+      from settlement_rows line
+      left join settlement_statements statement
+        on statement.tenant_id=line.tenant_id and statement.settlement_id=line.settlement_id
+      where line.tenant_id=$1 and line.order_id is not null
+      order by line.order_id,line.posted_date desc nulls last,line.settlement_id desc`,[tenantId])).rows;
+    const byOrder=new Map(); for(const row of settlement){
+      const mappedCategory=categorizeFinanceLabel(`${row.amount_type} ${row.amount_description}`);
+      const category=mappedCategory==='item_price'&&/refund|return/i.test(String(row.transaction_type??''))?'refund':mappedCategory;
+      const list=byOrder.get(row.order_id)??[];list.push({...row,category});byOrder.set(row.order_id,list);
     }
-    return {orders,source:hasFinanceItems?'Finances API':'Settlement report fallback'};
+    let settlementFallbackUsed=false;
+    for (const order of orders) {
+      // Finances is preferred per order. A single order with Finances data must
+      // not prevent settlement-backed reconciliation for every other order.
+      if (order.hasFeeData) continue;
+      const lines=byOrder.get(order.amazon_order_id)??[]; if(!lines.length) continue;
+      const sum=predicate=>lines.filter(predicate).reduce((total,line)=>total+Number(line.amount),0);
+      order.referral_commission=Math.max(0,-sum(line=>['referral_commission','refund_commission'].includes(line.category)));
+      order.fulfillment_fee=Math.max(0,-sum(line=>line.category.startsWith('fulfillment_fee')));
+      order.shipping_fee=Math.max(0,-sum(line=>line.category==='shipping_fee'));
+      order.closing_fee=Math.max(0,-sum(line=>line.category==='closing_fee'));
+      order.other_fees=Math.max(0,-sum(line=>['gift_wrap_fee','digital_services_fee','storage_fee','chargeback','adjustment','other'].includes(line.category)));
+      order.promotion=sum(line=>line.category==='promotion'); order.refund=sum(line=>line.category==='refund'); order.reimbursement=sum(line=>line.category==='reimbursement');
+      order.total_deductions=Math.max(0,-sum(line=>FEE_CATEGORIES.includes(line.category)))
+        +Math.max(0,-sum(line=>line.category==='refund'))
+        +Math.max(0,-sum(line=>line.category==='promotion'));
+      const settlementGross=sum(line=>['item_price','shipping_charge','gift_wrap'].includes(line.category)&&Number(line.amount)>0); if(settlementGross) order.gross_item_price=settlementGross;
+      order.net_payout=lines.reduce((total,line)=>total+Number(line.amount),0); order.other_amount=order.net_payout-Number(order.gross_item_price)+order.total_deductions;
+      const payoutLine=lines.find(line=>String(line.transaction_type??'').toLowerCase()==='order'||String(line.amount_type??'').toLowerCase()==='itemprice')??lines[0];
+      const payoutSettlementId=payoutLine?.settlement_id??order.settlement_id??null;
+      const depositDate=lines.find(line=>line.settlement_id===payoutSettlementId&&line.deposit_date)?.deposit_date??null;
+      order.settlement_id=payoutSettlementId;
+      order.hasFeeData=true; order.feeSource='Settlement report';
+      order.payment_received=Boolean(depositDate); order.payout_date_time=depositDate??null;
+      order.payout_status=depositDate?'Deposit initiated by Amazon':'Settlement recorded; deposit date unavailable';
+      settlementFallbackUsed=true;
+    }
+    const source=hasFinanceItems
+      ? settlementFallbackUsed?'Finances API with per-order settlement fallback':'Finances API'
+      : settlementFallbackUsed?'Settlement report fallback':'No released finance or settlement data';
+    const coverage=await loadSourceCoverage(db,tenantId,range);
+    return {
+      orders,
+      source,
+      coverageComplete: coverage.ordersComplete
+        && (coverage.financeComplete || coverage.settlementsComplete),
+      coverage
+    };
   });
 });
 
@@ -779,14 +820,16 @@ app.get('/api/tenants/:tenantId/orders-reconciliation/:orderId', async request =
   return withTenant(tenantId,async db=>{
     const order=(await db.query('select * from orders where tenant_id=$1 and amazon_order_id=$2',[tenantId,orderId])).rows[0]??null;
     const items=(await db.query('select asin,sku,title,quantity_ordered,item_price,item_tax,promotion_discount,package_weight,weight_unit,package_dimensions from order_items where tenant_id=$1 and amazon_order_id=$2',[tenantId,orderId])).rows;
-    // Match detail lines through the canonical transaction header: item breakdown
-    // order identifiers are optional in Amazon's Finances response.
-    let fees=(await db.query(`with chosen as (select transaction_id from finance_transactions where tenant_id=$1 and related_order_id=$2 order by
-      case when regexp_replace(lower(coalesce(transaction_type,'')),'[^a-z]','','g')='orderpayment' then 0 else 1 end,
-      case when lower(coalesce(raw->>'transactionStatus',raw->>'TransactionStatus',''))='released' then 0 else 1 end,posted_date desc limit 1)
-      select fi.transaction_id,fi.category,fi.amount_description,fi.amount,fi.currency,fi.posted_date,fi.raw from finance_transaction_items fi join chosen c on c.transaction_id=fi.transaction_id where fi.tenant_id=$1 order by fi.posted_date,fi.category`,[tenantId,orderId])).rows;
+    // Include every released transaction for the order: sale, refund,
+    // chargeback, reimbursement, and adjustment events all affect the result.
+    let fees=(await db.query(`select fi.transaction_id,fi.category,fi.amount_description,fi.amount,fi.currency,fi.posted_date,fi.raw
+      from finance_transaction_items fi
+      join finance_transactions ft on ft.tenant_id=fi.tenant_id and ft.transaction_id=fi.transaction_id
+      where fi.tenant_id=$1 and ft.related_order_id=$2
+        and lower(coalesce(ft.transaction_status,'released')) in ('released','deferred_released','deferredreleased')
+      order by fi.posted_date,fi.transaction_id,fi.category`,[tenantId,orderId])).rows;
     let source='Finances API';
-    if(!fees.length){source='Settlement report';fees=(await db.query("select settlement_id transaction_id,amount_type,amount_description,amount,'INR' currency,posted_date,raw from settlement_rows where tenant_id=$1 and order_id=$2 order by posted_date",[tenantId,orderId])).rows.map(row=>({...row,category:categorizeFinanceLabel(`${row.amount_type} ${row.amount_description}`)}));}
+    if(!fees.length){source='Settlement report';fees=(await db.query("select settlement_id transaction_id,transaction_type,amount_type,amount_description,amount,coalesce(currency,'INR') currency,posted_date,raw from settlement_rows where tenant_id=$1 and order_id=$2 order by posted_date",[tenantId,orderId])).rows.map(row=>{const mapped=categorizeFinanceLabel(`${row.amount_type} ${row.amount_description}`);return{...row,category:mapped==='item_price'&&/refund|return/i.test(String(row.transaction_type??''))?'refund':mapped};});}
     return {order,items,fees,source};
   });
 });
@@ -804,116 +847,145 @@ app.get('/api/tenants/:tenantId/dashboard', async request => {
   const seller = sellerRow
     ? { connected: true, sellerName: sellerRow.seller_name, sellerId: sellerRow.amazon_seller_id, marketplaceId: sellerRow.marketplace_id, authStatus: sellerRow.auth_status, connectedAt: sellerRow.connected_at, lastTokenRefreshAt: sellerRow.last_token_refresh_at }
     : { connected: false };
+  const marketplaceTimeZone = MARKETPLACES[sellerRow?.marketplace_id]?.timeZone ?? 'Asia/Kolkata';
   return withTenant(tenantId, async client => {
     // Requests interrupted by a process restart or disconnected client can
     // leave a running row behind after imported data was committed. Persist
     // the timeout so all pages agree and the stale state does not live forever.
     await client.query(
       `update sync_jobs
-       set status='failed', completed_at=coalesce(completed_at, started_at + interval '6 minutes'),
+       set status='failed', completed_at=coalesce(completed_at, started_at + interval '6 hours'),
            error_message=coalesce(error_message, 'Sync stopped before completion. Please retry.')
-       where tenant_id=$1 and status='running' and started_at < now() - interval '6 minutes'`,
+       where tenant_id=$1 and status='running' and started_at < now() - interval '6 hours'`,
       [tenantId]
     );
     const amazonAuth = (await pool.query("select amazon_seller_id, marketplace_id, auth_status, connected_at, last_token_refresh_at from sellers where tenant_id=$1 and auth_status='authorized' order by connected_at desc limit 1", [tenantId])).rows[0] ?? null;
+    const sourceCoverage = await loadSourceCoverage(client, tenantId, {
+      start: start.toISOString(),
+      end: end.toISOString()
+    });
     const kpis = (await client.query(`select coalesce(sum(amount),0) net_settled, coalesce(sum(case when amount > 0 then amount else 0 end),0) earnings, coalesce(sum(case when amount < 0 then amount else 0 end),0) deductions from settlement_rows where tenant_id=$1 and posted_date >= $2 and posted_date < $3`, [tenantId, start, end])).rows[0];
     const orders = (await client.query(`select count(*) orders, coalesce(sum(total_amount),0) order_value from orders where tenant_id=$1 and order_date >= $2 and order_date < $3`, [tenantId, start, end])).rows[0];
     const businessReportRows = (await client.query(`
-      with scoped as (
-        select * from sales_traffic_daily
-        where tenant_id=$1 and date >= $2::date and date < $3::date
-      ), daily as (
-        select date,
-          coalesce(sum(ordered_product_sales),0) ordered_product_sales,
-          coalesce(sum(ordered_product_sales_b2b),0) ordered_product_sales_b2b,
-          coalesce(sum(units_ordered),0) units_ordered,
-          coalesce(sum(units_ordered_b2b),0) units_ordered_b2b,
-          coalesce(sum(total_order_items),0) total_order_items,
-          coalesce(sum(total_order_items_b2b),0) total_order_items_b2b,
-          coalesce(avg(nullif(average_sales_per_order_item,0)),0) average_sales_per_order_item,
-          coalesce(avg(nullif(average_sales_per_order_item_b2b,0)),0) average_sales_per_order_item_b2b,
-          coalesce(avg(nullif(average_units_per_order_item,0)),0) average_units_per_order_item,
-          coalesce(avg(nullif(average_units_per_order_item_b2b,0)),0) average_units_per_order_item_b2b,
-          coalesce(avg(nullif(average_selling_price,0)),0) average_selling_price
-        from scoped where not exists (select 1 from scoped all_rows where all_rows.date=scoped.date and all_rows.asin='ALL')
-        group by date
-        union all
-        select date, ordered_product_sales, ordered_product_sales_b2b, units_ordered, units_ordered_b2b, total_order_items, total_order_items_b2b, average_sales_per_order_item, average_sales_per_order_item_b2b, average_units_per_order_item, average_units_per_order_item_b2b, average_selling_price
-        from scoped where asin='ALL'
-      )
-      select * from daily order by date desc limit 120`, [tenantId, start, end])).rows.reverse();
+      select date,ordered_product_sales,ordered_product_sales_b2b,units_ordered,units_ordered_b2b,
+        total_order_items,total_order_items_b2b,average_sales_per_order_item,
+        average_sales_per_order_item_b2b,average_units_per_order_item,
+        average_units_per_order_item_b2b,average_selling_price,sessions,page_views,units_refunded,refund_rate
+      from sales_traffic_daily
+      where tenant_id=$1 and asin='ALL'
+        and date >= timezone($4,$2::timestamptz)::date
+        and date < timezone($4,$3::timestamptz)::date
+        and $5::boolean
+      order by date desc`, [tenantId, start, end, marketplaceTimeZone, sourceCoverage.salesTrafficComplete])).rows.reverse();
     const products = (await client.query(`
-      with traffic_products as (
-        select asin, sum(units_ordered) units, sum(ordered_product_sales) sales, avg(featured_offer_percentage) buy_box
-        from sales_traffic_daily
-        where tenant_id=$1 and date >= $2::date and date < $3::date and asin is not null and asin <> 'ALL'
-        group by asin
+      with selected_period as (
+        select period_start,period_end
+        from sales_traffic_asin
+        where tenant_id=$1
+          and period_start <= timezone($4,$2::timestamptz)::date
+          and period_end >= (timezone($4,$3::timestamptz)::date-1)
+          and $5::boolean
+        order by (period_end-period_start),period_end desc
+        limit 1
+      ), traffic_product_rows as (
+        select coalesce(nullif(child_asin,''),nullif(parent_asin,''),nullif(sku,'')) asin,
+          units_ordered units,ordered_product_sales sales,featured_offer_percentage buy_box,
+          sessions,page_views,'Sales & Traffic report' source
+        from sales_traffic_asin traffic
+        join selected_period period using(period_start,period_end)
+        where traffic.tenant_id=$1
+      ), traffic_products as (
+        select asin,sum(units) units,sum(sales) sales,avg(buy_box) buy_box,
+          sum(sessions) sessions,sum(page_views) page_views,max(source) source
+        from traffic_product_rows where asin is not null group by asin
       ), item_products as (
-        select asin, sum(quantity_ordered) units, sum(item_price) sales, null::numeric buy_box
+        select asin,sum(quantity_ordered) units,sum(item_price) sales,null::numeric buy_box,
+          null::integer sessions,null::integer page_views,'Orders API fallback' source
         from order_items oi
         join orders o on o.tenant_id=oi.tenant_id and o.amazon_order_id=oi.amazon_order_id
         where oi.tenant_id=$1 and o.order_date >= $2 and o.order_date < $3 and oi.asin is not null
+          and $6::boolean
+          and not $5::boolean
         group by asin
       ), merged as (
         select coalesce(t.asin, i.asin) asin,
-          greatest(coalesce(t.units, 0), coalesce(i.units, 0)) units,
-          greatest(coalesce(t.sales, 0), coalesce(i.sales, 0)) sales,
-          t.buy_box
+          case when t.asin is not null then t.units else i.units end units,
+          case when t.asin is not null then t.sales else i.sales end sales,
+          t.buy_box,t.sessions,t.page_views,
+          case when t.asin is not null then t.source else i.source end source
         from traffic_products t full outer join item_products i on i.asin = t.asin
       )
-      select asin, units, sales, buy_box from merged order by sales desc nulls last, units desc nulls last limit 20`, [tenantId, start, end])).rows;
+      select asin,units,sales,buy_box,sessions,page_views,source
+      from merged order by sales desc nulls last,units desc nulls last limit 20`, [
+        tenantId,
+        start,
+        end,
+        marketplaceTimeZone,
+        sourceCoverage.salesTrafficComplete,
+        sourceCoverage.ordersComplete
+      ])).rows;
     const trend = (await client.query(`
-      with traffic_trend as (
-        select date, sum(ordered_product_sales) sales, sum(units_ordered) units, sum(sessions) sessions
+      with source_coverage as (
+        select $5::boolean sales_traffic_complete,$6::boolean orders_complete
+      ), traffic_trend as (
+        select date,ordered_product_sales sales,units_ordered units,sessions,page_views,units_refunded,
+          'Sales & Traffic report' source
         from sales_traffic_daily
-        where tenant_id=$1 and date >= $2::date and date < $3::date
-        group by date
+        where tenant_id=$1 and asin='ALL'
+          and date >= timezone($4,$2::timestamptz)::date
+          and date < timezone($4,$3::timestamptz)::date
+          and (select sales_traffic_complete from source_coverage)
       ), order_trend as (
-        select date(order_date) date, sum(total_amount) sales, coalesce(sum(items.quantity), 0) units, 0::bigint sessions
+        select timezone($4,order_date)::date date,sum(total_amount) sales,coalesce(sum(items.quantity),0) units,
+          null::integer sessions,null::integer page_views,null::integer units_refunded,
+          'Orders API fallback' source
         from orders o
         left join lateral (
           select sum(quantity_ordered) quantity from order_items oi where oi.tenant_id=o.tenant_id and oi.amazon_order_id=o.amazon_order_id
         ) items on true
         where o.tenant_id=$1 and o.order_date >= $2 and o.order_date < $3 and o.order_date is not null
-        group by date(o.order_date)
+          and not (select sales_traffic_complete from source_coverage)
+          and (select orders_complete from source_coverage)
+        group by timezone($4,o.order_date)::date
       ), merged as (
         select coalesce(t.date, o.date) date,
-          greatest(coalesce(t.sales, 0), coalesce(o.sales, 0)) sales,
-          greatest(coalesce(t.units, 0), coalesce(o.units, 0)) units,
-          coalesce(t.sessions, o.sessions, 0) sessions
+          case when t.date is not null then t.sales else o.sales end sales,
+          case when t.date is not null then t.units else o.units end units,
+          t.sessions,t.page_views,t.units_refunded,
+          case when t.date is not null then t.source else o.source end source
         from traffic_trend t full outer join order_trend o on o.date = t.date
       )
-      select date, sales, units, sessions from merged order by date desc limit 90`, [tenantId, start, end])).rows.reverse();
+      select date,sales,units,sessions,page_views,units_refunded,source
+      from merged order by date desc`, [
+        tenantId,
+        start,
+        end,
+        marketplaceTimeZone,
+        sourceCoverage.salesTrafficComplete,
+        sourceCoverage.ordersComplete
+      ])).rows.reverse();
     const payments = (await client.query(`
-      with settlement_payments as (
-        select settlement_id, date(posted_date) posted_date, sum(amount) net_amount, count(*) lines
-        from settlement_rows
-        where tenant_id=$1 and posted_date >= $2 and posted_date < $3
-        group by settlement_id,date(posted_date)
-      ), finance_payments as (
-        select coalesce(transaction_id, related_order_id, 'finance-' || date(posted_date)::text) settlement_id,
-          date(posted_date) posted_date,
-          sum(total_amount) net_amount,
-          count(*) lines
-        from finance_transactions
-        where tenant_id=$1 and posted_date >= $2 and posted_date < $3 and posted_date is not null
-        group by coalesce(transaction_id, related_order_id, 'finance-' || date(posted_date)::text), date(posted_date)
-      ), merged as (
-        select * from settlement_payments
-        union all
-        select * from finance_payments where not exists (select 1 from settlement_payments)
-      )
-      select settlement_id, posted_date, net_amount, lines from merged order by posted_date desc nulls last limit 100`, [tenantId, start, end])).rows;
+      select statement.settlement_id,date(statement.deposit_date) posted_date,
+        statement.total_amount net_amount,count(line.id) lines
+      from settlement_statements statement
+      left join settlement_rows line
+        on line.tenant_id=statement.tenant_id and line.settlement_id=statement.settlement_id
+      where statement.tenant_id=$1
+        and statement.deposit_date >= $2 and statement.deposit_date < $3
+      group by statement.settlement_id,statement.deposit_date,statement.total_amount
+      order by statement.deposit_date desc`, [tenantId, start, end])).rows;
     const jobs = (await client.query(`
       with normalized_jobs as (
-        select report_type, status, started_at, completed_at, error_message, s3_key
+        select report_type,status,started_at,completed_at,error_message,s3_key,
+          data_start_time,data_end_time,rows_imported,coverage_complete
         from sync_jobs where tenant_id=$1
       )
-      select distinct on (report_type) report_type, status, started_at, completed_at, error_message, s3_key
+      select distinct on (report_type) report_type,status,started_at,completed_at,error_message,s3_key,
+        data_start_time,data_end_time,rows_imported,coverage_complete
       from normalized_jobs
       order by report_type, started_at desc nulls last
     `, [tenantId])).rows;
-    const settlementLines = (await client.query('select settlement_id, order_id, amount_type, amount_description, amount, posted_date from settlement_rows where tenant_id=$1 and posted_date >= $2 and posted_date < $3 order by posted_date desc nulls last limit 250', [tenantId, start, end])).rows;
+    const settlementLines = (await client.query('select settlement_id,order_id,transaction_type,amount_type,amount_description,amount,currency,posted_date,sku,quantity from settlement_rows where tenant_id=$1 and posted_date >= $2 and posted_date < $3 order by posted_date desc nulls last', [tenantId, start, end])).rows;
     const orderRows = (await client.query(`
       select o.amazon_order_id, o.order_date, o.status, o.total_amount, o.fulfillment_channel, o.sales_channel,
         count(oi.id) item_lines,
@@ -929,13 +1001,13 @@ app.get('/api/tenants/:tenantId/dashboard', async request => {
       left join order_items oi on oi.tenant_id=o.tenant_id and oi.amazon_order_id=o.amazon_order_id
       where o.tenant_id=$1 and o.order_date >= $2 and o.order_date < $3
       group by o.amazon_order_id, o.order_date, o.status, o.total_amount, o.fulfillment_channel, o.sales_channel
-      order by o.order_date desc nulls last limit 250`, [tenantId, start, end])).rows;
-    const inventory = (await client.query('select sku, fulfillable_quantity, snapshot_date from inventory_snapshots where tenant_id=$1 and snapshot_date >= $2::date and snapshot_date < $3::date order by snapshot_date desc, fulfillable_quantity desc nulls last limit 50', [tenantId, start, end])).rows;
-    const returns = (await client.query('select order_id, return_reason, disposition, status, return_date, quantity from returns where tenant_id=$1 and return_date >= $2::date and return_date < $3::date order by return_date desc nulls last limit 50', [tenantId, start, end])).rows;
-    const reimbursements = (await client.query('select sku, amount, reason, reimbursement_date from reimbursements where tenant_id=$1 and reimbursement_date >= $2::date and reimbursement_date < $3::date order by reimbursement_date desc nulls last limit 50', [tenantId, start, end])).rows;
-    const invoices = (await client.query('select invoice_type, order_id, taxable_value, cgst, sgst, igst, invoice_date from gst_invoices where tenant_id=$1 and invoice_date >= $2::date and invoice_date < $3::date order by invoice_date desc nulls last limit 50', [tenantId, start, end])).rows;
-    const orderItems = (await client.query('select oi.amazon_order_id, oi.asin, oi.sku, oi.title, oi.quantity_ordered, oi.item_price, oi.item_tax, oi.promotion_discount from order_items oi join orders o on o.tenant_id=oi.tenant_id and o.amazon_order_id=oi.amazon_order_id where oi.tenant_id=$1 and o.order_date >= $2 and o.order_date < $3 order by oi.quantity_ordered desc nulls last limit 50', [tenantId, start, end])).rows;
-    const financeTransactions = (await client.query('select transaction_id, transaction_type, posted_date, total_amount, currency, related_order_id, raw from finance_transactions where tenant_id=$1 and posted_date >= $2 and posted_date < $3 order by posted_date desc nulls last limit 2000', [tenantId, start, end])).rows;
+      order by o.order_date desc nulls last`, [tenantId, start, end])).rows;
+    const inventory = (await client.query('select sku,fulfillable_quantity,snapshot_date from inventory_snapshots where tenant_id=$1 and snapshot_date >= timezone($4,$2::timestamptz)::date and snapshot_date < timezone($4,$3::timestamptz)::date order by snapshot_date desc,fulfillable_quantity desc nulls last', [tenantId, start, end, marketplaceTimeZone])).rows;
+    const returns = (await client.query('select order_id,order_item_id,sku,asin,return_reason,disposition,status,amazon_status,return_date,quantity from returns where tenant_id=$1 and return_date >= timezone($4,$2::timestamptz)::date and return_date < timezone($4,$3::timestamptz)::date order by return_date desc nulls last', [tenantId, start, end, marketplaceTimeZone])).rows;
+    const reimbursements = (await client.query('select reimbursement_id,order_id,sku,asin,amount,amount_per_unit,currency,quantity_cash,quantity_inventory,quantity_total,reason,reimbursement_date from reimbursements where tenant_id=$1 and reimbursement_date >= timezone($4,$2::timestamptz)::date and reimbursement_date < timezone($4,$3::timestamptz)::date order by reimbursement_date desc nulls last', [tenantId, start, end, marketplaceTimeZone])).rows;
+    const invoices = (await client.query('select invoice_type,document_number,line_id,transaction_type,order_id,sku,asin,quantity,taxable_value,invoice_amount,tax_total,cgst,sgst,utgst,igst,cess,invoice_date from gst_invoices where tenant_id=$1 and invoice_date >= timezone($4,$2::timestamptz)::date and invoice_date < timezone($4,$3::timestamptz)::date order by invoice_date desc nulls last', [tenantId, start, end, marketplaceTimeZone])).rows;
+    const orderItems = (await client.query('select oi.amazon_order_id, oi.asin, oi.sku, oi.title, oi.quantity_ordered, oi.item_price, oi.item_tax, oi.promotion_discount from order_items oi join orders o on o.tenant_id=oi.tenant_id and o.amazon_order_id=oi.amazon_order_id where oi.tenant_id=$1 and o.order_date >= $2 and o.order_date < $3 order by oi.quantity_ordered desc nulls last', [tenantId, start, end])).rows;
+    const financeTransactions = (await client.query('select transaction_id,transaction_type,transaction_status,description,account_type,posted_date,total_amount,currency,related_order_id,raw from finance_transactions where tenant_id=$1 and posted_date >= $2 and posted_date < $3 order by posted_date desc nulls last', [tenantId, start, end])).rows;
     const financialComponents = [...settlementComponentRows(settlementLines), ...financeTransactions.flatMap(financeComponentRows)];
     const financialSummary = summarizeComponents(financialComponents);
     const orderPayments = buildOrderPaymentRows(orderRows, settlementLines, financeTransactions);
@@ -961,15 +1033,26 @@ app.get('/api/tenants/:tenantId/dashboard', async request => {
 // Backward-compatible report endpoints for existing clients.
 app.get('/api/tenants/:tenantId/summary', async request => {
   const { tenantId } = TenantParamsSchema.parse(request.params);
+  const range = requestedRange(request.query);
   await requireTenantUser(request, tenantId);
   await assertActiveTenant(tenantId);
-  return withTenant(tenantId, async client => ({
-    settlementTotal: (await client.query('select coalesce(sum(amount),0) total from settlement_rows where tenant_id=$1', [tenantId])).rows[0].total,
-    grossSales: (await client.query("select coalesce(sum(amount),0) total from settlement_rows where tenant_id=$1 and (amount_type ilike '%principal%' or amount_description ilike '%principal%')", [tenantId])).rows[0].total,
-    fees: (await client.query("select coalesce(sum(amount),0) total from settlement_rows where tenant_id=$1 and amount < 0 and (amount_type ilike '%fee%' or amount_description ilike '%fee%')", [tenantId])).rows[0].total,
-    feeLeaks: (await client.query('select count(*) count from fee_leak_flags where tenant_id=$1', [tenantId])).rows[0].count,
-    recentJobs: (await client.query('select report_type,status,started_at,completed_at,error_message,s3_key from sync_jobs where tenant_id=$1 order by started_at desc nulls last limit 10', [tenantId])).rows
-  }));
+  return withTenant(tenantId, async client => {
+    const calculations=await loadDashboardCalculations(client,tenantId,range);
+    const grossSales=calculations.metrics.netSales.components.find(component=>component.category==='gross_sales')?.amount??null;
+    return {
+      settlementTotal: calculations.metrics.settled.value,
+      grossSales: calculations.metrics.netSales.value == null ? null : grossSales,
+      fees: calculations.metrics.deductions.value,
+      status: {
+        settlement: calculations.metrics.settled.status,
+        grossSales: calculations.metrics.netSales.status,
+        fees: calculations.metrics.deductions.status
+      },
+      sourceCoverage: calculations.sourceCoverage,
+      feeLeaks: (await client.query('select count(*) count from fee_leak_flags where tenant_id=$1 and flagged_at >= $2 and flagged_at < $3', [tenantId,range.start,range.end])).rows[0].count,
+      recentJobs: (await client.query('select report_type,status,started_at,completed_at,error_message,s3_key from sync_jobs where tenant_id=$1 order by started_at desc nulls last limit 10', [tenantId])).rows
+    };
+  });
 });
 
 
@@ -988,8 +1071,14 @@ if (!databaseUrlConfigured) {
     .catch(error => app.log.warn({ err: normalizeDatabaseError(error) }, 'Seller auth schema self-check skipped; run migrations before Amazon authorization'));
   await ensureTenantDataIsolationSchema()
     .catch(error => app.log.warn({ err: normalizeDatabaseError(error) }, 'Tenant data isolation self-check skipped; run migrations before serving tenant dashboards'));
-  await pool.query("insert into users(id,email,password_hash,role,status) values($1,$2,$3,'admin','active') on conflict(email) do nothing", [adminId, defaultAdminEmail, hashPassword(defaultAdminPassword)])
-    .catch(error => app.log.warn({ err: normalizeDatabaseError(error) }, 'Admin seed skipped; run migrations before first login'));
+  if (configuredAdminEmail && configuredAdminPassword) {
+    await pool.query(
+      "insert into users(id,email,password_hash,role,status) values($1,$2,$3,'admin','active') on conflict(email) do nothing",
+      [adminId, configuredAdminEmail, hashPassword(configuredAdminPassword)]
+    ).catch(error => app.log.warn({ err: normalizeDatabaseError(error) }, 'Admin seed skipped; run migrations before first login'));
+  } else {
+    app.log.warn('ADMIN_EMAIL and ADMIN_PASSWORD are not configured; no default administrator was created.');
+  }
 }
 
 startScheduler();

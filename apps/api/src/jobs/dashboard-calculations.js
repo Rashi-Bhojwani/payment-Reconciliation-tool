@@ -1,3 +1,5 @@
+import { extractFinanceSectionRows } from './finance-components.js';
+
 const num = value => value == null || value === '' ? null : Number(value);
 const amount = row => Number(row?.amount ?? row?.total_amount ?? 0) || 0;
 const norm = value => String(value ?? '').toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim();
