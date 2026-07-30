@@ -34,3 +34,26 @@ test('removes duplicate reports and finance summary rows, and uses one reimburse
 test('GST invoice value uses genuine documents, credit notes, mixed rates and stable document keys',()=>{const input=mindcircusFixture();input.gstInvoices=[{source_row_id:'1',taxable_value:100,raw:{'document-number':'INV1','line-item-id':'1','document-type':'Invoice','gst-rate':18}},{source_row_id:'dup',taxable_value:100,raw:{'document-number':'INV1','line-item-id':'1','document-type':'Invoice','gst-rate':18}},{source_row_id:'2',taxable_value:40,raw:{'document-number':'CN1','line-item-id':'1','document-type':'Credit Note','gst-rate':5}},{source_row_id:'synthetic',taxable_value:999,raw:{}}];assert.equal(calculateDashboardMetrics(input,range).metrics.gstValue.value,60);});
 test('GST invoice value is unavailable without genuine imported invoices',()=>{const r=calculateDashboardMetrics({...mindcircusFixture(),gstInvoices:[{taxable_value:381909.1,raw:{}}]},range);assert.equal(r.metrics.gstValue.value,null);assert.equal(r.metrics.gstValue.status,'Unavailable');});
 test('derives half-open range days and excludes failed/out-of-range deposits',()=>{const input=mindcircusFixture();input.settlementHeaders.push({settlement_id:'outside',deposit_date:'2026-07-27T00:00:00Z',total_amount:1000});const r=calculateDashboardMetrics(input,range);assert.equal(inclusiveDays(range.start,range.end),30);assert.equal(r.metrics.settled.value,131801.69);});
+
+test('matches Amazon Custom Unified Account Activity buckets from settlement API rows',()=>{
+  const input={
+    orders:[],orderItems:[],returns:[],financeItems:[],reimbursements:[],gstInvoices:[],
+    settlementRows:[
+      line('sale','Principal',567.60,'Order',{amount_type:'ItemPrice'}),
+      line('refund','Principal',-141.90,'Refund',{amount_type:'ItemPrice'}),
+      line('easy','Amazon Easy Ship Charges',-4.72,'other-transaction',{amount_type:'other-transaction'}),
+      line('service','Service fees',-259.60,'other-transaction',{amount_type:'other-transaction'}),
+      line('other-refund','Other transaction fee refunds',66.08,'other-transaction',{amount_type:'other-transaction'}),
+      line('tcs','TCS-IGST',-2.13,'Order',{amount_type:'ItemTCS'}),
+      line('gst','Product Tax',28.40,'Order',{amount_type:'ItemPrice'}),
+      line('gst-refund','Product tax discount',-7.10,'Order',{amount_type:'Promotion'})
+    ],
+    settlementHeaders:[{settlement_id:'transfer',deposit_date:'2026-07-22T00:00:00Z',total_amount:246.63}]
+  };
+  const r=calculateDashboardMetrics(input,{start:'2026-07-21T00:00:00Z',end:'2026-07-30T00:00:00Z'});
+  assert.equal(r.statement.income.value,425.70);
+  assert.equal(r.statement.expenses.value,-200.37);
+  assert.equal(r.statement.tax.value,0);
+  assert.equal(r.statement.gst.value,21.30);
+  assert.equal(r.statement.transfers.value,-246.63);
+});
