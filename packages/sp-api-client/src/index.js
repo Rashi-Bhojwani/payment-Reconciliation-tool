@@ -86,11 +86,25 @@ export function reportRequestRange(reportType, range, marketplaceId = INDIA_MARK
   };
 }
 
-function completedReportCoversRequest(reportType, requestRange, reportedStart, reportedEnd) {
+export function completedReportCoversRequest(reportType, requestRange, reportedStart, reportedEnd, marketplaceId = INDIA_MARKETPLACE_ID) {
   if (!reportedStart || !reportedEnd) return false;
-  if (reportType === 'GET_SALES_AND_TRAFFIC_REPORT') {
-    return String(reportedStart).slice(0, 10) <= requestRange.start
-      && String(reportedEnd).slice(0, 10) >= requestRange.end;
+  if (reportType === 'GET_SALES_AND_TRAFFIC_REPORT' || GST_REPORTS.has(reportType)) {
+    const timeZone = MARKETPLACES[marketplaceId]?.timeZone ?? 'UTC';
+    const requestStart = requestRange.coverageStart ?? requestRange.start;
+    const requestEnd = requestRange.coverageEnd ?? requestRange.end;
+    const requestedStartDate = !Number.isNaN(new Date(requestStart).getTime())
+      ? dateInTimeZone(new Date(requestStart), timeZone)
+      : String(requestRange.start).slice(0, 10);
+    const requestedEndDate = !Number.isNaN(new Date(requestEnd).getTime())
+      ? dateInTimeZone(new Date(new Date(requestEnd).getTime() - 1), timeZone)
+      : String(requestRange.end).slice(0, 10);
+    return (
+      String(reportedStart).slice(0, 10) <= requestRange.start
+      && String(reportedEnd).slice(0, 10) >= requestRange.end
+    ) || (
+      String(reportedStart).slice(0, 10) <= requestedStartDate
+      && String(reportedEnd).slice(0, 10) >= requestedEndDate
+    );
   }
   const actualStart = new Date(reportedStart).getTime();
   const actualEnd = new Date(reportedEnd).getTime();
@@ -440,7 +454,8 @@ export class SpApiClient {
         parsedReportType,
         requestRange,
         reportedDataStartTime,
-        reportedDataEndTime
+        reportedDataEndTime,
+        marketplaceId
       ),
       cancelledNoData
     };
