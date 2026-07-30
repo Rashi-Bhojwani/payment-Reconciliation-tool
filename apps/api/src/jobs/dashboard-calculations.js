@@ -8,11 +8,11 @@ function dedupe(rows,key=keyOf){const seen=new Set(),included=[],duplicates=[];f
 const isSummary=row=>String(row.category??'').startsWith('summary_');
 const isRefund=row=>/refund/.test(text(row));
 const isPrincipal=row=>/principal|item price/.test(norm(`${row.amount_type??''} ${row.amount_description??''} ${row.category??''}`));
-const isPromotion=row=>/promotion|promo rebate/.test(text(row));
+const isPromotion=row=>/promotion|promo rebate/.test(text(row))&&!/product tax discount|shipping tax discount|gift wrap tax discount/.test(text(row));
 const isWithholding=row=>/\b(tcs|tds)\b/.test(text(row));
 const isReimbursement=row=>/reimburse|safe t|lost|damaged|clawback/.test(text(row));
-const isFee=row=>/fee|commission|closing|storage|shipping label|service|advertis|chargeback|adjustment/.test(text(row))&&!isReimbursement(row)&&!isPrincipal(row)&&!isPromotion(row);
-const isProductGst=row=>/product tax|shipping tax|gift wrap tax|\bgst collected|\bgst refund/.test(text(row))&&!/fee|commission|service/.test(text(row));
+const isFee=row=>/itemfees|itemtcs|itemtds|other transaction|fee|commission|closing|storage|shipping label|service|advertis|chargeback|adjustment|easy ship charges|postagepurchase|tcs|tds/.test(text(row))&&!isReimbursement(row)&&!isPrincipal(row)&&!isPromotion(row);
+const isProductGst=row=>/product tax|shipping tax|gift wrap tax|tax discount|\bgst collected|\bgst refund/.test(text(row))&&!/fee|commission|service|itemtcs|itemtds|tcs|tds/.test(text(row));
 const isGenericTax=row=>/\btax\b/.test(text(row))&&!isProductGst(row)&&!isWithholding(row)&&!isFee(row);
 const isTransfer=row=>/transfer|deposit|bank account|withdrawal/.test(text(row));
 const round2=value=>Math.round((Number(value)+Number.EPSILON)*100)/100;
@@ -39,7 +39,7 @@ export function calculateDashboardMetrics(input,range){
   const netQty=shippedUnits==null||returnedUnits==null?null:shippedUnits-returnedUnits;
 
   const financeAudit=dedupe((input.financeItems??[]).filter(row=>!isSummary(row)),financialKey);const settlementAudit=dedupe(input.settlementRows??[],financialKey);
-  const settlementComplete=settlementAudit.included.some(isPrincipal)&&settlementAudit.included.some(row=>isFee(row)||isWithholding(row))&&settlementAudit.included.some(isProductGst);
+  const settlementComplete=settlementAudit.included.some(row=>isPrincipal(row)||isProductGst(row)||isFee(row)||isTransfer(row))&&settlementAudit.included.some(row=>row.settlement_id||row.raw?.['settlement-id']||row.raw?.['settlement id']);
   const financialRows=settlementComplete?settlementAudit.included:financeAudit.included;
   const financialDuplicates=settlementComplete?settlementAudit.duplicates:financeAudit.duplicates;
   const financialSource=settlementComplete?'Amazon Settlement report':'Amazon Finances API';

@@ -509,14 +509,6 @@ app.post('/api/tenants/:tenantId/sync/:reportType', async request => {
     await recordSyntheticReportSync(params.tenantId, params.reportType);
     return { reportType: params.reportType, status: 'completed', fallback: 'DIRECT_SP_API_SYNC', ...fallback };
   }
-  if (params.reportType === 'GET_GST_MTR_B2B_CUSTOM' || params.reportType === 'GET_GST_MTR_B2C_CUSTOM') {
-    const invoiceType = params.reportType === 'GET_GST_MTR_B2B_CUSTOM' ? 'b2b' : 'b2c';
-    const rowsImported = await buildGstInvoicesFromOrderItems(params.tenantId, invoiceType);
-    if (rowsImported > 0) {
-      await recordSyntheticReportSync(params.tenantId, params.reportType, 'fallback://order-items-gst-estimate');
-      return { reportType: params.reportType, status: 'completed', fallback: 'ORDER_ITEMS_GST_ESTIMATE', rowsImported };
-    }
-  }
   try {
     const result = await syncReportForTenant({ ...params, range: body.range });
     return { reportType: params.reportType, status: 'completed', ...result };
