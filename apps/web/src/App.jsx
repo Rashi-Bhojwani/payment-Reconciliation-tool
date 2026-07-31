@@ -339,6 +339,7 @@ function SyncLedger({ tenantId, jobs = [], onSynced, reportTypes, title, subtitl
               <div className="ledger-meta">
                 <b>{report.label}</b>
                 <small>{local?.error ?? local?.summary ?? (job?.completed_at ? `Last synced ${timeAgo(job.completed_at)}` : report.hint)}</small>
+                {!local && job?.error_message && <small className={job.status === 'failed' ? 'ledger-note-error' : 'ledger-note-warning'}>{job.error_message}</small>}
               </div>
               <span className={`pill status-${statusLabel}`}>{statusLabel}</span>
               <Button variant="secondary" disabled={disabled || busy} onClick={() => syncOne(report.type)}>{busy ? 'Syncing…' : 'Sync'}</Button>

@@ -316,11 +316,11 @@ function queueInitialSellerSync(tenantId) {
 }
 
 
-async function recordSyntheticReportSync(tenantId, reportType, s3Key = 'fallback://direct-sp-api') {
+async function recordSyntheticReportSync(tenantId, reportType, s3Key = 'fallback://direct-sp-api', note = null) {
   await pool.query(
-    `insert into sync_jobs(tenant_id, report_type, status, started_at, completed_at, s3_key)
-     values($1,$2,'completed',now(),now(),$3)`,
-    [tenantId, reportType, s3Key]
+    `insert into sync_jobs(tenant_id, report_type, status, started_at, completed_at, s3_key, error_message)
+     values($1,$2,'completed',now(),now(),$3,$4)`,
+    [tenantId, reportType, s3Key, note]
   );
 }
 
@@ -366,23 +366,35 @@ async function syncReportForSellerRequest(params, range) {
     if (params.reportType === 'GET_GST_MTR_B2B_CUSTOM' || params.reportType === 'GET_GST_MTR_B2C_CUSTOM') {
       const invoiceType = params.reportType === 'GET_GST_MTR_B2B_CUSTOM' ? 'b2b' : 'b2c';
       const rowsImported = await buildGstInvoicesFromOrderItems(params.tenantId, invoiceType).catch(() => 0);
-      await recordSyntheticReportSync(params.tenantId, params.reportType, rowsImported > 0 ? 'fallback://order-items-gst-estimate' : 'fallback://gst-report-unavailable');
+      await recordSyntheticReportSync(params.tenantId, params.reportType, rowsImported > 0 ? 'fallback://order-items-gst-estimate' : 'fallback://gst-report-unavailable', message);
       return { reportType: params.reportType, status: 'completed', fallback: rowsImported > 0 ? 'ORDER_ITEMS_GST_ESTIMATE' : 'GST_REPORT_UNAVAILABLE', rowsImported, warning: message };
     }
     // Amazon generates the settlement report on its own payout schedule, so
     // "no completed report yet for this range" is a routine, expected state
-    // (not an outage). calculateDashboardMetrics already falls back to
-    // Finances API rows whenever a complete settlement statement isn't
-    // present, so syncing Finance transactions here keeps the dashboard
-    // numbers correct without ever surfacing a scary "failed" sync job.
+    // (not an outage) - try the direct-API data as a substitute rather than
+    // failing outright. But if that substitute *also* fails, this must still
+    // surface as 'failed': reporting 'completed' when neither source produced
+    // data would leave the dashboard silently showing zero with no way to
+    // tell that from a real, empty-but-successful sync.
     const directFallbackReports = new Set(['GET_SALES_AND_TRAFFIC_REPORT', 'GET_FBA_MYI_UNSUPPRESSED_INVENTORY_DATA', 'GET_FBA_REIMBURSEMENTS_DATA', 'GET_V2_SETTLEMENT_REPORT_DATA_FLAT_FILE_V2']);
     if (directFallbackReports.has(params.reportType)) {
-      const fallback = await syncRecentApiDataForTenant(params.tenantId, { range }).catch(fallbackError => ({ fallbackWarning: fallbackError instanceof Error ? fallbackError.message : 'Direct API fallback failed' }));
-      await recordSyntheticReportSync(params.tenantId, params.reportType);
-      return { reportType: params.reportType, status: 'completed', fallback: 'DIRECT_SP_API_SYNC', warning: message, ...fallback };
+      try {
+        const fallback = await syncRecentApiDataForTenant(params.tenantId, { range });
+        await recordSyntheticReportSync(params.tenantId, params.reportType, 'fallback://direct-sp-api', message);
+        return { reportType: params.reportType, status: 'completed', fallback: 'DIRECT_SP_API_SYNC', warning: message, ...fallback };
+      } catch (fallbackError) {
+        // Both the real Amazon report AND the direct-API fallback failed.
+        // syncReportForTenant already wrote the real 'failed' sync_jobs row
+        // with `message` above - do not paper over it with a fake
+        // 'completed' row here, or the sync ledger (and every dashboard
+        // number that depends on this report) silently lies about data that
+        // was never actually saved.
+        const fallbackMessage = fallbackError instanceof Error ? fallbackError.message : 'Direct API fallback failed';
+        return { reportType: params.reportType, status: 'failed', error: `${message} — fallback also failed: ${fallbackMessage}` };
+      }
     }
     if (params.reportType === 'GET_FBA_FULFILLMENT_CUSTOMER_RETURNS_DATA' && /cancelled|no data|403|fatal/i.test(message)) {
-      await recordSyntheticReportSync(params.tenantId, params.reportType, 'fallback://returns-report-unavailable');
+      await recordSyntheticReportSync(params.tenantId, params.reportType, 'fallback://returns-report-unavailable', message);
       return { reportType: params.reportType, status: 'completed', fallback: 'RETURNS_REPORT_UNAVAILABLE', rowsImported: 0, warning: message };
     }
     return { reportType: params.reportType, status: 'failed', error: message };

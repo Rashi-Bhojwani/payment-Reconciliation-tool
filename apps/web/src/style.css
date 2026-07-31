@@ -504,6 +504,8 @@ select, input { font-family: inherit; }
 .ledger-meta { display: flex; flex-direction: column; line-height: 1.3; min-width: 0; }
 .ledger-meta b { font-size: 13.5px; }
 .ledger-meta small { color: var(--muted); font-size: 12px; }
+.ledger-meta small.ledger-note-error { color: var(--danger); }
+.ledger-meta small.ledger-note-warning { color: #8a5a12; }
 
 /* report-family accent assignments */
 .code-api { --accent: var(--c-api); }
