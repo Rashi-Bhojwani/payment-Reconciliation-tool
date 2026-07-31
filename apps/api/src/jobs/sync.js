@@ -511,7 +511,7 @@ export async function syncRecentApiDataForTenant(tenantId, options = {}) {
           // that land in `other` can be inspected and improved safely.
           const components = flattenFinanceTransaction(transaction);
           for (const component of components) {
-            financeItemRows.push([parsedTenantId, component.transactionId, component.orderId ?? null, component.sku ?? null, component.asin ?? null, component.category, component.description ?? null, component.amount, component.currency ?? 'INR', component.postedDate, component.raw]);
+            financeItemRows.push([parsedTenantId, component.transactionId, component.orderId ?? null, component.sku ?? null, component.asin ?? null, component.category, component.description ?? null, component.amount, component.currency ?? 'INR', component.postedDate, component.raw, sourceKey({}, [component.transactionId, component.orderId, component.sku, component.category, component.description, component.amount, component.postedDate])]);
           }
           transactionsImported += 1;
           // transactionType only ever documents "Shipment" as a value - it is
@@ -535,7 +535,7 @@ export async function syncRecentApiDataForTenant(tenantId, options = {}) {
         if (financeTransactionIds.length) await db.query('delete from finance_transaction_items where tenant_id=$1 and transaction_id = any($2::text[])', [parsedTenantId, financeTransactionIds]);
         await batchUpsert(db, {
           table: 'finance_transaction_items',
-          columns: ['tenant_id', 'transaction_id', 'order_id', 'sku', 'asin', 'category', 'amount_description', 'amount', 'currency', 'posted_date', 'raw'],
+          columns: ['tenant_id', 'transaction_id', 'order_id', 'sku', 'asin', 'category', 'amount_description', 'amount', 'currency', 'posted_date', 'raw', 'source_key'],
           rows: financeItemRows
         });
         reimbursementsImported = await batchUpsert(db, {
