@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import cron from 'node-cron';
 import pLimit from 'p-limit';
 import { z } from 'zod';
@@ -58,6 +59,14 @@ function financeRelatedValue(transaction, wantedNames) {
   return undefined;
 }
 /** @param {Record<string, unknown>} row @param {string[]} names */
+
+function sourceKey(row, parts = []) {
+  const explicit = text(pick(row, ['source-key', 'source key', 'sourceKey', 'transaction-id', 'transaction id', 'transactionId', 'return-event-id', 'event-id', 'eventId']));
+  if (explicit) return explicit;
+  const material = parts.map(part => text(part) ?? '').join('|') || JSON.stringify(row);
+  return createHash('sha256').update(material).digest('hex').slice(0, 48);
+}
+
 function pick(row, names) {
   const lowerMap = new Map(Object.entries(row).map(([key, value]) => [key.toLowerCase().replace(/[^a-z0-9]/g, ''), value]));
   for (const name of names) {
@@ -124,9 +133,9 @@ async function saveSettlementRows(tenantId, content) {
     for (const row of rows) {
       const amount = number(pick(row, ['amount']));
       await client.query(
-        `insert into settlement_rows(tenant_id, settlement_id, order_id, amount_type, amount_description, amount, posted_date, raw)
-         values($1,$2,$3,$4,$5,$6,$7,$8) on conflict do nothing`,
-        [tenantId, text(pick(row, ['settlement-id', 'settlement id', 'settlementId'])), text(pick(row, ['order-id', 'order id', 'amazon-order-id', 'amazonOrderId'])), text(pick(row, ['amount-type', 'amount type', 'amountType'])), text(pick(row, ['amount-description', 'amount description', 'amountDescription'])), amount, reportDate(pick(row, ['posted-date', 'posted date', 'postedDate'])), row]
+        `insert into settlement_rows(tenant_id, settlement_id, order_id, amount_type, amount_description, amount, posted_date, raw, source_key)
+         values($1,$2,$3,$4,$5,$6,$7,$8,$9) on conflict do nothing`,
+        [tenantId, text(pick(row, ['settlement-id', 'settlement id', 'settlementId'])), text(pick(row, ['order-id', 'order id', 'amazon-order-id', 'amazonOrderId'])), text(pick(row, ['amount-type', 'amount type', 'amountType'])), text(pick(row, ['amount-description', 'amount description', 'amountDescription'])), amount, reportDate(pick(row, ['posted-date', 'posted date', 'postedDate'])), row, sourceKey(row, [pick(row, ['settlement-id', 'settlement id', 'settlementId']), pick(row, ['transaction-type', 'transaction type', 'transactionType']), pick(row, ['order-id', 'order id', 'amazon-order-id', 'amazonOrderId']), pick(row, ['amount-type', 'amount type', 'amountType']), pick(row, ['amount-description', 'amount description', 'amountDescription']), pick(row, ['posted-date', 'posted date', 'postedDate']), amount])]
       );
     }
   });
@@ -155,10 +164,10 @@ async function saveReturns(tenantId, content) {
   await withTenant(tenantId, async client => {
     for (const row of rows) {
       await client.query(
-        `insert into returns(tenant_id, order_id, return_reason, disposition, status, return_date, quantity, raw)
-         values($1,$2,$3,$4,$5,$6,$7,$8)
-         on conflict (tenant_id, order_id, return_date, return_reason, disposition) do update set status=excluded.status, quantity=excluded.quantity, raw=excluded.raw`,
-        [tenantId, text(pick(row, ['order-id', 'order id', 'amazon-order-id', 'amazonOrderId'])), text(pick(row, ['reason', 'return-reason', 'return reason', 'returnReason'])), text(pick(row, ['disposition', 'detailed-disposition', 'detailed disposition'])), 'yet_to_receive', text(pick(row, ['return-date', 'return date', 'returnDate', 'date'])) ?? null, pick(row, ['quantity','quantity-returned','return quantity']) == null ? null : integer(pick(row, ['quantity','quantity-returned','return quantity'])), row]
+        `insert into returns(tenant_id, order_id, return_reason, disposition, status, return_date, quantity, raw, source_key)
+         values($1,$2,$3,$4,$5,$6,$7,$8,$9)
+         on conflict (tenant_id, order_id, return_date, return_reason, disposition) do update set status=excluded.status, quantity=excluded.quantity, raw=excluded.raw, source_key=excluded.source_key`,
+        [tenantId, text(pick(row, ['order-id', 'order id', 'amazon-order-id', 'amazonOrderId'])), text(pick(row, ['reason', 'return-reason', 'return reason', 'returnReason'])), text(pick(row, ['disposition', 'detailed-disposition', 'detailed disposition'])), 'yet_to_receive', text(pick(row, ['return-date', 'return date', 'returnDate', 'date'])) ?? null, pick(row, ['quantity','quantity-returned','return quantity']) == null ? null : integer(pick(row, ['quantity','quantity-returned','return quantity'])), row, sourceKey(row, [pick(row, ['order-id', 'order id', 'amazon-order-id', 'amazonOrderId']), pick(row, ['return-date', 'return date', 'returnDate', 'date']), pick(row, ['reason', 'return-reason', 'return reason', 'returnReason']), pick(row, ['disposition', 'detailed-disposition', 'detailed disposition'])])]
       );
     }
   });
