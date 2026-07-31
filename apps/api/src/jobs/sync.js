@@ -132,9 +132,19 @@ async function saveSettlementRows(tenantId, content) {
   await withTenant(tenantId, async client => {
     for (const row of rows) {
       const amount = number(pick(row, ['amount']));
+      // Amazon posts a settlement's individual transaction lines throughout
+      // its pay cycle but only adds deposit-date/total-amount once the
+      // period closes and actually pays out. If this exact line was synced
+      // earlier (before the settlement closed), it already satisfies the
+      // unique constraint below — "do nothing" would silently discard the
+      // now-finalized deposit metadata on every later re-sync, permanently
+      // freezing that settlement out of deposit/transfer totals even though
+      // its line items are present. Overwrite raw with the latest pull.
       await client.query(
         `insert into settlement_rows(tenant_id, settlement_id, order_id, amount_type, amount_description, amount, posted_date, raw, source_key)
-         values($1,$2,$3,$4,$5,$6,$7,$8,$9) on conflict do nothing`,
+         values($1,$2,$3,$4,$5,$6,$7,$8,$9)
+         on conflict (tenant_id, order_id, amount_type, amount_description, posted_date, amount)
+         do update set raw = excluded.raw, settlement_id = excluded.settlement_id`,
         [tenantId, text(pick(row, ['settlement-id', 'settlement id', 'settlementId'])), text(pick(row, ['order-id', 'order id', 'amazon-order-id', 'amazonOrderId'])), text(pick(row, ['amount-type', 'amount type', 'amountType'])), text(pick(row, ['amount-description', 'amount description', 'amountDescription'])), amount, reportDate(pick(row, ['posted-date', 'posted date', 'postedDate'])), row, sourceKey(row, [pick(row, ['settlement-id', 'settlement id', 'settlementId']), pick(row, ['transaction-type', 'transaction type', 'transactionType']), pick(row, ['order-id', 'order id', 'amazon-order-id', 'amazonOrderId']), pick(row, ['amount-type', 'amount type', 'amountType']), pick(row, ['amount-description', 'amount description', 'amountDescription']), pick(row, ['posted-date', 'posted date', 'postedDate']), amount])]
       );
     }
