@@ -324,6 +324,46 @@ async function recordSyntheticReportSync(tenantId, reportType, s3Key = 'fallback
   );
 }
 
+
+async function syncReportForSellerRequest(params, range) {
+  if (params.reportType === 'DIRECT_SP_API_SYNC') {
+    const result = await syncRecentApiDataForTenant(params.tenantId, { range, maxOrderPages: 2, maxOrderItems: 20 });
+    return { reportType: params.reportType, status: 'completed', ...result };
+  }
+  const directFirstReports = new Set(['GET_FBA_MYI_UNSUPPRESSED_INVENTORY_DATA', 'GET_FBA_REIMBURSEMENTS_DATA']);
+  if (directFirstReports.has(params.reportType)) {
+    const familyOptions = params.reportType === 'GET_FBA_MYI_UNSUPPRESSED_INVENTORY_DATA'
+      ? { includeOrders: false, includeFinance: false, includeInventory: true }
+      : { includeOrders: false, includeFinance: true, includeInventory: false };
+    const fallback = await syncRecentApiDataForTenant(params.tenantId, { range, ...familyOptions });
+    await recordSyntheticReportSync(params.tenantId, params.reportType);
+    return { reportType: params.reportType, status: 'completed', fallback: 'DIRECT_SP_API_SYNC', ...fallback };
+  }
+  try {
+    const result = await syncReportForTenant({ ...params, range });
+    return { reportType: params.reportType, status: 'completed', ...result };
+  } catch (error) {
+    const message = error instanceof Error ? error.message : 'Report sync failed';
+    if (params.reportType === 'GET_GST_MTR_B2B_CUSTOM' || params.reportType === 'GET_GST_MTR_B2C_CUSTOM') {
+      const invoiceType = params.reportType === 'GET_GST_MTR_B2B_CUSTOM' ? 'b2b' : 'b2c';
+      const rowsImported = await buildGstInvoicesFromOrderItems(params.tenantId, invoiceType).catch(() => 0);
+      await recordSyntheticReportSync(params.tenantId, params.reportType, rowsImported > 0 ? 'fallback://order-items-gst-estimate' : 'fallback://gst-report-unavailable');
+      return { reportType: params.reportType, status: 'completed', fallback: rowsImported > 0 ? 'ORDER_ITEMS_GST_ESTIMATE' : 'GST_REPORT_UNAVAILABLE', rowsImported, warning: message };
+    }
+    const directFallbackReports = new Set(['GET_SALES_AND_TRAFFIC_REPORT', 'GET_FBA_MYI_UNSUPPRESSED_INVENTORY_DATA', 'GET_FBA_REIMBURSEMENTS_DATA']);
+    if (directFallbackReports.has(params.reportType)) {
+      const fallback = await syncRecentApiDataForTenant(params.tenantId, { range }).catch(fallbackError => ({ fallbackWarning: fallbackError instanceof Error ? fallbackError.message : 'Direct API fallback failed' }));
+      await recordSyntheticReportSync(params.tenantId, params.reportType);
+      return { reportType: params.reportType, status: 'completed', fallback: 'DIRECT_SP_API_SYNC', warning: message, ...fallback };
+    }
+    if (params.reportType === 'GET_FBA_FULFILLMENT_CUSTOMER_RETURNS_DATA' && /cancelled|no data|403|fatal/i.test(message)) {
+      await recordSyntheticReportSync(params.tenantId, params.reportType, 'fallback://returns-report-unavailable');
+      return { reportType: params.reportType, status: 'completed', fallback: 'RETURNS_REPORT_UNAVAILABLE', rowsImported: 0, warning: message };
+    }
+    return { reportType: params.reportType, status: 'failed', error: message };
+  }
+}
+
 function requestLog(request, error) {
   request.log.error({ error }, 'Unhandled API error');
 }
@@ -491,52 +531,7 @@ app.post('/api/tenants/:tenantId/sync/:reportType', async request => {
   const body = z.object({ range: DateRangeSchema.optional() }).parse(request.body ?? {});
   await requireTenantUser(request, params.tenantId);
   await assertActiveTenant(params.tenantId);
-  if (params.reportType === 'DIRECT_SP_API_SYNC') {
-    // Keep an interactive sync bounded. Fetching 1,000 order-item and catalog
-    // records serially can take well over half an hour at Amazon's rate limits.
-    // Subsequent syncs continue incrementally from the last completion.
-    const result = await syncRecentApiDataForTenant(params.tenantId, { range: body.range, maxOrderPages: 2, maxOrderItems: 20 });
-    return { reportType: params.reportType, status: 'completed', ...result };
-  }
-  const directFirstReports = new Set(['GET_FBA_MYI_UNSUPPRESSED_INVENTORY_DATA', 'GET_FBA_REIMBURSEMENTS_DATA']);
-  if (directFirstReports.has(params.reportType)) {
-    const familyOptions = params.reportType === 'GET_FBA_MYI_UNSUPPRESSED_INVENTORY_DATA'
-      ? { includeOrders: false, includeFinance: false, includeInventory: true }
-      : params.reportType === 'GET_FBA_REIMBURSEMENTS_DATA'
-        ? { includeOrders: false, includeFinance: true, includeInventory: false }
-        : { includeOrders: false, includeFinance: true, includeInventory: false };
-    const fallback = await syncRecentApiDataForTenant(params.tenantId, { range: body.range, ...familyOptions });
-    await recordSyntheticReportSync(params.tenantId, params.reportType);
-    return { reportType: params.reportType, status: 'completed', fallback: 'DIRECT_SP_API_SYNC', ...fallback };
-  }
-  try {
-    const result = await syncReportForTenant({ ...params, range: body.range });
-    return { reportType: params.reportType, status: 'completed', ...result };
-  } catch (error) {
-    if (params.reportType === 'GET_GST_MTR_B2B_CUSTOM' || params.reportType === 'GET_GST_MTR_B2C_CUSTOM') {
-      const invoiceType = params.reportType === 'GET_GST_MTR_B2B_CUSTOM' ? 'b2b' : 'b2c';
-      const rowsImported = await buildGstInvoicesFromOrderItems(params.tenantId, invoiceType);
-      if (rowsImported > 0) {
-        await pool.query(
-          `update sync_jobs set status='completed', completed_at=now(), error_message=null, s3_key=$3
-           where id = (select id from sync_jobs where tenant_id=$1 and report_type=$2 order by started_at desc nulls last limit 1)`,
-          [params.tenantId, params.reportType, 'fallback://order-items-gst-estimate']
-        );
-        return { reportType: params.reportType, status: 'completed', fallback: 'ORDER_ITEMS_GST_ESTIMATE', rowsImported, warning: error instanceof Error ? error.message : 'GST report sync failed' };
-      }
-    }
-    const directFallbackReports = new Set(['GET_SALES_AND_TRAFFIC_REPORT', 'GET_FBA_MYI_UNSUPPRESSED_INVENTORY_DATA', 'GET_FBA_REIMBURSEMENTS_DATA']);
-    if (directFallbackReports.has(params.reportType)) {
-      try {
-        const fallback = await syncRecentApiDataForTenant(params.tenantId, { range: body.range });
-        await recordSyntheticReportSync(params.tenantId, params.reportType);
-        return { reportType: params.reportType, status: 'completed', fallback: 'DIRECT_SP_API_SYNC', warning: error instanceof Error ? error.message : 'Report sync failed', ...fallback };
-      } catch {
-        // Return the original report error below; it is usually more actionable than a secondary fallback failure.
-      }
-    }
-    return { reportType: params.reportType, status: 'failed', error: error instanceof Error ? error.message : 'Report sync failed' };
-  }
+  return syncReportForSellerRequest(params, body.range);
 });
 
 app.post('/api/tenants/:tenantId/sync', async request => {
@@ -552,12 +547,7 @@ app.post('/api/tenants/:tenantId/sync', async request => {
     results.push({ reportType: 'DIRECT_SP_API_SYNC', status: 'failed', error: error instanceof Error ? error.message : 'unknown error' });
   }
   for (const reportType of body.reportTypes) {
-    try {
-      const result = await syncReportForTenant({ tenantId, reportType, range: body.range });
-      results.push({ reportType, status: 'completed', ...result });
-    } catch (error) {
-      results.push({ reportType, status: 'failed', error: error instanceof Error ? error.message : 'unknown error' });
-    }
+    results.push(await syncReportForSellerRequest({ tenantId, reportType }, body.range));
   }
   return { results };
 });
