@@ -327,17 +327,36 @@ async function recordSyntheticReportSync(tenantId, reportType, s3Key = 'fallback
 
 async function syncReportForSellerRequest(params, range) {
   if (params.reportType === 'DIRECT_SP_API_SYNC') {
-    const result = await syncRecentApiDataForTenant(params.tenantId, { range, maxOrderPages: 2, maxOrderItems: 20 });
-    return { reportType: params.reportType, status: 'completed', ...result };
+    try {
+      const result = await syncRecentApiDataForTenant(params.tenantId, { range, maxOrderPages: 2, maxOrderItems: 20 });
+      return { reportType: params.reportType, status: 'completed', ...result };
+    } catch (error) {
+      // This is the base data layer, so there is no further fallback to try —
+      // but a failure here must still come back as a clean JSON result
+      // instead of an uncaught 500, so the sync ledger shows the real reason
+      // rather than a generic "Internal server error".
+      return { reportType: params.reportType, status: 'failed', error: error instanceof Error ? error.message : 'Direct API sync failed' };
+    }
   }
   const directFirstReports = new Set(['GET_FBA_MYI_UNSUPPRESSED_INVENTORY_DATA', 'GET_FBA_REIMBURSEMENTS_DATA']);
   if (directFirstReports.has(params.reportType)) {
     const familyOptions = params.reportType === 'GET_FBA_MYI_UNSUPPRESSED_INVENTORY_DATA'
       ? { includeOrders: false, includeFinance: false, includeInventory: true }
       : { includeOrders: false, includeFinance: true, includeInventory: false };
-    const fallback = await syncRecentApiDataForTenant(params.tenantId, { range, ...familyOptions });
-    await recordSyntheticReportSync(params.tenantId, params.reportType);
-    return { reportType: params.reportType, status: 'completed', fallback: 'DIRECT_SP_API_SYNC', ...fallback };
+    try {
+      const fallback = await syncRecentApiDataForTenant(params.tenantId, { range, ...familyOptions });
+      await recordSyntheticReportSync(params.tenantId, params.reportType);
+      return { reportType: params.reportType, status: 'completed', fallback: 'DIRECT_SP_API_SYNC', ...fallback };
+    } catch {
+      // The fast direct-API path threw (transient error, missing token
+      // scope, a DB hiccup, etc.) instead of returning a warning like it
+      // does for its own internal Orders/Finance/Inventory calls. Previously
+      // that uncaught error crashed the whole request as a raw 500 ("Internal
+      // server error") and the report was never tried through Amazon's own
+      // Reports API at all. Fall through to that real SP-API report instead
+      // of failing outright — it already has its own direct-API fallback
+      // below if it also can't produce data.
+    }
   }
   try {
     const result = await syncReportForTenant({ ...params, range });
