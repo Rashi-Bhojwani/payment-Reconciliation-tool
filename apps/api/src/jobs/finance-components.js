@@ -37,6 +37,17 @@ function identifierValue(value, pattern) {
   return Object.entries(value).find(([key]) => pattern.test(key))?.[1];
 }
 
+// Per the Finances API v2024-06-19 schema, SKU/ASIN are not direct fields of
+// an Item or Transaction - they live on a polymorphic Context entry whose
+// contextType is "ProductContext" (contexts: [{contextType, asin, sku,
+// quantityShipped, fulfillmentNetwork}, ...]). There is no "productDetails"
+// or "productContext" field anywhere in the real response.
+function productContext(contexts) {
+  const list = Array.isArray(contexts) ? contexts : [];
+  const match = list.find(entry => /^productcontext$/i.test(String(entry?.contextType ?? entry?.ContextType ?? '')));
+  return { sku: match?.sku ?? match?.Sku ?? match?.sellerSku ?? match?.SellerSKU, asin: match?.asin ?? match?.ASIN };
+}
+
 function summaryCategory(label) {
   const value = String(label ?? '').replace(/[^a-z0-9]/gi, '').toLowerCase();
   if (/totalproductcharge|productcharge/.test(value)) return 'summary_product_charges';
@@ -71,18 +82,26 @@ export function flattenFinanceTransaction(transaction) {
   }
   if (Array.isArray(items) && items.length) {
     for (const item of items) {
-      const details = item.productDetails ?? item.ProductDetails ?? item.productContext ?? item.ProductContext ?? item;
-      const context = { orderId: identifierValue(item.relatedIdentifiers ?? item.RelatedIdentifiers, /order/i) ?? transactionOrderId, sku: details.sku ?? details.Sku ?? details.sellerSku ?? details.SellerSKU, asin: details.asin ?? details.ASIN };
+      const details = productContext(item.contexts ?? item.Contexts);
+      const context = { orderId: identifierValue(item.relatedIdentifiers ?? item.RelatedIdentifiers, /order/i) ?? transactionOrderId, sku: details.sku, asin: details.asin };
       walk(item.breakdown ?? item.Breakdown ?? item.breakdowns ?? item.Breakdowns ?? [], context);
     }
   }
   // Some 2024-06-19 responses put breakdowns directly on the transaction and
   // expose SKU/ASIN separately in contexts rather than an items array.
   if (!rows.length) {
-    const contextNode = (transaction?.contexts ?? transaction?.Contexts ?? [])[0] ?? {};
-    const details = contextNode.productContext ?? contextNode.ProductContext ?? contextNode;
-    walk(transaction?.breakdown ?? transaction?.Breakdown ?? transaction?.breakdowns ?? transaction?.Breakdowns ?? [], { orderId: transactionOrderId, sku: details.sku ?? details.Sku, asin: details.asin ?? details.ASIN });
+    const details = productContext(transaction?.contexts ?? transaction?.Contexts);
+    walk(transaction?.breakdown ?? transaction?.Breakdown ?? transaction?.breakdowns ?? transaction?.Breakdowns ?? [], { orderId: transactionOrderId, sku: details.sku, asin: details.asin });
   }
-  if (!rows.length) rows.push({ transactionId, orderId: transactionOrderId, sku: identifierValue(transaction?.relatedIdentifiers ?? transaction?.RelatedIdentifiers, /sku/i), asin: undefined, category: categorizeFinanceLabel(transaction?.transactionType ?? transaction?.TransactionType), description: transaction?.transactionType ?? transaction?.TransactionType ?? 'Transaction total', amount: money(transaction?.totalAmount ?? transaction?.TotalAmount), currency, postedDate, raw: transaction });
+  // transactionType is a structural field (its only documented value is
+  // "Shipment" - it never carries a semantic reason). The actual reason for
+  // the transaction ("Order Payment", "Refund Order", a reimbursement, etc.)
+  // is in `description`. Categorizing off transactionType here would silently
+  // bucket every unbroken-down transaction as "other".
+  if (!rows.length) {
+    const label = transaction?.description ?? transaction?.Description ?? transaction?.transactionType ?? transaction?.TransactionType ?? 'Transaction total';
+    const details = productContext(transaction?.contexts ?? transaction?.Contexts);
+    rows.push({ transactionId, orderId: transactionOrderId, sku: details.sku, asin: details.asin, category: categorizeFinanceLabel(label), description: String(label), amount: money(transaction?.totalAmount ?? transaction?.TotalAmount), currency, postedDate, raw: transaction });
+  }
   return rows.filter(row => row.transactionId);
 }

@@ -445,7 +445,8 @@ export async function syncRecentApiDataForTenant(tenantId, options = {}) {
           // generation. Persist every source node in raw so classifications
           // that land in `other` can be inspected and improved safely.
           await db.query('delete from finance_transaction_items where tenant_id=$1 and transaction_id=$2', [parsedTenantId, transactionId]);
-          for (const component of flattenFinanceTransaction(transaction)) {
+          const components = flattenFinanceTransaction(transaction);
+          for (const component of components) {
             await db.query(
               `insert into finance_transaction_items(tenant_id, transaction_id, order_id, sku, asin, category, amount_description, amount, currency, posted_date, raw)
                values($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) on conflict do nothing`,
@@ -453,13 +454,19 @@ export async function syncRecentApiDataForTenant(tenantId, options = {}) {
             );
           }
           transactionsImported += 1;
-          const transactionType = String(transaction.transactionType ?? transaction.TransactionType ?? '').toLowerCase();
-          if (transactionType.includes('reimbursement')) {
+          // transactionType only ever documents "Shipment" as a value - it is
+          // a structural field, not a reason. Reimbursement events (SAFE-T,
+          // lost/damaged inventory, etc.) are only identifiable by their
+          // description/breakdown label, which flattenFinanceTransaction
+          // already categorizes correctly via the same rules used everywhere
+          // else in the app. Reuse that instead of re-deriving it here from a
+          // field that can't actually carry the signal.
+          for (const component of components.filter(row => row.category === 'reimbursement')) {
             await db.query(
               `insert into reimbursements(tenant_id, amount, reason, sku, reimbursement_date)
                values($1,$2,$3,$4,$5)
                on conflict (tenant_id, sku, reimbursement_date, amount, reason) do nothing`,
-              [parsedTenantId, number(transaction.totalAmount?.currencyAmount ?? transaction.TotalAmount?.CurrencyAmount ?? transaction.totalAmount?.Amount ?? transaction.TotalAmount?.Amount), transaction.transactionType ?? transaction.TransactionType ?? 'Finance reimbursement', financeRelatedValue(transaction, ['SKU']) ?? transactionId, transaction.postedDate ?? transaction.PostedDate ?? null]
+              [parsedTenantId, component.amount, component.description ?? 'Finance reimbursement', component.sku ?? component.orderId ?? transactionId, component.postedDate ?? transaction.postedDate ?? transaction.PostedDate ?? null]
             );
             reimbursementsImported += 1;
           }
