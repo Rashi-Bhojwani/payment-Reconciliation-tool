@@ -501,9 +501,20 @@ async function syncActiveTenants(reportType) {
   const parsedReportType = z.enum(REPORT_TYPES).parse(reportType);
   const tenants = await pool.query("select id from tenants where status = 'active'");
   const limit = pLimit(3);
-  await Promise.all(tenants.rows.map(row => limit(() => syncReportForTenant({ tenantId: row.id, reportType: parsedReportType }))));
+  // One tenant's report failure (e.g. Amazon has no settlement report ready
+  // yet for this period) must never stop every other tenant's nightly sync,
+  // and must never surface as an unhandled rejection that could take the
+  // whole scheduler down. syncReportForTenant already records the failure on
+  // the tenant's own sync_jobs row, so it is safe to swallow here.
+  await Promise.all(tenants.rows.map(row => limit(() =>
+    syncReportForTenant({ tenantId: row.id, reportType: parsedReportType })
+      .catch(error => { console.error(`Nightly sync failed for tenant ${row.id} (${parsedReportType}):`, error instanceof Error ? error.message : error); })
+  )));
 }
 
 export function startScheduler() {
-  cron.schedule('0 2 * * *', () => { void Promise.all(NIGHTLY_REPORTS.map(reportType => syncActiveTenants(reportType))); });
+  cron.schedule('0 2 * * *', () => {
+    Promise.all(NIGHTLY_REPORTS.map(reportType => syncActiveTenants(reportType)))
+      .catch(error => console.error('Nightly sync scheduler run failed:', error instanceof Error ? error.message : error));
+  });
 }

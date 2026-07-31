@@ -350,7 +350,13 @@ async function syncReportForSellerRequest(params, range) {
       await recordSyntheticReportSync(params.tenantId, params.reportType, rowsImported > 0 ? 'fallback://order-items-gst-estimate' : 'fallback://gst-report-unavailable');
       return { reportType: params.reportType, status: 'completed', fallback: rowsImported > 0 ? 'ORDER_ITEMS_GST_ESTIMATE' : 'GST_REPORT_UNAVAILABLE', rowsImported, warning: message };
     }
-    const directFallbackReports = new Set(['GET_SALES_AND_TRAFFIC_REPORT', 'GET_FBA_MYI_UNSUPPRESSED_INVENTORY_DATA', 'GET_FBA_REIMBURSEMENTS_DATA']);
+    // Amazon generates the settlement report on its own payout schedule, so
+    // "no completed report yet for this range" is a routine, expected state
+    // (not an outage). calculateDashboardMetrics already falls back to
+    // Finances API rows whenever a complete settlement statement isn't
+    // present, so syncing Finance transactions here keeps the dashboard
+    // numbers correct without ever surfacing a scary "failed" sync job.
+    const directFallbackReports = new Set(['GET_SALES_AND_TRAFFIC_REPORT', 'GET_FBA_MYI_UNSUPPRESSED_INVENTORY_DATA', 'GET_FBA_REIMBURSEMENTS_DATA', 'GET_V2_SETTLEMENT_REPORT_DATA_FLAT_FILE_V2']);
     if (directFallbackReports.has(params.reportType)) {
       const fallback = await syncRecentApiDataForTenant(params.tenantId, { range }).catch(fallbackError => ({ fallbackWarning: fallbackError instanceof Error ? fallbackError.message : 'Direct API fallback failed' }));
       await recordSyntheticReportSync(params.tenantId, params.reportType);

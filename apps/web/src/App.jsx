@@ -193,27 +193,44 @@ function Login({ setSession }) {
 // on the left, click-to-select custom range on the right. The chosen range
 // is shared via context so panel subtitles that used to hardcode
 // "Last 30 Days" now reflect whatever the user picked.
-function startOfDay(d) { const x = new Date(d); x.setHours(0, 0, 0, 0); return x; }
-function addDays(d, n) { const x = new Date(d); x.setDate(x.getDate() + n); return x; }
-function formatShort(d) { return d.toLocaleDateString('en-IN', { month: 'short', day: 'numeric' }); }
+//
+// Amazon Seller Central always reports "today"/"this week"/a custom date
+// range using India Standard Time (IST, UTC+5:30 year-round, no DST) for an
+// India marketplace account — this tool's default and primary market. If day
+// boundaries were computed in the *browser's* local timezone instead, a
+// viewer outside IST would get a range shifted by hours, silently pulling in
+// or excluding orders/settlements Seller Central counts on a different
+// calendar day. Every "day" computed here is therefore pinned to IST.
+const IST_OFFSET_MS = 5.5 * 60 * 60 * 1000;
+const IST_TIME_ZONE = 'Asia/Kolkata';
+function istParts(d) {
+  const t = new Date(new Date(d).getTime() + IST_OFFSET_MS);
+  return { year: t.getUTCFullYear(), month: t.getUTCMonth(), date: t.getUTCDate() };
+}
+function startOfDay(d) { const { year, month, date } = istParts(d); return new Date(Date.UTC(year, month, date) - IST_OFFSET_MS); }
+function addDays(d, n) { return new Date(new Date(d).getTime() + n * 864e5); }
+function formatShort(d) { return d.toLocaleDateString('en-IN', { month: 'short', day: 'numeric', timeZone: IST_TIME_ZONE }); }
 function formatDateParam(date) { return startOfDay(date).toISOString(); }
 function rangeQuery(range) { return `start=${encodeURIComponent(formatDateParam(range.start))}&end=${encodeURIComponent(formatDateParam(addDays(range.end, 1)))}`; }
 function formatRangeLabel(start, end) {
   const startStr = formatShort(start);
-  const endStr = start.getFullYear() === end.getFullYear() ? formatShort(end) : end.toLocaleDateString('en-IN', { month: 'short', day: 'numeric', year: 'numeric' });
-  return `${startStr} – ${endStr}, ${end.getFullYear()}`;
+  const endStr = istParts(start).year === istParts(end).year ? formatShort(end) : end.toLocaleDateString('en-IN', { month: 'short', day: 'numeric', year: 'numeric', timeZone: IST_TIME_ZONE });
+  return `${startStr} – ${endStr}, ${istParts(end).year}`;
 }
 function defaultDateRange() { const end = startOfDay(new Date()); return { label: 'Last 30 Days', start: addDays(end, -29), end }; }
 const DateRangeContext = createContext({ range: defaultDateRange(), setRange: () => {} });
 
 function toDateInputValue(date) {
-  const d = startOfDay(date);
-  const yyyy = d.getFullYear();
-  const mm = String(d.getMonth() + 1).padStart(2, '0');
-  const dd = String(d.getDate()).padStart(2, '0');
-  return `${yyyy}-${mm}-${dd}`;
+  // Read the IST calendar date directly instead of using local getters
+  // (getFullYear/getMonth/getDate), which reflect the browser's timezone and
+  // can report the wrong day near midnight for a viewer outside IST.
+  const { year, month, date: day } = istParts(date);
+  return `${year}-${String(month + 1).padStart(2, '0')}-${String(day).padStart(2, '0')}`;
 }
-function fromDateInputValue(value) { return startOfDay(new Date(`${value}T00:00:00`)); }
+function fromDateInputValue(value) {
+  const [year, month, day] = value.split('-').map(Number);
+  return new Date(Date.UTC(year, month - 1, day) - IST_OFFSET_MS);
+}
 function DateRangePicker({ value, onChange }) {
   const [open, setOpen] = useState(false);
   const [draft, setDraft] = useState(() => ({ start: toDateInputValue(value.start), end: toDateInputValue(value.end) }));
@@ -398,11 +415,17 @@ function SellerDashboard() {
     void load(range, rangeSyncRef.current.requestId);
   }, [tenantId, range.start, range.end]);
 
-  const channelData = useMemo(() => [
-    { name: 'Order value', value: Number(data?.orders?.order_value ?? 0) },
-    { name: 'Settlement earnings', value: Number(data?.kpis?.earnings ?? 0) },
-    { name: 'Settlement deductions', value: Math.abs(Number(data?.kpis?.deductions ?? 0)) }
-  ].filter(item => item.value > 0), [data]);
+  // Pulled from the same calculateDashboardMetrics engine that powers every
+  // other KPI on this dashboard, so this chart can never disagree with the
+  // Net Sales / Deductions / Settled figures shown elsewhere on the page.
+  const channelData = useMemo(() => {
+    const calculated = data?.dashboardCalculations?.metrics;
+    return [
+      { name: 'Net Sales', value: Number(calculated?.netSales?.value ?? 0) },
+      { name: 'Deductions', value: Math.abs(Number(calculated?.deductions?.value ?? 0)) },
+      { name: 'Settled Amount', value: Number(calculated?.settled?.value ?? 0) }
+    ].filter(item => item.value > 0);
+  }, [data]);
   const reportTypes = VIEW_REPORT_TYPES[view];
   const ledgerCopy = VIEW_LEDGER_COPY[view];
   const detailView = view === 'report-detail' || view === 'metric-detail';
@@ -762,7 +785,10 @@ function buildDashboardSummary(data, range = defaultDateRange()) {
   };
 }
 function readableTrend(data) {
-  return (data?.trend ?? []).map(row => ({ ...row, label: new Date(row.date).toLocaleDateString('en-IN', { day: '2-digit', month: 'short' }) }));
+  // row.date is a bare calendar date (no time component) already anchored to
+  // the seller's reporting day. Format it as UTC so a browser in a negative
+  // UTC offset can never roll it back to the previous day.
+  return (data?.trend ?? []).map(row => ({ ...row, label: new Date(row.date).toLocaleDateString('en-IN', { day: '2-digit', month: 'short', timeZone: 'UTC' }) }));
 }
 
 function readableBusinessReportRows(data) {
