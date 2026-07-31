@@ -76,6 +76,59 @@ function pick(row, names) {
   return undefined;
 }
 
+const BATCH_UPSERT_CHUNK_SIZE = 500;
+
+/**
+ * Inserts many rows in a handful of multi-row statements instead of one
+ * sequential round trip per row. A high-volume seller's settlement or
+ * finance-event report is realistically tens of thousands of lines; one
+ * awaited query per row at that scale is slow enough to risk the sync
+ * request itself timing out mid-import (server platform, reverse proxy, or
+ * browser), leaving only whatever was inserted before the cutoff actually
+ * saved - a "completed" sync with silently incomplete data, indistinguishable
+ * from a correct one until the totals are compared against Amazon.
+ * @param {import('pg').PoolClient} client
+ * @param {{ table: string, columns: string[], conflictColumns?: string[], updateColumns?: string[], rows: unknown[][], chunkSize?: number }} params
+ * @returns {Promise<number>}
+ */
+export async function batchUpsert(client, { table, columns, conflictColumns, updateColumns, rows, chunkSize = BATCH_UPSERT_CHUNK_SIZE }) {
+  if (!rows.length) return 0;
+  const conflictIndexes = updateColumns?.length ? conflictColumns.map(name => columns.indexOf(name)) : null;
+  const action = updateColumns?.length
+    ? `on conflict (${conflictColumns.join(',')}) do update set ${updateColumns.map(name => `${name}=excluded.${name}`).join(', ')}`
+    : 'on conflict do nothing';
+  let imported = 0;
+  for (let offset = 0; offset < rows.length; offset += chunkSize) {
+    let chunk = rows.slice(offset, offset + chunkSize);
+    if (conflictIndexes) {
+      // A single "insert ... on conflict do update" cannot affect the same
+      // target row twice in one statement, so same-key rows within a chunk
+      // must be pre-merged (keep the latest). But the real unique
+      // constraints here include nullable columns, and Postgres never treats
+      // NULL as equal to NULL for conflict purposes - two rows that are both
+      // NULL in a key column are NOT duplicates of each other. A naive
+      // string-join key would incorrectly collapse them, so any row with a
+      // null key component always gets its own unique synthetic key instead.
+      const seen = new Map();
+      chunk.forEach((row, rowIndex) => {
+        const keyParts = conflictIndexes.map(index => row[index]);
+        const key = keyParts.some(value => value == null) ? `row${rowIndex}` : JSON.stringify(keyParts);
+        seen.set(key, row);
+      });
+      chunk = [...seen.values()];
+    }
+    const values = [];
+    const placeholders = chunk.map((row, rowIndex) => {
+      values.push(...row);
+      const base = rowIndex * columns.length;
+      return `(${columns.map((_, columnIndex) => `$${base + columnIndex + 1}`).join(',')})`;
+    }).join(',');
+    await client.query(`insert into ${table}(${columns.join(',')}) values ${placeholders} ${action}`, values);
+    imported += chunk.length;
+  }
+  return imported;
+}
+
 /** @param {string} textContent @returns {Array<Record<string, unknown>>} */
 function parseTsv(textContent) {
   const trimmed = z.string().parse(textContent).trim();
@@ -130,24 +183,25 @@ function parseReportRows(reportType, content) {
 async function saveSettlementRows(tenantId, content) {
   const rows = z.array(ReportRowSchema).parse(parseReportRows('GET_V2_SETTLEMENT_REPORT_DATA_FLAT_FILE_V2', content));
   await withTenant(tenantId, async client => {
-    for (const row of rows) {
+    const batch = rows.map(row => {
       const amount = number(pick(row, ['amount']));
-      // Amazon posts a settlement's individual transaction lines throughout
-      // its pay cycle but only adds deposit-date/total-amount once the
-      // period closes and actually pays out. If this exact line was synced
-      // earlier (before the settlement closed), it already satisfies the
-      // unique constraint below — "do nothing" would silently discard the
-      // now-finalized deposit metadata on every later re-sync, permanently
-      // freezing that settlement out of deposit/transfer totals even though
-      // its line items are present. Overwrite raw with the latest pull.
-      await client.query(
-        `insert into settlement_rows(tenant_id, settlement_id, order_id, amount_type, amount_description, amount, posted_date, raw, source_key)
-         values($1,$2,$3,$4,$5,$6,$7,$8,$9)
-         on conflict (tenant_id, order_id, amount_type, amount_description, posted_date, amount)
-         do update set raw = excluded.raw, settlement_id = excluded.settlement_id`,
-        [tenantId, text(pick(row, ['settlement-id', 'settlement id', 'settlementId'])), text(pick(row, ['order-id', 'order id', 'amazon-order-id', 'amazonOrderId'])), text(pick(row, ['amount-type', 'amount type', 'amountType'])), text(pick(row, ['amount-description', 'amount description', 'amountDescription'])), amount, reportDate(pick(row, ['posted-date', 'posted date', 'postedDate'])), row, sourceKey(row, [pick(row, ['settlement-id', 'settlement id', 'settlementId']), pick(row, ['transaction-type', 'transaction type', 'transactionType']), pick(row, ['order-id', 'order id', 'amazon-order-id', 'amazonOrderId']), pick(row, ['amount-type', 'amount type', 'amountType']), pick(row, ['amount-description', 'amount description', 'amountDescription']), pick(row, ['posted-date', 'posted date', 'postedDate']), amount])]
-      );
-    }
+      return [tenantId, text(pick(row, ['settlement-id', 'settlement id', 'settlementId'])), text(pick(row, ['order-id', 'order id', 'amazon-order-id', 'amazonOrderId'])), text(pick(row, ['amount-type', 'amount type', 'amountType'])), text(pick(row, ['amount-description', 'amount description', 'amountDescription'])), amount, reportDate(pick(row, ['posted-date', 'posted date', 'postedDate'])), row, sourceKey(row, [pick(row, ['settlement-id', 'settlement id', 'settlementId']), pick(row, ['transaction-type', 'transaction type', 'transactionType']), pick(row, ['order-id', 'order id', 'amazon-order-id', 'amazonOrderId']), pick(row, ['amount-type', 'amount type', 'amountType']), pick(row, ['amount-description', 'amount description', 'amountDescription']), pick(row, ['posted-date', 'posted date', 'postedDate']), amount])];
+    });
+    // Amazon posts a settlement's individual transaction lines throughout
+    // its pay cycle but only adds deposit-date/total-amount once the
+    // period closes and actually pays out. If this exact line was synced
+    // earlier (before the settlement closed), it already satisfies the
+    // conflict target below — "do nothing" would silently discard the
+    // now-finalized deposit metadata on every later re-sync, permanently
+    // freezing that settlement out of deposit/transfer totals even though
+    // its line items are present. Overwrite raw with the latest pull.
+    await batchUpsert(client, {
+      table: 'settlement_rows',
+      columns: ['tenant_id', 'settlement_id', 'order_id', 'amount_type', 'amount_description', 'amount', 'posted_date', 'raw', 'source_key'],
+      conflictColumns: ['tenant_id', 'order_id', 'amount_type', 'amount_description', 'posted_date', 'amount'],
+      updateColumns: ['raw', 'settlement_id'],
+      rows: batch
+    });
   });
   return rows.length;
 }
@@ -156,14 +210,14 @@ async function saveSettlementRows(tenantId, content) {
 async function saveGstInvoices(tenantId, content, invoiceType) {
   const rows = z.array(ReportRowSchema).parse(parseReportRows(invoiceType === 'b2b' ? 'GET_GST_MTR_B2B_CUSTOM' : 'GET_GST_MTR_B2C_CUSTOM', content));
   await withTenant(tenantId, async client => {
-    for (const row of rows) {
-      await client.query(
-        `insert into gst_invoices(tenant_id, invoice_type, order_id, cgst, sgst, igst, taxable_value, invoice_date, raw)
-         values($1,$2,$3,$4,$5,$6,$7,$8,$9)
-         on conflict (tenant_id, invoice_type, order_id, invoice_date) do update set cgst=excluded.cgst, sgst=excluded.sgst, igst=excluded.igst, taxable_value=excluded.taxable_value, raw=excluded.raw`,
-        [tenantId, invoiceType, text(pick(row, ['order-id', 'order id', 'amazon-order-id', 'amazonOrderId'])), number(pick(row, ['cgst', 'cgst tax', 'cgst amount'])), number(pick(row, ['sgst', 'sgst tax', 'sgst amount'])), number(pick(row, ['igst', 'igst tax', 'igst amount'])), number(pick(row, ['taxable-value', 'taxable value', 'taxableValue', 'taxable amount'])), text(pick(row, ['invoice-date', 'invoice date', 'invoiceDate', 'transaction-date', 'transaction date'])) ?? null, row]
-      );
-    }
+    const batch = rows.map(row => [tenantId, invoiceType, text(pick(row, ['order-id', 'order id', 'amazon-order-id', 'amazonOrderId'])), number(pick(row, ['cgst', 'cgst tax', 'cgst amount'])), number(pick(row, ['sgst', 'sgst tax', 'sgst amount'])), number(pick(row, ['igst', 'igst tax', 'igst amount'])), number(pick(row, ['taxable-value', 'taxable value', 'taxableValue', 'taxable amount'])), text(pick(row, ['invoice-date', 'invoice date', 'invoiceDate', 'transaction-date', 'transaction date'])) ?? null, row]);
+    await batchUpsert(client, {
+      table: 'gst_invoices',
+      columns: ['tenant_id', 'invoice_type', 'order_id', 'cgst', 'sgst', 'igst', 'taxable_value', 'invoice_date', 'raw'],
+      conflictColumns: ['tenant_id', 'invoice_type', 'order_id', 'invoice_date'],
+      updateColumns: ['cgst', 'sgst', 'igst', 'taxable_value', 'raw'],
+      rows: batch
+    });
   });
   return rows.length;
 }
@@ -172,14 +226,14 @@ async function saveGstInvoices(tenantId, content, invoiceType) {
 async function saveReturns(tenantId, content) {
   const rows = z.array(ReportRowSchema).parse(parseReportRows('GET_FBA_FULFILLMENT_CUSTOMER_RETURNS_DATA', content));
   await withTenant(tenantId, async client => {
-    for (const row of rows) {
-      await client.query(
-        `insert into returns(tenant_id, order_id, return_reason, disposition, status, return_date, quantity, raw, source_key)
-         values($1,$2,$3,$4,$5,$6,$7,$8,$9)
-         on conflict (tenant_id, order_id, return_date, return_reason, disposition) do update set status=excluded.status, quantity=excluded.quantity, raw=excluded.raw, source_key=excluded.source_key`,
-        [tenantId, text(pick(row, ['order-id', 'order id', 'amazon-order-id', 'amazonOrderId'])), text(pick(row, ['reason', 'return-reason', 'return reason', 'returnReason'])), text(pick(row, ['disposition', 'detailed-disposition', 'detailed disposition'])), 'yet_to_receive', text(pick(row, ['return-date', 'return date', 'returnDate', 'date'])) ?? null, pick(row, ['quantity','quantity-returned','return quantity']) == null ? null : integer(pick(row, ['quantity','quantity-returned','return quantity'])), row, sourceKey(row, [pick(row, ['order-id', 'order id', 'amazon-order-id', 'amazonOrderId']), pick(row, ['return-date', 'return date', 'returnDate', 'date']), pick(row, ['reason', 'return-reason', 'return reason', 'returnReason']), pick(row, ['disposition', 'detailed-disposition', 'detailed disposition'])])]
-      );
-    }
+    const batch = rows.map(row => [tenantId, text(pick(row, ['order-id', 'order id', 'amazon-order-id', 'amazonOrderId'])), text(pick(row, ['reason', 'return-reason', 'return reason', 'returnReason'])), text(pick(row, ['disposition', 'detailed-disposition', 'detailed disposition'])), 'yet_to_receive', text(pick(row, ['return-date', 'return date', 'returnDate', 'date'])) ?? null, pick(row, ['quantity', 'quantity-returned', 'return quantity']) == null ? null : integer(pick(row, ['quantity', 'quantity-returned', 'return quantity'])), row, sourceKey(row, [pick(row, ['order-id', 'order id', 'amazon-order-id', 'amazonOrderId']), pick(row, ['return-date', 'return date', 'returnDate', 'date']), pick(row, ['reason', 'return-reason', 'return reason', 'returnReason']), pick(row, ['disposition', 'detailed-disposition', 'detailed disposition'])])]);
+    await batchUpsert(client, {
+      table: 'returns',
+      columns: ['tenant_id', 'order_id', 'return_reason', 'disposition', 'status', 'return_date', 'quantity', 'raw', 'source_key'],
+      conflictColumns: ['tenant_id', 'order_id', 'return_date', 'return_reason', 'disposition'],
+      updateColumns: ['status', 'quantity', 'raw', 'source_key'],
+      rows: batch
+    });
   });
   return rows.length;
 }
@@ -188,14 +242,12 @@ async function saveReturns(tenantId, content) {
 async function saveReimbursements(tenantId, content) {
   const rows = z.array(ReportRowSchema).parse(parseReportRows('GET_FBA_REIMBURSEMENTS_DATA', content));
   await withTenant(tenantId, async client => {
-    for (const row of rows) {
-      await client.query(
-        `insert into reimbursements(tenant_id, amount, reason, sku, reimbursement_date)
-         values($1,$2,$3,$4,$5)
-         on conflict (tenant_id, sku, reimbursement_date, amount, reason) do nothing`,
-        [tenantId, number(pick(row, ['amount', 'total-amount', 'total amount', 'reimbursement amount'])), text(pick(row, ['reason', 'reason-code', 'reason code', 'approval-reason'])), text(pick(row, ['sku', 'seller-sku', 'seller sku'])), text(pick(row, ['reimbursement-date', 'reimbursement date', 'approval-date', 'approval date'])) ?? null]
-      );
-    }
+    const batch = rows.map(row => [tenantId, number(pick(row, ['amount', 'total-amount', 'total amount', 'reimbursement amount'])), text(pick(row, ['reason', 'reason-code', 'reason code', 'approval-reason'])), text(pick(row, ['sku', 'seller-sku', 'seller sku'])), text(pick(row, ['reimbursement-date', 'reimbursement date', 'approval-date', 'approval date'])) ?? null]);
+    await batchUpsert(client, {
+      table: 'reimbursements',
+      columns: ['tenant_id', 'amount', 'reason', 'sku', 'reimbursement_date'],
+      rows: batch
+    });
   });
   return rows.length;
 }
@@ -205,16 +257,17 @@ async function saveInventorySnapshots(tenantId, content) {
   const rows = z.array(ReportRowSchema).parse(parseReportRows('GET_FBA_MYI_UNSUPPRESSED_INVENTORY_DATA', content));
   const snapshotDate = new Date().toISOString().slice(0, 10);
   await withTenant(tenantId, async client => {
-    for (const row of rows) {
-      const sku = text(pick(row, ['sku', 'seller-sku', 'seller sku']));
-      if (!sku) continue;
-      await client.query(
-        `insert into inventory_snapshots(tenant_id, sku, fulfillable_quantity, snapshot_date)
-         values($1,$2,$3,$4)
-         on conflict (tenant_id, sku, snapshot_date) do update set fulfillable_quantity=excluded.fulfillable_quantity`,
-        [tenantId, sku, integer(pick(row, ['fulfillable-quantity', 'fulfillable quantity', 'afn-fulfillable-quantity', 'afn fulfillable quantity', 'quantity'])), snapshotDate]
-      );
-    }
+    const batch = rows
+      .map(row => [row, text(pick(row, ['sku', 'seller-sku', 'seller sku']))])
+      .filter(([, sku]) => sku)
+      .map(([row, sku]) => [tenantId, sku, integer(pick(row, ['fulfillable-quantity', 'fulfillable quantity', 'afn-fulfillable-quantity', 'afn fulfillable quantity', 'quantity'])), snapshotDate]);
+    await batchUpsert(client, {
+      table: 'inventory_snapshots',
+      columns: ['tenant_id', 'sku', 'fulfillable_quantity', 'snapshot_date'],
+      conflictColumns: ['tenant_id', 'sku', 'snapshot_date'],
+      updateColumns: ['fulfillable_quantity'],
+      rows: batch
+    });
   });
   return rows.length;
 }
@@ -224,17 +277,17 @@ async function saveSalesTrafficDaily(tenantId, content, range) {
   const rows = z.array(ReportRowSchema).parse(parseReportRows('GET_SALES_AND_TRAFFIC_REPORT', content));
   const fallbackDate = range?.start ? new Date(range.start).toISOString().slice(0, 10) : null;
   await withTenant(tenantId, async client => {
-    for (const row of rows) {
-      const date = text(pick(row, ['date', 'startDate', 'start-date'])) ?? fallbackDate;
-      if (!date) continue;
-      const asin = text(pick(row, ['asin', 'parentAsin', 'parent-asin', 'childAsin', 'child-asin'])) ?? 'ALL';
-      await client.query(
-        `insert into sales_traffic_daily(tenant_id, date, asin, sessions, page_views, units_ordered, ordered_product_sales, featured_offer_percentage, units_refunded, shipped_product_sales, ordered_product_sales_b2b, units_ordered_b2b, total_order_items, total_order_items_b2b, average_sales_per_order_item, average_sales_per_order_item_b2b, average_units_per_order_item, average_units_per_order_item_b2b, average_selling_price, raw)
-         values($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20)
-         on conflict (tenant_id, date, asin) do update set sessions=excluded.sessions, page_views=excluded.page_views, units_ordered=excluded.units_ordered, ordered_product_sales=excluded.ordered_product_sales, featured_offer_percentage=excluded.featured_offer_percentage, units_refunded=excluded.units_refunded, shipped_product_sales=excluded.shipped_product_sales, ordered_product_sales_b2b=excluded.ordered_product_sales_b2b, units_ordered_b2b=excluded.units_ordered_b2b, total_order_items=excluded.total_order_items, total_order_items_b2b=excluded.total_order_items_b2b, average_sales_per_order_item=excluded.average_sales_per_order_item, average_sales_per_order_item_b2b=excluded.average_sales_per_order_item_b2b, average_units_per_order_item=excluded.average_units_per_order_item, average_units_per_order_item_b2b=excluded.average_units_per_order_item_b2b, average_selling_price=excluded.average_selling_price, raw=excluded.raw`,
-        [tenantId, date, asin, integer(pick(row, ['sessions', 'sessionsTotal'])), integer(pick(row, ['pageViews', 'page-views', 'page views', 'pageViewsTotal'])), integer(pick(row, ['unitsOrdered', 'units-ordered', 'units ordered'])), number(pick(row, ['orderedProductSales.amount', 'salesByDate.orderedProductSales.amount', 'salesByAsin.orderedProductSales.amount', 'orderedProductSales', 'ordered-product-sales', 'ordered product sales', 'orderedProductSalesAmount', 'amount'])), number(pick(row, ['featuredOfferPercentage', 'featured-offer-percentage', 'featured offer percentage', 'buyBoxPercentage'])), integer(pick(row, ['unitsRefunded', 'units-refunded', 'units refunded'])), number(pick(row, ['shippedProductSales', 'shipped-product-sales', 'shipped product sales', 'shippedProductSalesAmount'])), number(pick(row, ['orderedProductSalesB2B.amount', 'salesByDate.orderedProductSalesB2B.amount', 'salesByAsin.orderedProductSalesB2B.amount', 'orderedProductSalesB2B', 'ordered-product-sales-b2b', 'ordered product sales b2b', 'orderedProductSalesB2BAmount'])), integer(pick(row, ['unitsOrderedB2B', 'units-ordered-b2b', 'units ordered b2b'])), integer(pick(row, ['totalOrderItems', 'total-order-items', 'total order items'])), integer(pick(row, ['totalOrderItemsB2B', 'total-order-items-b2b', 'total order items b2b'])), number(pick(row, ['averageSalesPerOrderItem.amount', 'salesByDate.averageSalesPerOrderItem.amount', 'salesByAsin.averageSalesPerOrderItem.amount', 'averageSalesPerOrderItem', 'average-sales-per-order-item', 'average sales per order item'])), number(pick(row, ['averageSalesPerOrderItemB2B.amount', 'salesByDate.averageSalesPerOrderItemB2B.amount', 'salesByAsin.averageSalesPerOrderItemB2B.amount', 'averageSalesPerOrderItemB2B', 'average-sales-per-order-item-b2b', 'average sales per order item b2b'])), number(pick(row, ['averageUnitsPerOrderItem', 'average-units-per-order-item', 'average units per order item'])), number(pick(row, ['averageUnitsPerOrderItemB2B', 'average-units-per-order-item-b2b', 'average units per order item b2b'])), number(pick(row, ['averageSellingPrice.amount', 'salesByDate.averageSellingPrice.amount', 'salesByAsin.averageSellingPrice.amount', 'averageSellingPrice', 'average-selling-price', 'average selling price'])), row]
-      );
-    }
+    const batch = rows
+      .map(row => [row, text(pick(row, ['date', 'startDate', 'start-date'])) ?? fallbackDate])
+      .filter(([, date]) => date)
+      .map(([row, date]) => [tenantId, date, text(pick(row, ['asin', 'parentAsin', 'parent-asin', 'childAsin', 'child-asin'])) ?? 'ALL', integer(pick(row, ['sessions', 'sessionsTotal'])), integer(pick(row, ['pageViews', 'page-views', 'page views', 'pageViewsTotal'])), integer(pick(row, ['unitsOrdered', 'units-ordered', 'units ordered'])), number(pick(row, ['orderedProductSales.amount', 'salesByDate.orderedProductSales.amount', 'salesByAsin.orderedProductSales.amount', 'orderedProductSales', 'ordered-product-sales', 'ordered product sales', 'orderedProductSalesAmount', 'amount'])), number(pick(row, ['featuredOfferPercentage', 'featured-offer-percentage', 'featured offer percentage', 'buyBoxPercentage'])), integer(pick(row, ['unitsRefunded', 'units-refunded', 'units refunded'])), number(pick(row, ['shippedProductSales', 'shipped-product-sales', 'shipped product sales', 'shippedProductSalesAmount'])), number(pick(row, ['orderedProductSalesB2B.amount', 'salesByDate.orderedProductSalesB2B.amount', 'salesByAsin.orderedProductSalesB2B.amount', 'orderedProductSalesB2B', 'ordered-product-sales-b2b', 'ordered product sales b2b', 'orderedProductSalesB2BAmount'])), integer(pick(row, ['unitsOrderedB2B', 'units-ordered-b2b', 'units ordered b2b'])), integer(pick(row, ['totalOrderItems', 'total-order-items', 'total order items'])), integer(pick(row, ['totalOrderItemsB2B', 'total-order-items-b2b', 'total order items b2b'])), number(pick(row, ['averageSalesPerOrderItem.amount', 'salesByDate.averageSalesPerOrderItem.amount', 'salesByAsin.averageSalesPerOrderItem.amount', 'averageSalesPerOrderItem', 'average-sales-per-order-item', 'average sales per order item'])), number(pick(row, ['averageSalesPerOrderItemB2B.amount', 'salesByDate.averageSalesPerOrderItemB2B.amount', 'salesByAsin.averageSalesPerOrderItemB2B.amount', 'averageSalesPerOrderItemB2B', 'average-sales-per-order-item-b2b', 'average sales per order item b2b'])), number(pick(row, ['averageUnitsPerOrderItem', 'average-units-per-order-item', 'average units per order item'])), number(pick(row, ['averageUnitsPerOrderItemB2B', 'average-units-per-order-item-b2b', 'average units per order item b2b'])), number(pick(row, ['averageSellingPrice.amount', 'salesByDate.averageSellingPrice.amount', 'salesByAsin.averageSellingPrice.amount', 'averageSellingPrice', 'average-selling-price', 'average selling price'])), row]);
+    await batchUpsert(client, {
+      table: 'sales_traffic_daily',
+      columns: ['tenant_id', 'date', 'asin', 'sessions', 'page_views', 'units_ordered', 'ordered_product_sales', 'featured_offer_percentage', 'units_refunded', 'shipped_product_sales', 'ordered_product_sales_b2b', 'units_ordered_b2b', 'total_order_items', 'total_order_items_b2b', 'average_sales_per_order_item', 'average_sales_per_order_item_b2b', 'average_units_per_order_item', 'average_units_per_order_item_b2b', 'average_selling_price', 'raw'],
+      conflictColumns: ['tenant_id', 'date', 'asin'],
+      updateColumns: ['sessions', 'page_views', 'units_ordered', 'ordered_product_sales', 'featured_offer_percentage', 'units_refunded', 'shipped_product_sales', 'ordered_product_sales_b2b', 'units_ordered_b2b', 'total_order_items', 'total_order_items_b2b', 'average_sales_per_order_item', 'average_sales_per_order_item_b2b', 'average_units_per_order_item', 'average_units_per_order_item_b2b', 'average_selling_price', 'raw'],
+      rows: batch
+    });
   });
   return rows.length;
 }
@@ -355,17 +408,19 @@ export async function syncRecentApiDataForTenant(tenantId, options = {}) {
       let catalogItemsImported = 0;
       const catalogCache = new Map();
       await withTenant(parsedTenantId, async db => {
+        // Orders/items themselves are cheap to batch; what genuinely must
+        // stay sequential is the per-order Order Items API call and the
+        // per-ASIN Catalog Items API call, since both are real, rate-limited
+        // network requests to Amazon, not database writes. So this loop only
+        // fetches from Amazon and collects rows - every DB write is issued
+        // once, in batches, after the loop instead of once per row inside it.
+        const orderRows = [];
+        const orderItemRows = [];
         let orderItemsFetched = 0;
         for (const order of orders) {
           const orderId = order.AmazonOrderId ?? order.amazonOrderId;
           if (!orderId) continue;
-          await db.query(
-            `insert into orders(tenant_id, amazon_order_id, order_date, total_amount, status, fulfillment_channel, sales_channel, raw)
-             values($1,$2,$3,$4,$5,$6,$7,$8::jsonb)
-             on conflict (tenant_id, amazon_order_id) do update set order_date=excluded.order_date, total_amount=excluded.total_amount,
-               status=excluded.status, fulfillment_channel=excluded.fulfillment_channel, sales_channel=excluded.sales_channel, raw=excluded.raw`,
-            [parsedTenantId, orderId, order.PurchaseDate ?? order.purchaseDate ?? null, number(order.OrderTotal?.Amount ?? order.orderTotal?.amount), order.OrderStatus ?? order.orderStatus ?? null, order.FulfillmentChannel ?? order.fulfillmentChannel ?? null, order.SalesChannel ?? order.salesChannel ?? null, JSON.stringify(order)]
-          );
+          orderRows.push([parsedTenantId, orderId, order.PurchaseDate ?? order.purchaseDate ?? null, number(order.OrderTotal?.Amount ?? order.orderTotal?.amount), order.OrderStatus ?? order.orderStatus ?? null, order.FulfillmentChannel ?? order.fulfillmentChannel ?? null, order.SalesChannel ?? order.salesChannel ?? null, order]);
           ordersImported += 1;
           const existingItems = await db.query('select 1 from order_items where tenant_id=$1 and amazon_order_id=$2 limit 1', [parsedTenantId, orderId]);
           if (existingItems.rowCount) {
@@ -388,15 +443,23 @@ export async function syncRecentApiDataForTenant(tenantId, options = {}) {
               if (catalog) catalogItemsImported += 1;
             }
             const shipping = catalogShippingFacts(catalog);
-            await db.query(
-              `insert into order_items(tenant_id, amazon_order_id, asin, sku, title, quantity_ordered, item_price, item_tax, promotion_discount, raw, package_weight, weight_unit, package_dimensions, catalog_raw)
-               values($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
-               on conflict (tenant_id, amazon_order_id, sku, asin) do update set title=excluded.title, quantity_ordered=excluded.quantity_ordered, item_price=excluded.item_price, item_tax=excluded.item_tax, promotion_discount=excluded.promotion_discount, raw=excluded.raw,
-                 package_weight=excluded.package_weight, weight_unit=excluded.weight_unit, package_dimensions=excluded.package_dimensions, catalog_raw=excluded.catalog_raw`,
-              [parsedTenantId, orderId, asin, item.SellerSKU ?? item.sellerSku ?? null, item.Title ?? item.title ?? null, integer(item.QuantityOrdered ?? item.quantityOrdered), number(item.ItemPrice?.Amount ?? item.itemPrice?.amount), number(item.ItemTax?.Amount ?? item.itemTax?.amount), number(item.PromotionDiscount?.Amount ?? item.promotionDiscount?.amount), item, shipping.weight || null, shipping.weightUnit ?? null, shipping.dimensions, catalog ?? {}]
-            );
+            orderItemRows.push([parsedTenantId, orderId, asin, item.SellerSKU ?? item.sellerSku ?? null, item.Title ?? item.title ?? null, integer(item.QuantityOrdered ?? item.quantityOrdered), number(item.ItemPrice?.Amount ?? item.itemPrice?.amount), number(item.ItemTax?.Amount ?? item.itemTax?.amount), number(item.PromotionDiscount?.Amount ?? item.promotionDiscount?.amount), item, shipping.weight || null, shipping.weightUnit ?? null, shipping.dimensions, catalog ?? {}]);
           }
         }
+        await batchUpsert(db, {
+          table: 'orders',
+          columns: ['tenant_id', 'amazon_order_id', 'order_date', 'total_amount', 'status', 'fulfillment_channel', 'sales_channel', 'raw'],
+          conflictColumns: ['tenant_id', 'amazon_order_id'],
+          updateColumns: ['order_date', 'total_amount', 'status', 'fulfillment_channel', 'sales_channel', 'raw'],
+          rows: orderRows
+        });
+        await batchUpsert(db, {
+          table: 'order_items',
+          columns: ['tenant_id', 'amazon_order_id', 'asin', 'sku', 'title', 'quantity_ordered', 'item_price', 'item_tax', 'promotion_discount', 'raw', 'package_weight', 'weight_unit', 'package_dimensions', 'catalog_raw'],
+          conflictColumns: ['tenant_id', 'amazon_order_id', 'sku', 'asin'],
+          updateColumns: ['title', 'quantity_ordered', 'item_price', 'item_tax', 'promotion_discount', 'raw', 'package_weight', 'weight_unit', 'package_dimensions', 'catalog_raw'],
+          rows: orderItemRows
+        });
         // Backfill catalog facts for previously imported order items as well;
         // otherwise only brand-new orders would ever receive shipping weight.
         const missingCatalogItems = (await db.query(
@@ -420,38 +483,35 @@ export async function syncRecentApiDataForTenant(tenantId, options = {}) {
             [parsedTenantId, asin, shipping.weight || null, shipping.weightUnit ?? null, shipping.dimensions, catalog]
           );
         }
-        for (const summary of inventorySummaries) {
-          const sku = summary.sellerSku ?? summary.SellerSKU ?? summary.sellerSKU;
-          if (!sku) continue;
-          const fulfillableQuantity = summary.inventoryDetails?.fulfillableQuantity ?? summary.InventoryDetails?.FulfillableQuantity ?? summary.fulfillableQuantity ?? summary.FulfillableQuantity;
-          await db.query(
-            `insert into inventory_snapshots(tenant_id, sku, fulfillable_quantity, snapshot_date)
-             values($1,$2,$3,$4)
-             on conflict (tenant_id, sku, snapshot_date) do update set fulfillable_quantity=excluded.fulfillable_quantity`,
-            [parsedTenantId, sku, integer(fulfillableQuantity), snapshotDate]
-          );
-          inventoryImported += 1;
-        }
+        const inventoryRows = inventorySummaries
+          .map(summary => [summary, summary.sellerSku ?? summary.SellerSKU ?? summary.sellerSKU])
+          .filter(([, sku]) => sku)
+          .map(([summary, sku]) => [parsedTenantId, sku, integer(summary.inventoryDetails?.fulfillableQuantity ?? summary.InventoryDetails?.FulfillableQuantity ?? summary.fulfillableQuantity ?? summary.FulfillableQuantity), snapshotDate]);
+        inventoryImported = await batchUpsert(db, {
+          table: 'inventory_snapshots',
+          columns: ['tenant_id', 'sku', 'fulfillable_quantity', 'snapshot_date'],
+          conflictColumns: ['tenant_id', 'sku', 'snapshot_date'],
+          updateColumns: ['fulfillable_quantity'],
+          rows: inventoryRows
+        });
+        // flattenFinanceTransaction is pure CPU work (no network/DB calls),
+        // so every transaction can be flattened up front and every resulting
+        // write batched, instead of one delete + N inserts per transaction.
+        const financeTransactionRows = [];
+        const financeTransactionIds = [];
+        const financeItemRows = [];
+        const reimbursementRows = [];
         for (const transaction of transactions) {
           const transactionId = transaction.transactionId ?? transaction.TransactionId ?? transaction.financialEventGroupId ?? transaction.FinancialEventGroupId;
           if (!transactionId) continue;
-          await db.query(
-            `insert into finance_transactions(tenant_id, transaction_id, transaction_type, posted_date, total_amount, currency, related_order_id, raw)
-             values($1,$2,$3,$4,$5,$6,$7,$8)
-             on conflict (tenant_id, transaction_id) do update set transaction_type=excluded.transaction_type, posted_date=excluded.posted_date, total_amount=excluded.total_amount, currency=excluded.currency, related_order_id=excluded.related_order_id, raw=excluded.raw`,
-            [parsedTenantId, transactionId, transaction.transactionType ?? transaction.TransactionType ?? null, transaction.postedDate ?? transaction.PostedDate ?? null, number(transaction.totalAmount?.currencyAmount ?? transaction.TotalAmount?.CurrencyAmount ?? transaction.totalAmount?.Amount ?? transaction.TotalAmount?.Amount), transaction.totalAmount?.currencyCode ?? transaction.TotalAmount?.CurrencyCode ?? 'INR', financeRelatedValue(transaction, ['ORDER_ID', 'AMAZON_ORDER_ID']) ?? null, transaction]
-          );
+          financeTransactionRows.push([parsedTenantId, transactionId, transaction.transactionType ?? transaction.TransactionType ?? null, transaction.postedDate ?? transaction.PostedDate ?? null, number(transaction.totalAmount?.currencyAmount ?? transaction.TotalAmount?.CurrencyAmount ?? transaction.totalAmount?.Amount ?? transaction.TotalAmount?.Amount), transaction.totalAmount?.currencyCode ?? transaction.TotalAmount?.CurrencyCode ?? 'INR', financeRelatedValue(transaction, ['ORDER_ID', 'AMAZON_ORDER_ID']) ?? null, transaction]);
+          financeTransactionIds.push(transactionId);
           // Finances API field casing and nested breakdown names can vary by
           // generation. Persist every source node in raw so classifications
           // that land in `other` can be inspected and improved safely.
-          await db.query('delete from finance_transaction_items where tenant_id=$1 and transaction_id=$2', [parsedTenantId, transactionId]);
           const components = flattenFinanceTransaction(transaction);
           for (const component of components) {
-            await db.query(
-              `insert into finance_transaction_items(tenant_id, transaction_id, order_id, sku, asin, category, amount_description, amount, currency, posted_date, raw)
-               values($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) on conflict do nothing`,
-              [parsedTenantId, component.transactionId, component.orderId ?? null, component.sku ?? null, component.asin ?? null, component.category, component.description ?? null, component.amount, component.currency ?? 'INR', component.postedDate, component.raw]
-            );
+            financeItemRows.push([parsedTenantId, component.transactionId, component.orderId ?? null, component.sku ?? null, component.asin ?? null, component.category, component.description ?? null, component.amount, component.currency ?? 'INR', component.postedDate, component.raw]);
           }
           transactionsImported += 1;
           // transactionType only ever documents "Shipment" as a value - it is
@@ -462,15 +522,27 @@ export async function syncRecentApiDataForTenant(tenantId, options = {}) {
           // else in the app. Reuse that instead of re-deriving it here from a
           // field that can't actually carry the signal.
           for (const component of components.filter(row => row.category === 'reimbursement')) {
-            await db.query(
-              `insert into reimbursements(tenant_id, amount, reason, sku, reimbursement_date)
-               values($1,$2,$3,$4,$5)
-               on conflict (tenant_id, sku, reimbursement_date, amount, reason) do nothing`,
-              [parsedTenantId, component.amount, component.description ?? 'Finance reimbursement', component.sku ?? component.orderId ?? transactionId, component.postedDate ?? transaction.postedDate ?? transaction.PostedDate ?? null]
-            );
-            reimbursementsImported += 1;
+            reimbursementRows.push([parsedTenantId, component.amount, component.description ?? 'Finance reimbursement', component.sku ?? component.orderId ?? transactionId, component.postedDate ?? transaction.postedDate ?? transaction.PostedDate ?? null]);
           }
         }
+        await batchUpsert(db, {
+          table: 'finance_transactions',
+          columns: ['tenant_id', 'transaction_id', 'transaction_type', 'posted_date', 'total_amount', 'currency', 'related_order_id', 'raw'],
+          conflictColumns: ['tenant_id', 'transaction_id'],
+          updateColumns: ['transaction_type', 'posted_date', 'total_amount', 'currency', 'related_order_id', 'raw'],
+          rows: financeTransactionRows
+        });
+        if (financeTransactionIds.length) await db.query('delete from finance_transaction_items where tenant_id=$1 and transaction_id = any($2::text[])', [parsedTenantId, financeTransactionIds]);
+        await batchUpsert(db, {
+          table: 'finance_transaction_items',
+          columns: ['tenant_id', 'transaction_id', 'order_id', 'sku', 'asin', 'category', 'amount_description', 'amount', 'currency', 'posted_date', 'raw'],
+          rows: financeItemRows
+        });
+        reimbursementsImported = await batchUpsert(db, {
+          table: 'reimbursements',
+          columns: ['tenant_id', 'amount', 'reason', 'sku', 'reimbursement_date'],
+          rows: reimbursementRows
+        });
       });
       await pool.query('update sync_jobs set status=$1, completed_at=now() where id=$2', ['completed', sync.rows[0].id]);
       return { ordersImported, transactionsImported, inventoryImported, reimbursementsImported, catalogItemsImported, orderItemsSkipped, incrementalSince: createdAfter, incrementalUntil: createdBefore, ordersWarning, financeWarning: financeResponse?.syncError, inventoryWarning: inventoryResponse?.syncError };
