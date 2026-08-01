@@ -9,9 +9,18 @@ const isSummary=row=>String(row.category??'').startsWith('summary_');
 const isRefund=row=>/refund/.test(text(row));
 const isPrincipal=row=>/principal|item price/.test(norm(`${row.amount_type??''} ${row.amount_description??''} ${row.category??''}`));
 const isPromotion=row=>/promotion|promo rebate/.test(text(row))&&!/product tax discount|shipping tax discount|gift wrap tax discount/.test(text(row));
-const isWithholding=row=>/\b(tcs|tds)\b/.test(text(row));
+// Amazon's own Transaction/Account Activity statement puts TDS Reimbursement
+// and Chargebacks under Income - grouped with A-to-z Guarantee claims,
+// SAFE-T Reimbursements and Clawbacks as claims-related credits/debits,
+// distinct from the TCS/TDS actually withheld from a sale. Excluding
+// "reimburse" matches from isWithholding, and dropping "chargeback" from
+// isFee (it does not belong in either isFee's Expenses grouping or
+// isReimbursement's own Reimbursements KPI - it is simply an Income line
+// with no more specific category), keeps both aligned with the real
+// statement sections without changing what counts as a "reimbursement".
+const isWithholding=row=>/\b(tcs|tds)\b/.test(text(row))&&!/reimburse/.test(text(row));
 const isReimbursement=row=>/reimburse|safe t|lost|damaged|clawback/.test(text(row));
-const isFee=row=>/itemfees|itemtcs|itemtds|other transaction|fee|commission|closing|storage|shipping label|service|advertis|chargeback|adjustment|easy ship charges|postagepurchase|tcs|tds/.test(text(row))&&!isReimbursement(row)&&!isPrincipal(row)&&!isPromotion(row);
+const isFee=row=>/itemfees|itemtcs|itemtds|other transaction|fee|commission|closing|storage|shipping label|service|advertis|adjustment|easy ship charges|postagepurchase|tcs|tds/.test(text(row))&&!isReimbursement(row)&&!isPrincipal(row)&&!isPromotion(row);
 const isProductGst=row=>/product tax|shipping tax|gift wrap tax|tax discount|\bgst collected|\bgst refund/.test(text(row))&&!/fee|commission|service|itemtcs|itemtds|tcs|tds/.test(text(row));
 const isGenericTax=row=>/\btax\b/.test(text(row))&&!isProductGst(row)&&!isWithholding(row)&&!isFee(row);
 const isTransfer=row=>/transfer|deposit|bank account|withdrawal/.test(text(row));
