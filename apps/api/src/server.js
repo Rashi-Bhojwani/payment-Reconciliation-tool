@@ -973,11 +973,15 @@ app.get('/api/tenants/:tenantId/dashboard', async request => {
     // computations for any account with more settlement lines than the cap
     // in the selected range (confirmed: one real account had 700+ lines in a
     // 25-day window, well past the old limit of 250).
-    const settlementLines = (await client.query(`select settlement_id, order_id, amount_type, amount_description, amount, posted_date,
+    const settlementLines = (await client.query(`select id source_row_id, settlement_id, order_id, amount_type, amount_description, amount, posted_date,
         coalesce(raw->>'transaction-type',raw->>'transaction type',raw->>'transactionType') transaction_type,
         coalesce(raw->>'order-item-code',raw->>'order item code') order_item_code,
         coalesce(raw->>'merchant-order-item-id',raw->>'merchant order item id') merchant_order_item_id,
-        coalesce(raw->>'sku') sku
+        coalesce(raw->>'sku') sku,
+        coalesce(raw->>'quantity-purchased',raw->>'quantity purchased') quantity_purchased,
+        coalesce(raw->>'posted-date-time',raw->>'posted date time') posted_date_time,
+        coalesce(raw->>'adjustment-id',raw->>'adjustment id') adjustment_id,
+        source_key
       from settlement_rows where tenant_id=$1 and posted_date >= $2 and posted_date < $3 order by posted_date desc nulls last limit 10000`, [tenantId, start, end])).rows;
     const orderRows = (await client.query(`
       select o.amazon_order_id, o.order_date, o.status, o.total_amount, o.fulfillment_channel, o.sales_channel,
