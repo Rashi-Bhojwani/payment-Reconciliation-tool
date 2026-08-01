@@ -316,16 +316,43 @@ function queueInitialSellerSync(tenantId) {
 }
 
 
-async function recordSyntheticReportSync(tenantId, reportType, s3Key = 'fallback://direct-sp-api', note = null) {
+async function recordSyntheticReportSync(tenantId, reportType, s3Key = 'fallback://direct-sp-api', note = null, range = null) {
   await pool.query(
-    `insert into sync_jobs(tenant_id, report_type, status, started_at, completed_at, s3_key, error_message)
-     values($1,$2,'completed',now(),now(),$3,$4)`,
-    [tenantId, reportType, s3Key, note]
+    `insert into sync_jobs(tenant_id, report_type, status, started_at, completed_at, s3_key, error_message, range_start, range_end)
+     values($1,$2,'completed',now(),now(),$3,$4,$5,$6)`,
+    [tenantId, reportType, s3Key, note, range?.start ?? null, range?.end ?? null]
   );
+}
+
+// A completed sync from the last few minutes that already fully covers the
+// newly requested range is data we already have - re-hitting Amazon for it
+// only burns rate-limit budget (confirmed by this account's own SP-API usage
+// report: heavy 429s across orders, report creation, and document downloads)
+// without changing the answer. A DB-only recency check costs nothing and
+// keeps genuinely new ranges, or a sync more than a few minutes old, working
+// exactly as before.
+const SYNC_REUSE_WINDOW_MS = 5 * 60 * 1000;
+async function findReusableSync(tenantId, reportType, range) {
+  if (!range?.start || !range?.end) return null;
+  const recent = await pool.query(
+    `select id, completed_at, range_start, range_end from sync_jobs
+     where tenant_id=$1 and report_type=$2 and status='completed'
+       and completed_at is not null and completed_at > now() - ($5::int * interval '1 millisecond')
+       and range_start is not null and range_end is not null
+       and range_start <= $3 and range_end >= $4
+     order by completed_at desc limit 1`,
+    [tenantId, reportType, range.start, range.end, SYNC_REUSE_WINDOW_MS]
+  );
+  return recent.rows[0] ?? null;
 }
 
 
 async function syncReportForSellerRequest(params, range) {
+  const reusable = await findReusableSync(params.tenantId, params.reportType, range);
+  if (reusable) {
+    const secondsAgo = Math.max(0, Math.round((Date.now() - new Date(reusable.completed_at).getTime()) / 1000));
+    return { reportType: params.reportType, status: 'completed', reused: true, message: `Already synced this range ${secondsAgo}s ago; reusing that data instead of calling Amazon again.` };
+  }
   if (params.reportType === 'DIRECT_SP_API_SYNC') {
     try {
       const result = await syncRecentApiDataForTenant(params.tenantId, { range, maxOrderPages: 2, maxOrderItems: 20 });
@@ -345,7 +372,7 @@ async function syncReportForSellerRequest(params, range) {
       : { includeOrders: false, includeFinance: true, includeInventory: false };
     try {
       const fallback = await syncRecentApiDataForTenant(params.tenantId, { range, ...familyOptions });
-      await recordSyntheticReportSync(params.tenantId, params.reportType);
+      await recordSyntheticReportSync(params.tenantId, params.reportType, undefined, null, range);
       return { reportType: params.reportType, status: 'completed', fallback: 'DIRECT_SP_API_SYNC', ...fallback };
     } catch {
       // The fast direct-API path threw (transient error, missing token
@@ -366,7 +393,7 @@ async function syncReportForSellerRequest(params, range) {
     if (params.reportType === 'GET_GST_MTR_B2B_CUSTOM' || params.reportType === 'GET_GST_MTR_B2C_CUSTOM') {
       const invoiceType = params.reportType === 'GET_GST_MTR_B2B_CUSTOM' ? 'b2b' : 'b2c';
       const rowsImported = await buildGstInvoicesFromOrderItems(params.tenantId, invoiceType).catch(() => 0);
-      await recordSyntheticReportSync(params.tenantId, params.reportType, rowsImported > 0 ? 'fallback://order-items-gst-estimate' : 'fallback://gst-report-unavailable', message);
+      await recordSyntheticReportSync(params.tenantId, params.reportType, rowsImported > 0 ? 'fallback://order-items-gst-estimate' : 'fallback://gst-report-unavailable', message, range);
       return { reportType: params.reportType, status: 'completed', fallback: rowsImported > 0 ? 'ORDER_ITEMS_GST_ESTIMATE' : 'GST_REPORT_UNAVAILABLE', rowsImported, warning: message };
     }
     // Amazon generates the settlement report on its own payout schedule, so
@@ -380,7 +407,7 @@ async function syncReportForSellerRequest(params, range) {
     if (directFallbackReports.has(params.reportType)) {
       try {
         const fallback = await syncRecentApiDataForTenant(params.tenantId, { range });
-        await recordSyntheticReportSync(params.tenantId, params.reportType, 'fallback://direct-sp-api', message);
+        await recordSyntheticReportSync(params.tenantId, params.reportType, 'fallback://direct-sp-api', message, range);
         return { reportType: params.reportType, status: 'completed', fallback: 'DIRECT_SP_API_SYNC', warning: message, ...fallback };
       } catch (fallbackError) {
         // Both the real Amazon report AND the direct-API fallback failed.
@@ -394,7 +421,7 @@ async function syncReportForSellerRequest(params, range) {
       }
     }
     if (params.reportType === 'GET_FBA_FULFILLMENT_CUSTOMER_RETURNS_DATA' && /cancelled|no data|403|fatal/i.test(message)) {
-      await recordSyntheticReportSync(params.tenantId, params.reportType, 'fallback://returns-report-unavailable', message);
+      await recordSyntheticReportSync(params.tenantId, params.reportType, 'fallback://returns-report-unavailable', message, range);
       return { reportType: params.reportType, status: 'completed', fallback: 'RETURNS_REPORT_UNAVAILABLE', rowsImported: 0, warning: message };
     }
     return { reportType: params.reportType, status: 'failed', error: message };

@@ -187,19 +187,21 @@ async function saveSettlementRows(tenantId, content) {
       const amount = number(pick(row, ['amount']));
       return [tenantId, text(pick(row, ['settlement-id', 'settlement id', 'settlementId'])), text(pick(row, ['order-id', 'order id', 'amazon-order-id', 'amazonOrderId'])), text(pick(row, ['amount-type', 'amount type', 'amountType'])), text(pick(row, ['amount-description', 'amount description', 'amountDescription'])), amount, reportDate(pick(row, ['posted-date', 'posted date', 'postedDate'])), row, sourceKey(row, [pick(row, ['settlement-id', 'settlement id', 'settlementId']), pick(row, ['transaction-type', 'transaction type', 'transactionType']), pick(row, ['order-id', 'order id', 'amazon-order-id', 'amazonOrderId']), pick(row, ['amount-type', 'amount type', 'amountType']), pick(row, ['amount-description', 'amount description', 'amountDescription']), pick(row, ['posted-date', 'posted date', 'postedDate']), amount])];
     });
-    // Amazon posts a settlement's individual transaction lines throughout
-    // its pay cycle but only adds deposit-date/total-amount once the
-    // period closes and actually pays out. If this exact line was synced
-    // earlier (before the settlement closed), it already satisfies the
-    // conflict target below — "do nothing" would silently discard the
-    // now-finalized deposit metadata on every later re-sync, permanently
-    // freezing that settlement out of deposit/transfer totals even though
-    // its line items are present. Overwrite raw with the latest pull.
+    // source_key is deterministic per settlement/transaction line, and is
+    // the real conflict identity here - not the business columns. Settlement
+    // header rows deliberately share NULL order_id/amount_type/
+    // amount_description/posted_date across *different* settlements
+    // (Postgres never treats two NULLs as equal, so a composite target on
+    // those columns can never tell one settlement's header from another's,
+    // by design), but re-syncing the *same* settlement a second time
+    // produces the exact same source_key both times - so source_key is what
+    // actually needs to drive the update-vs-insert decision, refreshing
+    // deposit metadata on re-sync instead of erroring or duplicating.
     await batchUpsert(client, {
       table: 'settlement_rows',
       columns: ['tenant_id', 'settlement_id', 'order_id', 'amount_type', 'amount_description', 'amount', 'posted_date', 'raw', 'source_key'],
-      conflictColumns: ['tenant_id', 'order_id', 'amount_type', 'amount_description', 'posted_date', 'amount'],
-      updateColumns: ['raw', 'settlement_id'],
+      conflictColumns: ['tenant_id', 'source_key'],
+      updateColumns: ['settlement_id', 'order_id', 'amount_type', 'amount_description', 'amount', 'posted_date', 'raw'],
       rows: batch
     });
   });
@@ -227,11 +229,14 @@ async function saveReturns(tenantId, content) {
   const rows = z.array(ReportRowSchema).parse(parseReportRows('GET_FBA_FULFILLMENT_CUSTOMER_RETURNS_DATA', content));
   await withTenant(tenantId, async client => {
     const batch = rows.map(row => [tenantId, text(pick(row, ['order-id', 'order id', 'amazon-order-id', 'amazonOrderId'])), text(pick(row, ['reason', 'return-reason', 'return reason', 'returnReason'])), text(pick(row, ['disposition', 'detailed-disposition', 'detailed disposition'])), 'yet_to_receive', text(pick(row, ['return-date', 'return date', 'returnDate', 'date'])) ?? null, pick(row, ['quantity', 'quantity-returned', 'return quantity']) == null ? null : integer(pick(row, ['quantity', 'quantity-returned', 'return quantity'])), row, sourceKey(row, [pick(row, ['order-id', 'order id', 'amazon-order-id', 'amazonOrderId']), pick(row, ['return-date', 'return date', 'returnDate', 'date']), pick(row, ['reason', 'return-reason', 'return reason', 'returnReason']), pick(row, ['disposition', 'detailed-disposition', 'detailed disposition'])])]);
+    // Same reasoning as settlement_rows: source_key, not the business
+    // columns, is the deterministic identity of a source row, and is what
+    // the ON CONFLICT target must actually be to update-not-error on re-sync.
     await batchUpsert(client, {
       table: 'returns',
       columns: ['tenant_id', 'order_id', 'return_reason', 'disposition', 'status', 'return_date', 'quantity', 'raw', 'source_key'],
-      conflictColumns: ['tenant_id', 'order_id', 'return_date', 'return_reason', 'disposition'],
-      updateColumns: ['status', 'quantity', 'raw', 'source_key'],
+      conflictColumns: ['tenant_id', 'source_key'],
+      updateColumns: ['order_id', 'return_reason', 'disposition', 'status', 'return_date', 'quantity', 'raw'],
       rows: batch
     });
   });
@@ -242,10 +247,16 @@ async function saveReturns(tenantId, content) {
 async function saveReimbursements(tenantId, content) {
   const rows = z.array(ReportRowSchema).parse(parseReportRows('GET_FBA_REIMBURSEMENTS_DATA', content));
   await withTenant(tenantId, async client => {
-    const batch = rows.map(row => [tenantId, number(pick(row, ['amount', 'total-amount', 'total amount', 'reimbursement amount'])), text(pick(row, ['reason', 'reason-code', 'reason code', 'approval-reason'])), text(pick(row, ['sku', 'seller-sku', 'seller sku'])), text(pick(row, ['reimbursement-date', 'reimbursement date', 'approval-date', 'approval date'])) ?? null]);
+    const batch = rows.map(row => {
+      const amount = number(pick(row, ['amount', 'total-amount', 'total amount', 'reimbursement amount']));
+      const reason = text(pick(row, ['reason', 'reason-code', 'reason code', 'approval-reason']));
+      const sku = text(pick(row, ['sku', 'seller-sku', 'seller sku']));
+      const reimbursementDate = text(pick(row, ['reimbursement-date', 'reimbursement date', 'approval-date', 'approval date'])) ?? null;
+      return [tenantId, amount, reason, sku, reimbursementDate, sourceKey(row, [sku, reimbursementDate, amount, reason])];
+    });
     await batchUpsert(client, {
       table: 'reimbursements',
-      columns: ['tenant_id', 'amount', 'reason', 'sku', 'reimbursement_date'],
+      columns: ['tenant_id', 'amount', 'reason', 'sku', 'reimbursement_date', 'source_key'],
       rows: batch
     });
   });
@@ -316,7 +327,7 @@ export async function syncReportForTenant(params) {
   // The SP-API client already retries throttled HTTP calls, so execute each
   // user-triggered report job only once.
   return runJob(`sync:${parsed.reportType}:${parsed.tenantId}`, async () => {
-    const sync = await pool.query('insert into sync_jobs(tenant_id, report_type, status, started_at) values($1,$2,$3,now()) returning id', [parsed.tenantId, parsed.reportType, 'running']);
+    const sync = await pool.query('insert into sync_jobs(tenant_id, report_type, status, started_at, range_start, range_end) values($1,$2,$3,now(),$4,$5) returning id', [parsed.tenantId, parsed.reportType, 'running', range.start, range.end]);
     try {
       const seller = await pool.query("select refresh_token_encrypted, marketplace_id from sellers where tenant_id = $1 and auth_status = 'authorized' order by connected_at desc limit 1", [parsed.tenantId]);
       if (!seller.rowCount) throw new Error('No connected Amazon seller account');
@@ -379,7 +390,7 @@ async function syncRecentApiDataForTenantDirect(tenantId, options = {}) {
   const maxOrderItems = Math.max(0, Math.min(Number(options.maxOrderItems ?? 1000), 1000));
   await assertActiveTenant(parsedTenantId);
   return runJob(`sync:direct-api:${parsedTenantId}`, async () => {
-    const sync = await pool.query('insert into sync_jobs(tenant_id, report_type, status, started_at) values($1,$2,$3,now()) returning id', [parsedTenantId, 'DIRECT_SP_API_SYNC', 'running']);
+    const sync = await pool.query('insert into sync_jobs(tenant_id, report_type, status, started_at, range_start, range_end) values($1,$2,$3,now(),$4,$5) returning id', [parsedTenantId, 'DIRECT_SP_API_SYNC', 'running', range?.start ?? null, range?.end ?? null]);
     try {
       const seller = await pool.query("select refresh_token_encrypted, marketplace_id from sellers where tenant_id = $1 and auth_status = 'authorized' order by connected_at desc limit 1", [parsedTenantId]);
       if (!seller.rowCount) throw new Error('No connected Amazon seller account');
@@ -481,7 +492,9 @@ async function syncRecentApiDataForTenantDirect(tenantId, options = {}) {
               catalogCache.set(asin, catalog);
             }
             const shipping = catalogShippingFacts(catalog?.unavailable ? null : catalog);
-            orderItemRows.push([parsedTenantId, orderId, asin, item.SellerSKU ?? item.sellerSku ?? null, item.Title ?? item.title ?? null, integer(item.QuantityOrdered ?? item.quantityOrdered), number(item.ItemPrice?.Amount ?? item.itemPrice?.amount), number(item.ItemTax?.Amount ?? item.itemTax?.amount), number(item.PromotionDiscount?.Amount ?? item.promotionDiscount?.amount), item, shipping.weight || null, shipping.weightUnit ?? null, shipping.dimensions, catalog ?? {}]);
+            const sku = item.SellerSKU ?? item.sellerSku ?? null;
+            const orderItemId = item.OrderItemId ?? item.orderItemId ?? null;
+            orderItemRows.push([parsedTenantId, orderId, asin, sku, item.Title ?? item.title ?? null, integer(item.QuantityOrdered ?? item.quantityOrdered), number(item.ItemPrice?.Amount ?? item.itemPrice?.amount), number(item.ItemTax?.Amount ?? item.itemTax?.amount), number(item.PromotionDiscount?.Amount ?? item.promotionDiscount?.amount), item, shipping.weight || null, shipping.weightUnit ?? null, shipping.dimensions, catalog ?? {}, sourceKey({}, [orderId, orderItemId, sku, asin])]);
           }
         }
         await batchUpsert(db, {
@@ -491,11 +504,17 @@ async function syncRecentApiDataForTenantDirect(tenantId, options = {}) {
           updateColumns: ['order_date', 'total_amount', 'status', 'fulfillment_channel', 'sales_channel', 'raw'],
           rows: orderRows
         });
+        // source_key (order_id + order-item-id + sku + asin) is the real,
+        // always-non-null identity of a line item. sku/asin alone can both
+        // be null for the same order (e.g. bundle components), and Postgres
+        // never treats two NULLs as a match, so a (tenant_id, amazon_order_id,
+        // sku, asin) conflict target could insert duplicate rows for those
+        // instead of updating the existing one.
         await batchUpsert(db, {
           table: 'order_items',
-          columns: ['tenant_id', 'amazon_order_id', 'asin', 'sku', 'title', 'quantity_ordered', 'item_price', 'item_tax', 'promotion_discount', 'raw', 'package_weight', 'weight_unit', 'package_dimensions', 'catalog_raw'],
-          conflictColumns: ['tenant_id', 'amazon_order_id', 'sku', 'asin'],
-          updateColumns: ['title', 'quantity_ordered', 'item_price', 'item_tax', 'promotion_discount', 'raw', 'package_weight', 'weight_unit', 'package_dimensions', 'catalog_raw'],
+          columns: ['tenant_id', 'amazon_order_id', 'asin', 'sku', 'title', 'quantity_ordered', 'item_price', 'item_tax', 'promotion_discount', 'raw', 'package_weight', 'weight_unit', 'package_dimensions', 'catalog_raw', 'source_key'],
+          conflictColumns: ['tenant_id', 'source_key'],
+          updateColumns: ['amazon_order_id', 'asin', 'sku', 'title', 'quantity_ordered', 'item_price', 'item_tax', 'promotion_discount', 'raw', 'package_weight', 'weight_unit', 'package_dimensions', 'catalog_raw'],
           rows: orderItemRows
         });
         // Backfill catalog facts for previously imported order items as well;
