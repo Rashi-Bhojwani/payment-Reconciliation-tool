@@ -742,9 +742,18 @@ async function loadDashboardCalculations(db, tenantId, range) {
       from finance_transaction_items fi left join finance_transactions ft on ft.tenant_id=fi.tenant_id and ft.transaction_id=fi.transaction_id
       where fi.tenant_id=$1 and fi.posted_date >= $2 and fi.posted_date < $3`,[tenantId,range.start,range.end]);
   const financeTransactions = await db.query('select transaction_id,transaction_type,posted_date,total_amount,currency,related_order_id,raw from finance_transactions where tenant_id=$1 and posted_date >= $2 and posted_date < $3',[tenantId,range.start,range.end]);
+  // Deliberately NOT range-filtered. "Has this order ever been settled?" is a
+  // property of the order, not of the selected window: an order's settlement
+  // lines can post outside the range the user is looking at (a late-June order
+  // settled in early July, a refund settled in the next cycle) while its
+  // Finance API rows post inside it. Deriving the settled set from the
+  // in-range settlement rows alone therefore reports "never settled" for
+  // orders that plainly were, and the Deferred merge then adds their money on
+  // top of settlement money that is already counted somewhere.
+  const settledOrderIds = await db.query('select distinct order_id from settlement_rows where tenant_id=$1 and order_id is not null and order_id<>$2',[tenantId,'']);
   const reimbursements = await db.query('select amount,reason,sku,reimbursement_date from reimbursements where tenant_id=$1 and reimbursement_date >= $2::date and reimbursement_date < $3::date',[tenantId,range.start,range.end]);
   const gstInvoices = await db.query('select id source_row_id,invoice_type,order_id,cgst,sgst,igst,taxable_value,invoice_date,raw from gst_invoices where tenant_id=$1 and invoice_date >= $2::date and invoice_date < $3::date',[tenantId,range.start,range.end]);
-  return calculateDashboardMetrics({orders:orders.rows,orderItems:orderItems.rows,returns:returns.rows,settlementRows:settlementRows.rows,settlementHeaders:settlementHeaders.rows,financeItems:financeItems.rows,financeTransactions:financeTransactions.rows,reimbursements:reimbursements.rows,gstInvoices:gstInvoices.rows},range);
+  return calculateDashboardMetrics({orders:orders.rows,orderItems:orderItems.rows,returns:returns.rows,settlementRows:settlementRows.rows,settlementHeaders:settlementHeaders.rows,financeItems:financeItems.rows,financeTransactions:financeTransactions.rows,reimbursements:reimbursements.rows,gstInvoices:gstInvoices.rows,settledOrderIdsAllTime:settledOrderIds.rows.map(row=>row.order_id)},range);
 }
 
 app.get('/api/tenants/:tenantId/calculations/:metric', async request => {
@@ -1097,9 +1106,29 @@ app.get('/api/tenants/:tenantId/dashboard', async request => {
     // is diagnosable from real field values in the terminal instead of
     // guessed at from the dashboard totals alone.
     const pendingDetail=dashboardCalculations.diagnostics?.pendingFinanceRowsDetail;
+    const mergeSummary=dashboardCalculations.diagnostics?.pendingMergeSummary;
     if (pendingDetail?.length) {
-      console.log(`[dashboard ${tenantId.slice(0,8)}] merged ${pendingDetail.length} pending (Deferred) Finance API row(s):`);
-      for (const row of pendingDetail) console.log(`  order=${row.order_id} status=${row.transaction_status} category=${row.category} amount_type=${row.amount_type ?? ''} amount_description=${row.amount_description ?? ''} amount=${row.amount} -> bucket=${row.bucket}`);
+      const label=`[dashboard ${tenantId.slice(0,8)}]`;
+      const money=value=>Number(value ?? 0).toFixed(2);
+      // Totals first: how much the Deferred merge adds on top of settlement,
+      // per bucket. These are the numbers to compare against the gap versus
+      // Amazon's Account Activity Statement - the per-row lines below can all
+      // be individually correct while the merged SET is still wrong.
+      console.log(`${label} Deferred merge: ${mergeSummary.pendingRows} row(s) across ${mergeSummary.pendingOrders} order(s), from ${mergeSummary.financeRowsInRange} Finance row(s) in range; ${mergeSummary.settledOrderIdsKnown} order(s) known settled (all time)`);
+      for (const bucket of ['income','expenses','gst','tax','transfer']) {
+        const baseline=mergeSummary.settlementBaselineTotals[bucket] ?? 0;
+        const added=mergeSummary.pendingAddedTotals[bucket] ?? 0;
+        if (baseline || added) console.log(`${label}   ${bucket.padEnd(8)} settlement=${money(baseline).padStart(12)} + pending=${money(added).padStart(12)} = ${money(baseline+added).padStart(12)}`);
+      }
+      // An order whose pending money arrives via more than one Finance
+      // transaction is the one thing a per-row check cannot catch: Amazon can
+      // represent the same order's money twice across its deferral lifecycle,
+      // and both copies pass every classification and status test.
+      if (mergeSummary.ordersWithMultipleTransactions.length) {
+        console.log(`${label}   WARNING: ${mergeSummary.ordersWithMultipleTransactions.length} pending order(s) carry more than one Finance transaction - possible duplicate representation of the same money:`);
+        for (const entry of mergeSummary.ordersWithMultipleTransactions) console.log(`${label}     order=${entry.order_id} total=${money(entry.total)} via ${entry.transactions.map(t=>`${t.transaction_id}=${money(t.total)}`).join(' , ')}`);
+      }
+      for (const row of pendingDetail) console.log(`${label}   order=${row.order_id} status=${row.transaction_status} category=${row.category} amount_type=${row.amount_type ?? ''} amount_description=${row.amount_description ?? ''} amount=${row.amount} -> bucket=${row.bucket}`);
     }
     const hasImportedData = Number(orders.orders ?? 0) > 0 || Number(kpis.net_settled ?? 0) !== 0 || products.length > 0 || payments.length > 0 || inventory.length > 0;
     return { seller, amazonAuth, hasImportedData, kpis, orders, orderRows, orderPayments, paymentComponents, paymentSummary, dashboardCalculations, businessReportRows, products, trend, payments, settlementLines, financialComponents, financialSummary, jobs, inventory, returns, reimbursements, invoices, orderItems, financeTransactions, autoSyncing: autoSyncReportTypes };

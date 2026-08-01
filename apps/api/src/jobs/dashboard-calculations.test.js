@@ -66,3 +66,48 @@ test('uses Amazon settlement header period and date formats for transfers',()=>{
   const withStatementPeriod=calculateDashboardMetrics({...base,settlementHeaders:[{settlement_id:'period',settlement_start_date:'27.06.2026 00:00:00 UTC',settlement_end_date:'26.07.2026 23:59:59 UTC',total_amount:131801.69}]},{start:'2026-06-27T00:00:00Z',end:'2026-07-27T00:00:00Z'});
   assert.equal(withStatementPeriod.statement.transfers.value,-131801.69);
 });
+
+test('treats an order as settled from its settlement lines anywhere, not just in the viewed range',()=>{
+  // A settlement line's posted_date is the transaction date, so an order sold
+  // near a range boundary very often has its settlement lines land outside
+  // the window the user is looking at while its Finance API rows land inside
+  // it. Judging "settled" from in-range settlement rows alone then declares
+  // such an order pending and merges its Deferred money on top of settlement
+  // money that is already counted - real double-counting, invisible per row.
+  const base={
+    orders:[],orderItems:[],returns:[],reimbursements:[],gstInvoices:[],settlementHeaders:[],
+    settlementRows:[
+      line('in-range-sale','Principal',1000,'Order',{order_id:'order-in-range',amount_type:'ItemPrice'}),
+      line('in-range-fee','Commission',-100,'Order',{order_id:'order-in-range',amount_type:'ItemFees'})
+    ],
+    financeItems:[
+      {source_row_id:'f-settled',transaction_id:'tx-settled',order_id:'order-outside-range',transaction_status:'Deferred',category:'item_price',amount_description:'OurPricePrincipal',amount:500,posted_date:'2026-07-10T00:00:00Z',raw:{}},
+      {source_row_id:'f-pending',transaction_id:'tx-pending',order_id:'order-never-settled',transaction_status:'Deferred',category:'item_price',amount_description:'OurPricePrincipal',amount:250,posted_date:'2026-07-10T00:00:00Z',raw:{}}
+    ]
+  };
+  const range={start:'2026-07-01T00:00:00Z',end:'2026-07-30T00:00:00Z'};
+  // Without the all-time settled set, the already-settled order is wrongly merged.
+  assert.equal(calculateDashboardMetrics(base,range).statement.income.value,1750);
+  // With it, only the genuinely never-settled order is added.
+  const corrected=calculateDashboardMetrics({...base,settledOrderIdsAllTime:['order-in-range','order-outside-range']},range);
+  assert.equal(corrected.statement.income.value,1250);
+  assert.equal(corrected.diagnostics.pendingMergeSummary.pendingOrders,1);
+  assert.equal(corrected.diagnostics.pendingMergeSummary.pendingAddedTotals.income,250);
+  assert.equal(corrected.diagnostics.pendingMergeSummary.settlementBaselineTotals.income,1000);
+});
+
+test('flags a pending order whose money arrives via more than one Finance transaction',()=>{
+  // Per-row checks cannot see this: both copies classify identically and both
+  // pass the Deferred status test, so only a per-order view exposes it.
+  const range={start:'2026-07-01T00:00:00Z',end:'2026-07-30T00:00:00Z'};
+  const financeRow=(id,transactionId,amountValue)=>({source_row_id:id,transaction_id:transactionId,order_id:'order-dup',transaction_status:'Deferred',category:'item_price',amount_description:'OurPricePrincipal',amount:amountValue,posted_date:'2026-07-10T00:00:00Z',raw:{}});
+  const r=calculateDashboardMetrics({
+    orders:[],orderItems:[],returns:[],reimbursements:[],gstInvoices:[],settlementHeaders:[],settledOrderIdsAllTime:[],
+    settlementRows:[line('sale','Principal',100,'Order',{order_id:'order-settled',amount_type:'ItemPrice'})],
+    financeItems:[financeRow('a','tx-1',300),financeRow('b','tx-2',300)]
+  },range);
+  const flagged=r.diagnostics.pendingMergeSummary.ordersWithMultipleTransactions;
+  assert.equal(flagged.length,1);
+  assert.equal(flagged[0].order_id,'order-dup');
+  assert.equal(flagged[0].transactions.length,2);
+});

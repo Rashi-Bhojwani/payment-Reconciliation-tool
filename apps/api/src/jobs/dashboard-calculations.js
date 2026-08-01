@@ -125,7 +125,18 @@ export function calculateDashboardMetrics(input,range){
   // order is genuinely still pending before it is added; either one being
   // wrong just means a real Deferred item is conservatively left out, not
   // that a settled one gets double-counted.
-  const settledOrderIds=new Set(settlementAudit.included.map(row=>row.order_id).filter(Boolean));
+  //
+  // "Settled" is a property of the ORDER, not of the selected window. An
+  // order's settlement lines routinely post outside the range being viewed
+  // (a late-June order settled in early July; a refund settled a cycle after
+  // the sale) while its Finance API rows post inside it. Building the settled
+  // set only from in-range settlement rows therefore says "never settled"
+  // about orders that demonstrably were, and the merge then stacks their
+  // Deferred money on top of settlement money already counted. settledOrder-
+  // IdsAllTime is the tenant's full set of settled order IDs, unfiltered by
+  // date, so an order is only ever treated as pending when Amazon has no
+  // settlement line for it anywhere.
+  const settledOrderIds=new Set([...(input.settledOrderIdsAllTime??[]),...settlementAudit.included.map(row=>row.order_id)].filter(Boolean));
   const pendingFinanceRows=financeAudit.included.filter(row=>row.order_id&&!settledOrderIds.has(row.order_id)&&row.transaction_status&&!/released/i.test(row.transaction_status));
   const financialRows=settlementComplete?[...settlementAudit.included,...pendingFinanceRows]:financeAudit.included;
   const financialDuplicates=settlementComplete?settlementAudit.duplicates:financeAudit.duplicates;
@@ -161,7 +172,33 @@ export function calculateDashboardMetrics(input,range){
   // actual field values instead of guessed at again.
   const bucketOf=row=>isFee(row)||isWithholding(row)?'expenses':isProductGst(row)?'gst':isGenericTax(row)?'tax':isTransfer(row)?'transfer':'income';
   const pendingFinanceRowsDetail=pendingFinanceRows.map(row=>({order_id:row.order_id,transaction_status:row.transaction_status,category:row.category,amount_type:row.amount_type,amount_description:row.amount_description,amount:amount(row),bucket:bucketOf(row)}));
-  const diagnostics={sourcePolicy:{financial:`${financialSource} (${settlementComplete?`settlement takes precedence, plus ${pendingFinanceRows.length} Deferred Finance API row(s) for orders with no settlement rows yet`:'settlement incomplete; Finances fallback'})`,reimbursements:financeReimbursements.length?financialSource:'Reimbursements report fallback',gst:'Imported GST B2B/B2C rows only',settled:'Settlement headers filtered by deposit_date'},includedRows:financialRows.length,excludedRows:(settlementComplete?excludedFinanceRows:settlementAudit.included.length),duplicateRows:financialDuplicates.length+itemAudit.duplicates.length+returnAudit.duplicates.length+gstAudit.duplicates.length,categoryTotals:{grossSales,productRefunds,netPromotions,expenseDebits,expenseCredits,tcsTds,operationalFees,gst,tax,transfers},pendingFinanceRowsDetail};
+  // Row-by-row output proves each row is classified correctly but says nothing
+  // about whether the right SET of rows was merged - and an over-merge looks
+  // identical to a correct merge line by line. These aggregates separate the
+  // two: bucketTotals shows exactly how much the merge adds on top of the
+  // settlement baseline (directly comparable against the gap versus Amazon's
+  // statement), and ordersWithMultipleTransactions flags orders whose pending
+  // money arrives via more than one Finance transaction - the signature of
+  // Amazon representing one order's money twice across its deferral
+  // lifecycle, which no per-row check can detect.
+  const bucketTotals=rows=>rows.reduce((totals,row)=>{const bucket=bucketOf(row);totals[bucket]=round2((totals[bucket]??0)+amount(row));return totals;},{});
+  const pendingByOrder=new Map();
+  for(const row of pendingFinanceRows){
+    const entry=pendingByOrder.get(row.order_id)??{transactions:new Map(),total:0};
+    entry.transactions.set(row.transaction_id,round2((entry.transactions.get(row.transaction_id)??0)+amount(row)));
+    entry.total=round2(entry.total+amount(row));
+    pendingByOrder.set(row.order_id,entry);
+  }
+  const pendingMergeSummary={
+    settlementBaselineTotals:bucketTotals(settlementAudit.included),
+    pendingAddedTotals:bucketTotals(pendingFinanceRows),
+    pendingOrders:pendingByOrder.size,
+    pendingRows:pendingFinanceRows.length,
+    financeRowsInRange:financeAudit.included.length,
+    settledOrderIdsKnown:settledOrderIds.size,
+    ordersWithMultipleTransactions:[...pendingByOrder].filter(([,entry])=>entry.transactions.size>1).map(([orderId,entry])=>({order_id:orderId,total:entry.total,transactions:[...entry.transactions].map(([transactionId,total])=>({transaction_id:transactionId,total}))}))
+  };
+  const diagnostics={sourcePolicy:{financial:`${financialSource} (${settlementComplete?`settlement takes precedence, plus ${pendingFinanceRows.length} Deferred Finance API row(s) for orders with no settlement rows yet`:'settlement incomplete; Finances fallback'})`,reimbursements:financeReimbursements.length?financialSource:'Reimbursements report fallback',gst:'Imported GST B2B/B2C rows only',settled:'Settlement headers filtered by deposit_date'},includedRows:financialRows.length,excludedRows:(settlementComplete?excludedFinanceRows:settlementAudit.included.length),duplicateRows:financialDuplicates.length+itemAudit.duplicates.length+returnAudit.duplicates.length+gstAudit.duplicates.length,categoryTotals:{grossSales,productRefunds,netPromotions,expenseDebits,expenseCredits,tcsTds,operationalFees,gst,tax,transfers},pendingFinanceRowsDetail,pendingMergeSummary};
   const metric=(value,unit,formula,components,rows,source=financialSource,status=value==null?'Unavailable':null)=>({value,unit,formula,components,rows,source,status,range,diagnostics});
   const metrics={
     netSales:metric(netSales,'amount','Gross product Principal sales − Refund Principal lines − net seller-funded promotions',[component('gross_sales','Gross product sales',grossSales,grossRows),component('product_refunds','Product refunds',-productRefunds,refundPrincipalRows,'−'),component('promotions','Net seller-funded promotions',-netPromotions,promoRows,'−')],[...grossRows,...refundPrincipalRows,...promoRows]),
