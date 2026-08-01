@@ -34,6 +34,7 @@ const SETTLEMENT_REPORT_LIST_MAX_PAGES = 20;
 const SETTLEMENT_REPORT_DOWNLOAD_CAP = 20;
 const REPORT_DOCUMENT_DOWNLOAD_TIMEOUT_MS = 5 * 60 * 1000;
 const SP_API_MAX_ATTEMPTS = 6;
+const DOCUMENT_DOWNLOAD_MAX_ATTEMPTS = 4;
 
 /**
  * Amazon rejects report requests whose dataEndTime is in the future. The web
@@ -331,9 +332,33 @@ export class SpApiClient {
     // settlement report can be tens of MB; without a timeout, a stalled
     // connection on a large file hangs the whole sync indefinitely instead
     // of failing cleanly and letting the caller retry.
-    const download = await fetch(url, { signal: AbortSignal.timeout(REPORT_DOCUMENT_DOWNLOAD_TIMEOUT_MS) });
-    if (!download.ok) throw new Error(`Document download failed: ${download.status}`);
-    const buffer = Buffer.from(await download.arrayBuffer());
+    //
+    // A multi-document settlement sync calls this once per document in a
+    // loop, and a single unretried transient network error here (confirmed
+    // live: a bare "fetch failed" - a thrown TypeError from a dropped
+    // connection, not an HTTP error status at all) aborted the *entire*
+    // multi-document sync, discarding every document already successfully
+    // downloaded in the same run. A short retry loop, same as the SP-API
+    // rate-limit retries elsewhere in this file, absorbs one-off network
+    // blips without masking a genuinely broken download.
+    let buffer;
+    for (let attempt = 0; attempt < DOCUMENT_DOWNLOAD_MAX_ATTEMPTS; attempt += 1) {
+      try {
+        const download = await fetch(url, { signal: AbortSignal.timeout(REPORT_DOCUMENT_DOWNLOAD_TIMEOUT_MS) });
+        if (!download.ok) throw new Error(`Document download failed: ${download.status}`);
+        buffer = Buffer.from(await download.arrayBuffer());
+        break;
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        if (attempt === DOCUMENT_DOWNLOAD_MAX_ATTEMPTS - 1) {
+          console.error(`[${this.label}] document download for ${reportDocumentId} gave up after ${DOCUMENT_DOWNLOAD_MAX_ATTEMPTS} attempts: ${message}`);
+          throw error;
+        }
+        const waitMs = 2000 * 2 ** attempt;
+        console.warn(`[${this.label}] document download for ${reportDocumentId} failed (${message}), retry ${attempt + 1}/${DOCUMENT_DOWNLOAD_MAX_ATTEMPTS} in ${waitMs}ms`);
+        await new Promise(resolve => setTimeout(resolve, waitMs));
+      }
+    }
     let content = buffer.toString('utf8');
     if (compressionAlgorithm === 'GZIP') {
       try { content = gunzipSync(buffer).toString('utf8'); } catch { content = buffer.toString('utf8'); }
