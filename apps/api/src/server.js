@@ -430,14 +430,31 @@ async function syncReportForSellerRequest(params, range) {
     // Amazon generates the settlement report on its own payout schedule, so
     // "no completed report yet for this range" is a routine, expected state
     // (not an outage) - try the direct-API data as a substitute rather than
-    // failing outright. But if that substitute *also* fails, this must still
-    // surface as 'failed': reporting 'completed' when neither source produced
-    // data would leave the dashboard silently showing zero with no way to
-    // tell that from a real, empty-but-successful sync.
+    // failing outright, and it is fair to call that 'completed' since
+    // retrying the real report immediately would not produce a different
+    // answer anyway.
+    //
+    // A rate-limit exhaustion or network error is a different situation
+    // entirely: the real report *exists* and would very likely succeed on a
+    // later attempt, but confirmed live (a Settlement Reset & Resync run
+    // that hit "429" six times in a row on one document) - silently
+    // recording this as 'completed' via the same synthetic-success row
+    // blocks the hourly auto-sync coverage check from ever retrying the
+    // real report, permanently settling for the lower-fidelity Finance-API
+    // substitute while showing a plain green "COMPLETED" pill. Only the
+    // "not generated yet" case gets the quiet substitution; a transient
+    // failure of a report that actually exists must keep the honest
+    // 'failed' row syncReportForTenant already wrote above, still try the
+    // substitute so *something* is available in the meantime, but not
+    // paper over the failure with a fake completed status.
     const directFallbackReports = new Set(['GET_SALES_AND_TRAFFIC_REPORT', 'GET_FBA_MYI_UNSUPPRESSED_INVENTORY_DATA', 'GET_FBA_REIMBURSEMENTS_DATA', 'GET_V2_SETTLEMENT_REPORT_DATA_FLAT_FILE_V2']);
     if (directFallbackReports.has(params.reportType)) {
+      const reportGenuinelyNotAvailableYet = /no completed .* report is available/i.test(message);
       try {
         const fallback = await syncRecentApiDataForTenant(params.tenantId, { range });
+        if (!reportGenuinelyNotAvailableYet) {
+          return { reportType: params.reportType, status: 'failed', error: message, fallback: 'DIRECT_SP_API_SYNC', ...fallback };
+        }
         await recordSyntheticReportSync(params.tenantId, params.reportType, 'fallback://direct-sp-api', message, range);
         return { reportType: params.reportType, status: 'completed', fallback: 'DIRECT_SP_API_SYNC', warning: message, ...fallback };
       } catch (fallbackError) {
