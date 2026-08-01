@@ -56,30 +56,9 @@ export function calculateDashboardMetrics(input,range){
 
   const financeAudit=dedupe((input.financeItems??[]).filter(row=>!isSummary(row)),financialKey);const settlementAudit=dedupe(input.settlementRows??[],financialKey);
   const settlementComplete=settlementAudit.included.some(row=>isPrincipal(row)||isProductGst(row)||isFee(row)||isTransfer(row))&&settlementAudit.included.some(row=>row.settlement_id||row.raw?.['settlement-id']||row.raw?.['settlement id']);
-  // Amazon's own Account Activity Statement is accrual-based: it includes
-  // "Deferred" transactions (recognized by Amazon, but not yet paid out) as
-  // well as "Released" ones. Settlement reports are strictly cash-basis - a
-  // Deferred transaction cannot yet appear in any settlement document, by
-  // definition, since a settlement only exists once Amazon has actually
-  // released the money. Confirmed live against a real account and Amazon's
-  // own Transaction View export for the identical date range: the
-  // settlement-only total undershot Amazon's statement by exactly the value
-  // of the account's Deferred activity for that range (one large Deferred
-  // refund plus a batch of Deferred order payments).
-  //
-  // The fix is not to replace settlement data with finance data - settlement
-  // rows remain the more granular, authoritative source for whatever HAS
-  // actually settled - but to merge in finance rows for orders that have no
-  // settlement rows at all in this range. Those can only be pending/Deferred
-  // activity, since a settled order's rows would already be present in
-  // settlementAudit; excluding any order_id already covered by settlement is
-  // what prevents the same transaction being counted twice once it later
-  // does settle and starts appearing in both sources.
-  const settledOrderIds=new Set(settlementAudit.included.map(row=>row.order_id).filter(Boolean));
-  const pendingFinanceRows=financeAudit.included.filter(row=>row.order_id&&!settledOrderIds.has(row.order_id));
-  const financialRows=settlementComplete?[...settlementAudit.included,...pendingFinanceRows]:financeAudit.included;
+  const financialRows=settlementComplete?settlementAudit.included:financeAudit.included;
   const financialDuplicates=settlementComplete?settlementAudit.duplicates:financeAudit.duplicates;
-  const financialSource=settlementComplete?(pendingFinanceRows.length?'Amazon Settlement report + pending Finance API activity':'Amazon Settlement report'):'Amazon Finances API';
+  const financialSource=settlementComplete?'Amazon Settlement report':'Amazon Finances API';
   const principalRows=financialRows.filter(isPrincipal);const grossRows=principalRows.filter(row=>amount(row)>0&&!isRefund(row));const refundPrincipalRows=principalRows.filter(row=>amount(row)<0&&isRefund(row));
   const promoRows=financialRows.filter(isPromotion);const promoDebits=promoRows.filter(row=>amount(row)<0);const promoRefunds=promoRows.filter(row=>amount(row)>0);
   const grossSales=signedSum(grossRows);const productRefunds=Math.abs(signedSum(refundPrincipalRows));const netPromotions=round2(Math.abs(signedSum(promoDebits))-signedSum(promoRefunds));const netSales=round2(grossSales-productRefunds-netPromotions);
@@ -99,8 +78,7 @@ export function calculateDashboardMetrics(input,range){
   const incomeRows=financialRows.filter(row=>!isFee(row)&&!isWithholding(row)&&!isProductGst(row)&&!isGenericTax(row)&&!isTransfer(row));
   const gst=signedSum(productGstRows),tax=signedSum(genericTaxRows),income=signedSum(incomeRows),expenses=signedSum(expenseRows),transfers=signedSum(transferRows);
   const days=inclusiveDays(range.start,range.end);const unitRate=returnedUnits==null?null:shippedUnits==null||shippedUnits===0?(returnedUnits>0?null:0):returnedUnits/shippedUnits*100;const refundValueRate=grossSales?productRefunds/grossSales*100:null;
-  const excludedFinanceRows=settlementComplete?financeAudit.included.length-pendingFinanceRows.length:0;
-  const diagnostics={sourcePolicy:{financial:`${financialSource} (${settlementComplete?`settlement takes precedence, plus ${pendingFinanceRows.length} not-yet-settled Finance API row(s) for orders with no settlement rows yet`:'settlement incomplete; Finances fallback'})`,reimbursements:financeReimbursements.length?financialSource:'Reimbursements report fallback',gst:'Imported GST B2B/B2C rows only',settled:'Settlement headers filtered by deposit_date'},includedRows:financialRows.length,excludedRows:(settlementComplete?excludedFinanceRows:settlementAudit.included.length),duplicateRows:financialDuplicates.length+itemAudit.duplicates.length+returnAudit.duplicates.length+gstAudit.duplicates.length,categoryTotals:{grossSales,productRefunds,netPromotions,expenseDebits,expenseCredits,tcsTds,operationalFees,gst,tax,transfers}};
+  const diagnostics={sourcePolicy:{financial:`${financialSource} (${settlementComplete?'complete statement takes precedence':'settlement incomplete; Finances fallback'})`,reimbursements:financeReimbursements.length?financialSource:'Reimbursements report fallback',gst:'Imported GST B2B/B2C rows only',settled:'Settlement headers filtered by deposit_date'},includedRows:financialRows.length,excludedRows:(settlementComplete?financeAudit.included.length:settlementAudit.included.length),duplicateRows:financialDuplicates.length+itemAudit.duplicates.length+returnAudit.duplicates.length+gstAudit.duplicates.length,categoryTotals:{grossSales,productRefunds,netPromotions,expenseDebits,expenseCredits,tcsTds,operationalFees,gst,tax,transfers}};
   const metric=(value,unit,formula,components,rows,source=financialSource,status=value==null?'Unavailable':null)=>({value,unit,formula,components,rows,source,status,range,diagnostics});
   const metrics={
     netSales:metric(netSales,'amount','Gross product Principal sales − Refund Principal lines − net seller-funded promotions',[component('gross_sales','Gross product sales',grossSales,grossRows),component('product_refunds','Product refunds',-productRefunds,refundPrincipalRows,'−'),component('promotions','Net seller-funded promotions',-netPromotions,promoRows,'−')],[...grossRows,...refundPrincipalRows,...promoRows]),
