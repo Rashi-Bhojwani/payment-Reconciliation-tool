@@ -726,8 +726,18 @@ async function loadDashboardCalculations(db, tenantId, range) {
       coalesce(raw->>'transaction-type',raw->>'transaction type',raw->>'transactionType') parent_transaction_type
       from settlement_rows where tenant_id=$1 and posted_date >= $2 and posted_date < $3`,[tenantId,range.start,range.end]);
   const settlementHeaders = await db.query(`select settlement_id,coalesce(raw->>'deposit-date',raw->>'deposit date',raw->>'depositDate') deposit_date,coalesce(raw->>'settlement-start-date',raw->>'settlement start date',raw->>'settlementStartDate') settlement_start_date,coalesce(raw->>'settlement-end-date',raw->>'settlement end date',raw->>'settlementEndDate') settlement_end_date,coalesce(nullif(raw->>'total-amount',''),nullif(raw->>'total amount',''),nullif(raw->>'totalAmount','')) total_amount,coalesce(raw->>'transaction-type',raw->>'transaction type') transaction_type,raw from settlement_rows where tenant_id=$1 and (coalesce(raw->>'deposit-date',raw->>'deposit date',raw->>'depositDate','')<>'' or coalesce(raw->>'settlement-start-date',raw->>'settlement start date',raw->>'settlementStartDate','')<>'')`,[tenantId]);
-  const financeItems = await db.query(`select fi.id source_row_id,fi.transaction_id,fi.order_id,fi.sku,fi.asin,fi.category,fi.amount_description,fi.amount,fi.currency,fi.posted_date,fi.raw,
+  // order_id here is deliberately ft.related_order_id (the transaction-level
+  // identifier, extracted by financeRelatedValue matching an exact
+  // ORDER_ID/AMAZON_ORDER_ID identifier name), not fi.order_id. fi.order_id
+  // is populated per line-item by flattenFinanceTransaction's looser /order/i
+  // key-name scan and is null or inconsistent on many components - exactly
+  // what the already-working Order Payments transaction ledger (below) also
+  // avoids, using related_order_id for the same reason. Falling back to
+  // fi.order_id only when related_order_id is unavailable keeps a value for
+  // rows whose parent transaction genuinely lacks one.
+  const financeItems = await db.query(`select fi.id source_row_id,fi.transaction_id,coalesce(ft.related_order_id,fi.order_id) order_id,fi.sku,fi.asin,fi.category,fi.amount_description,fi.amount,fi.currency,fi.posted_date,fi.raw,
       ft.transaction_type parent_transaction_type,
+      coalesce(ft.raw->>'transactionStatus',ft.raw->>'TransactionStatus') transaction_status,
       coalesce(ft.raw->>'accountType',ft.raw->>'AccountType',ft.raw#>>'{sellingPartnerMetadata,accountType}') account_type
       from finance_transaction_items fi left join finance_transactions ft on ft.tenant_id=fi.tenant_id and ft.transaction_id=fi.transaction_id
       where fi.tenant_id=$1 and fi.posted_date >= $2 and fi.posted_date < $3`,[tenantId,range.start,range.end]);
