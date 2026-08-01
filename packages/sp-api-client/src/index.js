@@ -257,7 +257,10 @@ export class SpApiClient {
       // (nothing here is skipped forever - only already-processed).
       const boundedReports = newReports.slice(0, SETTLEMENT_REPORT_DOWNLOAD_CAP);
       const documents = [];
-      for (const report of boundedReports) documents.push(await this.downloadReportDocument(report.reportDocumentId));
+      for (const report of boundedReports) {
+        const downloaded = await this.downloadReportDocument(report.reportDocumentId);
+        documents.push({ reportDocumentId: report.reportDocumentId, ...downloaded });
+      }
       const content = documents.map((document, index) => index === 0 ? document.content : document.content.split(/\r?\n/).slice(1).join('\n')).join('\n');
       return {
         reportId: boundedReports[0].reportId,
@@ -267,7 +270,11 @@ export class SpApiClient {
         reportsMerged: boundedReports.length,
         reportsAvailable: matchingReports.length,
         reportsTruncated: newReports.length > boundedReports.length,
-        documentIds: boundedReports.map(item => item.reportDocumentId)
+        documentIds: boundedReports.map(item => item.reportDocumentId),
+        // Keep document boundaries all the way through persistence. Two real
+        // Amazon rows may be byte-for-byte identical; only document + row
+        // position is a lossless identity for a flat-file report line.
+        documents
       };
     }
     const reportOptions = parsedReportType === 'GET_SALES_AND_TRAFFIC_REPORT'

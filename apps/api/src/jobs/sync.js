@@ -180,12 +180,18 @@ function parseReportRows(reportType, content) {
 }
 
 /** @param {string} tenantId @param {string} content */
-async function saveSettlementRows(tenantId, content) {
+async function saveSettlementRows(tenantId, content, sourceDocumentId) {
   const rows = z.array(ReportRowSchema).parse(parseReportRows('GET_V2_SETTLEMENT_REPORT_DATA_FLAT_FILE_V2', content));
   await withTenant(tenantId, async client => {
-    const batch = rows.map(row => {
+    const batch = rows.map((row, rowIndex) => {
       const amount = number(pick(row, ['amount']));
-      return [tenantId, text(pick(row, ['settlement-id', 'settlement id', 'settlementId'])), text(pick(row, ['order-id', 'order id', 'amazon-order-id', 'amazonOrderId'])), text(pick(row, ['amount-type', 'amount type', 'amountType'])), text(pick(row, ['amount-description', 'amount description', 'amountDescription'])), amount, reportDate(pick(row, ['posted-date', 'posted date', 'postedDate'])), row, sourceKey(row, [pick(row, ['settlement-id', 'settlement id', 'settlementId']), pick(row, ['transaction-type', 'transaction type', 'transactionType']), pick(row, ['order-id', 'order id', 'amazon-order-id', 'amazonOrderId']), pick(row, ['amount-type', 'amount type', 'amountType']), pick(row, ['amount-description', 'amount description', 'amountDescription']), pick(row, ['posted-date', 'posted date', 'postedDate']), amount])];
+      const rowNumber = rowIndex + 1;
+      // Content-derived keys silently collapse legitimate duplicate lines
+      // (for example two units charged the same fee on the same order/date).
+      // Amazon's immutable document ID plus physical row number preserves
+      // every source line while remaining perfectly idempotent on re-sync.
+      const identity = sourceDocumentId ? sourceKey({}, [sourceDocumentId, rowNumber]) : sourceKey(row, [JSON.stringify(row), rowNumber]);
+      return [tenantId, text(pick(row, ['settlement-id', 'settlement id', 'settlementId'])), text(pick(row, ['order-id', 'order id', 'amazon-order-id', 'amazonOrderId'])), text(pick(row, ['amount-type', 'amount type', 'amountType'])), text(pick(row, ['amount-description', 'amount description', 'amountDescription'])), amount, reportDate(pick(row, ['posted-date', 'posted date', 'postedDate'])), row, identity, sourceDocumentId ?? null, rowNumber];
     });
     // source_key is deterministic per settlement/transaction line, and is
     // the real conflict identity here - not the business columns. Settlement
@@ -199,9 +205,9 @@ async function saveSettlementRows(tenantId, content) {
     // deposit metadata on re-sync instead of erroring or duplicating.
     await batchUpsert(client, {
       table: 'settlement_rows',
-      columns: ['tenant_id', 'settlement_id', 'order_id', 'amount_type', 'amount_description', 'amount', 'posted_date', 'raw', 'source_key'],
+      columns: ['tenant_id', 'settlement_id', 'order_id', 'amount_type', 'amount_description', 'amount', 'posted_date', 'raw', 'source_key', 'source_document_id', 'source_row_number'],
       conflictColumns: ['tenant_id', 'source_key'],
-      updateColumns: ['settlement_id', 'order_id', 'amount_type', 'amount_description', 'amount', 'posted_date', 'raw'],
+      updateColumns: ['settlement_id', 'order_id', 'amount_type', 'amount_description', 'amount', 'posted_date', 'raw', 'source_document_id', 'source_row_number'],
       rows: batch
     });
   });
@@ -304,9 +310,9 @@ async function saveSalesTrafficDaily(tenantId, content, range) {
 }
 
 /** @param {string} tenantId @param {string} reportType @param {string} content */
-async function saveStructuredRows(tenantId, reportType, content, range) {
+async function saveStructuredRows(tenantId, reportType, content, range, sourceDocumentId) {
   switch (reportType) {
-    case 'GET_V2_SETTLEMENT_REPORT_DATA_FLAT_FILE_V2': return saveSettlementRows(tenantId, content);
+    case 'GET_V2_SETTLEMENT_REPORT_DATA_FLAT_FILE_V2': return saveSettlementRows(tenantId, content, sourceDocumentId);
     case 'GET_GST_MTR_B2B_CUSTOM': return saveGstInvoices(tenantId, content, 'b2b');
     case 'GET_GST_MTR_B2C_CUSTOM': return saveGstInvoices(tenantId, content, 'b2c');
     case 'GET_FBA_FULFILLMENT_CUSTOMER_RETURNS_DATA': return saveReturns(tenantId, content);
@@ -347,7 +353,11 @@ export async function syncReportForTenant(params) {
         return { rowsImported: 0, alreadyUpToDate: true };
       }
       const s3Key = await putRawReport({ tenantId: parsed.tenantId, reportType: parsed.reportType, reportId: report.reportId, content: report.content });
-      const rowsImported = await saveStructuredRows(parsed.tenantId, parsed.reportType, report.content, range);
+      // Settlement list syncs contain multiple immutable documents. Import
+      // each separately so row identity never depends on financial values.
+      const rowsImported = report.documents?.length
+        ? (await Promise.all(report.documents.map(document => saveStructuredRows(parsed.tenantId, parsed.reportType, document.content, range, document.reportDocumentId)))).reduce((sum, count) => sum + count, 0)
+        : await saveStructuredRows(parsed.tenantId, parsed.reportType, report.content, range, report.reportDocumentId);
       if (report.documentIds?.length) {
         await withTenant(parsed.tenantId, db => batchUpsert(db, {
           table: 'processed_report_documents',
