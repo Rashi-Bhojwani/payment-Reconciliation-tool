@@ -3,12 +3,18 @@ const amount = row => Number(row?.amount ?? row?.total_amount ?? 0) || 0;
 const norm = value => String(value ?? '').toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim();
 const rawField = (raw, names) => { const entries=Object.entries(raw??{}); for(const name of names){const wanted=norm(name).replaceAll(' ','');const hit=entries.find(([key])=>norm(key).replaceAll(' ','')===wanted);if(hit&&hit[1]!==''&&hit[1]!=null)return hit[1];} };
 const text = row => norm(`${row.parent_transaction_type??''} ${row.transaction_type??''} ${row.account_type??''} ${row.amount_type??''} ${row.amount_description??''} ${row.category??''}`);
+const compact = value => norm(value).replaceAll(' ','');
+const amountType = row => compact(row.amount_type ?? row.category ?? '');
 const keyOf = row => row.source_row_id ?? row.id ?? `${row.transaction_id??row.settlement_id??''}|${row.order_id??''}|${row.order_item_id??row.sku??''}|${row.category??row.amount_type??''}|${row.amount_description??''}|${row.posted_date??''}|${amount(row)}`;
 function dedupe(rows,key=keyOf){const seen=new Set(),included=[],duplicates=[];for(const row of rows){const keyValue=key(row);(seen.has(keyValue)?duplicates:included).push(row);seen.add(keyValue);}return{included,duplicates};}
 const isSummary=row=>String(row.category??'').startsWith('summary_');
 const isRefund=row=>/refund/.test(text(row));
-const isPrincipal=row=>/principal|item price/.test(norm(`${row.amount_type??''} ${row.amount_description??''} ${row.category??''}`));
-const isPromotion=row=>/promotion|promo rebate/.test(text(row))&&!/product tax discount|shipping tax discount|gift wrap tax discount/.test(text(row));
+// In Amazon settlement flat files "Principal" is an amount-description used
+// under several different amount types. ItemTax/Principal is GST, while
+// ItemPrice/Principal is product revenue. Treating the word Principal alone
+// as revenue was the main source of inflated sales/income and missing GST.
+const isPrincipal=row=>['itemprice','productcharge'].includes(amountType(row))||(!amountType(row)&&/principal|item price/.test(text(row)))||row.category==='item_price';
+const isPromotion=row=>(amountType(row)==='promotion'||/promotion|promo rebate/.test(text(row)))&&!/product tax discount|shipping tax discount|gift wrap tax discount/.test(text(row));
 // Amazon's own Transaction/Account Activity statement puts TDS Reimbursement
 // and Chargebacks under Income - grouped with A-to-z Guarantee claims,
 // SAFE-T Reimbursements and Clawbacks as claims-related credits/debits,
@@ -20,8 +26,8 @@ const isPromotion=row=>/promotion|promo rebate/.test(text(row))&&!/product tax d
 // statement sections without changing what counts as a "reimbursement".
 const isWithholding=row=>/\b(tcs|tds)\b/.test(text(row))&&!/reimburse/.test(text(row));
 const isReimbursement=row=>/reimburse|safe t|lost|damaged|clawback/.test(text(row));
-const isFee=row=>/itemfees|itemtcs|itemtds|other transaction|fee|commission|closing|storage|shipping label|service|advertis|adjustment|easy ship charges|postagepurchase|tcs|tds/.test(text(row))&&!isReimbursement(row)&&!isPrincipal(row)&&!isPromotion(row);
-const isProductGst=row=>/product tax|shipping tax|gift wrap tax|tax discount|\bgst collected|\bgst refund/.test(text(row))&&!/fee|commission|service|itemtcs|itemtds|tcs|tds/.test(text(row));
+const isFee=row=>/itemfees|itemfee|itemtcs|itemtds|othertransaction/.test(amountType(row))||(/other transaction|fee|commission|closing|storage|shipping label|service|advertis|adjustment|easy ship charges|postagepurchase|tcs|tds/.test(text(row))&&!isReimbursement(row)&&!isPrincipal(row)&&!isPromotion(row));
+const isProductGst=row=>amountType(row)==='itemtax'||(/product tax|shipping tax|gift wrap tax|tax discount|\bgst collected|\bgst refund/.test(text(row))&&!/fee|commission|service|itemtcs|itemtds|tcs|tds/.test(text(row)));
 const isGenericTax=row=>/\btax\b/.test(text(row))&&!isProductGst(row)&&!isWithholding(row)&&!isFee(row);
 const isTransfer=row=>/transfer|deposit|bank account|withdrawal/.test(text(row));
 const round2=value=>Math.round((Number(value)+Number.EPSILON)*100)/100;

@@ -58,6 +58,23 @@ test('matches Amazon Custom Unified Account Activity buckets from settlement API
   assert.equal(r.statement.transfers.value,-246.63);
 });
 
+test('classifies Amazon ItemTax Principal as GST instead of product income',()=>{
+  const base={orders:[],orderItems:[],returns:[],financeItems:[],reimbursements:[],gstInvoices:[],settlementHeaders:[],settlementRows:[
+    line('sale','Principal',100,'Order',{amount_type:'ItemPrice'}),
+    line('sale-gst','Principal',18,'Order',{amount_type:'ItemTax'}),
+    line('refund','Principal',-20,'Refund',{amount_type:'ItemPrice'}),
+    line('refund-gst','Principal',-3.60,'Refund',{amount_type:'ItemTax'}),
+    line('commission','Commission',-10,'Order',{amount_type:'ItemFees'}),
+    line('tds','TDS (Section 194-O)',-1,'Order',{amount_type:'ItemTDS'})
+  ]};
+  const result=calculateDashboardMetrics(base,range);
+  assert.equal(result.metrics.netSales.value,80);
+  assert.equal(result.statement.income.value,80);
+  assert.equal(result.statement.gst.value,14.4);
+  assert.equal(result.statement.expenses.value,-11);
+  assert.equal(result.statement.tax.value,0);
+});
+
 
 test('uses Amazon settlement header period and date formats for transfers',()=>{
   const base={orders:[],orderItems:[],returns:[],financeItems:[],reimbursements:[],gstInvoices:[],settlementRows:[line('sale','Principal',10,'Order',{amount_type:'ItemPrice'})]};

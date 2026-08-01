@@ -183,33 +183,39 @@ function parseReportRows(reportType, content) {
 async function saveSettlementRows(tenantId, content, sourceDocumentId) {
   const rows = z.array(ReportRowSchema).parse(parseReportRows('GET_V2_SETTLEMENT_REPORT_DATA_FLAT_FILE_V2', content));
   await withTenant(tenantId, async client => {
-    const batch = rows.map((row, rowIndex) => {
-      const amount = number(pick(row, ['amount']));
-      const rowNumber = rowIndex + 1;
-      // Content-derived keys silently collapse legitimate duplicate lines
-      // (for example two units charged the same fee on the same order/date).
-      // Amazon's immutable document ID plus physical row number preserves
-      // every source line while remaining perfectly idempotent on re-sync.
-      const identity = sourceDocumentId ? sourceKey({}, [sourceDocumentId, rowNumber]) : sourceKey(row, [JSON.stringify(row), rowNumber]);
-      return [tenantId, text(pick(row, ['settlement-id', 'settlement id', 'settlementId'])), text(pick(row, ['order-id', 'order id', 'amazon-order-id', 'amazonOrderId'])), text(pick(row, ['amount-type', 'amount type', 'amountType'])), text(pick(row, ['amount-description', 'amount description', 'amountDescription'])), amount, reportDate(pick(row, ['posted-date', 'posted date', 'postedDate'])), row, identity, sourceDocumentId ?? null, rowNumber];
-    });
-    // source_key is deterministic per settlement/transaction line, and is
-    // the real conflict identity here - not the business columns. Settlement
-    // header rows deliberately share NULL order_id/amount_type/
-    // amount_description/posted_date across *different* settlements
-    // (Postgres never treats two NULLs as equal, so a composite target on
-    // those columns can never tell one settlement's header from another's,
-    // by design), but re-syncing the *same* settlement a second time
-    // produces the exact same source_key both times - so source_key is what
-    // actually needs to drive the update-vs-insert decision, refreshing
-    // deposit metadata on re-sync instead of erroring or duplicating.
-    await batchUpsert(client, {
-      table: 'settlement_rows',
-      columns: ['tenant_id', 'settlement_id', 'order_id', 'amount_type', 'amount_description', 'amount', 'posted_date', 'raw', 'source_key', 'source_document_id', 'source_row_number'],
-      conflictColumns: ['tenant_id', 'source_key'],
-      updateColumns: ['settlement_id', 'order_id', 'amount_type', 'amount_description', 'amount', 'posted_date', 'raw', 'source_document_id', 'source_row_number'],
-      rows: batch
-    });
+    await client.query('begin');
+    try {
+      const settlementIds = [...new Set(rows.map(row => text(pick(row, ['settlement-id', 'settlement id', 'settlementId']))).filter(Boolean))];
+      // Migration 019 deliberately leaves legacy data online. Replace only
+      // settlements represented by this successfully downloaded document in
+      // the same transaction as their exact replacement rows.
+      if (sourceDocumentId && settlementIds.length) {
+        await client.query('delete from settlement_rows where tenant_id=$1 and source_document_id is null and settlement_id = any($2::text[])', [tenantId, settlementIds]);
+      }
+      const batch = rows.map((row, rowIndex) => {
+        const amount = number(pick(row, ['amount']));
+        const rowNumber = rowIndex + 1;
+        // Content-derived keys silently collapse legitimate duplicate lines
+        // (for example two units charged the same fee on the same order/date).
+        // Amazon's immutable document ID plus physical row number preserves
+        // every source line while remaining perfectly idempotent on re-sync.
+        const identity = sourceDocumentId ? sourceKey({}, [sourceDocumentId, rowNumber]) : sourceKey(row, [JSON.stringify(row), rowNumber]);
+        return [tenantId, text(pick(row, ['settlement-id', 'settlement id', 'settlementId'])), text(pick(row, ['order-id', 'order id', 'amazon-order-id', 'amazonOrderId'])), text(pick(row, ['amount-type', 'amount type', 'amountType'])), text(pick(row, ['amount-description', 'amount description', 'amountDescription'])), amount, reportDate(pick(row, ['posted-date', 'posted date', 'postedDate'])), row, identity, sourceDocumentId ?? null, rowNumber];
+      });
+      // source_key is deterministic per settlement/transaction line, and is
+      // the real conflict identity here - not the business columns.
+      await batchUpsert(client, {
+        table: 'settlement_rows',
+        columns: ['tenant_id', 'settlement_id', 'order_id', 'amount_type', 'amount_description', 'amount', 'posted_date', 'raw', 'source_key', 'source_document_id', 'source_row_number'],
+        conflictColumns: ['tenant_id', 'source_key'],
+        updateColumns: ['settlement_id', 'order_id', 'amount_type', 'amount_description', 'amount', 'posted_date', 'raw', 'source_document_id', 'source_row_number'],
+        rows: batch
+      });
+      await client.query('commit');
+    } catch (error) {
+      await client.query('rollback').catch(() => undefined);
+      throw error;
+    }
   });
   return rows.length;
 }
@@ -355,9 +361,14 @@ export async function syncReportForTenant(params) {
       const s3Key = await putRawReport({ tenantId: parsed.tenantId, reportType: parsed.reportType, reportId: report.reportId, content: report.content });
       // Settlement list syncs contain multiple immutable documents. Import
       // each separately so row identity never depends on financial values.
-      const rowsImported = report.documents?.length
-        ? (await Promise.all(report.documents.map(document => saveStructuredRows(parsed.tenantId, parsed.reportType, document.content, range, document.reportDocumentId)))).reduce((sum, count) => sum + count, 0)
-        : await saveStructuredRows(parsed.tenantId, parsed.reportType, report.content, range, report.reportDocumentId);
+      let rowsImported = 0;
+      if (report.documents?.length) {
+        // Keep replacements sequential: overlapping documents must never race
+        // while retiring legacy rows for the same settlement ID.
+        for (const document of report.documents) rowsImported += await saveStructuredRows(parsed.tenantId, parsed.reportType, document.content, range, document.reportDocumentId);
+      } else {
+        rowsImported = await saveStructuredRows(parsed.tenantId, parsed.reportType, report.content, range, report.reportDocumentId);
+      }
       if (report.documentIds?.length) {
         await withTenant(parsed.tenantId, db => batchUpsert(db, {
           table: 'processed_report_documents',
@@ -419,8 +430,12 @@ async function syncRecentApiDataForTenantDirect(tenantId, options = {}) {
   const includeOrders = options.includeOrders ?? true;
   const includeFinance = options.includeFinance ?? true;
   const includeInventory = options.includeInventory ?? true;
-  const maxOrderPages = Math.max(1, Math.min(Number(options.maxOrderPages ?? 100), 100));
-  const maxOrderItems = Math.max(0, Math.min(Number(options.maxOrderItems ?? 1000), 1000));
+  // Explicit limits remain useful for tests/diagnostics, but production must
+  // follow every NextToken and every order. The former defaults (2 pages and
+  // 20 order-item calls from server.js) permanently omitted most data for a
+  // busy seller while still recording the sync as completed.
+  const maxOrderPages = options.maxOrderPages == null ? Number.POSITIVE_INFINITY : Math.max(1, Number(options.maxOrderPages));
+  const maxOrderItems = options.maxOrderItems == null ? Number.POSITIVE_INFINITY : Math.max(0, Number(options.maxOrderItems));
   await assertActiveTenant(parsedTenantId);
   return runJob(`sync:direct-api:${parsedTenantId}`, async () => {
     const startedAt = Date.now();
@@ -438,9 +453,11 @@ async function syncRecentApiDataForTenantDirect(tenantId, options = {}) {
         try {
           let ordersResponse = await client.listOrders(createdAfter, marketplaceId, createdBefore);
           orderPages.push(ordersResponse);
+          const orderTokens = new Set();
           for (let page = 1; page < maxOrderPages; page += 1) {
             const nextToken = ordersResponse?.payload?.NextToken ?? ordersResponse?.NextToken;
-            if (!nextToken) break;
+            if (!nextToken || orderTokens.has(nextToken)) break;
+            orderTokens.add(nextToken);
             ordersResponse = await client.listOrdersByNextToken(nextToken);
             orderPages.push(ordersResponse);
           }
@@ -473,6 +490,7 @@ async function syncRecentApiDataForTenantDirect(tenantId, options = {}) {
       let inventoryImported = 0;
       let reimbursementsImported = 0;
       let orderItemsSkipped = 0;
+      let orderItemsFailures = 0;
       let catalogItemsImported = 0;
       const catalogCache = new Map();
       // A 403 from the Catalog Items API means this app's SP-API
@@ -517,7 +535,9 @@ async function syncRecentApiDataForTenantDirect(tenantId, options = {}) {
             orderItemsSkipped += 1;
             continue;
           }
-          const itemsResponse = await client.listOrderItems(orderId).catch(() => undefined);
+          let itemsResponse;
+          try { itemsResponse = await client.listOrderItems(orderId); }
+          catch { orderItemsFailures += 1; }
           orderItemsFetched += 1;
           const items = itemsResponse?.payload?.OrderItems ?? itemsResponse?.OrderItems ?? [];
           for (const item of items) {
@@ -643,7 +663,9 @@ async function syncRecentApiDataForTenantDirect(tenantId, options = {}) {
           rows: reimbursementRows
         });
       });
-      console.log(`[${logLabel}] completed in ${Date.now() - startedAt}ms - ${ordersImported} orders, ${transactionsImported} finance transactions, ${inventoryImported} inventory rows, ${reimbursementsImported} reimbursements` + (ordersWarning ? ` (orders warning: ${ordersWarning})` : '') + (financeResponse?.syncError ? ` (finance warning: ${financeResponse.syncError})` : '') + (inventoryResponse?.syncError ? ` (inventory warning: ${inventoryResponse.syncError})` : ''));
+      const incompleteReasons = [ordersWarning, financePages.find(page => page?.syncError)?.syncError, inventoryResponse?.syncError, orderItemsFailures ? `${orderItemsFailures} Order Items request(s) failed` : null].filter(Boolean);
+      if (incompleteReasons.length) throw new Error(`Amazon sync incomplete: ${incompleteReasons.join('; ')}`);
+      console.log(`[${logLabel}] completed in ${Date.now() - startedAt}ms - ${ordersImported} orders, ${transactionsImported} finance transactions, ${inventoryImported} inventory rows, ${reimbursementsImported} reimbursements`);
       await pool.query('update sync_jobs set status=$1, completed_at=now() where id=$2', ['completed', sync.rows[0].id]);
       return { ordersImported, transactionsImported, inventoryImported, reimbursementsImported, catalogItemsImported, orderItemsSkipped, incrementalSince: createdAfter, incrementalUntil: createdBefore, ordersWarning, financeWarning: financeResponse?.syncError, inventoryWarning: inventoryResponse?.syncError };
     } catch (error) {

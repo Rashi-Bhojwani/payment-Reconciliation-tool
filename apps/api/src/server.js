@@ -372,7 +372,7 @@ async function findMissingReportTypes(tenantId, range) {
 }
 function triggerBackgroundSync(tenantId, reportType, range) {
   const task = reportType === 'DIRECT_SP_API_SYNC'
-    ? syncRecentApiDataForTenant(tenantId, { range, maxOrderPages: 2, maxOrderItems: 20 })
+    ? syncRecentApiDataForTenant(tenantId, { range })
     : syncReportForSellerRequest({ tenantId, reportType }, range);
   task.catch(error => app.log.warn({ err: error, tenantId, reportType }, 'Automatic background sync failed'));
 }
@@ -386,7 +386,7 @@ async function syncReportForSellerRequest(params, range) {
   }
   if (params.reportType === 'DIRECT_SP_API_SYNC') {
     try {
-      const result = await syncRecentApiDataForTenant(params.tenantId, { range, maxOrderPages: 2, maxOrderItems: 20 });
+      const result = await syncRecentApiDataForTenant(params.tenantId, { range });
       return { reportType: params.reportType, status: 'completed', ...result };
     } catch (error) {
       // This is the base data layer, so there is no further fallback to try —
@@ -653,7 +653,7 @@ app.post('/api/tenants/:tenantId/sync', async request => {
   const body = SellerSyncSchema.parse(request.body ?? {});
   const results = [];
   try {
-    const result = await syncRecentApiDataForTenant(tenantId, { range: body.range, maxOrderPages: 2, maxOrderItems: 20 });
+    const result = await syncRecentApiDataForTenant(tenantId, { range: body.range });
     results.push({ reportType: 'DIRECT_SP_API_SYNC', status: 'completed', ...result });
   } catch (error) {
     results.push({ reportType: 'DIRECT_SP_API_SYNC', status: 'failed', error: error instanceof Error ? error.message : 'unknown error' });
