@@ -25,7 +25,13 @@ const REPORT_DATA_LAG_MS = 2 * 60 * 1000;
 const REPORT_POLL_INTERVAL_MS = 15_000;
 const REPORT_POLL_ATTEMPTS = 20;
 const SETTLEMENT_REPORT_LIST_MAX_PAGES = 20;
-const SETTLEMENT_REPORT_DOWNLOAD_CAP = 60;
+// Bounds a single sync call's wall-clock time (Amazon's real ~45s/document
+// limit on this operation, minus the 10-document burst allowance, means this
+// is roughly 10 minutes worst case for one request) rather than how much
+// data is fetchable overall - reportsTruncated + the skip-already-processed
+// logic above mean nothing past this cap is lost, only deferred to the next
+// sync, which will pick up exactly where this one left off.
+const SETTLEMENT_REPORT_DOWNLOAD_CAP = 20;
 const REPORT_DOCUMENT_DOWNLOAD_TIMEOUT_MS = 5 * 60 * 1000;
 const SP_API_MAX_ATTEMPTS = 6;
 
@@ -61,17 +67,23 @@ export function normalizeReportRange(range, now = Date.now()) {
 // published steady-state rates (ms = 1000 / requests-per-second) for the
 // Reports API v2021-06-30 operations this client actually calls; other
 // families keep their previous conservative pacing.
+// burst = how many requests Amazon actually lets through back-to-back before
+// the steady-state interval applies (a real token bucket, matching Amazon's
+// documented model) - without it, every single request pays the full
+// steady-state interval even at the very start of a sync, which is far more
+// conservative than Amazon's actual quota and makes bulk operations (a
+// settlement history with many documents) needlessly slow.
 const SP_API_OPERATION_LIMITS = Object.freeze([
-  { key: 'reports:create', method: 'POST', pattern: /^\/reports\/2021-06-30\/reports$/, intervalMs: 60_000 },
-  { key: 'reports:list', method: 'GET', pattern: /^\/reports\/2021-06-30\/reports(\?|$)/, intervalMs: 45_000 },
-  { key: 'reports:poll', method: 'GET', pattern: /^\/reports\/2021-06-30\/reports\/[^/]+$/, intervalMs: 500 },
-  { key: 'reports:document', method: 'GET', pattern: /^\/reports\/2021-06-30\/documents\//, intervalMs: 45_000 },
-  { key: 'orders', pattern: /^\/orders\//, intervalMs: 2200 },
-  { key: 'finances', pattern: /^\/finances\//, intervalMs: 5000 },
-  { key: 'fba', pattern: /^\/fba\/inventory\//, intervalMs: 5000 },
-  { key: 'tokens', pattern: /^\/tokens\//, intervalMs: 5000 },
-  { key: 'products', pattern: /^\/products\/fees\//, intervalMs: 2200 },
-  { key: 'catalog', pattern: /^\/catalog\//, intervalMs: 2200 }
+  { key: 'reports:create', method: 'POST', pattern: /^\/reports\/2021-06-30\/reports$/, intervalMs: 60_000, burst: 15 },
+  { key: 'reports:list', method: 'GET', pattern: /^\/reports\/2021-06-30\/reports(\?|$)/, intervalMs: 45_000, burst: 10 },
+  { key: 'reports:poll', method: 'GET', pattern: /^\/reports\/2021-06-30\/reports\/[^/]+$/, intervalMs: 500, burst: 15 },
+  { key: 'reports:document', method: 'GET', pattern: /^\/reports\/2021-06-30\/documents\//, intervalMs: 45_000, burst: 10 },
+  { key: 'orders', pattern: /^\/orders\//, intervalMs: 2200, burst: 1 },
+  { key: 'finances', pattern: /^\/finances\//, intervalMs: 5000, burst: 1 },
+  { key: 'fba', pattern: /^\/fba\/inventory\//, intervalMs: 5000, burst: 1 },
+  { key: 'tokens', pattern: /^\/tokens\//, intervalMs: 5000, burst: 1 },
+  { key: 'products', pattern: /^\/products\/fees\//, intervalMs: 2200, burst: 1 },
+  { key: 'catalog', pattern: /^\/catalog\//, intervalMs: 2200, burst: 1 }
 ]);
 const DEFAULT_SP_API_INTERVAL_MS = 3000;
 
@@ -79,7 +91,7 @@ const DEFAULT_SP_API_INTERVAL_MS = 3000;
 function rateLimitBucket(method, path) {
   const pathname = path.split('?')[0];
   const match = SP_API_OPERATION_LIMITS.find(item => (!item.method || item.method === method) && item.pattern.test(pathname));
-  return { key: match?.key ?? (pathname.split('/').filter(Boolean)[0] ?? 'default'), intervalMs: match?.intervalMs ?? DEFAULT_SP_API_INTERVAL_MS };
+  return { key: match?.key ?? (pathname.split('/').filter(Boolean)[0] ?? 'default'), intervalMs: match?.intervalMs ?? DEFAULT_SP_API_INTERVAL_MS, burst: match?.burst ?? 1 };
 }
 
 export class SpApiClient {
@@ -97,15 +109,28 @@ export class SpApiClient {
     this.nextGlobalSlotAt = Date.now();
   }
 
-  /** @param {string} method @param {string} path */
+  /**
+   * Token-bucket pacing per operation: a bucket starts full (burst tokens
+   * available immediately, matching Amazon's real quota model) and refills
+   * at the steady-state rate. Only once burst capacity is exhausted does a
+   * request actually wait the full steady-state interval. Without this, a
+   * bulk operation (downloading many settlement documents) would pay the
+   * full interval on every single request from the first one, which is far
+   * more conservative than what Amazon actually allows.
+   * @param {string} method @param {string} path
+   */
   async waitForSlot(method, path) {
-    const { key, intervalMs } = rateLimitBucket(method, path);
+    const { key, intervalMs, burst } = rateLimitBucket(method, path);
     const now = Date.now();
-    const nextAvailableAt = Math.max(this.rateLimitState.get(key) ?? now, this.nextGlobalSlotAt);
-    const waitMs = Math.max(0, nextAvailableAt - now);
-    this.rateLimitState.set(key, now + waitMs + intervalMs);
-    this.nextGlobalSlotAt = now + waitMs + 750;
-    if (waitMs > 500) console.log(`[${this.label}] pacing ${method} ${path} - waiting ${waitMs}ms (bucket "${key}", ${intervalMs}ms/request)`);
+    let bucket = this.rateLimitState.get(key);
+    if (!bucket) { bucket = { tokens: burst, lastRefillAt: now }; this.rateLimitState.set(key, bucket); }
+    bucket.tokens = Math.min(burst, bucket.tokens + (now - bucket.lastRefillAt) / intervalMs);
+    bucket.lastRefillAt = now;
+    const bucketWaitMs = bucket.tokens < 1 ? (1 - bucket.tokens) * intervalMs : 0;
+    bucket.tokens = Math.max(0, bucket.tokens - 1);
+    const waitMs = Math.max(bucketWaitMs, this.nextGlobalSlotAt - now, 0);
+    this.nextGlobalSlotAt = now + waitMs + 200;
+    if (waitMs > 500) console.log(`[${this.label}] pacing ${method} ${path} - waiting ${Math.round(waitMs)}ms (bucket "${key}", ${intervalMs}ms/request, burst ${burst})`);
     if (waitMs > 0) await new Promise(resolve => setTimeout(resolve, waitMs));
   }
 
@@ -162,8 +187,8 @@ export class SpApiClient {
     return z.object({ restrictedDataToken: z.string().min(1) }).parse(await res.json()).restrictedDataToken;
   }
 
-  /** @param {string} reportType @param {string} tenantId @param {{ start: string, end: string }} range @param {string} [marketplaceId] */
-  async fetchReport(reportType, tenantId, range, marketplaceId = INDIA_MARKETPLACE_ID) {
+  /** @param {string} reportType @param {string} tenantId @param {{ start: string, end: string }} range @param {string} [marketplaceId] @param {{ skipDocumentIds?: Set<string> }} [options] */
+  async fetchReport(reportType, tenantId, range, marketplaceId = INDIA_MARKETPLACE_ID, options = {}) {
     const parsedReportType = z.enum(REPORT_TYPES).parse(reportType);
     const parsedRange = normalizeReportRange(range);
     const parsedTenant = z.string().uuid().parse(tenantId);
@@ -200,12 +225,36 @@ export class SpApiClient {
         .filter(item => item.reportDocumentId && (!item.dataEndTime || new Date(item.dataEndTime).getTime() >= requestedStart) && (!item.dataStartTime || new Date(item.dataStartTime).getTime() <= requestedEnd))
         .sort((a, b) => new Date(b.dataEndTime ?? b.createdTime ?? 0).getTime() - new Date(a.dataEndTime ?? a.createdTime ?? 0).getTime());
       if (!matchingReports.length) throw new Error('No completed Amazon settlement report is available for this date range yet');
-      // Every matching report genuinely overlaps the requested range and is
-      // real seller data - there is no principled amount of it to discard.
-      // This safety cap only guards against a pathologically wide range
-      // request, and is generous enough that a normal account (even one
-      // settling multiple times a week) will never hit it.
-      const boundedReports = matchingReports.slice(0, SETTLEMENT_REPORT_DOWNLOAD_CAP);
+      // A settlement report document is immutable once generated - Amazon
+      // never revises one after the fact - so a document this tenant has
+      // already downloaded and successfully saved has nothing new to offer.
+      // Re-downloading it anyway was the actual cause of settlement syncs
+      // taking 10+ minutes and re-fetching the same historical documents on
+      // every single sync: with a 45s/request real Amazon limit on this
+      // operation, a long-history account's full backlog could never
+      // finish within one request before this existed.
+      const skipDocumentIds = options.skipDocumentIds ?? new Set();
+      const newReports = matchingReports.filter(item => !skipDocumentIds.has(item.reportDocumentId));
+      if (!newReports.length) {
+        return {
+          reportId: matchingReports[0].reportId,
+          reportDocumentId: matchingReports[0].reportDocumentId,
+          content: '',
+          compressionAlgorithm: 'MERGED_SETTLEMENT_REPORTS',
+          reportsMerged: 0,
+          reportsAvailable: matchingReports.length,
+          reportsTruncated: false,
+          documentIds: [],
+          allAlreadyProcessed: true
+        };
+      }
+      // Every remaining report genuinely overlaps the requested range, is
+      // real seller data, and has never been fetched before - there is no
+      // principled amount of it to discard. This safety cap only guards
+      // against a pathologically large first-time backlog in a single
+      // request; anything past it is picked up by the *next* sync instead
+      // (nothing here is skipped forever - only already-processed).
+      const boundedReports = newReports.slice(0, SETTLEMENT_REPORT_DOWNLOAD_CAP);
       const documents = [];
       for (const report of boundedReports) documents.push(await this.downloadReportDocument(report.reportDocumentId));
       const content = documents.map((document, index) => index === 0 ? document.content : document.content.split(/\r?\n/).slice(1).join('\n')).join('\n');
@@ -216,7 +265,8 @@ export class SpApiClient {
         compressionAlgorithm: 'MERGED_SETTLEMENT_REPORTS',
         reportsMerged: boundedReports.length,
         reportsAvailable: matchingReports.length,
-        reportsTruncated: matchingReports.length > boundedReports.length
+        reportsTruncated: newReports.length > boundedReports.length,
+        documentIds: boundedReports.map(item => item.reportDocumentId)
       };
     }
     const reportOptions = parsedReportType === 'GET_SALES_AND_TRAFFIC_REPORT'

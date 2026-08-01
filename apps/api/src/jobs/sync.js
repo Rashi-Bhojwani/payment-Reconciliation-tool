@@ -335,10 +335,27 @@ export async function syncReportForTenant(params) {
       const seller = await pool.query("select refresh_token_encrypted, marketplace_id from sellers where tenant_id = $1 and auth_status = 'authorized' order by connected_at desc limit 1", [parsed.tenantId]);
       if (!seller.rowCount) throw new Error('No connected Amazon seller account');
       const client = new SpApiClient(decryptSecret(seller.rows[0].refresh_token_encrypted), { baseUrl: getSpApiEndpoint(seller.rows[0].marketplace_id), label: logLabel });
-      const report = await client.fetchReport(parsed.reportType, parsed.tenantId, range, seller.rows[0].marketplace_id);
+      // Settlement report documents are immutable once generated - skip any
+      // this tenant has already downloaded and saved, so a long settlement
+      // history doesn't get re-fetched in full on every sync (see fetchReport).
+      const alreadyProcessed = await withTenant(parsed.tenantId, db => db.query('select report_document_id from processed_report_documents where tenant_id=$1 and report_type=$2', [parsed.tenantId, parsed.reportType]));
+      const skipDocumentIds = new Set(alreadyProcessed.rows.map(row => row.report_document_id));
+      const report = await client.fetchReport(parsed.reportType, parsed.tenantId, range, seller.rows[0].marketplace_id, { skipDocumentIds });
+      if (report.allAlreadyProcessed) {
+        console.log(`[${logLabel}] completed in ${Date.now() - startedAt}ms - all ${report.reportsAvailable} available document(s) already synced, nothing new`);
+        await pool.query('update sync_jobs set status=$1, completed_at=now() where id=$2', ['completed', sync.rows[0].id]);
+        return { rowsImported: 0, alreadyUpToDate: true };
+      }
       const s3Key = await putRawReport({ tenantId: parsed.tenantId, reportType: parsed.reportType, reportId: report.reportId, content: report.content });
       const rowsImported = await saveStructuredRows(parsed.tenantId, parsed.reportType, report.content, range);
-      console.log(`[${logLabel}] completed in ${Date.now() - startedAt}ms - ${rowsImported} rows imported`);
+      if (report.documentIds?.length) {
+        await withTenant(parsed.tenantId, db => batchUpsert(db, {
+          table: 'processed_report_documents',
+          columns: ['tenant_id', 'report_document_id', 'report_type'],
+          rows: report.documentIds.map(documentId => [parsed.tenantId, documentId, parsed.reportType])
+        }));
+      }
+      console.log(`[${logLabel}] completed in ${Date.now() - startedAt}ms - ${rowsImported} rows imported` + (report.reportsTruncated ? ` (${report.reportsAvailable - (report.reportsMerged ?? 0)} more document(s) remain for the next sync)` : ''));
       await pool.query('update sync_jobs set status=$1, completed_at=now(), s3_key=$2 where id=$3', ['completed', s3Key, sync.rows[0].id]);
       return { rowsImported, s3Key };
     } catch (error) {
