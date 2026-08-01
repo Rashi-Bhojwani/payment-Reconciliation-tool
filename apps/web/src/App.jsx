@@ -402,12 +402,30 @@ function SellerDashboard() {
   const [error, setError] = useState('');
   const [loading, setLoading] = useState(false);
   const rangeSyncRef = useRef({ key: '', requestId: 0 });
+  // The server auto-syncs whatever a date range is missing in the background
+  // and reports back which report types it kicked off (data.autoSyncing).
+  // Rather than making the seller know "sync" is a concept, poll a few times
+  // while that's non-empty so the dashboard fills in on its own - capped so
+  // a permanently-failing source (e.g. a real Amazon permission issue)
+  // can't poll forever.
+  const AUTO_POLL_MAX_ATTEMPTS = 5;
+  const AUTO_POLL_DELAY_MS = 20_000;
+  const autoPollRef = useRef({ key: '', attempts: 0 });
   async function load(targetRange = range, requestId = rangeSyncRef.current.requestId) {
     setError('');
     setLoading(true);
     try {
       const dashboard = await api(`/api/tenants/${tenantId}/dashboard?${rangeQuery(targetRange)}`);
-      if (requestId === rangeSyncRef.current.requestId) { setData(dashboard); setLoading(false); }
+      if (requestId !== rangeSyncRef.current.requestId) return;
+      setData(dashboard);
+      const rangeKey = `${targetRange.start}|${targetRange.end}`;
+      if (autoPollRef.current.key !== rangeKey) autoPollRef.current = { key: rangeKey, attempts: 0 };
+      if (dashboard.autoSyncing?.length && autoPollRef.current.attempts < AUTO_POLL_MAX_ATTEMPTS) {
+        autoPollRef.current.attempts += 1;
+        setTimeout(() => { if (requestId === rangeSyncRef.current.requestId) void load(targetRange, requestId); }, AUTO_POLL_DELAY_MS);
+      } else {
+        setLoading(false);
+      }
     } catch (e) {
       if (requestId === rangeSyncRef.current.requestId) { setError(e.message); setLoading(false); }
     }

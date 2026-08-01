@@ -332,7 +332,7 @@ async function recordSyntheticReportSync(tenantId, reportType, s3Key = 'fallback
 // keeps genuinely new ranges, or a sync more than a few minutes old, working
 // exactly as before.
 const SYNC_REUSE_WINDOW_MS = 5 * 60 * 1000;
-async function findReusableSync(tenantId, reportType, range) {
+async function findReusableSync(tenantId, reportType, range, windowMs = SYNC_REUSE_WINDOW_MS) {
   if (!range?.start || !range?.end) return null;
   const recent = await pool.query(
     `select id, completed_at, range_start, range_end from sync_jobs
@@ -341,9 +341,40 @@ async function findReusableSync(tenantId, reportType, range) {
        and range_start is not null and range_end is not null
        and range_start <= $3 and range_end >= $4
      order by completed_at desc limit 1`,
-    [tenantId, reportType, range.start, range.end, SYNC_REUSE_WINDOW_MS]
+    [tenantId, reportType, range.start, range.end, windowMs]
   );
   return recent.rows[0] ?? null;
+}
+
+// A seller opening the dashboard for a date range should never have to know
+// that "sync" is a concept, let alone click it per report - they just want
+// correct numbers for the range they picked. Anything not covered by a
+// reasonably recent completed sync gets fetched automatically in the
+// background (not awaited - a full sync can take minutes, and the dashboard
+// must still respond with whatever data already exists) the moment the
+// dashboard is opened for that range.
+const AUTO_SYNC_FRESHNESS_WINDOW_MS = 60 * 60 * 1000;
+const AUTO_SYNC_REPORT_TYPES = Object.freeze(['DIRECT_SP_API_SYNC', 'GET_V2_SETTLEMENT_REPORT_DATA_FLAT_FILE_V2', 'GET_SALES_AND_TRAFFIC_REPORT', 'GET_GST_MTR_B2B_CUSTOM', 'GET_GST_MTR_B2C_CUSTOM', 'GET_FBA_MYI_UNSUPPRESSED_INVENTORY_DATA', 'GET_FBA_REIMBURSEMENTS_DATA', 'GET_FBA_FULFILLMENT_CUSTOMER_RETURNS_DATA']);
+async function findMissingReportTypes(tenantId, range) {
+  if (!range?.start || !range?.end) return [];
+  const missing = [];
+  for (const reportType of AUTO_SYNC_REPORT_TYPES) {
+    const reusable = await findReusableSync(tenantId, reportType, range, AUTO_SYNC_FRESHNESS_WINDOW_MS);
+    if (reusable) continue;
+    const running = await pool.query(
+      "select 1 from sync_jobs where tenant_id=$1 and report_type=$2 and status='running' and started_at > now() - interval '10 minutes' limit 1",
+      [tenantId, reportType]
+    );
+    if (running.rowCount) continue;
+    missing.push(reportType);
+  }
+  return missing;
+}
+function triggerBackgroundSync(tenantId, reportType, range) {
+  const task = reportType === 'DIRECT_SP_API_SYNC'
+    ? syncRecentApiDataForTenant(tenantId, { range, maxOrderPages: 2, maxOrderItems: 20 })
+    : syncReportForSellerRequest({ tenantId, reportType }, range);
+  task.catch(error => app.log.warn({ err: error, tenantId, reportType }, 'Automatic background sync failed'));
 }
 
 
@@ -825,6 +856,9 @@ app.get('/api/tenants/:tenantId/dashboard', async request => {
   const seller = sellerRow
     ? { connected: true, sellerName: sellerRow.seller_name, sellerId: sellerRow.amazon_seller_id, marketplaceId: sellerRow.marketplace_id, authStatus: sellerRow.auth_status, connectedAt: sellerRow.connected_at, lastTokenRefreshAt: sellerRow.last_token_refresh_at }
     : { connected: false };
+  const effectiveRange = { start: start.toISOString(), end: end.toISOString() };
+  const autoSyncReportTypes = sellerRow ? await findMissingReportTypes(tenantId, effectiveRange) : [];
+  for (const reportType of autoSyncReportTypes) triggerBackgroundSync(tenantId, reportType, effectiveRange);
   return withTenant(tenantId, async client => {
     // Requests interrupted by a process restart or disconnected client can
     // leave a running row behind after imported data was committed. Persist
@@ -975,7 +1009,7 @@ app.get('/api/tenants/:tenantId/dashboard', async request => {
     }, { grossSales: 0, deductions: 0, sellerReceivable: 0, fbaReceivable: 0, fbmReceivable: 0, otherReceivable: 0 });
     const dashboardCalculations=await loadDashboardCalculations(client,tenantId,{start:start.toISOString(),end:end.toISOString()});
     const hasImportedData = Number(orders.orders ?? 0) > 0 || Number(kpis.net_settled ?? 0) !== 0 || products.length > 0 || payments.length > 0 || inventory.length > 0;
-    return { seller, amazonAuth, hasImportedData, kpis, orders, orderRows, orderPayments, paymentComponents, paymentSummary, dashboardCalculations, businessReportRows, products, trend, payments, settlementLines, financialComponents, financialSummary, jobs, inventory, returns, reimbursements, invoices, orderItems, financeTransactions };
+    return { seller, amazonAuth, hasImportedData, kpis, orders, orderRows, orderPayments, paymentComponents, paymentSummary, dashboardCalculations, businessReportRows, products, trend, payments, settlementLines, financialComponents, financialSummary, jobs, inventory, returns, reimbursements, invoices, orderItems, financeTransactions, autoSyncing: autoSyncReportTypes };
   });
 });
 
