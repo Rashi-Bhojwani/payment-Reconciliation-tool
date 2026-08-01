@@ -471,13 +471,16 @@ function SellerDashboard() {
     {view === 'sales' && <SalesAnalytics data={data} channelData={channelData} />}
     {view === 'businessPerformance' && <BusinessPerformanceReport data={data} />}
     {view === 'productPerformance' && <ProductPerformanceReport data={data} />}
-    {view === 'inventory' && <TableCard title="Inventory" rows={data?.inventory ?? []} columns={['sku', 'fulfillable_quantity', 'snapshot_date']} />}
-    {view === 'payouts' && <TableCard title="Payout Activity" rows={data?.payments ?? []} columns={['posted_date', 'settlement_id', 'net_amount', 'lines']} />}
-    {view === 'brand' && <TableCard title="Product Performance" rows={data?.products ?? []} columns={['asin', 'units', 'sales', 'buy_box']} />}
+    {view === 'inventory' && <TableCard title="Inventory" rows={data?.inventory ?? []} columns={['sku', 'fulfillable_quantity', 'snapshot_date']} downloadFilename="inventory.csv" />}
+    {view === 'payouts' && <>
+      <TableCard title="Payout Activity" rows={data?.payments ?? []} columns={['posted_date', 'settlement_id', 'net_amount', 'lines']} downloadFilename="payout-activity.csv" />
+      <TableCard title="Settlement Lines (itemized)" rows={data?.settlementLines ?? []} columns={['posted_date', 'settlement_id', 'order_id', 'amount_type', 'amount_description', 'amount']} pageSize={10} downloadFilename="settlement-lines.csv" />
+    </>}
+    {view === 'brand' && <TableCard title="Product Performance" rows={data?.products ?? []} columns={['asin', 'units', 'sales', 'buy_box']} downloadFilename="product-performance.csv" />}
     {view === 'feeAudit' && <FeeLeakAudit tenantId={tenantId} />}
-    {view === 'returns' && <TableCard title="Return Details" rows={data?.returns ?? []} columns={['order_id', 'return_reason', 'disposition', 'status', 'return_date']} />}
-    {view === 'reimbursements' && <TableCard title="Reimbursement Details" rows={data?.reimbursements ?? []} columns={['sku', 'amount', 'reason', 'reimbursement_date']} />}
-    {view === 'tax' && <TableCard title="GST Invoice Details" rows={data?.invoices ?? []} columns={['invoice_type', 'order_id', 'taxable_value', 'cgst', 'sgst', 'igst', 'invoice_date']} />}
+    {view === 'returns' && <TableCard title="Return Details" rows={data?.returns ?? []} columns={['order_id', 'return_reason', 'disposition', 'status', 'return_date']} downloadFilename="returns.csv" />}
+    {view === 'reimbursements' && <TableCard title="Reimbursement Details" rows={data?.reimbursements ?? []} columns={['sku', 'amount', 'reason', 'reimbursement_date']} downloadFilename="reimbursements.csv" />}
+    {view === 'tax' && <TableCard title="GST Invoice Details" rows={data?.invoices ?? []} columns={['invoice_type', 'order_id', 'taxable_value', 'cgst', 'sgst', 'igst', 'invoice_date']} downloadFilename="gst-invoices.csv" />}
     {view === 'reports' && <ReportsExplorer tenantId={tenantId} data={data} />}
     {view === 'rawData' && <RawApiDataExplorer data={data} />}
     {view === 'report-detail' && <ReportDetail data={data} reportType={params.get('reportType')} />}
@@ -925,7 +928,7 @@ function ReportChart({ title, data, type, dataKey, keys }) {
 
 function PanelHeader({ title, subtitle }) { const { range } = useContext(DateRangeContext); return <div className="panel-header"><h2>{title}</h2><span>{subtitle ?? range.label}</span></div>; }
 function Legend({ items }) { return <div className="legend-list">{items.map((item, i) => <div key={item.name}><span style={{ background: COLORS[i % COLORS.length] }} />{item.name}<b>{formatCurrency(item.value)}</b></div>)}</div>; }
-function TableCard({ title, rows = [], columns, pageSize = 6 }) {
+function TableCard({ title, rows = [], columns, pageSize = 6, downloadFilename }) {
   const [page, setPage] = useState(0);
   const totalPages = Math.max(1, Math.ceil(rows.length / pageSize));
   useEffect(() => { setPage(0); }, [rows, pageSize]);
@@ -933,6 +936,7 @@ function TableCard({ title, rows = [], columns, pageSize = 6 }) {
   const visibleRows = rows.slice(safePage * pageSize, safePage * pageSize + pageSize);
   return <Card className="table-card">
     <PanelHeader title={title} />
+    {downloadFilename && <div className="table-card-actions"><Button variant="secondary" disabled={!rows.length} onClick={() => downloadCsv(downloadFilename, rows, columns)}>Download CSV ({formatNumber(rows.length)} rows)</Button></div>}
     {rows.length ? <>
       <div className="table-wrap"><table><thead><tr>{columns.map(c => <th key={c}>{c.replaceAll('_', ' ')}</th>)}</tr></thead><tbody>{visibleRows.map((row, i) => <tr key={i}>{columns.map(c => <td key={c}>{row[c] ?? '—'}</td>)}</tr>)}</tbody></table></div>
       {rows.length > pageSize && <div className="pager"><Button variant="ghost" disabled={safePage === 0} onClick={() => setPage(p => Math.max(0, p - 1))}>← Previous</Button><span>Page {safePage + 1} of {totalPages} · {formatNumber(rows.length)} rows</span><Button variant="ghost" disabled={safePage >= totalPages - 1} onClick={() => setPage(p => Math.min(totalPages - 1, p + 1))}>Next →</Button></div>}

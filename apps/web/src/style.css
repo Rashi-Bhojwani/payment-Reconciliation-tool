@@ -586,6 +586,7 @@ select, input { font-family: inherit; }
 .dashboard-grid.two { grid-template-columns: 1fr 1fr; }
 .panel, .table-card { display: flex; flex-direction: column; gap: 14px; }
 .panel-header { display: flex; align-items: baseline; justify-content: space-between; }
+.table-card-actions { display: flex; justify-content: flex-end; }
 .panel-header h2 { font-size: 15px; }
 .panel-header span { color: var(--muted); font-size: 11.5px; font-family: 'IBM Plex Mono', monospace; text-transform: uppercase; letter-spacing: 0.04em; }
 .legend-list { display: flex; flex-direction: column; gap: 8px; margin-top: 6px; }
