@@ -537,6 +537,9 @@ select, input { font-family: inherit; }
 .pill.status-suspended { background: var(--danger-bg); color: var(--danger); }
 .pill.status-idle { background: var(--paper); color: var(--muted); }
 .pill.status-locked { background: var(--paper); color: var(--muted); opacity: 0.7; }
+.range-loading-pill { display: inline-flex; align-items: center; gap: 6px; }
+.spinner-dot { width: 8px; height: 8px; border-radius: 50%; background: currentColor; animation: spinner-dot-pulse 1s ease-in-out infinite; }
+@keyframes spinner-dot-pulse { 0%, 100% { opacity: 0.25; transform: scale(0.8); } 50% { opacity: 1; transform: scale(1.1); } }
 .ledger-locked-note {
   background: var(--danger-bg);
   color: var(--danger);

@@ -400,14 +400,16 @@ function SellerDashboard() {
   const { range } = useContext(DateRangeContext);
   const [data, setData] = useState(null);
   const [error, setError] = useState('');
+  const [loading, setLoading] = useState(false);
   const rangeSyncRef = useRef({ key: '', requestId: 0 });
   async function load(targetRange = range, requestId = rangeSyncRef.current.requestId) {
     setError('');
+    setLoading(true);
     try {
       const dashboard = await api(`/api/tenants/${tenantId}/dashboard?${rangeQuery(targetRange)}`);
-      if (requestId === rangeSyncRef.current.requestId) setData(dashboard);
+      if (requestId === rangeSyncRef.current.requestId) { setData(dashboard); setLoading(false); }
     } catch (e) {
-      if (requestId === rangeSyncRef.current.requestId) setError(e.message);
+      if (requestId === rangeSyncRef.current.requestId) { setError(e.message); setLoading(false); }
     }
   }
   useEffect(() => {
@@ -436,6 +438,7 @@ function SellerDashboard() {
     <div className="section-title">
       <div><h1>{viewTitle(view)}</h1><p>{viewDescription(view)}</p></div>
       <div className="actions">
+        {loading && <span className="pill status-running range-loading-pill"><span className="spinner-dot" />Refreshing…</span>}
         <AmazonConnectionPanel tenantId={tenantId} seller={data?.seller} onChange={load} setError={setError} />
       </div>
     </div>
