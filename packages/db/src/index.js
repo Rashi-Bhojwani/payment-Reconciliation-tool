@@ -1,5 +1,21 @@
 import pg from 'pg';
 
+// node-postgres's default DATE (OID 1082) parser builds a JS Date using the
+// server process's LOCAL system timezone (new Date(year, month-1, day)),
+// then callers serialize it with .toISOString() (UTC) - so the exact same
+// stored SQL date renders differently depending on what timezone the Node
+// process happens to run in. Confirmed directly: on an IST machine, SQL
+// DATE '2026-07-25' serializes as "2026-07-24T18:30:00.000Z" - silently
+// shifted a day earlier as far as any UTC-based reader (`new Date(...,
+// {timeZone:'UTC'})`, a raw string compare, etc.) is concerned. A backend
+// that behaves differently in dev (often non-UTC) versus production (often
+// UTC) for date-only columns - return_date, invoice_date,
+// reimbursement_date, snapshot_date, and settlement payouts grouped by
+// date(posted_date) - is exactly the kind of bug that "works on my machine"
+// and then doesn't. Returning the raw "YYYY-MM-DD" string instead removes
+// the timezone conversion entirely, so every environment behaves the same.
+pg.types.setTypeParser(1082, value => value);
+
 const { Pool } = pg;
 const databaseUrl = process.env.DATABASE_URL;
 export const databaseUrlConfigured = Boolean(databaseUrl && databaseUrl !== 'HEHE');
