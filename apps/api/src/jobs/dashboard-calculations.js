@@ -1,8 +1,38 @@
 const num = value => value == null || value === '' ? null : Number(value);
 const amount = row => Number(row?.amount ?? row?.total_amount ?? 0) || 0;
-const norm = value => String(value ?? '').toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim();
+// Settlement labels are already space-separated English ("Product Tax",
+// "Fixed closing fee"), but Finance API breakdown labels are PascalCase with
+// no separators at all ("OurPriceTax", "ItemTDS"). Splitting camelCase/
+// PascalCase boundaries before the generic non-alphanumeric collapse turns
+// "OurPriceTax" into "our price tax" so a word-boundary pattern like \btax\b
+// can actually match "tax" as its own word - previously it normalized to
+// one glued token "ourpricetax", which \btax\b (and \b(tcs|tds)\b) can never
+// match in the middle of. Confirmed live: this was silently sending
+// "OurPriceTax" rows on Finance-API-sourced (Deferred/pending) transactions
+// past every specific classifier undetected. Already-space-separated
+// settlement text is unaffected - there is no lowercase-to-uppercase
+// transition inside "Product Tax" to split.
+const norm = value => String(value ?? '')
+  .replace(/([a-z0-9])([A-Z])/g, '$1 $2')
+  .replace(/([A-Z]+)([A-Z][a-z])/g, '$1 $2')
+  .toLowerCase()
+  .replace(/[^a-z0-9]+/g, ' ')
+  .trim();
 const rawField = (raw, names) => { const entries=Object.entries(raw??{}); for(const name of names){const wanted=norm(name).replaceAll(' ','');const hit=entries.find(([key])=>norm(key).replaceAll(' ','')===wanted);if(hit&&hit[1]!==''&&hit[1]!=null)return hit[1];} };
-const text = row => norm(`${row.parent_transaction_type??''} ${row.transaction_type??''} ${row.account_type??''} ${row.amount_type??''} ${row.amount_description??''} ${row.category??''}`);
+// account_type ("Cash On Delivery Transactions and Non-Transactional Fees",
+// "Electronic Transactions (Credit Card/Net Banking/GC)") is a per-
+// TRANSACTION payment-rail descriptor, not a per-line-item category signal -
+// yet it was folded into every classifier's search text. That first COD
+// label literally contains the substring "Fees", so isFee's bare "fee"
+// keyword matched on it regardless of what the actual line item was.
+// Confirmed live: the identical line type (e.g. "OurPriceTax") landed in
+// Expenses for a COD-paid order and Income for a card-paid order - the only
+// difference between the two rows was which payment rail collected the
+// money, which has nothing to do with what category that specific line
+// belongs in. Settlement rows never populate account_type at all, so this
+// was a real, pre-existing latent bug that only started affecting real
+// numbers once Finance API rows (which do populate it) started being used.
+const text = row => norm(`${row.parent_transaction_type??''} ${row.transaction_type??''} ${row.amount_type??''} ${row.amount_description??''} ${row.category??''}`);
 const keyOf = row => row.source_row_id ?? row.id ?? `${row.transaction_id??row.settlement_id??''}|${row.order_id??''}|${row.order_item_id??row.sku??''}|${row.category??row.amount_type??''}|${row.amount_description??''}|${row.posted_date??''}|${amount(row)}`;
 function dedupe(rows,key=keyOf){const seen=new Set(),included=[],duplicates=[];for(const row of rows){const keyValue=key(row);(seen.has(keyValue)?duplicates:included).push(row);seen.add(keyValue);}return{included,duplicates};}
 const isSummary=row=>String(row.category??'').startsWith('summary_');
@@ -21,7 +51,13 @@ const isPromotion=row=>/promotion|promo rebate/.test(text(row))&&!/product tax d
 const isWithholding=row=>/\b(tcs|tds)\b/.test(text(row))&&!/reimburse/.test(text(row));
 const isReimbursement=row=>/reimburse|safe t|lost|damaged|clawback/.test(text(row));
 const isFee=row=>/itemfees|itemtcs|itemtds|other transaction|fee|commission|closing|storage|shipping label|service|advertis|adjustment|easy ship charges|postagepurchase|tcs|tds/.test(text(row))&&!isReimbursement(row)&&!isPrincipal(row)&&!isPromotion(row);
-const isProductGst=row=>/product tax|shipping tax|gift wrap tax|tax discount|\bgst collected|\bgst refund/.test(text(row))&&!/fee|commission|service|itemtcs|itemtds|tcs|tds/.test(text(row));
+// "our price tax" is the Finance API's own name (after camelCase splitting)
+// for what settlement calls "Product Tax" - the tax on the item's own sale
+// price, as distinct from "shipping tax"/"gift wrap tax". Without this
+// alias it does not contain the literal phrase "product tax" and falls
+// through to isGenericTax instead of GST, producing a phantom non-zero Tax
+// figure on Deferred orders even after the camelCase-splitting fix.
+const isProductGst=row=>/product tax|our price tax|shipping tax|gift wrap tax|tax discount|\bgst collected|\bgst refund/.test(text(row))&&!/fee|commission|service|itemtcs|itemtds|tcs|tds/.test(text(row));
 // finance_transaction_items.category is not a raw Amazon label like
 // settlement's amount_type/amount_description - it is a normalized bucket
 // name from categorizeFinanceLabel() (finance-components.js), which
