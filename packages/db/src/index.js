@@ -17,7 +17,7 @@ import pg from 'pg';
 pg.types.setTypeParser(1082, value => value);
 
 const { Pool } = pg;
-const databaseUrl = process.env.DATABASE_URL;
+const databaseUrl = "postgresql://reconciliation:Rashib123@reconciliation-db.cvi6iwyo0o2r.ap-south-1.rds.amazonaws.com:5432/postgres";
 export const databaseUrlConfigured = Boolean(databaseUrl && databaseUrl !== 'HEHE');
 export const pool = new Pool({
   connectionString: databaseUrlConfigured ? databaseUrl : undefined,
