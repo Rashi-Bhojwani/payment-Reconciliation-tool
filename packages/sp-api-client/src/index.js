@@ -27,6 +27,7 @@ const REPORT_POLL_ATTEMPTS = 20;
 const SETTLEMENT_REPORT_LIST_MAX_PAGES = 20;
 const SETTLEMENT_REPORT_DOWNLOAD_CAP = 60;
 const REPORT_DOCUMENT_DOWNLOAD_TIMEOUT_MS = 5 * 60 * 1000;
+const SP_API_MAX_ATTEMPTS = 6;
 
 /**
  * Amazon rejects report requests whose dataEndTime is in the future. The web
@@ -50,44 +51,62 @@ export function normalizeReportRange(range, now = Date.now()) {
   return { start: start.toISOString(), end: end.toISOString() };
 }
 
-const SP_API_RATE_LIMITS = Object.freeze([
-  { pattern: /^\/orders\//, intervalMs: 2200 },
-  { pattern: /^\/reports\//, intervalMs: 5000 },
-  { pattern: /^\/finances\//, intervalMs: 5000 },
-  { pattern: /^\/fba\/inventory\//, intervalMs: 5000 },
-  { pattern: /^\/tokens\//, intervalMs: 5000 },
-  { pattern: /^\/products\/fees\//, intervalMs: 2200 },
-  { pattern: /^\/catalog\//, intervalMs: 2200 }
+// Amazon enforces a *separate* steady-state rate limit per specific
+// operation, not per API family - lumping every /reports/* call into one
+// bucket (as this used to do) means bulk report-document downloads fire far
+// faster than Amazon actually allows for that specific operation, run out
+// their retry budget, and throw "SP-API request failed after retries" even
+// though report *creation* and *polling* (much more generous limits) still
+// have room to spare in the same shared bucket. These intervals are Amazon's
+// published steady-state rates (ms = 1000 / requests-per-second) for the
+// Reports API v2021-06-30 operations this client actually calls; other
+// families keep their previous conservative pacing.
+const SP_API_OPERATION_LIMITS = Object.freeze([
+  { key: 'reports:create', method: 'POST', pattern: /^\/reports\/2021-06-30\/reports$/, intervalMs: 60_000 },
+  { key: 'reports:list', method: 'GET', pattern: /^\/reports\/2021-06-30\/reports(\?|$)/, intervalMs: 45_000 },
+  { key: 'reports:poll', method: 'GET', pattern: /^\/reports\/2021-06-30\/reports\/[^/]+$/, intervalMs: 500 },
+  { key: 'reports:document', method: 'GET', pattern: /^\/reports\/2021-06-30\/documents\//, intervalMs: 45_000 },
+  { key: 'orders', pattern: /^\/orders\//, intervalMs: 2200 },
+  { key: 'finances', pattern: /^\/finances\//, intervalMs: 5000 },
+  { key: 'fba', pattern: /^\/fba\/inventory\//, intervalMs: 5000 },
+  { key: 'tokens', pattern: /^\/tokens\//, intervalMs: 5000 },
+  { key: 'products', pattern: /^\/products\/fees\//, intervalMs: 2200 },
+  { key: 'catalog', pattern: /^\/catalog\//, intervalMs: 2200 }
 ]);
 const DEFAULT_SP_API_INTERVAL_MS = 3000;
-const rateLimitState = new Map();
-let globalNextAvailableAt = Date.now();
 
-/** @param {string} path */
-function rateLimitBucket(path) {
-  const limit = SP_API_RATE_LIMITS.find(item => item.pattern.test(path));
-  const family = path.split('/').filter(Boolean)[0] ?? 'default';
-  return { key: family, intervalMs: limit?.intervalMs ?? DEFAULT_SP_API_INTERVAL_MS };
-}
-
-/** @param {string} path */
-async function waitForSpApiSlot(path) {
-  const { key, intervalMs } = rateLimitBucket(path);
-  const now = Date.now();
-  const nextAvailableAt = Math.max(rateLimitState.get(key) ?? now, globalNextAvailableAt);
-  const waitMs = Math.max(0, nextAvailableAt - now);
-  const reservedAt = now + waitMs + intervalMs;
-  rateLimitState.set(key, reservedAt);
-  globalNextAvailableAt = now + waitMs + 750;
-  if (waitMs > 0) await new Promise(resolve => setTimeout(resolve, waitMs));
+/** @param {string} method @param {string} path */
+function rateLimitBucket(method, path) {
+  const pathname = path.split('?')[0];
+  const match = SP_API_OPERATION_LIMITS.find(item => (!item.method || item.method === method) && item.pattern.test(pathname));
+  return { key: match?.key ?? (pathname.split('/').filter(Boolean)[0] ?? 'default'), intervalMs: match?.intervalMs ?? DEFAULT_SP_API_INTERVAL_MS };
 }
 
 export class SpApiClient {
-  /** @param {string} refreshToken @param {{ clientId?: string, clientSecret?: string }} [cfg] */
+  /** @param {string} refreshToken @param {{ clientId?: string, clientSecret?: string, baseUrl?: string, label?: string }} [cfg] */
   constructor(refreshToken, cfg = {}) {
     this.refreshToken = z.string().min(1).parse(refreshToken);
     this.cfg = { clientId: cfg.clientId ?? process.env.LWA_CLIENT_ID, clientSecret: cfg.clientSecret ?? process.env.LWA_CLIENT_SECRET, baseUrl: cfg.baseUrl ?? SP_API_BASE_URL };
     this.cachedToken = null;
+    this.label = cfg.label ?? 'sp-api';
+    // Rate-limit pacing is per-seller-account in Amazon's real quota model -
+    // this must live on the instance (one instance per seller/sync), not at
+    // module scope, or two different sellers syncing at the same time would
+    // needlessly throttle each other against a shared, imaginary quota.
+    this.rateLimitState = new Map();
+    this.nextGlobalSlotAt = Date.now();
+  }
+
+  /** @param {string} method @param {string} path */
+  async waitForSlot(method, path) {
+    const { key, intervalMs } = rateLimitBucket(method, path);
+    const now = Date.now();
+    const nextAvailableAt = Math.max(this.rateLimitState.get(key) ?? now, this.nextGlobalSlotAt);
+    const waitMs = Math.max(0, nextAvailableAt - now);
+    this.rateLimitState.set(key, now + waitMs + intervalMs);
+    this.nextGlobalSlotAt = now + waitMs + 750;
+    if (waitMs > 500) console.log(`[${this.label}] pacing ${method} ${path} - waiting ${waitMs}ms (bucket "${key}", ${intervalMs}ms/request)`);
+    if (waitMs > 0) await new Promise(resolve => setTimeout(resolve, waitMs));
   }
 
   async getAccessToken() {
@@ -105,21 +124,30 @@ export class SpApiClient {
 
   /** @param {string} path @param {RequestInit} [init] @param {string} [token] */
   async request(path, init = {}, token) {
+    const method = init.method ?? 'GET';
     let accessToken = token ?? (await this.getAccessToken()).accessToken;
-    for (let attempt = 0; attempt < 5; attempt += 1) {
-      await waitForSpApiSlot(path);
+    const attemptLog = [];
+    for (let attempt = 0; attempt < SP_API_MAX_ATTEMPTS; attempt += 1) {
+      await this.waitForSlot(method, path);
       const res = await fetch(`${this.cfg.baseUrl}${path}`, {
         ...init,
         headers: { 'content-type': 'application/json', 'x-amz-access-token': accessToken, ...(init.headers ?? {}) }
       });
       const rateLimit = Number(res.headers.get('x-amzn-RateLimit-Limit') ?? '0.5');
-      if (![429, 503].includes(res.status)) return res;
+      if (![429, 503].includes(res.status)) {
+        if (attempt > 0) console.log(`[${this.label}] ${method} ${path} succeeded (${res.status}) on attempt ${attempt + 1}/${SP_API_MAX_ATTEMPTS} after: ${attemptLog.join(', ')}`);
+        return res;
+      }
       const retryAfter = Number(res.headers.get('retry-after'));
       const backoffMs = Number.isFinite(retryAfter) && retryAfter > 0 ? retryAfter * 1000 : (1000 / Math.max(rateLimit, 0.05)) * 2 ** attempt;
-      await new Promise(resolve => setTimeout(resolve, Math.min(120_000, backoffMs)));
+      const waitMs = Math.min(120_000, backoffMs);
+      attemptLog.push(`${res.status} (waited ${Math.round(waitMs)}ms)`);
+      console.warn(`[${this.label}] ${method} ${path} -> ${res.status}, retry ${attempt + 1}/${SP_API_MAX_ATTEMPTS} in ${Math.round(waitMs)}ms`);
+      await new Promise(resolve => setTimeout(resolve, waitMs));
       accessToken = token ?? (await this.getAccessToken()).accessToken;
     }
-    throw new Error(`SP-API request failed after retries: ${path}`);
+    console.error(`[${this.label}] ${method} ${path} gave up after ${SP_API_MAX_ATTEMPTS} attempts: ${attemptLog.join(', ')}`);
+    throw new Error(`SP-API request failed after retries: ${method} ${path} (${attemptLog.join(', ')})`);
   }
 
   /** @param {string} documentId */

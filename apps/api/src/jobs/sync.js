@@ -327,18 +327,24 @@ export async function syncReportForTenant(params) {
   // The SP-API client already retries throttled HTTP calls, so execute each
   // user-triggered report job only once.
   return runJob(`sync:${parsed.reportType}:${parsed.tenantId}`, async () => {
+    const startedAt = Date.now();
+    const logLabel = `sync ${parsed.tenantId.slice(0, 8)}:${parsed.reportType}`;
+    console.log(`[${logLabel}] starting (range ${range.start} to ${range.end})`);
     const sync = await pool.query('insert into sync_jobs(tenant_id, report_type, status, started_at, range_start, range_end) values($1,$2,$3,now(),$4,$5) returning id', [parsed.tenantId, parsed.reportType, 'running', range.start, range.end]);
     try {
       const seller = await pool.query("select refresh_token_encrypted, marketplace_id from sellers where tenant_id = $1 and auth_status = 'authorized' order by connected_at desc limit 1", [parsed.tenantId]);
       if (!seller.rowCount) throw new Error('No connected Amazon seller account');
-      const client = new SpApiClient(decryptSecret(seller.rows[0].refresh_token_encrypted), { baseUrl: getSpApiEndpoint(seller.rows[0].marketplace_id) });
+      const client = new SpApiClient(decryptSecret(seller.rows[0].refresh_token_encrypted), { baseUrl: getSpApiEndpoint(seller.rows[0].marketplace_id), label: logLabel });
       const report = await client.fetchReport(parsed.reportType, parsed.tenantId, range, seller.rows[0].marketplace_id);
       const s3Key = await putRawReport({ tenantId: parsed.tenantId, reportType: parsed.reportType, reportId: report.reportId, content: report.content });
       const rowsImported = await saveStructuredRows(parsed.tenantId, parsed.reportType, report.content, range);
+      console.log(`[${logLabel}] completed in ${Date.now() - startedAt}ms - ${rowsImported} rows imported`);
       await pool.query('update sync_jobs set status=$1, completed_at=now(), s3_key=$2 where id=$3', ['completed', s3Key, sync.rows[0].id]);
       return { rowsImported, s3Key };
     } catch (error) {
-      await pool.query('update sync_jobs set status=$1, completed_at=now(), error_message=$2 where id=$3', ['failed', error instanceof Error ? error.message : 'unknown error', sync.rows[0].id]);
+      const message = error instanceof Error ? error.message : 'unknown error';
+      console.error(`[${logLabel}] failed after ${Date.now() - startedAt}ms: ${message}`);
+      await pool.query('update sync_jobs set status=$1, completed_at=now(), error_message=$2 where id=$3', ['failed', message, sync.rows[0].id]);
       throw error;
     }
   }, 1);
@@ -390,12 +396,15 @@ async function syncRecentApiDataForTenantDirect(tenantId, options = {}) {
   const maxOrderItems = Math.max(0, Math.min(Number(options.maxOrderItems ?? 1000), 1000));
   await assertActiveTenant(parsedTenantId);
   return runJob(`sync:direct-api:${parsedTenantId}`, async () => {
+    const startedAt = Date.now();
+    const logLabel = `sync ${parsedTenantId.slice(0, 8)}:DIRECT_SP_API_SYNC`;
+    console.log(`[${logLabel}] starting (createdAfter=${createdAfter}, createdBefore=${createdBefore})`);
     const sync = await pool.query('insert into sync_jobs(tenant_id, report_type, status, started_at, range_start, range_end) values($1,$2,$3,now(),$4,$5) returning id', [parsedTenantId, 'DIRECT_SP_API_SYNC', 'running', range?.start ?? null, range?.end ?? null]);
     try {
       const seller = await pool.query("select refresh_token_encrypted, marketplace_id from sellers where tenant_id = $1 and auth_status = 'authorized' order by connected_at desc limit 1", [parsedTenantId]);
       if (!seller.rowCount) throw new Error('No connected Amazon seller account');
       const marketplaceId = seller.rows[0].marketplace_id;
-      const client = new SpApiClient(decryptSecret(seller.rows[0].refresh_token_encrypted), { baseUrl: getSpApiEndpoint(marketplaceId) });
+      const client = new SpApiClient(decryptSecret(seller.rows[0].refresh_token_encrypted), { baseUrl: getSpApiEndpoint(marketplaceId), label: logLabel });
       let ordersWarning;
       const orderPages = [];
       if (includeOrders) {
@@ -607,10 +616,13 @@ async function syncRecentApiDataForTenantDirect(tenantId, options = {}) {
           rows: reimbursementRows
         });
       });
+      console.log(`[${logLabel}] completed in ${Date.now() - startedAt}ms - ${ordersImported} orders, ${transactionsImported} finance transactions, ${inventoryImported} inventory rows, ${reimbursementsImported} reimbursements` + (ordersWarning ? ` (orders warning: ${ordersWarning})` : '') + (financeResponse?.syncError ? ` (finance warning: ${financeResponse.syncError})` : '') + (inventoryResponse?.syncError ? ` (inventory warning: ${inventoryResponse.syncError})` : ''));
       await pool.query('update sync_jobs set status=$1, completed_at=now() where id=$2', ['completed', sync.rows[0].id]);
       return { ordersImported, transactionsImported, inventoryImported, reimbursementsImported, catalogItemsImported, orderItemsSkipped, incrementalSince: createdAfter, incrementalUntil: createdBefore, ordersWarning, financeWarning: financeResponse?.syncError, inventoryWarning: inventoryResponse?.syncError };
     } catch (error) {
-      await pool.query('update sync_jobs set status=$1, completed_at=now(), error_message=$2 where id=$3', ['failed', error instanceof Error ? error.message : 'unknown error', sync.rows[0].id]);
+      const message = error instanceof Error ? error.message : 'unknown error';
+      console.error(`[${logLabel}] failed after ${Date.now() - startedAt}ms: ${message}`);
+      await pool.query('update sync_jobs set status=$1, completed_at=now(), error_message=$2 where id=$3', ['failed', message, sync.rows[0].id]);
       throw error;
     }
   }, 1);
