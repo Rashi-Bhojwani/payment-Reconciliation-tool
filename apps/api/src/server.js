@@ -1090,6 +1090,17 @@ app.get('/api/tenants/:tenantId/dashboard', async request => {
       return summary;
     }, { grossSales: 0, deductions: 0, sellerReceivable: 0, fbaReceivable: 0, fbmReceivable: 0, otherReceivable: 0 });
     const dashboardCalculations=await loadDashboardCalculations(client,tenantId,{start:start.toISOString(),end:end.toISOString()});
+    // Visibility into exactly which Finance API rows the Deferred-transaction
+    // merge pulled in and how each one got classified - printed whenever the
+    // merge actually adds something, so a live categorization mismatch
+    // (e.g. a "tax" row that should have landed in GST or Expenses/TCS-TDS)
+    // is diagnosable from real field values in the terminal instead of
+    // guessed at from the dashboard totals alone.
+    const pendingDetail=dashboardCalculations.diagnostics?.pendingFinanceRowsDetail;
+    if (pendingDetail?.length) {
+      console.log(`[dashboard ${tenantId.slice(0,8)}] merged ${pendingDetail.length} pending (Deferred) Finance API row(s):`);
+      for (const row of pendingDetail) console.log(`  order=${row.order_id} status=${row.transaction_status} category=${row.category} amount_type=${row.amount_type ?? ''} amount_description=${row.amount_description ?? ''} amount=${row.amount} -> bucket=${row.bucket}`);
+    }
     const hasImportedData = Number(orders.orders ?? 0) > 0 || Number(kpis.net_settled ?? 0) !== 0 || products.length > 0 || payments.length > 0 || inventory.length > 0;
     return { seller, amazonAuth, hasImportedData, kpis, orders, orderRows, orderPayments, paymentComponents, paymentSummary, dashboardCalculations, businessReportRows, products, trend, payments, settlementLines, financialComponents, financialSummary, jobs, inventory, returns, reimbursements, invoices, orderItems, financeTransactions, autoSyncing: autoSyncReportTypes };
   });

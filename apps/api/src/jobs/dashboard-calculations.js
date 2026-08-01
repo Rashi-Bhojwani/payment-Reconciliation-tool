@@ -22,7 +22,20 @@ const isWithholding=row=>/\b(tcs|tds)\b/.test(text(row))&&!/reimburse/.test(text
 const isReimbursement=row=>/reimburse|safe t|lost|damaged|clawback/.test(text(row));
 const isFee=row=>/itemfees|itemtcs|itemtds|other transaction|fee|commission|closing|storage|shipping label|service|advertis|adjustment|easy ship charges|postagepurchase|tcs|tds/.test(text(row))&&!isReimbursement(row)&&!isPrincipal(row)&&!isPromotion(row);
 const isProductGst=row=>/product tax|shipping tax|gift wrap tax|tax discount|\bgst collected|\bgst refund/.test(text(row))&&!/fee|commission|service|itemtcs|itemtds|tcs|tds/.test(text(row));
-const isGenericTax=row=>/\btax\b/.test(text(row))&&!isProductGst(row)&&!isWithholding(row)&&!isFee(row);
+// finance_transaction_items.category is not a raw Amazon label like
+// settlement's amount_type/amount_description - it is a normalized bucket
+// name from categorizeFinanceLabel() (finance-components.js), which
+// deliberately collapses product tax, GST, TCS and TDS into one generic
+// 'tax' string since the Finances API doesn't expose a finer split at that
+// level. text() folds category in alongside the real fields for every other
+// classifier, which is fine everywhere else, but here it means the bare
+// bucket name alone - with no "product tax"/"tcs"/"tds" wording actually
+// present - was enough to satisfy \btax\b and misclassify a merged pending
+// row as generic Tax (confirmed live: this account's real Tax is always 0,
+// yet merging in Finance API rows made it show non-zero). Only the row's
+// own amount_type/amount_description - the actual label text, not the
+// bucket it got sorted into - may trigger this specific classifier.
+const isGenericTax=row=>/\btax\b/.test(norm(`${row.amount_type??''} ${row.amount_description??''}`))&&!isProductGst(row)&&!isWithholding(row)&&!isFee(row);
 const isTransfer=row=>/transfer|deposit|bank account|withdrawal/.test(text(row));
 const round2=value=>Math.round((Number(value)+Number.EPSILON)*100)/100;
 const signedSum=rows=>round2(rows.reduce((sum,row)=>sum+amount(row),0));
@@ -101,7 +114,18 @@ export function calculateDashboardMetrics(input,range){
   const gst=signedSum(productGstRows),tax=signedSum(genericTaxRows),income=signedSum(incomeRows),expenses=signedSum(expenseRows),transfers=signedSum(transferRows);
   const days=inclusiveDays(range.start,range.end);const unitRate=returnedUnits==null?null:shippedUnits==null||shippedUnits===0?(returnedUnits>0?null:0):returnedUnits/shippedUnits*100;const refundValueRate=grossSales?productRefunds/grossSales*100:null;
   const excludedFinanceRows=settlementComplete?financeAudit.included.length-pendingFinanceRows.length:0;
-  const diagnostics={sourcePolicy:{financial:`${financialSource} (${settlementComplete?`settlement takes precedence, plus ${pendingFinanceRows.length} Deferred Finance API row(s) for orders with no settlement rows yet`:'settlement incomplete; Finances fallback'})`,reimbursements:financeReimbursements.length?financialSource:'Reimbursements report fallback',gst:'Imported GST B2B/B2C rows only',settled:'Settlement headers filtered by deposit_date'},includedRows:financialRows.length,excludedRows:(settlementComplete?excludedFinanceRows:settlementAudit.included.length),duplicateRows:financialDuplicates.length+itemAudit.duplicates.length+returnAudit.duplicates.length+gstAudit.duplicates.length,categoryTotals:{grossSales,productRefunds,netPromotions,expenseDebits,expenseCredits,tcsTds,operationalFees,gst,tax,transfers}};
+  // Which bucket each merged pending row actually landed in - the merge
+  // itself was proven correct (order_id + status double-check), but the
+  // *classification* of a Finance API row can still differ from a
+  // settlement row's, since Finance API descriptions/categories don't
+  // necessarily use the same vocabulary the isFee/isProductGst/isGenericTax
+  // regexes were tuned against settlement rows for (e.g. a generic "tax"
+  // category that doesn't say "product tax" or "TCS/TDS" specifically).
+  // Logged (not just counted) so a live mismatch is diagnosable from the
+  // actual field values instead of guessed at again.
+  const bucketOf=row=>isFee(row)||isWithholding(row)?'expenses':isProductGst(row)?'gst':isGenericTax(row)?'tax':isTransfer(row)?'transfer':'income';
+  const pendingFinanceRowsDetail=pendingFinanceRows.map(row=>({order_id:row.order_id,transaction_status:row.transaction_status,category:row.category,amount_type:row.amount_type,amount_description:row.amount_description,amount:amount(row),bucket:bucketOf(row)}));
+  const diagnostics={sourcePolicy:{financial:`${financialSource} (${settlementComplete?`settlement takes precedence, plus ${pendingFinanceRows.length} Deferred Finance API row(s) for orders with no settlement rows yet`:'settlement incomplete; Finances fallback'})`,reimbursements:financeReimbursements.length?financialSource:'Reimbursements report fallback',gst:'Imported GST B2B/B2C rows only',settled:'Settlement headers filtered by deposit_date'},includedRows:financialRows.length,excludedRows:(settlementComplete?excludedFinanceRows:settlementAudit.included.length),duplicateRows:financialDuplicates.length+itemAudit.duplicates.length+returnAudit.duplicates.length+gstAudit.duplicates.length,categoryTotals:{grossSales,productRefunds,netPromotions,expenseDebits,expenseCredits,tcsTds,operationalFees,gst,tax,transfers},pendingFinanceRowsDetail};
   const metric=(value,unit,formula,components,rows,source=financialSource,status=value==null?'Unavailable':null)=>({value,unit,formula,components,rows,source,status,range,diagnostics});
   const metrics={
     netSales:metric(netSales,'amount','Gross product Principal sales − Refund Principal lines − net seller-funded promotions',[component('gross_sales','Gross product sales',grossSales,grossRows),component('product_refunds','Product refunds',-productRefunds,refundPrincipalRows,'−'),component('promotions','Net seller-funded promotions',-netPromotions,promoRows,'−')],[...grossRows,...refundPrincipalRows,...promoRows]),
