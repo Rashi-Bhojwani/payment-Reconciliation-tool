@@ -57,6 +57,23 @@ function summaryCategory(label) {
   return null;
 }
 
+// Some breakdown leaves carry only a generic sub-component name - "Base"
+// (the pre-tax amount) and "Tax" (GST on it) are the confirmed real-world
+// case (verified live: every single "Base"/"Tax" pair in a real account's
+// Deferred transactions was exactly an 18.00% ratio - India's GST rate -
+// with no exception). On their own these are meaningless for
+// classification: "Base" could be the pre-tax amount of *any* fee, and a
+// bare "Tax" line is indistinguishable from withholding or product tax.
+// Their parent node's own label (e.g. "Commission", "FBAPerUnitFulfillmentFee")
+// is the only thing that actually says what the fee *is*, and the original
+// code discarded it entirely whenever the leaf had any label of its own -
+// inheritedLabel was a pure fallback, never combined with the leaf's own
+// description. Prefixing the parent's label back on for just this known
+// generic set restores that context without changing the label used for
+// leaves that already carry Amazon's own specific name (a "Commission" leaf
+// still classifies as "Commission", not "SomeParent Commission").
+const GENERIC_LEAF_LABELS = new Set(['base', 'tax', 'amount', 'fee', 'total']);
+
 export function flattenFinanceTransaction(transaction) {
   const items = transaction?.items ?? transaction?.Items ?? transaction?.contexts ?? transaction?.Contexts;
   const transactionId = transaction?.transactionId ?? transaction?.TransactionId ?? transaction?.financialEventGroupId ?? transaction?.FinancialEventGroupId;
@@ -67,7 +84,11 @@ export function flattenFinanceTransaction(transaction) {
   function walk(value, context, inheritedLabel) {
     if (Array.isArray(value)) return value.forEach(entry => walk(entry, context, inheritedLabel));
     if (!value || typeof value !== 'object') return;
-    const label = value.description ?? value.Description ?? value.type ?? value.Type ?? value.breakdownType ?? value.BreakdownType ?? inheritedLabel;
+    const ownLabel = value.description ?? value.Description ?? value.type ?? value.Type ?? value.breakdownType ?? value.BreakdownType;
+    const isGenericOwnLabel = ownLabel && GENERIC_LEAF_LABELS.has(String(ownLabel).trim().toLowerCase());
+    const label = isGenericOwnLabel && inheritedLabel && String(inheritedLabel).toLowerCase() !== String(ownLabel).toLowerCase()
+      ? `${inheritedLabel} ${ownLabel}`
+      : (ownLabel ?? inheritedLabel);
     const amountNode = value.amount ?? value.Amount ?? value.breakdownAmount ?? value.BreakdownAmount ?? value.chargeAmount ?? value.ChargeAmount ?? value.feeAmount ?? value.FeeAmount;
     const childBreakdowns = value.breakdown ?? value.Breakdown ?? value.breakdowns ?? value.Breakdowns;
     // Amazon sometimes supplies a parent total alongside its nested component
