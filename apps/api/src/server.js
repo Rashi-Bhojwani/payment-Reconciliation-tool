@@ -1099,36 +1099,25 @@ app.get('/api/tenants/:tenantId/dashboard', async request => {
       return summary;
     }, { grossSales: 0, deductions: 0, sellerReceivable: 0, fbaReceivable: 0, fbmReceivable: 0, otherReceivable: 0 });
     const dashboardCalculations=await loadDashboardCalculations(client,tenantId,{start:start.toISOString(),end:end.toISOString()});
-    // Visibility into exactly which Finance API rows the Deferred-transaction
-    // merge pulled in and how each one got classified - printed whenever the
-    // merge actually adds something, so a live categorization mismatch
-    // (e.g. a "tax" row that should have landed in GST or Expenses/TCS-TDS)
-    // is diagnosable from real field values in the terminal instead of
-    // guessed at from the dashboard totals alone.
+    // Deferred activity is measured on every render but never added to the
+    // statement. Checked against a real seller's own Account Activity
+    // Statement, adding it moved every bucket further from Amazon and tripled
+    // the total error, so the reported figures stay settlement-only and this
+    // block exists to size the pending pipeline - and to keep the two
+    // distinguishable failure modes apart: "Amazon counts money we do not
+    // hold" versus "we misclassify money we do hold".
     const pendingDetail=dashboardCalculations.diagnostics?.pendingFinanceRowsDetail;
     const mergeSummary=dashboardCalculations.diagnostics?.pendingMergeSummary;
     if (pendingDetail?.length) {
       const label=`[dashboard ${tenantId.slice(0,8)}]`;
       const money=value=>Number(value ?? 0).toFixed(2);
-      // Totals first: how much the Deferred merge adds on top of settlement,
-      // per bucket. These are the numbers to compare against the gap versus
-      // Amazon's Account Activity Statement - the per-row lines below can all
-      // be individually correct while the merged SET is still wrong.
-      console.log(`${label} Deferred merge: ${mergeSummary.pendingRows} row(s) across ${mergeSummary.pendingOrders} order(s), from ${mergeSummary.financeRowsInRange} Finance row(s) in range; ${mergeSummary.settledOrderIdsKnown} order(s) known settled (all time)`);
+      console.log(`${label} statement is settlement-only. Deferred activity measured but EXCLUDED: ${mergeSummary.pendingRows} row(s) across ${mergeSummary.pendingOrders} order(s), from ${mergeSummary.financeRowsInRange} Finance row(s) in range; ${mergeSummary.settledOrderIdsKnown} order(s) known settled (all time)`);
       for (const bucket of ['income','expenses','gst','tax','transfer']) {
         const baseline=mergeSummary.settlementBaselineTotals[bucket] ?? 0;
-        const added=mergeSummary.pendingAddedTotals[bucket] ?? 0;
-        if (baseline || added) console.log(`${label}   ${bucket.padEnd(8)} settlement=${money(baseline).padStart(12)} + pending=${money(added).padStart(12)} = ${money(baseline+added).padStart(12)}`);
+        const excluded=mergeSummary.pendingExcludedTotals[bucket] ?? 0;
+        if (baseline || excluded) console.log(`${label}   ${bucket.padEnd(8)} reported=${money(baseline).padStart(12)}   (deferred, not counted: ${money(excluded).padStart(12)})`);
       }
-      // An order whose pending money arrives via more than one Finance
-      // transaction is the one thing a per-row check cannot catch: Amazon can
-      // represent the same order's money twice across its deferral lifecycle,
-      // and both copies pass every classification and status test.
-      if (mergeSummary.ordersWithMultipleTransactions.length) {
-        console.log(`${label}   WARNING: ${mergeSummary.ordersWithMultipleTransactions.length} pending order(s) carry more than one Finance transaction - possible duplicate representation of the same money:`);
-        for (const entry of mergeSummary.ordersWithMultipleTransactions) console.log(`${label}     order=${entry.order_id} total=${money(entry.total)} via ${entry.transactions.map(t=>`${t.transaction_id}=${money(t.total)}`).join(' , ')}`);
-      }
-      for (const row of pendingDetail) console.log(`${label}   order=${row.order_id} status=${row.transaction_status} category=${row.category} amount_type=${row.amount_type ?? ''} amount_description=${row.amount_description ?? ''} amount=${row.amount} -> bucket=${row.bucket}`);
+      for (const row of pendingDetail) console.log(`${label}   [excluded] order=${row.order_id} status=${row.transaction_status} category=${row.category} amount_desc=${row.amount_description ?? ''} amount=${row.amount} -> would be ${row.bucket}`);
     }
     const hasImportedData = Number(orders.orders ?? 0) > 0 || Number(kpis.net_settled ?? 0) !== 0 || products.length > 0 || payments.length > 0 || inventory.length > 0;
     return { seller, amazonAuth, hasImportedData, kpis, orders, orderRows, orderPayments, paymentComponents, paymentSummary, dashboardCalculations, businessReportRows, products, trend, payments, settlementLines, financialComponents, financialSummary, jobs, inventory, returns, reimbursements, invoices, orderItems, financeTransactions, autoSyncing: autoSyncReportTypes };

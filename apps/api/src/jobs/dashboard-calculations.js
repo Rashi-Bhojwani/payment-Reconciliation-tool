@@ -105,42 +105,41 @@ export function calculateDashboardMetrics(input,range){
 
   const financeAudit=dedupe((input.financeItems??[]).filter(row=>!isSummary(row)),financialKey);const settlementAudit=dedupe(input.settlementRows??[],financialKey);
   const settlementComplete=settlementAudit.included.some(row=>isPrincipal(row)||isProductGst(row)||isFee(row)||isTransfer(row))&&settlementAudit.included.some(row=>row.settlement_id||row.raw?.['settlement-id']||row.raw?.['settlement id']);
-  // Amazon's own Account Activity Statement is accrual-based: it includes
-  // "Deferred" transactions (recognized by Amazon, but not yet paid out) as
-  // well as "Released" ones. Settlement reports are strictly cash-basis - a
-  // Deferred transaction cannot appear in any settlement document, by
-  // definition, since a settlement only exists once Amazon has actually
-  // released the money.
+  // Deferred (not-yet-released) Finance API activity is deliberately NOT
+  // added to the statement. It was added on the theory that Amazon's Account
+  // Activity Statement is accrual-based; that theory was tested against a
+  // real seller's own statement PDF for 1-25 Jul 2026 and is wrong. Measured
+  // against Amazon's published section totals for that period:
   //
-  // A first attempt at this (merging in any finance row whose order_id was
-  // absent from settlement) caused real double-counting in production: it
-  // keyed off finance_transaction_items.order_id, which is populated
-  // per-line-item by a loose key-name scan and is null/inconsistent for many
-  // components - so plenty of already-settled orders failed to match and got
-  // counted twice. This version requires row.order_id to be the transaction-
-  // level related_order_id (the same reliable identifier the working Order
-  // Payments transaction ledger already uses - see loadDashboardCalculations
-  // in server.js), *and* requires row.transaction_status to explicitly say
-  // the transaction has not been released yet. Both signals have to agree an
-  // order is genuinely still pending before it is added; either one being
-  // wrong just means a real Deferred item is conservatively left out, not
-  // that a settled one gets double-counted.
+  //                  settlement-only      merged        Amazon
+  //   Income            1,22,980.13   1,53,912.04   1,32,046.97
+  //   Expenses           -43,881.11    -52,429.16    -42,314.88
+  //   GST                 22,059.79     27,627.53     23,691.75
   //
-  // "Settled" is a property of the ORDER, not of the selected window. An
-  // order's settlement lines routinely post outside the range being viewed
-  // (a late-June order settled in early July; a refund settled a cycle after
-  // the sale) while its Finance API rows post inside it. Building the settled
-  // set only from in-range settlement rows therefore says "never settled"
-  // about orders that demonstrably were, and the merge then stacks their
-  // Deferred money on top of settlement money already counted. settledOrder-
-  // IdsAllTime is the tenant's full set of settled order IDs, unfiltered by
-  // date, so an order is only ever treated as pending when Amazon has no
-  // settlement line for it anywhere.
+  // Merging Deferred activity moves EVERY bucket further from Amazon and
+  // multiplies the total absolute error by 2.93x. Amazon's own Expenses
+  // (-42,314.88) is *less* negative than settlement-only (-43,881.11) while
+  // Deferred fees alone are -8,471.75, so the statement demonstrably does not
+  // carry the bulk of Deferred activity.
+  //
+  // The settlement path is independently confirmed exact: hand-mapping
+  // Amazon's own Income sub-lines (product sales, sale refunds, shipping
+  // credits, promotional rebates, FBA inventory credit, SAFE-T) onto
+  // settlement labels reproduces 1,22,980.13 to the paisa, and Amazon's
+  // Transaction View "Released" product total for orders we hold settlement
+  // lines for is 1,23,072.64 - exactly our settlement Principal net.
+  //
+  // What remains is a clean, well-characterised residual: Income is short
+  // 9,066.84 and GST short 1,631.96 - a ratio of 17.999%, i.e. India's GST
+  // rate, so the gap is whole order lines (principal plus its own tax) that
+  // are absent from our settlement data, not a misclassification of rows we
+  // already have. pendingMergeSummary below measures that gap on every render
+  // without letting it corrupt the statement.
   const settledOrderIds=new Set([...(input.settledOrderIdsAllTime??[]),...settlementAudit.included.map(row=>row.order_id)].filter(Boolean));
   const pendingFinanceRows=financeAudit.included.filter(row=>row.order_id&&!settledOrderIds.has(row.order_id)&&row.transaction_status&&!/released/i.test(row.transaction_status));
-  const financialRows=settlementComplete?[...settlementAudit.included,...pendingFinanceRows]:financeAudit.included;
+  const financialRows=settlementComplete?settlementAudit.included:financeAudit.included;
   const financialDuplicates=settlementComplete?settlementAudit.duplicates:financeAudit.duplicates;
-  const financialSource=settlementComplete?(pendingFinanceRows.length?'Amazon Settlement report + pending (Deferred) Finance API activity':'Amazon Settlement report'):'Amazon Finances API';
+  const financialSource=settlementComplete?'Amazon Settlement report':'Amazon Finances API';
   const principalRows=financialRows.filter(isPrincipal);const grossRows=principalRows.filter(row=>amount(row)>0&&!isRefund(row));const refundPrincipalRows=principalRows.filter(row=>amount(row)<0&&isRefund(row));
   const promoRows=financialRows.filter(isPromotion);const promoDebits=promoRows.filter(row=>amount(row)<0);const promoRefunds=promoRows.filter(row=>amount(row)>0);
   const grossSales=signedSum(grossRows);const productRefunds=Math.abs(signedSum(refundPrincipalRows));const netPromotions=round2(Math.abs(signedSum(promoDebits))-signedSum(promoRefunds));const netSales=round2(grossSales-productRefunds-netPromotions);
@@ -161,26 +160,14 @@ export function calculateDashboardMetrics(input,range){
   const gst=signedSum(productGstRows),tax=signedSum(genericTaxRows),income=signedSum(incomeRows),expenses=signedSum(expenseRows),transfers=signedSum(transferRows);
   const days=inclusiveDays(range.start,range.end);const unitRate=returnedUnits==null?null:shippedUnits==null||shippedUnits===0?(returnedUnits>0?null:0):returnedUnits/shippedUnits*100;const refundValueRate=grossSales?productRefunds/grossSales*100:null;
   const excludedFinanceRows=settlementComplete?financeAudit.included.length-pendingFinanceRows.length:0;
-  // Which bucket each merged pending row actually landed in - the merge
-  // itself was proven correct (order_id + status double-check), but the
-  // *classification* of a Finance API row can still differ from a
-  // settlement row's, since Finance API descriptions/categories don't
-  // necessarily use the same vocabulary the isFee/isProductGst/isGenericTax
-  // regexes were tuned against settlement rows for (e.g. a generic "tax"
-  // category that doesn't say "product tax" or "TCS/TDS" specifically).
-  // Logged (not just counted) so a live mismatch is diagnosable from the
-  // actual field values instead of guessed at again.
+  // Deferred activity is measured but never added (see above). Reporting it
+  // separately is what proved the merge wrong in the first place, and it is
+  // the only way to tell "Amazon counts money we do not have" apart from
+  // "we classify money we do have incorrectly" - the two failures look
+  // identical in the totals alone. Row-by-row output shows how each pending
+  // row *would* classify; the aggregates show what it *would* contribute.
   const bucketOf=row=>isFee(row)||isWithholding(row)?'expenses':isProductGst(row)?'gst':isGenericTax(row)?'tax':isTransfer(row)?'transfer':'income';
   const pendingFinanceRowsDetail=pendingFinanceRows.map(row=>({order_id:row.order_id,transaction_status:row.transaction_status,category:row.category,amount_type:row.amount_type,amount_description:row.amount_description,amount:amount(row),bucket:bucketOf(row)}));
-  // Row-by-row output proves each row is classified correctly but says nothing
-  // about whether the right SET of rows was merged - and an over-merge looks
-  // identical to a correct merge line by line. These aggregates separate the
-  // two: bucketTotals shows exactly how much the merge adds on top of the
-  // settlement baseline (directly comparable against the gap versus Amazon's
-  // statement), and ordersWithMultipleTransactions flags orders whose pending
-  // money arrives via more than one Finance transaction - the signature of
-  // Amazon representing one order's money twice across its deferral
-  // lifecycle, which no per-row check can detect.
   const bucketTotals=rows=>rows.reduce((totals,row)=>{const bucket=bucketOf(row);totals[bucket]=round2((totals[bucket]??0)+amount(row));return totals;},{});
   const pendingByOrder=new Map();
   for(const row of pendingFinanceRows){
@@ -190,15 +177,16 @@ export function calculateDashboardMetrics(input,range){
     pendingByOrder.set(row.order_id,entry);
   }
   const pendingMergeSummary={
+    merged:false,
     settlementBaselineTotals:bucketTotals(settlementAudit.included),
-    pendingAddedTotals:bucketTotals(pendingFinanceRows),
+    pendingExcludedTotals:bucketTotals(pendingFinanceRows),
     pendingOrders:pendingByOrder.size,
     pendingRows:pendingFinanceRows.length,
     financeRowsInRange:financeAudit.included.length,
     settledOrderIdsKnown:settledOrderIds.size,
     ordersWithMultipleTransactions:[...pendingByOrder].filter(([,entry])=>entry.transactions.size>1).map(([orderId,entry])=>({order_id:orderId,total:entry.total,transactions:[...entry.transactions].map(([transactionId,total])=>({transaction_id:transactionId,total}))}))
   };
-  const diagnostics={sourcePolicy:{financial:`${financialSource} (${settlementComplete?`settlement takes precedence, plus ${pendingFinanceRows.length} Deferred Finance API row(s) for orders with no settlement rows yet`:'settlement incomplete; Finances fallback'})`,reimbursements:financeReimbursements.length?financialSource:'Reimbursements report fallback',gst:'Imported GST B2B/B2C rows only',settled:'Settlement headers filtered by deposit_date'},includedRows:financialRows.length,excludedRows:(settlementComplete?excludedFinanceRows:settlementAudit.included.length),duplicateRows:financialDuplicates.length+itemAudit.duplicates.length+returnAudit.duplicates.length+gstAudit.duplicates.length,categoryTotals:{grossSales,productRefunds,netPromotions,expenseDebits,expenseCredits,tcsTds,operationalFees,gst,tax,transfers},pendingFinanceRowsDetail,pendingMergeSummary};
+  const diagnostics={sourcePolicy:{financial:`${financialSource} (${settlementComplete?`settlement only; ${pendingFinanceRows.length} Deferred Finance API row(s) measured but excluded - Amazon's statement does not carry them`:'settlement incomplete; Finances fallback'})`,reimbursements:financeReimbursements.length?financialSource:'Reimbursements report fallback',gst:'Imported GST B2B/B2C rows only',settled:'Settlement headers filtered by deposit_date'},includedRows:financialRows.length,excludedRows:(settlementComplete?excludedFinanceRows:settlementAudit.included.length),duplicateRows:financialDuplicates.length+itemAudit.duplicates.length+returnAudit.duplicates.length+gstAudit.duplicates.length,categoryTotals:{grossSales,productRefunds,netPromotions,expenseDebits,expenseCredits,tcsTds,operationalFees,gst,tax,transfers},pendingFinanceRowsDetail,pendingMergeSummary};
   const metric=(value,unit,formula,components,rows,source=financialSource,status=value==null?'Unavailable':null)=>({value,unit,formula,components,rows,source,status,range,diagnostics});
   const metrics={
     netSales:metric(netSales,'amount','Gross product Principal sales − Refund Principal lines − net seller-funded promotions',[component('gross_sales','Gross product sales',grossSales,grossRows),component('product_refunds','Product refunds',-productRefunds,refundPrincipalRows,'−'),component('promotions','Net seller-funded promotions',-netPromotions,promoRows,'−')],[...grossRows,...refundPrincipalRows,...promoRows]),
