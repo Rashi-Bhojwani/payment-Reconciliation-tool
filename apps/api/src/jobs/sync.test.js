@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { batchUpsert } from './sync.js';
+import { batchUpsert, withTenantSyncMutex } from './sync.js';
 
 function fakeClient() {
   const calls = [];
@@ -80,4 +80,39 @@ test('batchUpsert never treats two rows with a null conflict-key column as dupli
   });
   assert.equal(client.calls.length, 1);
   assert.deepEqual(client.calls[0].params, ['t1', null, null, 0, 'settlement-A', 't1', null, null, 0, 'settlement-B']);
+});
+
+test('withTenantSyncMutex runs same-tenant calls one at a time instead of letting them race Amazon concurrently', async () => {
+  const order = [];
+  let inFlight = 0;
+  const run = label => withTenantSyncMutex('tenant-a', async () => {
+    inFlight += 1;
+    assert.equal(inFlight, 1, 'a second same-tenant call started before the first finished');
+    order.push(`start:${label}`);
+    await new Promise(resolve => setTimeout(resolve, 5));
+    order.push(`end:${label}`);
+    inFlight -= 1;
+  });
+  await Promise.all([run('first'), run('second'), run('third')]);
+  assert.deepEqual(order, ['start:first', 'end:first', 'start:second', 'end:second', 'start:third', 'end:third']);
+});
+
+test('withTenantSyncMutex keeps different tenants independent', async () => {
+  const order = [];
+  const run = (tenantId, label) => withTenantSyncMutex(tenantId, async () => {
+    order.push(`start:${label}`);
+    await new Promise(resolve => setTimeout(resolve, 5));
+    order.push(`end:${label}`);
+  });
+  await Promise.all([run('tenant-a', 'a'), run('tenant-b', 'b')]);
+  // Two different tenants must be allowed to overlap - both starts happen
+  // before either end, proving they ran concurrently rather than queued.
+  assert.deepEqual(order.slice(0, 2).sort(), ['start:a', 'start:b']);
+});
+
+test('withTenantSyncMutex keeps queuing later calls even after an earlier one rejects', async () => {
+  let secondRan = false;
+  await assert.rejects(withTenantSyncMutex('tenant-c', async () => { throw new Error('boom'); }), /boom/);
+  await withTenantSyncMutex('tenant-c', async () => { secondRan = true; });
+  assert.equal(secondRan, true);
 });

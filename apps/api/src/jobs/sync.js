@@ -334,8 +334,29 @@ export async function syncReportForTenant(params) {
 }
 
 
+// Settlements/Sales & Traffic/Inventory/Reimbursements all fall back to this
+// same direct-API sync whenever their own Amazon report isn't ready, and the
+// base Orders & Finance sync calls it directly too - so a user (or the sync
+// ledger) can easily trigger two or three of these for the same tenant
+// within seconds of each other. Nothing previously stopped them running
+// concurrently: they'd both hit Amazon's per-account rate limits at once,
+// each slowing (and 429-ing) the other, which is consistent with jobs
+// sitting in 'running' well past when a single sync would finish. Queue
+// same-tenant calls instead so only one is ever in flight against Amazon.
+const tenantSyncMutex = new Map();
+export function withTenantSyncMutex(tenantId, fn) {
+  const previous = tenantSyncMutex.get(tenantId) ?? Promise.resolve();
+  const run = previous.catch(() => undefined).then(fn);
+  tenantSyncMutex.set(tenantId, run.catch(() => undefined));
+  return run;
+}
+
 /** @param {string} tenantId @param {{ days?: number }} [options] */
-export async function syncRecentApiDataForTenant(tenantId, options = {}) {
+export function syncRecentApiDataForTenant(tenantId, options = {}) {
+  return withTenantSyncMutex(tenantId, () => syncRecentApiDataForTenantDirect(tenantId, options));
+}
+
+async function syncRecentApiDataForTenantDirect(tenantId, options = {}) {
   const parsedTenantId = z.string().uuid().parse(tenantId);
   const range = options.range ? z.object({ start: z.string().datetime(), end: z.string().datetime() }).parse(options.range) : null;
   const defaultCreatedAfter = range ? new Date(range.start) : new Date(Date.now() - (options.days ?? 30) * 864e5);
@@ -407,6 +428,24 @@ export async function syncRecentApiDataForTenant(tenantId, options = {}) {
       let orderItemsSkipped = 0;
       let catalogItemsImported = 0;
       const catalogCache = new Map();
+      // A 403 from the Catalog Items API means this app's SP-API
+      // authorization does not include catalog access for this account -
+      // that is an Amazon-side permission grant, not a transient failure,
+      // and retrying it will never succeed. Once seen, stop spending any
+      // more of this run's calls on catalog lookups that are guaranteed to
+      // fail the same way.
+      let catalogAccessDenied = false;
+      const fetchCatalogItem = async asin => {
+        if (catalogAccessDenied) return { unavailable: true };
+        try {
+          const catalog = await client.getCatalogItem(asin, marketplaceId);
+          catalogItemsImported += 1;
+          return catalog;
+        } catch (error) {
+          if (error instanceof Error && /\b403\b/.test(error.message)) catalogAccessDenied = true;
+          return { unavailable: true };
+        }
+      };
       await withTenant(parsedTenantId, async db => {
         // Orders/items themselves are cheap to batch; what genuinely must
         // stay sequential is the per-order Order Items API call and the
@@ -438,11 +477,10 @@ export async function syncRecentApiDataForTenant(tenantId, options = {}) {
             const asin = item.ASIN ?? item.asin ?? null;
             let catalog = asin ? catalogCache.get(asin) : null;
             if (asin && !catalogCache.has(asin)) {
-              catalog = await client.getCatalogItem(asin, marketplaceId).catch(() => null);
+              catalog = await fetchCatalogItem(asin);
               catalogCache.set(asin, catalog);
-              if (catalog) catalogItemsImported += 1;
             }
-            const shipping = catalogShippingFacts(catalog);
+            const shipping = catalogShippingFacts(catalog?.unavailable ? null : catalog);
             orderItemRows.push([parsedTenantId, orderId, asin, item.SellerSKU ?? item.sellerSku ?? null, item.Title ?? item.title ?? null, integer(item.QuantityOrdered ?? item.quantityOrdered), number(item.ItemPrice?.Amount ?? item.itemPrice?.amount), number(item.ItemTax?.Amount ?? item.itemTax?.amount), number(item.PromotionDiscount?.Amount ?? item.promotionDiscount?.amount), item, shipping.weight || null, shipping.weightUnit ?? null, shipping.dimensions, catalog ?? {}]);
           }
         }
@@ -462,20 +500,26 @@ export async function syncRecentApiDataForTenant(tenantId, options = {}) {
         });
         // Backfill catalog facts for previously imported order items as well;
         // otherwise only brand-new orders would ever receive shipping weight.
+        // catalog_raw='{}' distinguishes "never attempted" from "attempted
+        // and Amazon denied it" (stored as {unavailable:true} below) - without
+        // that distinction this query would re-select, and re-attempt, the
+        // exact same permission-denied ASINs on every single future sync.
         const missingCatalogItems = (await db.query(
           `select distinct asin from order_items
-           where tenant_id=$1 and asin is not null and package_weight is null
+           where tenant_id=$1 and asin is not null and package_weight is null and catalog_raw = '{}'::jsonb
            limit 25`,
           [parsedTenantId]
         )).rows;
         for (const { asin } of missingCatalogItems) {
           let catalog = catalogCache.get(asin);
           if (!catalogCache.has(asin)) {
-            catalog = await client.getCatalogItem(asin, marketplaceId).catch(() => null);
+            catalog = await fetchCatalogItem(asin);
             catalogCache.set(asin, catalog);
-            if (catalog) catalogItemsImported += 1;
           }
-          if (!catalog) continue;
+          if (catalog?.unavailable) {
+            await db.query('update order_items set catalog_raw=$3 where tenant_id=$1 and asin=$2', [parsedTenantId, asin, catalog]);
+            continue;
+          }
           const shipping = catalogShippingFacts(catalog);
           await db.query(
             `update order_items set package_weight=$3, weight_unit=$4, package_dimensions=$5, catalog_raw=$6
