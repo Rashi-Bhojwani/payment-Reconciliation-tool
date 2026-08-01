@@ -474,7 +474,7 @@ function SellerDashboard() {
     {view === 'inventory' && <TableCard title="Inventory" rows={data?.inventory ?? []} columns={['sku', 'fulfillable_quantity', 'snapshot_date']} downloadFilename="inventory.csv" />}
     {view === 'payouts' && <>
       <TableCard title="Payout Activity" rows={data?.payments ?? []} columns={['posted_date', 'settlement_id', 'net_amount', 'lines']} downloadFilename="payout-activity.csv" />
-      <TableCard title="Settlement Lines (itemized)" rows={data?.settlementLines ?? []} columns={['posted_date', 'settlement_id', 'order_id', 'amount_type', 'amount_description', 'amount']} pageSize={10} downloadFilename="settlement-lines.csv" />
+      <TableCard title="Settlement Lines (itemized)" rows={data?.settlementLines ?? []} columns={['posted_date', 'settlement_id', 'order_id', 'transaction_type', 'order_item_code', 'merchant_order_item_id', 'sku', 'amount_type', 'amount_description', 'amount']} pageSize={10} downloadFilename="settlement-lines.csv" />
     </>}
     {view === 'brand' && <TableCard title="Product Performance" rows={data?.products ?? []} columns={['asin', 'units', 'sales', 'buy_box']} downloadFilename="product-performance.csv" />}
     {view === 'feeAudit' && <FeeLeakAudit tenantId={tenantId} />}
