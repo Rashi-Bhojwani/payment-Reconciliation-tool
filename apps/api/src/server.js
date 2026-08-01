@@ -647,6 +647,40 @@ app.post('/api/tenants/:tenantId/sync', async request => {
   return { results };
 });
 
+// A tenant that was actively re-synced during this session's earlier bugs
+// (before document-level dedup and a stable source_key formula both landed)
+// can be left with genuine duplicate-content settlement_rows: two rows that
+// differ only by source_key, because the same Amazon document got parsed
+// under two different versions of that formula. Settlement documents are
+// immutable on Amazon's side, so the only way to get a provably correct,
+// duplicate-free dataset - instead of guessing which of two identical-
+// looking rows is real - is to delete the stored rows for the affected
+// range and re-fetch them from scratch under the pipeline as it stands
+// today. processed_report_documents is cleared for the whole tenant+report
+// type (not just this range) because it is purely a re-download-avoidance
+// cache with no date columns of its own; clearing it never loses data - it
+// just means the next sync for any other period re-examines documents it
+// had already skipped, safely upserting the exact same rows back in place.
+async function resetSettlementData(tenantId, range) {
+  const counts = await withTenant(tenantId, async client => {
+    const deletedRows = await client.query('delete from settlement_rows where tenant_id=$1 and posted_date >= $2 and posted_date < $3', [tenantId, range.start, range.end]);
+    const deletedDocs = await client.query("delete from processed_report_documents where tenant_id=$1 and report_type='GET_V2_SETTLEMENT_REPORT_DATA_FLAT_FILE_V2'", [tenantId]);
+    const deletedJobs = await client.query("delete from sync_jobs where tenant_id=$1 and report_type='GET_V2_SETTLEMENT_REPORT_DATA_FLAT_FILE_V2' and range_start <= $3 and range_end >= $2", [tenantId, range.start, range.end]);
+    return { deletedSettlementRows: deletedRows.rowCount, deletedProcessedDocuments: deletedDocs.rowCount, deletedSyncJobs: deletedJobs.rowCount };
+  });
+  const resync = await syncReportForSellerRequest({ tenantId, reportType: 'GET_V2_SETTLEMENT_REPORT_DATA_FLAT_FILE_V2' }, range);
+  return { ...counts, resync };
+}
+
+app.post('/api/tenants/:tenantId/settlement-data/reset', async request => {
+  const { tenantId } = TenantParamsSchema.parse(request.params);
+  const body = z.object({ range: DateRangeSchema, confirm: z.literal(true, { errorMap: () => ({ message: 'This deletes stored settlement rows for the given range before re-fetching them from Amazon - pass confirm: true to proceed.' }) }) }).parse(request.body ?? {});
+  await requireTenantUser(request, tenantId);
+  await assertActiveTenant(tenantId);
+  app.log.warn({ tenantId, range: body.range }, 'Settlement data reset requested: deleting stored settlement rows for this range and re-syncing from Amazon');
+  return resetSettlementData(tenantId, body.range);
+});
+
 const DASHBOARD_METRICS = ['netSales','netQty','orders','returns','settled','deductions','reimbursements','drr','feeImpact','returnRate','refundValueRate','gstValue','income','expenses','tax','transfers','gst'];
 const CalculationParamsSchema = z.object({ tenantId: z.string().uuid(), metric: z.enum(DASHBOARD_METRICS) });
 const OrderDetailParamsSchema = z.object({ tenantId: z.string().uuid(), orderId: z.string().min(1) });

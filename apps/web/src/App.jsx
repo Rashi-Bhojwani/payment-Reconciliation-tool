@@ -111,6 +111,16 @@ async function syncAmazonSource(tenantId, reportType, range) {
   const payload = { method: 'POST', body: JSON.stringify({ range: { start: formatDateParam(range.start), end: formatDateParam(addDays(range.end, 1)) } }) };
   return api(`/api/tenants/${tenantId}/sync/${reportType}`, payload);
 }
+// Deletes stored settlement rows for the visible range and re-fetches them
+// from Amazon from scratch - the only way to guarantee a duplicate-free
+// dataset when a tenant's data may have been ingested under an older,
+// since-changed identity formula. Amazon's settlement documents are
+// immutable, so nothing is permanently lost; this only exists as an
+// explicit, confirmed action because it does delete stored rows first.
+async function resetSettlementData(tenantId, range) {
+  const payload = { method: 'POST', body: JSON.stringify({ range: { start: formatDateParam(range.start), end: formatDateParam(addDays(range.end, 1)) }, confirm: true }) };
+  return api(`/api/tenants/${tenantId}/settlement-data/reset`, payload);
+}
 
 function Button({ className = '', variant = 'primary', icon, children, ...props }) { return <button {...props} className={`btn btn-${variant} ${className}`}>{icon && <span className="btn-icon" aria-hidden="true">{icon}</span>}{children}</button>; }
 function Input(props) { return <input {...props} className="input" />; }
@@ -309,6 +319,24 @@ function SyncLedger({ tenantId, jobs = [], onSynced, reportTypes, title, subtitl
     }
   }
 
+  async function resetSettlements() {
+    if (disabled) return;
+    const rangeLabel = `${formatDateParam(range.start)} to ${formatDateParam(range.end)}`;
+    if (!window.confirm(`This deletes stored settlement rows for ${rangeLabel} and re-downloads them fresh from Amazon. Use this only if figures for this range look wrong. Continue?`)) return;
+    const reportType = 'GET_V2_SETTLEMENT_REPORT_DATA_FLAT_FILE_V2';
+    setRowState(s => ({ ...s, [reportType]: { loading: true } }));
+    try {
+      const result = await resetSettlementData(tenantId, range);
+      const syncResult = result?.resync;
+      if (syncResult?.status === 'failed') throw new Error(syncResult.error ?? 'Resync failed');
+      const summary = `Cleared ${formatNumber(result.deletedSettlementRows)} stored rows, re-imported ${formatNumber(syncResult?.rowsImported)} fresh rows`;
+      setRowState(s => ({ ...s, [reportType]: { loading: false, justSynced: true, summary } }));
+      await onSynced?.();
+    } catch (e) {
+      setRowState(s => ({ ...s, [reportType]: { loading: false, error: e.message } }));
+    }
+  }
+
   if (!reports.length) {
     return (
       <Card className="ledger-card">
@@ -342,6 +370,9 @@ function SyncLedger({ tenantId, jobs = [], onSynced, reportTypes, title, subtitl
                 {!local && job?.error_message && <small className={job.status === 'failed' ? 'ledger-note-error' : 'ledger-note-warning'}>{job.error_message}</small>}
               </div>
               <span className={`pill status-${statusLabel}`}>{statusLabel}</span>
+              {report.type === 'GET_V2_SETTLEMENT_REPORT_DATA_FLAT_FILE_V2' && (
+                <Button variant="secondary" disabled={disabled || busy} title="Deletes stored settlement rows for this range and re-downloads them from Amazon - use only if figures look wrong" onClick={() => resetSettlements()}>{busy ? '…' : 'Reset & Resync'}</Button>
+              )}
               <Button variant="secondary" disabled={disabled || busy} onClick={() => syncOne(report.type)}>{busy ? 'Syncing…' : 'Sync'}</Button>
             </div>
           );
