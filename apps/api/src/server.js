@@ -10,6 +10,7 @@ import { secrets } from './config/secrets.js';
 import { decryptSecret, encryptSecret } from './config/crypto.js';
 import { buildGstInvoicesFromOrderItems, startScheduler, syncRecentApiDataForTenant, syncReportForTenant } from './jobs/sync.js';
 import { buildRestoreStatements, createSyncQueue } from './jobs/sync-queue.js';
+import { calendarDays } from './jobs/reporting-calendar.js';
 import { categorizeFinanceLabel } from './jobs/finance-components.js';
 import { calculateDashboardMetrics } from './jobs/dashboard-calculations.js';
 import { runFeeAuditForTenant } from './jobs/fee-audit.js';
@@ -825,6 +826,7 @@ const CalculationParamsSchema = z.object({ tenantId: z.string().uuid(), metric: 
 const OrderDetailParamsSchema = z.object({ tenantId: z.string().uuid(), orderId: z.string().min(1) });
 const FEE_CATEGORIES = ['referral_commission', 'fulfillment_fee_per_order', 'fulfillment_fee_per_unit', 'fulfillment_fee_weight', 'shipping_fee', 'gift_wrap_fee', 'closing_fee', 'digital_services_fee', 'storage_fee', 'chargeback', 'tax'];
 function requestedRange(query) { const parsed = DashboardQuerySchema.parse(query); return { start: parsed.start ?? new Date(Date.now() - 30 * 864e5).toISOString(), end: parsed.end ?? new Date().toISOString() }; }
+
 function groupCalculationRows(rows) {
   const grouped = new Map();
   for (const row of rows) { const key = row.category; const current = grouped.get(key) ?? { category: key, label: key.replaceAll('_', ' '), amount: 0, count: 0 }; current.amount += Number(row.amount ?? 0); current.count += 1; grouped.set(key, current); }
@@ -843,7 +845,7 @@ function groupCalculationRows(rows) {
 async function loadDashboardCalculations(db, tenantId, range) {
   const orders = await db.query('select id source_row_id,amazon_order_id,status,order_date,total_amount,raw from orders where tenant_id=$1 and order_date >= $2 and order_date < $3',[tenantId,range.start,range.end]);
   const orderItems = await db.query(`select oi.id source_row_id,oi.amazon_order_id,oi.asin,oi.sku,oi.title,oi.quantity_ordered,oi.item_price,oi.promotion_discount,oi.raw,o.status,o.order_date from order_items oi join orders o on o.tenant_id=oi.tenant_id and o.amazon_order_id=oi.amazon_order_id where oi.tenant_id=$1 and o.order_date >= $2 and o.order_date < $3`,[tenantId,range.start,range.end]);
-  const returns = await db.query('select id source_row_id,order_id,return_date,return_reason,disposition,status,quantity,raw from returns where tenant_id=$1 and return_date >= $2::date and return_date < $3::date',[tenantId,range.start,range.end]);
+  const returns = await db.query('select id source_row_id,order_id,return_date,return_reason,disposition,status,quantity,raw from returns where tenant_id=$1 and return_date >= $2 and return_date < $3',[tenantId,...calendarDays(range)]);
   const settlementRows = await db.query(`select id source_row_id,settlement_id,order_id,amount_type,amount_description,amount,posted_date,raw,
       coalesce(raw->>'transaction-type',raw->>'transaction type',raw->>'transactionType') parent_transaction_type
       from settlement_rows where tenant_id=$1 and posted_date >= $2 and posted_date < $3`,[tenantId,range.start,range.end]);
@@ -929,8 +931,8 @@ async function loadDashboardCalculations(db, tenantId, range) {
       order by abs(sum(amount) - max(coalesce(nullif(raw->>'total-amount',''), nullif(raw->>'total amount',''), nullif(raw->>'totalAmount',''))::numeric)) desc`,
     [tenantId]
   ).catch(error => { app.log.warn({ err: error, tenantId }, 'Settlement integrity check failed'); return { rows: [] }; });
-  const reimbursements = await db.query('select amount,reason,sku,reimbursement_date from reimbursements where tenant_id=$1 and reimbursement_date >= $2::date and reimbursement_date < $3::date',[tenantId,range.start,range.end]);
-  const gstInvoices = await db.query('select id source_row_id,invoice_type,order_id,cgst,sgst,igst,taxable_value,invoice_date,raw from gst_invoices where tenant_id=$1 and invoice_date >= $2::date and invoice_date < $3::date',[tenantId,range.start,range.end]);
+  const reimbursements = await db.query('select amount,reason,sku,reimbursement_date from reimbursements where tenant_id=$1 and reimbursement_date >= $2 and reimbursement_date < $3',[tenantId,...calendarDays(range)]);
+  const gstInvoices = await db.query('select id source_row_id,invoice_type,order_id,cgst,sgst,igst,taxable_value,invoice_date,raw from gst_invoices where tenant_id=$1 and invoice_date >= $2 and invoice_date < $3',[tenantId,...calendarDays(range)]);
   return calculateDashboardMetrics({orders:orders.rows,orderItems:orderItems.rows,returns:returns.rows,settlementRows:settlementRows.rows,settlementHeaders:settlementHeaders.rows,financeItems:financeItems.rows,financeTransactions:financeTransactions.rows,reimbursements:reimbursements.rows,gstInvoices:gstInvoices.rows,settledOrderIdsAllTime:settledOrderIds.rows.map(row=>row.order_id),settlementIntegrity:settlementIntegrity.rows,outstandingSettlementSyncs:Number(outstandingSettlementSyncs.rows[0]?.pending ?? 0)},range);
 }
 
@@ -1131,7 +1133,7 @@ app.get('/api/tenants/:tenantId/dashboard', async request => {
     const businessReportRows = (await client.query(`
       with scoped as (
         select * from sales_traffic_daily
-        where tenant_id=$1 and date >= $2::date and date < $3::date
+        where tenant_id=$1 and date >= $2 and date < $3
       ), daily as (
         select date,
           coalesce(sum(ordered_product_sales),0) ordered_product_sales,
@@ -1151,12 +1153,12 @@ app.get('/api/tenants/:tenantId/dashboard', async request => {
         select date, ordered_product_sales, ordered_product_sales_b2b, units_ordered, units_ordered_b2b, total_order_items, total_order_items_b2b, average_sales_per_order_item, average_sales_per_order_item_b2b, average_units_per_order_item, average_units_per_order_item_b2b, average_selling_price
         from scoped where asin='ALL'
       )
-      select * from daily order by date desc limit 120`, [tenantId, start, end])).rows.reverse();
+      select * from daily order by date desc limit 120`, [tenantId, ...calendarDays({ start, end })])).rows.reverse();
     const products = (await client.query(`
       with traffic_products as (
         select asin, sum(units_ordered) units, sum(ordered_product_sales) sales, avg(featured_offer_percentage) buy_box
         from sales_traffic_daily
-        where tenant_id=$1 and date >= $2::date and date < $3::date and asin is not null and asin <> 'ALL'
+        where tenant_id=$1 and date >= $4 and date < $5 and asin is not null and asin <> 'ALL'
         group by asin
       ), item_products as (
         select asin, sum(quantity_ordered) units, sum(item_price) sales, null::numeric buy_box
@@ -1171,12 +1173,12 @@ app.get('/api/tenants/:tenantId/dashboard', async request => {
           t.buy_box
         from traffic_products t full outer join item_products i on i.asin = t.asin
       )
-      select asin, units, sales, buy_box from merged order by sales desc nulls last, units desc nulls last limit 20`, [tenantId, start, end])).rows;
+      select asin, units, sales, buy_box from merged order by sales desc nulls last, units desc nulls last limit 20`, [tenantId, start, end, ...calendarDays({ start, end })])).rows;
     const trend = (await client.query(`
       with traffic_trend as (
         select date, sum(ordered_product_sales) sales, sum(units_ordered) units, sum(sessions) sessions
         from sales_traffic_daily
-        where tenant_id=$1 and date >= $2::date and date < $3::date
+        where tenant_id=$1 and date >= $4 and date < $5
         group by date
       ), order_trend as (
         select date(order_date) date, sum(total_amount) sales, coalesce(sum(items.quantity), 0) units, 0::bigint sessions
@@ -1193,7 +1195,7 @@ app.get('/api/tenants/:tenantId/dashboard', async request => {
           coalesce(t.sessions, o.sessions, 0) sessions
         from traffic_trend t full outer join order_trend o on o.date = t.date
       )
-      select date, sales, units, sessions from merged order by date desc limit 90`, [tenantId, start, end])).rows.reverse();
+      select date, sales, units, sessions from merged order by date desc limit 90`, [tenantId, start, end, ...calendarDays({ start, end })])).rows.reverse();
     const payments = (await client.query(`
       with settlement_payments as (
         select settlement_id, date(posted_date) posted_date, sum(amount) net_amount, count(*) lines
@@ -1254,10 +1256,10 @@ app.get('/api/tenants/:tenantId/dashboard', async request => {
       where o.tenant_id=$1 and o.order_date >= $2 and o.order_date < $3
       group by o.amazon_order_id, o.order_date, o.status, o.total_amount, o.fulfillment_channel, o.sales_channel
       order by o.order_date desc nulls last limit 250`, [tenantId, start, end])).rows;
-    const inventory = (await client.query('select sku, fulfillable_quantity, snapshot_date from inventory_snapshots where tenant_id=$1 and snapshot_date >= $2::date and snapshot_date < $3::date order by snapshot_date desc, fulfillable_quantity desc nulls last limit 50', [tenantId, start, end])).rows;
-    const returns = (await client.query('select order_id, return_reason, disposition, status, return_date, quantity from returns where tenant_id=$1 and return_date >= $2::date and return_date < $3::date order by return_date desc nulls last limit 50', [tenantId, start, end])).rows;
-    const reimbursements = (await client.query('select sku, amount, reason, reimbursement_date from reimbursements where tenant_id=$1 and reimbursement_date >= $2::date and reimbursement_date < $3::date order by reimbursement_date desc nulls last limit 50', [tenantId, start, end])).rows;
-    const invoices = (await client.query('select invoice_type, order_id, taxable_value, cgst, sgst, igst, invoice_date from gst_invoices where tenant_id=$1 and invoice_date >= $2::date and invoice_date < $3::date order by invoice_date desc nulls last limit 50', [tenantId, start, end])).rows;
+    const inventory = (await client.query('select sku, fulfillable_quantity, snapshot_date from inventory_snapshots where tenant_id=$1 and snapshot_date >= $2 and snapshot_date < $3 order by snapshot_date desc, fulfillable_quantity desc nulls last limit 50', [tenantId, ...calendarDays({ start, end })])).rows;
+    const returns = (await client.query('select order_id, return_reason, disposition, status, return_date, quantity from returns where tenant_id=$1 and return_date >= $2 and return_date < $3 order by return_date desc nulls last limit 50', [tenantId, ...calendarDays({ start, end })])).rows;
+    const reimbursements = (await client.query('select sku, amount, reason, reimbursement_date from reimbursements where tenant_id=$1 and reimbursement_date >= $2 and reimbursement_date < $3 order by reimbursement_date desc nulls last limit 50', [tenantId, ...calendarDays({ start, end })])).rows;
+    const invoices = (await client.query('select invoice_type, order_id, taxable_value, cgst, sgst, igst, invoice_date from gst_invoices where tenant_id=$1 and invoice_date >= $2 and invoice_date < $3 order by invoice_date desc nulls last limit 50', [tenantId, ...calendarDays({ start, end })])).rows;
     const orderItems = (await client.query('select oi.amazon_order_id, oi.asin, oi.sku, oi.title, oi.quantity_ordered, oi.item_price, oi.item_tax, oi.promotion_discount from order_items oi join orders o on o.tenant_id=oi.tenant_id and o.amazon_order_id=oi.amazon_order_id where oi.tenant_id=$1 and o.order_date >= $2 and o.order_date < $3 order by oi.quantity_ordered desc nulls last limit 50', [tenantId, start, end])).rows;
     const financeTransactions = (await client.query('select transaction_id, transaction_type, posted_date, total_amount, currency, related_order_id, raw from finance_transactions where tenant_id=$1 and posted_date >= $2 and posted_date < $3 order by posted_date desc nulls last limit 2000', [tenantId, start, end])).rows;
     const financialComponents = [...settlementComponentRows(settlementLines), ...financeTransactions.flatMap(financeComponentRows)];
