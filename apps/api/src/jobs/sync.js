@@ -361,9 +361,28 @@ export async function syncReportForTenant(params) {
           rows: report.documentIds.map(documentId => [parsed.tenantId, documentId, parsed.reportType])
         }));
       }
-      console.log(`[${logLabel}] completed in ${Date.now() - startedAt}ms - ${rowsImported} rows imported` + (report.reportsTruncated ? ` (${report.reportsAvailable - (report.reportsMerged ?? 0)} more document(s) remain for the next sync)` : ''));
-      await pool.query('update sync_jobs set status=$1, completed_at=now(), s3_key=$2 where id=$3', ['completed', s3Key, sync.rows[0].id]);
-      return { rowsImported, s3Key };
+      const outstandingDocuments = report.reportsTruncated ? report.reportsAvailable - (report.reportsMerged ?? 0) : 0;
+      console.log(`[${logLabel}] completed in ${Date.now() - startedAt}ms - ${rowsImported} rows imported from ${report.reportsMerged ?? 0} of ${report.reportsAvailable} document(s) Amazon has for this range` + (outstandingDocuments ? ` - ${outstandingDocuments} STILL OUTSTANDING, figures are incomplete until they are fetched` : ''));
+      // A truncated sync fetched only part of what Amazon has, so it must not
+      // be recorded as a sync that covers this range. It used to be stored
+      // with the full range and status 'completed', which made
+      // findReusableSync treat the range as fully synced for the next hour -
+      // so the remaining documents were not fetched, the backlog drained at
+      // best one capped batch per hour, and the dashboard showed money
+      // computed from a partial settlement history with nothing to indicate
+      // it. Leaving the range null keeps the job visible in the ledger while
+      // letting the next dashboard load pick up where this one stopped;
+      // already-processed documents are skipped, so it converges instead of
+      // re-fetching, and the in-flight and backoff guards bound the traffic.
+      await pool.query(
+        outstandingDocuments
+          ? 'update sync_jobs set status=$1, completed_at=now(), s3_key=$2, range_start=null, range_end=null, error_message=$4 where id=$3'
+          : 'update sync_jobs set status=$1, completed_at=now(), s3_key=$2 where id=$3',
+        outstandingDocuments
+          ? ['completed', s3Key, sync.rows[0].id, `Partial: ${outstandingDocuments} settlement document(s) still to fetch`]
+          : ['completed', s3Key, sync.rows[0].id]
+      );
+      return { rowsImported, s3Key, documentsMerged: report.reportsMerged ?? 0, documentsAvailable: report.reportsAvailable, outstandingDocuments };
     } catch (error) {
       const message = error instanceof Error ? error.message : 'unknown error';
       console.error(`[${logLabel}] failed after ${Date.now() - startedAt}ms: ${message}`);

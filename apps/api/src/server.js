@@ -824,6 +824,18 @@ async function loadDashboardCalculations(db, tenantId, range) {
   // not whatever window the seller happens to be looking at, so checking only
   // the in-range subset would report a shortfall on every settlement that
   // straddles the edge of the view.
+  // Settlement syncs that fetched only part of what Amazon has. While any of
+  // these exist the money figures are computed from an incomplete settlement
+  // history, and the seller must be told rather than shown a confident wrong
+  // number. This is what distinguishes "Amazon has not settled it yet" from
+  // "we have not downloaded it yet" - the two look identical in the totals.
+  const outstandingSettlementSyncs = await db.query(
+    `select count(*)::int pending from sync_jobs
+      where tenant_id=$1 and report_type='GET_V2_SETTLEMENT_REPORT_DATA_FLAT_FILE_V2'
+        and status='completed' and error_message like 'Partial:%'
+        and completed_at > now() - interval '7 days'`,
+    [tenantId]
+  ).catch(() => ({ rows: [{ pending: 0 }] }));
   const settlementIntegrity = await db.query(
     `select settlement_id,
             count(*) row_count,
@@ -839,7 +851,7 @@ async function loadDashboardCalculations(db, tenantId, range) {
   ).catch(error => { app.log.warn({ err: error, tenantId }, 'Settlement integrity check failed'); return { rows: [] }; });
   const reimbursements = await db.query('select amount,reason,sku,reimbursement_date from reimbursements where tenant_id=$1 and reimbursement_date >= $2::date and reimbursement_date < $3::date',[tenantId,range.start,range.end]);
   const gstInvoices = await db.query('select id source_row_id,invoice_type,order_id,cgst,sgst,igst,taxable_value,invoice_date,raw from gst_invoices where tenant_id=$1 and invoice_date >= $2::date and invoice_date < $3::date',[tenantId,range.start,range.end]);
-  return calculateDashboardMetrics({orders:orders.rows,orderItems:orderItems.rows,returns:returns.rows,settlementRows:settlementRows.rows,settlementHeaders:settlementHeaders.rows,financeItems:financeItems.rows,financeTransactions:financeTransactions.rows,reimbursements:reimbursements.rows,gstInvoices:gstInvoices.rows,settledOrderIdsAllTime:settledOrderIds.rows.map(row=>row.order_id),settlementIntegrity:settlementIntegrity.rows},range);
+  return calculateDashboardMetrics({orders:orders.rows,orderItems:orderItems.rows,returns:returns.rows,settlementRows:settlementRows.rows,settlementHeaders:settlementHeaders.rows,financeItems:financeItems.rows,financeTransactions:financeTransactions.rows,reimbursements:reimbursements.rows,gstInvoices:gstInvoices.rows,settledOrderIdsAllTime:settledOrderIds.rows.map(row=>row.order_id),settlementIntegrity:settlementIntegrity.rows,outstandingSettlementSyncs:Number(outstandingSettlementSyncs.rows[0]?.pending ?? 0)},range);
 }
 
 app.get('/api/tenants/:tenantId/calculations/:metric', async request => {
@@ -1195,6 +1207,8 @@ app.get('/api/tenants/:tenantId/dashboard', async request => {
     // A settlement whose lines do not add up to Amazon's own stated total is
     // the one failure that corrupts every figure silently, so it is reported
     // first and unconditionally, with the exact shortfall.
+    const outstanding=dashboardCalculations.diagnostics?.outstandingSettlementSyncs;
+    if (outstanding) console.log(`[dashboard ${tenantId.slice(0, 8)}] INCOMPLETE SETTLEMENT HISTORY - ${outstanding} settlement sync(s) fetched only part of what Amazon has. Money figures are computed from incomplete data until those documents are downloaded.`);
     const integrity=dashboardCalculations.diagnostics?.settlementIntegrity;
     if (integrity?.length) {
       console.log(`[dashboard ${tenantId.slice(0, 8)}] SETTLEMENT INTEGRITY FAILURE - ${integrity.length} settlement(s) do not add up to the total Amazon stamped on them. Figures derived from them are wrong; re-run Reset & Resync for settlements.`);

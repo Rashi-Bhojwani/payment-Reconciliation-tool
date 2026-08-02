@@ -220,3 +220,12 @@ test('flags a settlement whose lines do not add up to Amazon\'s own stated total
   assert.equal(broken.diagnostics.settlementIntegrity[0].difference,82.21);
   assert.equal(broken.diagnostics.settlementIntegrity[0].settlement_id,'s1');
 });
+
+test('reports when settlement history is incomplete rather than showing confident wrong money',()=>{
+  // "Amazon has not settled it yet" and "we have not downloaded it yet" look
+  // identical in the totals. Only this tells them apart.
+  const range={start:'2026-07-21T00:00:00Z',end:'2026-07-30T00:00:00Z'};
+  const base={orders:[],orderItems:[],returns:[],reimbursements:[],gstInvoices:[],financeItems:[],settlementHeaders:[],settledOrderIdsAllTime:[],settlementRows:[line('a','Principal',567.60,'Order',{amount_type:'ItemPrice'})]};
+  assert.equal(calculateDashboardMetrics(base,range).diagnostics.outstandingSettlementSyncs,0);
+  assert.equal(calculateDashboardMetrics({...base,outstandingSettlementSyncs:2},range).diagnostics.outstandingSettlementSyncs,2);
+});
