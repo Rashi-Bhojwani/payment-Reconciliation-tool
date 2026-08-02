@@ -28,11 +28,11 @@ test('matches the MINDCIRCUS Amazon Account Activity fixture without constants',
 });
 test('uses current status only and preserves identical-SKU lines with stable item IDs',()=>{const r=calculateDashboardMetrics(mindcircusFixture(),range);assert.equal(r.metrics.netQty.value,3);assert.equal(r.metrics.orders.value,1);assert.equal(r.metrics.returnRate.value,40);});
 test('negative Principal is a refund through parent transaction metadata',()=>{const input=mindcircusFixture();const refund=input.settlementRows.find(x=>x.source_row_id==='sf-refund');delete refund.transaction_type;assert.equal(calculateDashboardMetrics(input,range).metrics.netSales.value,154522.8);});
-test('missing return quantity makes quantity KPIs unavailable instead of guessing one',()=>{const input=mindcircusFixture();input.returns[0].quantity=null;const r=calculateDashboardMetrics(input,range);assert.equal(r.metrics.returns.value,null);assert.equal(r.metrics.netQty.value,null);assert.equal(r.metrics.returnRate.value,null);assert.equal(r.metrics.returnRate.status,'Unavailable / source mismatch');});
-test('positive returns with unavailable shipped source never report zero percent',()=>{const input=mindcircusFixture();input.orderItems=[];const r=calculateDashboardMetrics(input,range);assert.equal(r.metrics.returnRate.value,null);assert.match(r.metrics.returnRate.status,/source mismatch/);});
+test('missing return quantity makes quantity KPIs unavailable instead of guessing one',()=>{const input=mindcircusFixture();input.returns[0].quantity=null;const r=calculateDashboardMetrics(input,range);assert.equal(r.metrics.returns.value,null);assert.equal(r.metrics.netQty.value,null);assert.equal(r.metrics.returnRate.value,null);assert.match(r.metrics.returnRate.status,/^Unavailable\b/);});
+test('positive returns with unavailable shipped source never report zero percent',()=>{const input=mindcircusFixture();input.orderItems=[];const r=calculateDashboardMetrics(input,range);assert.equal(r.metrics.returnRate.value,null);assert.match(r.metrics.returnRate.status,/^Unavailable\b/);});
 test('removes duplicate reports and finance summary rows, and uses one reimbursement source',()=>{const input=mindcircusFixture();input.settlementRows.push({...input.settlementRows[0],source_row_id:'duplicate-db-id'});input.financeItems.push({transaction_id:'x',category:'summary_amazon_fees',amount:-999,posted_date:'2026-07-10'});const r=calculateDashboardMetrics(input,range);assert.equal(r.metrics.netSales.value,154522.8);assert.equal(r.metrics.reimbursements.value,196.72);assert.ok(r.diagnostics.duplicateRows>0);});
 test('GST invoice value uses genuine documents, credit notes, mixed rates and stable document keys',()=>{const input=mindcircusFixture();input.gstInvoices=[{source_row_id:'1',taxable_value:100,raw:{'document-number':'INV1','line-item-id':'1','document-type':'Invoice','gst-rate':18}},{source_row_id:'dup',taxable_value:100,raw:{'document-number':'INV1','line-item-id':'1','document-type':'Invoice','gst-rate':18}},{source_row_id:'2',taxable_value:40,raw:{'document-number':'CN1','line-item-id':'1','document-type':'Credit Note','gst-rate':5}},{source_row_id:'synthetic',taxable_value:999,raw:{}}];assert.equal(calculateDashboardMetrics(input,range).metrics.gstValue.value,60);});
-test('GST invoice value is unavailable without genuine imported invoices',()=>{const r=calculateDashboardMetrics({...mindcircusFixture(),gstInvoices:[{taxable_value:381909.1,raw:{}}]},range);assert.equal(r.metrics.gstValue.value,null);assert.equal(r.metrics.gstValue.status,'Unavailable');});
+test('GST invoice value is unavailable without genuine imported invoices',()=>{const r=calculateDashboardMetrics({...mindcircusFixture(),gstInvoices:[{taxable_value:381909.1,raw:{}}]},range);assert.equal(r.metrics.gstValue.value,null);assert.match(r.metrics.gstValue.status,/^Unavailable\b/);});
 test('derives half-open range days and excludes failed/out-of-range deposits',()=>{const input=mindcircusFixture();input.settlementHeaders.push({settlement_id:'outside',deposit_date:'2026-07-27T00:00:00Z',total_amount:1000});const r=calculateDashboardMetrics(input,range);assert.equal(inclusiveDays(range.start,range.end),30);assert.equal(r.metrics.settled.value,131801.69);});
 
 test('matches Amazon Custom Unified Account Activity buckets from settlement API rows',()=>{
@@ -112,4 +112,43 @@ test('an order with settlement lines anywhere is never reported as pending',()=>
   const corrected=calculateDashboardMetrics({...base,settledOrderIdsAllTime:['order-in-range','order-outside-range']},range);
   assert.equal(corrected.diagnostics.pendingMergeSummary.pendingOrders,1);
   assert.equal(corrected.diagnostics.pendingMergeSummary.pendingExcludedTotals.income,500);
+});
+
+test('counts shipped units from Amazon settlement quantity when order items lag behind',()=>{
+  // Amazon meters listOrderItems at one order per 2200ms, so order_items
+  // routinely lags the orders themselves. The old rule blanked Net Qty and
+  // Return Rate entirely when any order's items had not arrived, even though
+  // Amazon had already stated the quantity on the settlement line.
+  const range={start:'2026-07-01T00:00:00Z',end:'2026-07-30T00:00:00Z'};
+  const orders=[{amazon_order_id:'order-a',status:'Shipped',order_date:'2026-07-05T00:00:00Z'},{amazon_order_id:'order-b',status:'Shipped',order_date:'2026-07-06T00:00:00Z'}];
+  const settlementRows=[
+    line('a','Principal',1000,'Order',{order_id:'order-a',amount_type:'ItemPrice',raw:{'quantity-purchased':'2'}}),
+    line('b','Principal',500,'Order',{order_id:'order-b',amount_type:'ItemPrice',raw:{'quantity-purchased':'3'}})
+  ];
+  const base={orders,returns:[],reimbursements:[],gstInvoices:[],settlementHeaders:[],financeItems:[],settledOrderIdsAllTime:[],settlementRows};
+  // Only order-a has items synced so far; order-b is counted from settlement.
+  const partial=calculateDashboardMetrics({...base,orderItems:[{source_row_id:'i1',amazon_order_id:'order-a',quantity_ordered:2,raw:{'order-item-id':'i1'}}]},range);
+  assert.equal(partial.metrics.netQty.value,5);
+  assert.match(partial.metrics.netQty.source,/settlement quantity-purchased/);
+  assert.equal(partial.metrics.netQty.status,null);
+  assert.equal(partial.metrics.returnRate.value,0);
+  // With no order items at all, settlement alone still carries both orders.
+  const settlementOnly=calculateDashboardMetrics({...base,orderItems:[]},range);
+  assert.equal(settlementOnly.metrics.netQty.value,5);
+  // An order Amazon has given no quantity for anywhere is reported, not hidden.
+  const shortfall=calculateDashboardMetrics({...base,orders:[...orders,{amazon_order_id:'order-c',status:'Shipped',order_date:'2026-07-07T00:00:00Z'}],orderItems:[]},range);
+  assert.equal(shortfall.metrics.netQty.value,5);
+  assert.match(shortfall.metrics.netQty.status,/1 of 3 orders still awaiting quantity/);
+});
+
+test('an order is never counted twice when both order items and settlement carry a quantity',()=>{
+  const range={start:'2026-07-01T00:00:00Z',end:'2026-07-30T00:00:00Z'};
+  const r=calculateDashboardMetrics({
+    orders:[{amazon_order_id:'order-a',status:'Shipped',order_date:'2026-07-05T00:00:00Z'}],
+    orderItems:[{source_row_id:'i1',amazon_order_id:'order-a',quantity_ordered:2,raw:{'order-item-id':'i1'}}],
+    returns:[],reimbursements:[],gstInvoices:[],settlementHeaders:[],financeItems:[],settledOrderIdsAllTime:[],
+    settlementRows:[line('a','Principal',1000,'Order',{order_id:'order-a',amount_type:'ItemPrice',raw:{'quantity-purchased':'2'}})]
+  },range);
+  assert.equal(r.metrics.netQty.value,2);
+  assert.equal(r.metrics.netQty.source,'Orders + Returns');
 });

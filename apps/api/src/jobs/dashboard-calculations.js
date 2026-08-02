@@ -97,13 +97,58 @@ export function calculateDashboardMetrics(input,range){
   const orderAudit=dedupe(input.orders??[],row=>row.amazon_order_id);const eligibleOrders=orderAudit.included.filter(row=>statusEligible(row.status));const eligibleIds=new Set(eligibleOrders.map(row=>row.amazon_order_id));
   const itemAudit=dedupe((input.orderItems??[]).filter(row=>eligibleIds.has(row.amazon_order_id)),row=>orderItemKey(row)??keyOf(row));
   const returnAudit=dedupe(input.returns??[],returnKey);
-  const shippedAvailable=itemAudit.included.length>0&&itemAudit.included.every(row=>num(row.quantity_ordered)!=null);
-  const returnsAvailable=returnAudit.included.length>0?returnAudit.included.every(row=>num(row.quantity)!=null):true;
-  const shippedUnits=shippedAvailable?itemAudit.included.reduce((s,r)=>s+num(r.quantity_ordered),0):null;
-  const returnedUnits=returnsAvailable?returnAudit.included.reduce((s,r)=>s+num(r.quantity),0):null;
-  const netQty=shippedUnits==null||returnedUnits==null?null:shippedUnits-returnedUnits;
 
   const financeAudit=dedupe((input.financeItems??[]).filter(row=>!isSummary(row)),financialKey);const settlementAudit=dedupe(input.settlementRows??[],financialKey);
+
+  // Shipped units. order_items (Orders API) is the primary source, but Amazon
+  // meters listOrderItems at one order per 2200ms, so on a large or freshly
+  // connected account it lags the orders themselves by minutes. The previous
+  // rule - EVERY item row must carry a quantity or the entire KPI reports
+  // "Unavailable" - meant one order whose items had not arrived yet blanked
+  // Net Qty, Return Rate and everything derived from them, on an account where
+  // Amazon had already stated the quantity in the settlement report.
+  //
+  // Settlement lines carry Amazon's own quantity-purchased per order item, so
+  // an eligible order that order_items has not reached yet is counted from
+  // that instead of being discarded. Nothing is estimated or inferred: an
+  // order contributes units only where Amazon itself stated a quantity, each
+  // order is counted from exactly one source, and orders Amazon has given no
+  // quantity for anywhere are reported as a coverage shortfall rather than
+  // silently treated as zero.
+  const settlementQuantity=row=>num(rawField(row.raw,['quantity-purchased','quantity purchased','quantityPurchased']));
+  const unitsByOrder=new Map();
+  for(const row of itemAudit.included){
+    const quantity=num(row.quantity_ordered);
+    if(quantity==null)continue;
+    unitsByOrder.set(row.amazon_order_id,(unitsByOrder.get(row.amazon_order_id)??0)+quantity);
+  }
+  const settlementUnitsByOrder=new Map();
+  for(const row of settlementAudit.included){
+    const quantity=settlementQuantity(row);
+    if(quantity==null||quantity<=0||!row.order_id||!isPrincipal(row)||isRefund(row))continue;
+    settlementUnitsByOrder.set(row.order_id,(settlementUnitsByOrder.get(row.order_id)??0)+quantity);
+  }
+  let ordersCountedFromSettlement=0;
+  for(const order of eligibleOrders){
+    if(unitsByOrder.has(order.amazon_order_id))continue;
+    const quantity=settlementUnitsByOrder.get(order.amazon_order_id);
+    if(quantity==null)continue;
+    unitsByOrder.set(order.amazon_order_id,quantity);
+    ordersCountedFromSettlement+=1;
+  }
+  const ordersWithoutQuantity=eligibleOrders.filter(order=>!unitsByOrder.has(order.amazon_order_id)).length;
+  const returnsAvailable=returnAudit.included.length>0?returnAudit.included.every(row=>num(row.quantity)!=null):true;
+  const shippedUnits=unitsByOrder.size?[...unitsByOrder.values()].reduce((sum,units)=>sum+units,0):null;
+  const returnedUnits=returnsAvailable?returnAudit.included.reduce((s,r)=>s+num(r.quantity),0):null;
+  const netQty=shippedUnits==null||returnedUnits==null?null:shippedUnits-returnedUnits;
+  const unitsSource=!unitsByOrder.size?'Orders + Returns'
+    :ordersCountedFromSettlement?`Orders + Returns (${ordersCountedFromSettlement} order${ordersCountedFromSettlement===1?'':'s'} counted from Amazon settlement quantity-purchased)`
+    :'Orders + Returns';
+  // A shortfall is stated, never hidden - but it no longer destroys the KPI.
+  const unitsCoverageNote=shippedUnits==null?'Unavailable - Amazon has not returned order items or settlement quantities for this range yet'
+    :ordersWithoutQuantity?`${ordersWithoutQuantity} of ${eligibleOrders.length} orders still awaiting quantity from Amazon`
+    :null;
+  const returnsNote=returnedUnits==null?'Unavailable - a synced return is missing its quantity':null;
   const settlementComplete=settlementAudit.included.some(row=>isPrincipal(row)||isProductGst(row)||isFee(row)||isTransfer(row))&&settlementAudit.included.some(row=>row.settlement_id||row.raw?.['settlement-id']||row.raw?.['settlement id']);
   // Deferred (not-yet-released) Finance API activity is deliberately NOT
   // added to the statement. It was added on the theory that Amazon's Account
@@ -190,17 +235,17 @@ export function calculateDashboardMetrics(input,range){
   const metric=(value,unit,formula,components,rows,source=financialSource,status=value==null?'Unavailable':null)=>({value,unit,formula,components,rows,source,status,range,diagnostics});
   const metrics={
     netSales:metric(netSales,'amount','Gross product Principal sales − Refund Principal lines − net seller-funded promotions',[component('gross_sales','Gross product sales',grossSales,grossRows),component('product_refunds','Product refunds',-productRefunds,refundPrincipalRows,'−'),component('promotions','Net seller-funded promotions',-netPromotions,promoRows,'−')],[...grossRows,...refundPrincipalRows,...promoRows]),
-    netQty:metric(netQty,'quantity','Shipped units − physically returned units; exact cancelled, pending/unshipped, and replacement statuses excluded',[component('shipped_units','Shipped units',shippedUnits,itemAudit.included),component('returned_units','Returned units',returnedUnits==null?null:-returnedUnits,returnAudit.included,'−')],[...itemAudit.included,...returnAudit.included],'Orders + Returns',netQty==null?'Unavailable / source mismatch':null),
+    netQty:metric(netQty,'quantity','Shipped units − physically returned units; exact cancelled, pending/unshipped, and replacement statuses excluded',[component('shipped_units','Shipped units',shippedUnits,itemAudit.included),component('returned_units','Returned units',returnedUnits==null?null:-returnedUnits,returnAudit.included,'−')],[...itemAudit.included,...returnAudit.included],unitsSource,unitsCoverageNote??returnsNote),
     orders:metric(eligibleOrders.length,'quantity','Distinct eligible Amazon order IDs by order_date; cancelled, pending/unshipped, and replacement statuses excluded',[component('eligible_orders','Eligible distinct orders',eligibleOrders.length,eligibleOrders)],eligibleOrders,'Orders API'),
-    returns:metric(returnedUnits,'quantity','Sum of Amazon return quantity; no missing quantity is guessed as one',[component('returned_units','Returned quantity',returnedUnits,returnAudit.included)],returnAudit.included,'Returns report',returnedUnits==null?'Unavailable':null),
+    returns:metric(returnedUnits,'quantity','Sum of Amazon return quantity; no missing quantity is guessed as one',[component('returned_units','Returned quantity',returnedUnits,returnAudit.included)],returnAudit.included,'Returns report',returnsNote),
     settled:metric(settled,'amount','Absolute value of successful bank deposits with deposit_date in the selected range',[component('successful_transfers','Successful bank transfers',settled,headerAudit.included)],headerAudit.included,'Settlement headers'),
     deductions:metric(deductions,'amount','Gross expense debits − expense refunds/credits (includes TCS/TDS)',[component('expense_debits','Gross expense debits',expenseDebits,expenseRows.filter(r=>amount(r)<0)),component('expense_credits','Expense refunds/credits',-expenseCredits,expenseRows.filter(r=>amount(r)>0),'−'),component('tcs_tds','TCS/TDS included',tcsTds,withholdingRows),component('operational_fees','Operational fees excluding TCS/TDS',operationalFees,expenseRows.filter(r=>!isWithholding(r)))],expenseRows),
     reimbursements:metric(reimbursements,'amount','Reimbursement credits − reimbursement reversals',[component('net_reimbursements','Net reimbursements',reimbursements,reimbursementRows)],reimbursementRows,financeReimbursements.length?financialSource:'Reimbursements report'),
     drr:metric(round2(netSales/days),'amount',`Net Sales ÷ ${days} calendar days derived from the half-open range`,[component('net_sales','Net Sales',netSales,[]),component('days','Calendar days',days,[])],[]),
     feeImpact:metric(grossSales?operationalFees/grossSales*100:null,'percentage','Operational Amazon fees excluding TCS/TDS ÷ gross product sales × 100',[component('operational_fees','Operational fees',operationalFees,expenseRows.filter(r=>!isWithholding(r))),component('gross_sales','Gross product sales',grossSales,grossRows)],expenseRows),
-    returnRate:metric(unitRate,'percentage','Physically returned units ÷ shipped units × 100',[component('returned_units','Returned units',returnedUnits,returnAudit.included),component('shipped_units','Shipped units',shippedUnits,itemAudit.included)],[...returnAudit.included,...itemAudit.included],'Orders + Returns',unitRate==null?'Unavailable / source mismatch':null),
+    returnRate:metric(unitRate,'percentage','Physically returned units ÷ shipped units × 100',[component('returned_units','Returned units',returnedUnits,returnAudit.included),component('shipped_units','Shipped units',shippedUnits,itemAudit.included)],[...returnAudit.included,...itemAudit.included],unitsSource,unitRate==null?(unitsCoverageNote??returnsNote??'Unavailable - no shipped units to divide by'):null),
     refundValueRate:metric(refundValueRate,'percentage','Product refund Principal value ÷ gross product Principal sales × 100',[component('product_refunds','Product refunds',productRefunds,refundPrincipalRows),component('gross_sales','Gross product sales',grossSales,grossRows)],[...refundPrincipalRows,...grossRows]),
-    gstValue:metric(gstInvoiceValue,'amount','Genuine GST sales-invoice taxable value − genuine credit-note/refund taxable value',[component('net_taxable_value','Net taxable invoice value',gstInvoiceValue,gstAudit.included)],gstAudit.included,'Imported GST B2B/B2C reports',gstAvailable?null:'Unavailable')
+    gstValue:metric(gstInvoiceValue,'amount','Genuine GST sales-invoice taxable value − genuine credit-note/refund taxable value',[component('net_taxable_value','Net taxable invoice value',gstInvoiceValue,gstAudit.included)],gstAudit.included,'Imported GST B2B/B2C reports',gstAvailable?null:'Unavailable - GST B2B/B2C invoice reports have not been imported for this range')
   };
   const group=rows=>{const map=new Map();for(const row of rows){const name=row.amount_description??row.category??row.transaction_type??'Other';const old=map.get(name)??{category:norm(name).replaceAll(' ','_'),label:name,amount:0,count:0};old.amount+=amount(row);old.count++;map.set(name,old);}return[...map.values()];};
   const statement={income:metric(income,'amount','Net Amazon Income statement lines',group(incomeRows),incomeRows),expenses:metric(expenses,'amount','Expense debits plus expense refunds/credits; includes TCS/TDS',group(expenseRows),expenseRows),tax:metric(tax,'amount','Amazon generic Tax section only',group(genericTaxRows),genericTaxRows),transfers:metric(transfers,'amount','Signed successful bank transfers by deposit_date',group(transferRows),transferRows,'Settlement headers'),gst:metric(gst,'amount','Product/shipping/gift-wrap GST collected plus GST refunds',group(productGstRows),productGstRows)};
