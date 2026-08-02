@@ -59,12 +59,32 @@ test('matches Amazon Custom Unified Account Activity buckets from settlement API
 });
 
 
-test('uses Amazon settlement header period and date formats for transfers',()=>{
+test('transfers count the deposit, in Amazon\'s own date format',()=>{
   const base={orders:[],orderItems:[],returns:[],financeItems:[],reimbursements:[],gstInvoices:[],settlementRows:[line('sale','Principal',10,'Order',{amount_type:'ItemPrice'})]};
   const withIndianDeposit=calculateDashboardMetrics({...base,settlementHeaders:[{settlement_id:'dd-mm',deposit_date:'29.07.2026 23:59 GMT+5:30',total_amount:246.63}]},{start:'2026-07-21T00:00:00Z',end:'2026-07-30T00:00:00Z'});
   assert.equal(withIndianDeposit.statement.transfers.value,-246.63);
-  const withStatementPeriod=calculateDashboardMetrics({...base,settlementHeaders:[{settlement_id:'period',settlement_start_date:'27.06.2026 00:00:00 UTC',settlement_end_date:'26.07.2026 23:59:59 UTC',total_amount:131801.69}]},{start:'2026-06-27T00:00:00Z',end:'2026-07-27T00:00:00Z'});
-  assert.equal(withStatementPeriod.statement.transfers.value,-131801.69);
+});
+
+test('a settlement whose period overlaps the window is not a transfer in it',()=>{
+  // Amazon's Transfers section is the money that reached the bank during the
+  // window, so the settlement period the payout covers is irrelevant to it -
+  // a 27 Jun-26 Jul settlement deposited on 28 Jul belongs to a statement
+  // that contains 28 Jul, and to no other. Counting it by period overlap
+  // instead is what put Seller A at -1,17,288.92 against Amazon's
+  // -1,07,559.21 and Seller B at -328.84 against -246.63, both over-counting.
+  const base={orders:[],orderItems:[],returns:[],financeItems:[],reimbursements:[],gstInvoices:[],settlementRows:[line('sale','Principal',10,'Order',{amount_type:'ItemPrice'})]};
+  const period={settlement_id:'period',settlement_start_date:'27.06.2026 00:00:00 UTC',settlement_end_date:'26.07.2026 23:59:59 UTC',total_amount:131801.69};
+  const window={start:'2026-06-27T00:00:00Z',end:'2026-07-27T00:00:00Z'};
+
+  const depositedLater=calculateDashboardMetrics({...base,settlementHeaders:[{...period,deposit_date:'28.07.2026 00:00:00 UTC'}]},window);
+  assert.equal(depositedLater.statement.transfers.value,0,'deposited after the window closed');
+  assert.equal(depositedLater.metrics.settled.value,0);
+
+  const notYetDeposited=calculateDashboardMetrics({...base,settlementHeaders:[period]},window);
+  assert.equal(notYetDeposited.statement.transfers.value,0,'an open settlement has paid out nothing yet');
+
+  const depositedInside=calculateDashboardMetrics({...base,settlementHeaders:[{...period,deposit_date:'26.07.2026 12:00:00 UTC'}]},window);
+  assert.equal(depositedInside.statement.transfers.value,-131801.69);
 });
 
 test('never merges Deferred Finance activity into the statement, but does measure it',()=>{

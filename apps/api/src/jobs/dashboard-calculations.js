@@ -93,7 +93,6 @@ const utcDate=value=>{
 };
 const rangeDates=range=>({start:new Date(range.start),end:new Date(range.end)});
 const inRange=(value,range)=>{const d=utcDate(value);const r=rangeDates(range);return !Number.isNaN(d.getTime())&&d>=r.start&&d<r.end;};
-const overlapsRange=(start,end,range)=>{const r=rangeDates(range);const a=utcDate(start),b=utcDate(end??start);return !Number.isNaN(a.getTime())&& !Number.isNaN(b.getTime()) && a<r.end && b>=r.start;};
 const statusEligible=status=>!new Set(['cancelled','canceled','pending','unshipped','replacement']).has(norm(status).replaceAll(' ',''));
 const orderItemKey=row=>rawField(row.raw,['order-item-id','orderItemId','order-item-code','amazon-order-item-id'])??row.order_item_id??row.source_row_id??row.id;
 const returnKey=row=>rawField(row.raw,['return-event-id','event-id','rma-id'])??`${row.order_id??''}|${rawField(row.raw,['order-item-id','orderItemId'])??row.order_item_id??''}|${row.sku??''}|${row.return_date??''}|${row.quantity??''}`;
@@ -217,7 +216,28 @@ export function calculateDashboardMetrics(input,range){
   const financeReimbursements=financialRows.filter(isReimbursement);const reportReimbursementAudit=dedupe(input.reimbursements??[]);
   const reimbursementRows=financeReimbursements.length?financeReimbursements:reportReimbursementAudit.included;const reimbursements=signedSum(reimbursementRows);
 
-  const headerAudit=dedupe((input.settlementHeaders??[]).filter(row=>!/failed/.test(text(row))&&((row.deposit_date&&inRange(row.deposit_date,range))||overlapsRange(row.settlement_start_date,row.settlement_end_date,range))),row=>row.settlement_id??keyOf(row));
+  // Amazon's Transfers section reports the money that actually left Amazon
+  // for the seller's bank *during the statement window* - it is keyed on the
+  // deposit, not on the settlement period the deposit pays for. The `||
+  // overlapsRange(settlement_start, settlement_end)` clause that used to sit
+  // here therefore counted a second, different population: settlements whose
+  // *period* touches the window even though the deposit landed outside it.
+  // Measured over-count, both accounts, both in the same direction:
+  //   Seller A 1-25 Jul: -1,17,288.92 vs Amazon -1,07,559.21  (+9,729.71)
+  //   Seller B 21-29 Jul:    -328.84 vs Amazon      -246.63  (+   82.21)
+  // The metric's own description already said "deposit_date in the selected
+  // range"; the code did something wider. Dropping the clause must move both
+  // accounts toward zero - if it moves anything the other way, the diagnosis
+  // above is wrong and this should be reverted rather than compensated for.
+  //
+  // That over-count was only half of it. The rows feeding this filter were
+  // also picked non-deterministically (see loadDashboardCalculations), which
+  // could resolve a settlement to a line carrying no total-amount and quietly
+  // score it 0. The two defects pull in opposite directions, which is why
+  // Seller A's transfers moved -1,09,260.18 -> -1,17,288.92 across reloads
+  // with nothing about transfers having changed. Both are fixed together;
+  // neither is meaningful to measure while the other is live.
+  const headerAudit=dedupe((input.settlementHeaders??[]).filter(row=>!/failed/.test(text(row))&&row.deposit_date&&inRange(row.deposit_date,range)),row=>row.settlement_id??keyOf(row));
   const transferRows=headerAudit.included.map(row=>({...row,amount:-Math.abs(Number(row.total_amount??row.amount??0))}));const settled=Math.abs(signedSum(transferRows));
 
   const gstImported=(input.gstInvoices??[]).filter(row=>Object.keys(row.raw??{}).length>0&&!/synthetic|order item estimate/.test(norm(`${row.source??''} ${JSON.stringify(row.raw??{})}`)));const gstAudit=dedupe(gstImported,gstKey);

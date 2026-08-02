@@ -847,7 +847,27 @@ async function loadDashboardCalculations(db, tenantId, range) {
   const settlementRows = await db.query(`select id source_row_id,settlement_id,order_id,amount_type,amount_description,amount,posted_date,raw,
       coalesce(raw->>'transaction-type',raw->>'transaction type',raw->>'transactionType') parent_transaction_type
       from settlement_rows where tenant_id=$1 and posted_date >= $2 and posted_date < $3`,[tenantId,range.start,range.end]);
-  const settlementHeaders = await db.query(`select settlement_id,coalesce(raw->>'deposit-date',raw->>'deposit date',raw->>'depositDate') deposit_date,coalesce(raw->>'settlement-start-date',raw->>'settlement start date',raw->>'settlementStartDate') settlement_start_date,coalesce(raw->>'settlement-end-date',raw->>'settlement end date',raw->>'settlementEndDate') settlement_end_date,coalesce(nullif(raw->>'total-amount',''),nullif(raw->>'total amount',''),nullif(raw->>'totalAmount','')) total_amount,coalesce(raw->>'transaction-type',raw->>'transaction type') transaction_type,raw from settlement_rows where tenant_id=$1 and (coalesce(raw->>'deposit-date',raw->>'deposit date',raw->>'depositDate','')<>'' or coalesce(raw->>'settlement-start-date',raw->>'settlement start date',raw->>'settlementStartDate','')<>'')`,[tenantId]);
+  // In a V2 settlement flat file only the *first* line of a document is the
+  // header: it carries deposit-date and total-amount and leaves the
+  // transaction columns empty, while every following line repeats
+  // settlement-id and settlement-start-date but not total-amount. Selecting
+  // on "has a deposit-date OR a settlement-start-date" therefore returned
+  // hundreds of non-header lines per document alongside the one real header,
+  // and the caller then picked one row per settlement_id from an unordered
+  // result - so which row won, and whether it had a total-amount at all, was
+  // whatever Postgres happened to return that time. Reproduced against a
+  // real Postgres with three documents (two deposited, one still open): the
+  // old predicate returned 17 rows, and taking the first per settlement_id
+  // resolved two of the three settlements to a detail line whose
+  // total-amount was empty - scoring a genuine payout as 0.00. The new
+  // predicate returns exactly the 2 real headers, and returns them
+  // identically after the rows are physically moved on disk.
+  //
+  // Requiring a non-empty total-amount keeps only genuine headers; requiring
+  // a deposit-date drops settlements Amazon has not paid out yet (they have
+  // transferred nothing, so they belong in no statement's Transfers); and
+  // the ORDER BY makes the choice reproducible instead of load-dependent.
+  const settlementHeaders = await db.query(`select settlement_id,coalesce(raw->>'deposit-date',raw->>'deposit date',raw->>'depositDate') deposit_date,coalesce(raw->>'settlement-start-date',raw->>'settlement start date',raw->>'settlementStartDate') settlement_start_date,coalesce(raw->>'settlement-end-date',raw->>'settlement end date',raw->>'settlementEndDate') settlement_end_date,coalesce(nullif(raw->>'total-amount',''),nullif(raw->>'total amount',''),nullif(raw->>'totalAmount','')) total_amount,coalesce(raw->>'transaction-type',raw->>'transaction type') transaction_type,raw from settlement_rows where tenant_id=$1 and coalesce(nullif(raw->>'total-amount',''),nullif(raw->>'total amount',''),nullif(raw->>'totalAmount','')) is not null and coalesce(raw->>'deposit-date',raw->>'deposit date',raw->>'depositDate','')<>'' order by settlement_id,deposit_date,id`,[tenantId]);
   // order_id here is deliberately ft.related_order_id (the transaction-level
   // identifier, extracted by financeRelatedValue matching an exact
   // ORDER_ID/AMAZON_ORDER_ID identifier name), not fi.order_id. fi.order_id
