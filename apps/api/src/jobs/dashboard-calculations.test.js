@@ -181,3 +181,42 @@ test('one return without a quantity no longer blanks Net Qty and Return Rate',()
   assert.equal(clean.metrics.netQty.value,100);
   assert.equal(clean.metrics.returnRate.value,0);
 });
+
+test('Net Sales counts product sales only, never the tax stamped with the same amount_type',()=>{
+  // Real seller (Ved Shakti Ayervedic, Jul 21-29 2026). Amazon's statement:
+  // seller fulfilled product sales 567.60, product sale refunds -141.90,
+  // GST collected 28.40, GST refunds -7.10. Amazon stamps amount_type
+  // "ItemPrice" on Principal AND Product Tax alike, so folding amount_type
+  // into the product-sale test made the tax count as a sale and the dashboard
+  // reported Net Sales of 596.00 (= 567.60 + 28.40) instead of 425.70.
+  const range={start:'2026-07-21T00:00:00Z',end:'2026-07-30T00:00:00Z'};
+  const r=calculateDashboardMetrics({
+    orders:[],orderItems:[],returns:[],reimbursements:[],gstInvoices:[],financeItems:[],settledOrderIdsAllTime:[],
+    settlementRows:[
+      line('sale','Principal',567.60,'Order',{amount_type:'ItemPrice'}),
+      line('refund','Principal',-141.90,'Refund',{amount_type:'ItemPrice'}),
+      line('gst','Product Tax',28.40,'Order',{amount_type:'ItemPrice'}),
+      line('gst-refund','Product Tax',-7.10,'Refund',{amount_type:'ItemPrice'})
+    ],
+    settlementHeaders:[{settlement_id:'s1',deposit_date:'2026-07-29T00:00:00Z',total_amount:246.63}]
+  },range);
+  assert.equal(r.metrics.netSales.value,425.70);
+  assert.equal(r.statement.income.value,425.70);
+  assert.equal(r.statement.gst.value,21.30);
+  assert.equal(r.statement.tax.value,0);
+  assert.equal(r.statement.transfers.value,-246.63);
+});
+
+test('flags a settlement whose lines do not add up to Amazon\'s own stated total',()=>{
+  // Every settlement document states its own total, so its lines must foot to
+  // it exactly. This is a complete self-check for ingestion loss - no
+  // statement PDF and no matching date range required.
+  const range={start:'2026-07-01T00:00:00Z',end:'2026-07-30T00:00:00Z'};
+  const base={orders:[],orderItems:[],returns:[],reimbursements:[],gstInvoices:[],financeItems:[],settlementHeaders:[],settledOrderIdsAllTime:[],settlementRows:[line('a','Principal',100,'Order')]};
+  const clean=calculateDashboardMetrics(base,range);
+  assert.deepEqual(clean.diagnostics.settlementIntegrity,[]);
+  const broken=calculateDashboardMetrics({...base,settlementIntegrity:[{settlement_id:'s1',row_count:9,rows_total:328.84,header_total:246.63}]},range);
+  assert.equal(broken.diagnostics.settlementIntegrity.length,1);
+  assert.equal(broken.diagnostics.settlementIntegrity[0].difference,82.21);
+  assert.equal(broken.diagnostics.settlementIntegrity[0].settlement_id,'s1');
+});

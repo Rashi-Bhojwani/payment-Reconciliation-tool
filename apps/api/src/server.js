@@ -813,9 +813,33 @@ async function loadDashboardCalculations(db, tenantId, range) {
   // orders that plainly were, and the Deferred merge then adds their money on
   // top of settlement money that is already counted somewhere.
   const settledOrderIds = await db.query('select distinct order_id from settlement_rows where tenant_id=$1 and order_id is not null and order_id<>$2',[tenantId,'']);
+  // Every Amazon settlement document states its own total, and the lines it
+  // contains must add up to exactly that. So this is a complete, self-checking
+  // proof that a settlement was ingested without losing or duplicating a
+  // single row - no statement PDF, no date range, no comparison against
+  // anything external. If a settlement does not foot, its lines are wrong and
+  // every figure derived from them is wrong, silently.
+  //
+  // Deliberately NOT range-filtered: a settlement's lines span its own period,
+  // not whatever window the seller happens to be looking at, so checking only
+  // the in-range subset would report a shortfall on every settlement that
+  // straddles the edge of the view.
+  const settlementIntegrity = await db.query(
+    `select settlement_id,
+            count(*) row_count,
+            round(sum(amount)::numeric, 2) rows_total,
+            round(max(coalesce(nullif(raw->>'total-amount',''), nullif(raw->>'total amount',''), nullif(raw->>'totalAmount',''))::numeric), 2) header_total
+       from settlement_rows
+      where tenant_id=$1 and settlement_id is not null and settlement_id <> ''
+      group by settlement_id
+     having max(coalesce(nullif(raw->>'total-amount',''), nullif(raw->>'total amount',''), nullif(raw->>'totalAmount',''))::numeric) is not null
+        and abs(sum(amount) - max(coalesce(nullif(raw->>'total-amount',''), nullif(raw->>'total amount',''), nullif(raw->>'totalAmount',''))::numeric)) > 0.01
+      order by abs(sum(amount) - max(coalesce(nullif(raw->>'total-amount',''), nullif(raw->>'total amount',''), nullif(raw->>'totalAmount',''))::numeric)) desc`,
+    [tenantId]
+  ).catch(error => { app.log.warn({ err: error, tenantId }, 'Settlement integrity check failed'); return { rows: [] }; });
   const reimbursements = await db.query('select amount,reason,sku,reimbursement_date from reimbursements where tenant_id=$1 and reimbursement_date >= $2::date and reimbursement_date < $3::date',[tenantId,range.start,range.end]);
   const gstInvoices = await db.query('select id source_row_id,invoice_type,order_id,cgst,sgst,igst,taxable_value,invoice_date,raw from gst_invoices where tenant_id=$1 and invoice_date >= $2::date and invoice_date < $3::date',[tenantId,range.start,range.end]);
-  return calculateDashboardMetrics({orders:orders.rows,orderItems:orderItems.rows,returns:returns.rows,settlementRows:settlementRows.rows,settlementHeaders:settlementHeaders.rows,financeItems:financeItems.rows,financeTransactions:financeTransactions.rows,reimbursements:reimbursements.rows,gstInvoices:gstInvoices.rows,settledOrderIdsAllTime:settledOrderIds.rows.map(row=>row.order_id)},range);
+  return calculateDashboardMetrics({orders:orders.rows,orderItems:orderItems.rows,returns:returns.rows,settlementRows:settlementRows.rows,settlementHeaders:settlementHeaders.rows,financeItems:financeItems.rows,financeTransactions:financeTransactions.rows,reimbursements:reimbursements.rows,gstInvoices:gstInvoices.rows,settledOrderIdsAllTime:settledOrderIds.rows.map(row=>row.order_id),settlementIntegrity:settlementIntegrity.rows},range);
 }
 
 app.get('/api/tenants/:tenantId/calculations/:metric', async request => {
@@ -1168,6 +1192,14 @@ app.get('/api/tenants/:tenantId/dashboard', async request => {
     // block exists to size the pending pipeline - and to keep the two
     // distinguishable failure modes apart: "Amazon counts money we do not
     // hold" versus "we misclassify money we do hold".
+    // A settlement whose lines do not add up to Amazon's own stated total is
+    // the one failure that corrupts every figure silently, so it is reported
+    // first and unconditionally, with the exact shortfall.
+    const integrity=dashboardCalculations.diagnostics?.settlementIntegrity;
+    if (integrity?.length) {
+      console.log(`[dashboard ${tenantId.slice(0, 8)}] SETTLEMENT INTEGRITY FAILURE - ${integrity.length} settlement(s) do not add up to the total Amazon stamped on them. Figures derived from them are wrong; re-run Reset & Resync for settlements.`);
+      for (const row of integrity) console.log(`[dashboard ${tenantId.slice(0, 8)}]   settlement=${row.settlement_id} rows=${row.row_count} sum=${row.rows_total.toFixed(2)} amazon_total=${row.header_total.toFixed(2)} difference=${row.difference.toFixed(2)}`);
+    }
     const pendingDetail=dashboardCalculations.diagnostics?.pendingFinanceRowsDetail;
     const mergeSummary=dashboardCalculations.diagnostics?.pendingMergeSummary;
     if (pendingDetail?.length) {

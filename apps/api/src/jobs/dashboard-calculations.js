@@ -37,7 +37,16 @@ const keyOf = row => row.source_row_id ?? row.id ?? `${row.transaction_id??row.s
 function dedupe(rows,key=keyOf){const seen=new Set(),included=[],duplicates=[];for(const row of rows){const keyValue=key(row);(seen.has(keyValue)?duplicates:included).push(row);seen.add(keyValue);}return{included,duplicates};}
 const isSummary=row=>String(row.category??'').startsWith('summary_');
 const isRefund=row=>/refund/.test(text(row));
-const isPrincipal=row=>/principal|item price/.test(norm(`${row.amount_type??''} ${row.amount_description??''} ${row.category??''}`));
+// amount_type is the settlement report's GROUP for a line, not the line
+// itself: Amazon stamps "ItemPrice" on Principal, Product Tax, Shipping and
+// Shipping tax alike. Including it here made every one of those count as a
+// product sale, because norm("ItemPrice Product Tax") contains "item price".
+// Confirmed against a real seller's statement: the dashboard reported Net
+// Sales of 596.00 where Amazon's product sales were 567.60 and GST was 28.40
+// - the tax was being added to the sale. Net Sales, Fee Impact, Refund Value
+// Rate and DRR all read off this. Only the line's own description (or the
+// normalized Finance API category) may decide that a row is a product sale.
+const isPrincipal=row=>/principal|item price/.test(norm(`${row.amount_description??''} ${row.category??''}`));
 const isPromotion=row=>/promotion|promo rebate/.test(text(row))&&!/product tax discount|shipping tax discount|gift wrap tax discount/.test(text(row));
 // Amazon's own Transaction/Account Activity statement puts TDS Reimbursement
 // and Chargebacks under Income - grouped with A-to-z Guarantee claims,
@@ -245,7 +254,10 @@ export function calculateDashboardMetrics(input,range){
     settledOrderIdsKnown:settledOrderIds.size,
     ordersWithMultipleTransactions:[...pendingByOrder].filter(([,entry])=>entry.transactions.size>1).map(([orderId,entry])=>({order_id:orderId,total:entry.total,transactions:[...entry.transactions].map(([transactionId,total])=>({transaction_id:transactionId,total}))}))
   };
-  const diagnostics={sourcePolicy:{financial:`${financialSource} (${settlementComplete?`settlement only; ${pendingFinanceRows.length} Deferred Finance API row(s) measured but excluded - Amazon's statement does not carry them`:'settlement incomplete; Finances fallback'})`,reimbursements:financeReimbursements.length?financialSource:'Reimbursements report fallback',gst:'Imported GST B2B/B2C rows only',settled:'Settlement headers filtered by deposit_date'},includedRows:financialRows.length,excludedRows:(settlementComplete?excludedFinanceRows:settlementAudit.included.length),duplicateRows:financialDuplicates.length+itemAudit.duplicates.length+returnAudit.duplicates.length+gstAudit.duplicates.length,categoryTotals:{grossSales,productRefunds,netPromotions,expenseDebits,expenseCredits,tcsTds,operationalFees,gst,tax,transfers},pendingFinanceRowsDetail,pendingMergeSummary};
+  const diagnostics={sourcePolicy:{financial:`${financialSource} (${settlementComplete?`settlement only; ${pendingFinanceRows.length} Deferred Finance API row(s) measured but excluded - Amazon's statement does not carry them`:'settlement incomplete; Finances fallback'})`,reimbursements:financeReimbursements.length?financialSource:'Reimbursements report fallback',gst:'Imported GST B2B/B2C rows only',settled:'Settlement headers filtered by deposit_date'},includedRows:financialRows.length,excludedRows:(settlementComplete?excludedFinanceRows:settlementAudit.included.length),duplicateRows:financialDuplicates.length+itemAudit.duplicates.length+returnAudit.duplicates.length+gstAudit.duplicates.length,categoryTotals:{grossSales,productRefunds,netPromotions,expenseDebits,expenseCredits,tcsTds,operationalFees,gst,tax,transfers},pendingFinanceRowsDetail,pendingMergeSummary,
+    // Settlements whose own lines do not add up to the total Amazon stamped on
+    // the document. Empty means every settlement held is provably complete.
+    settlementIntegrity:(input.settlementIntegrity??[]).map(row=>({settlement_id:row.settlement_id,row_count:Number(row.row_count),rows_total:Number(row.rows_total),header_total:Number(row.header_total),difference:round2(Number(row.rows_total)-Number(row.header_total))}))};
   const metric=(value,unit,formula,components,rows,source=financialSource,status=value==null?'Unavailable':null)=>({value,unit,formula,components,rows,source,status,range,diagnostics});
   const metrics={
     netSales:metric(netSales,'amount','Gross product Principal sales − Refund Principal lines − net seller-funded promotions',[component('gross_sales','Gross product sales',grossSales,grossRows),component('product_refunds','Product refunds',-productRefunds,refundPrincipalRows,'−'),component('promotions','Net seller-funded promotions',-netPromotions,promoRows,'−')],[...grossRows,...refundPrincipalRows,...promoRows]),
