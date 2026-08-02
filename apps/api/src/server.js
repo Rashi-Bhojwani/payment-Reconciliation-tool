@@ -9,6 +9,7 @@ import { getSpApiEndpoint, MARKETPLACES, REPORT_TYPES, SpApiClient } from '@reco
 import { secrets } from './config/secrets.js';
 import { decryptSecret, encryptSecret } from './config/crypto.js';
 import { buildGstInvoicesFromOrderItems, startScheduler, syncRecentApiDataForTenant, syncReportForTenant } from './jobs/sync.js';
+import { buildRestoreStatements, createSyncQueue } from './jobs/sync-queue.js';
 import { categorizeFinanceLabel } from './jobs/finance-components.js';
 import { calculateDashboardMetrics } from './jobs/dashboard-calculations.js';
 import { runFeeAuditForTenant } from './jobs/fee-audit.js';
@@ -404,7 +405,7 @@ async function findMissingReportTypes(tenantId, range) {
       [tenantId, reportType]
     );
     if (running.rowCount) continue;
-    if (inFlightSyncs.has(`${tenantId}:${reportType}`)) continue;
+    if (syncQueue.isBusy(`${tenantId}:${reportType}`)) continue;
     const backoffMs = await autoSyncBackoffRemainingMs(tenantId, reportType);
     if (backoffMs > 0) {
       console.log(`[sync ${tenantId.slice(0, 8)}:${reportType}] skipped - backing off after repeated failures, next auto-retry in ${Math.ceil(backoffMs / 60000)} min`);
@@ -417,14 +418,9 @@ async function findMissingReportTypes(tenantId, range) {
 // One run per tenant+report type per process, no matter how many requests ask
 // for it. Callers join the run already talking to Amazon instead of starting a
 // second one, which is what the sync_jobs check alone cannot guarantee.
-const inFlightSyncs = new Map();
+const syncQueue = createSyncQueue();
 function runExclusiveSync(tenantId, reportType, start) {
-  const key = `${tenantId}:${reportType}`;
-  const existing = inFlightSyncs.get(key);
-  if (existing) return existing;
-  const task = Promise.resolve().then(start).finally(() => inFlightSyncs.delete(key));
-  inFlightSyncs.set(key, task);
-  return task;
+  return syncQueue.run({ resourceKey: `${tenantId}:${reportType}`, start });
 }
 function triggerBackgroundSync(tenantId, reportType, range) {
   const task = runExclusiveSync(tenantId, reportType, () => reportType === 'DIRECT_SP_API_SYNC'
@@ -740,15 +736,79 @@ app.post('/api/tenants/:tenantId/sync', async request => {
 // cache with no date columns of its own; clearing it never loses data - it
 // just means the next sync for any other period re-examines documents it
 // had already skipped, safely upserting the exact same rows back in place.
-async function resetSettlementData(tenantId, range) {
-  const counts = await withTenant(tenantId, async client => {
-    const deletedRows = await client.query('delete from settlement_rows where tenant_id=$1 and posted_date >= $2 and posted_date < $3', [tenantId, range.start, range.end]);
-    const deletedDocs = await client.query("delete from processed_report_documents where tenant_id=$1 and report_type='GET_V2_SETTLEMENT_REPORT_DATA_FLAT_FILE_V2'", [tenantId]);
-    const deletedJobs = await client.query("delete from sync_jobs where tenant_id=$1 and report_type='GET_V2_SETTLEMENT_REPORT_DATA_FLAT_FILE_V2' and range_start <= $3 and range_end >= $2", [tenantId, range.start, range.end]);
-    return { deletedSettlementRows: deletedRows.rowCount, deletedProcessedDocuments: deletedDocs.rowCount, deletedSyncJobs: deletedJobs.rowCount };
+//
+// The delete happens before the re-fetch, which means a re-fetch that fails
+// leaves the tenant with *less* data than it started with. That is not
+// hypothetical: a Reset & Resync run hit "429" six times on a single document
+// and gave up after 248s, so the rows were deleted and nothing came back. A
+// reconciliation tool losing a seller's ledger because Amazon was busy is the
+// worst possible outcome, so the deleted rows are kept in memory for the
+// duration of the re-fetch and put back if it does not fully succeed. They go
+// back with `on conflict do nothing`, so any row the re-fetch *did* bring
+// down stays the authoritative copy and only genuine gaps are refilled.
+const SETTLEMENT_REPORT_TYPE = 'GET_V2_SETTLEMENT_REPORT_DATA_FLAT_FILE_V2';
+async function restoreSettlementRows(tenantId, rows) {
+  const statements = buildRestoreStatements(rows);
+  if (!statements.length) return 0;
+  return withTenant(tenantId, async client => {
+    let restored = 0;
+    for (const statement of statements) {
+      const result = await client.query(statement.text, statement.values);
+      restored += result.rowCount ?? 0;
+    }
+    return restored;
   });
-  const resync = await syncReportForSellerRequest({ tenantId, reportType: 'GET_V2_SETTLEMENT_REPORT_DATA_FLAT_FILE_V2' }, range);
-  return { ...counts, resync };
+}
+async function resetSettlementData(tenantId, range) {
+  return syncQueue.run({
+    resourceKey: `${tenantId}:${SETTLEMENT_REPORT_TYPE}`,
+    dedupeKey: `${tenantId}:reset:${SETTLEMENT_REPORT_TYPE}:${range.start}:${range.end}`,
+    queue: true,
+    start: () => runSettlementReset(tenantId, range)
+  });
+}
+async function runSettlementReset(tenantId, range) {
+  const { counts, snapshot } = await withTenant(tenantId, async client => {
+    // One transaction: a reader that arrives mid-reset must not see the rows
+    // half-gone, and a failure partway through must not leave the sync ledger
+    // cleared while the rows it describes are still present.
+    await client.query('begin');
+    try {
+      const deletedRows = await client.query('delete from settlement_rows where tenant_id=$1 and posted_date >= $2 and posted_date < $3 returning *', [tenantId, range.start, range.end]);
+      const deletedDocs = await client.query("delete from processed_report_documents where tenant_id=$1 and report_type=$2", [tenantId, SETTLEMENT_REPORT_TYPE]);
+      const deletedJobs = await client.query("delete from sync_jobs where tenant_id=$1 and report_type=$2 and range_start <= $4 and range_end >= $3", [tenantId, SETTLEMENT_REPORT_TYPE, range.start, range.end]);
+      await client.query('commit');
+      return {
+        snapshot: deletedRows.rows,
+        counts: { deletedSettlementRows: deletedRows.rowCount, deletedProcessedDocuments: deletedDocs.rowCount, deletedSyncJobs: deletedJobs.rowCount }
+      };
+    } catch (error) {
+      await client.query('rollback').catch(() => undefined);
+      throw error;
+    }
+  });
+
+  let resync;
+  try {
+    resync = await syncReportForSellerRequest({ tenantId, reportType: SETTLEMENT_REPORT_TYPE }, range);
+  } catch (error) {
+    const restoredSettlementRows = await restoreSettlementRows(tenantId, snapshot);
+    const message = error instanceof Error ? error.message : 'Settlement re-sync failed';
+    console.error(`[reset ${tenantId.slice(0, 8)}] re-sync threw after deleting ${snapshot.length} row(s); restored ${restoredSettlementRows} of them: ${message}`);
+    throw Object.assign(new Error(`Settlement re-sync failed, so the ${snapshot.length} deleted row(s) were put back (${restoredSettlementRows} restored) - your data is as it was before the reset. Amazon reported: ${message}`), { statusCode: 502 });
+  }
+
+  const outstandingDocuments = Number(resync?.outstandingDocuments ?? 0);
+  const incomplete = resync?.status === 'failed' || outstandingDocuments > 0;
+  if (!incomplete) return { ...counts, restoredSettlementRows: 0, resync };
+
+  const restoredSettlementRows = await restoreSettlementRows(tenantId, snapshot);
+  const reason = resync?.status === 'failed'
+    ? `the re-sync failed (${resync.error ?? 'no reason reported'})`
+    : `${outstandingDocuments} settlement document(s) could not be fetched`;
+  const warning = `Reset incomplete: ${reason}. ${restoredSettlementRows} of the ${snapshot.length} deleted row(s) were restored so no ledger data was lost - run the reset again once Amazon's rate limit clears.`;
+  console.warn(`[reset ${tenantId.slice(0, 8)}] ${warning}`);
+  return { ...counts, restoredSettlementRows, warning, resync };
 }
 
 app.post('/api/tenants/:tenantId/settlement-data/reset', async request => {

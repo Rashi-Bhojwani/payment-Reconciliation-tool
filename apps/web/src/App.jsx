@@ -328,7 +328,13 @@ function SyncLedger({ tenantId, jobs = [], onSynced, reportTypes, title, subtitl
     try {
       const result = await resetSettlementData(tenantId, range);
       const syncResult = result?.resync;
-      if (syncResult?.status === 'failed') throw new Error(syncResult.error ?? 'Resync failed');
+      // A reset that could not re-download everything puts the deleted rows
+      // back rather than leaving the ledger short, so it is neither a plain
+      // success nor a plain failure - say exactly which of the two happened
+      // instead of reporting "re-imported 0 fresh rows" as if it worked.
+      if (result?.warning || syncResult?.status === 'failed') {
+        throw new Error(result?.warning ?? `${syncResult?.error ?? 'Resync failed'}${result?.restoredSettlementRows ? ` (${formatNumber(result.restoredSettlementRows)} deleted rows were restored)` : ''}`);
+      }
       const summary = `Cleared ${formatNumber(result.deletedSettlementRows)} stored rows, re-imported ${formatNumber(syncResult?.rowsImported)} fresh rows`;
       setRowState(s => ({ ...s, [reportType]: { loading: false, justSynced: true, summary } }));
       await onSynced?.();
