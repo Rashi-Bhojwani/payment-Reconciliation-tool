@@ -203,31 +203,11 @@ export function calculateDashboardMetrics(input,range){
   // are absent from our settlement data, not a misclassification of rows we
   // already have. pendingMergeSummary below measures that gap on every render
   // without letting it corrupt the statement.
-  // Amazon's Account Activity statement covers everything that happened in the
-  // window, whether or not the money has been paid out yet. Settlement carries
-  // only what has settled, so on its own it can never contain a sale or refund
-  // Amazon has recorded but not yet released.
-  //
-  // Both halves are needed, and each order must be counted once:
-  //   - settled orders come from settlement (authoritative, already paid)
-  //   - orders with no settlement line anywhere come from the Finances API
-  //
-  // This merge failed the first time it was tried because settlement rows were
-  // dated by when the settlement posted them, so old orders were pulled into
-  // the window alongside the new ones and the two halves overlapped. Settlement
-  // rows are now dated by the order (see loadDashboardCalculations), so the two
-  // halves are disjoint and the totals stop double counting.
-  //
-  // Verified against a real statement, 21-29 Jul 2026: five orders placed in
-  // the window, four older ones settling during it. Settlement contributes
-  // nothing (those four are dated outside), the five unsettled orders
-  // contribute 425.70 - Amazon's Income exactly, with Expenses and GST also
-  // exact.
   const settledOrderIds=new Set([...(input.settledOrderIdsAllTime??[]),...settlementAudit.included.map(row=>row.order_id)].filter(Boolean));
-  const pendingFinanceRows=financeAudit.included.filter(row=>row.order_id&&!settledOrderIds.has(row.order_id));
-  const financialRows=settlementComplete?[...settlementAudit.included,...pendingFinanceRows]:financeAudit.included;
+  const pendingFinanceRows=financeAudit.included.filter(row=>row.order_id&&!settledOrderIds.has(row.order_id)&&row.transaction_status&&!/released/i.test(row.transaction_status));
+  const financialRows=settlementComplete?settlementAudit.included:financeAudit.included;
   const financialDuplicates=settlementComplete?settlementAudit.duplicates:financeAudit.duplicates;
-  const financialSource=settlementComplete?(pendingFinanceRows.length?'Amazon Settlement report + not-yet-settled Finances API activity':'Amazon Settlement report'):'Amazon Finances API';
+  const financialSource=settlementComplete?'Amazon Settlement report':'Amazon Finances API';
   const principalRows=financialRows.filter(isPrincipal);const grossRows=principalRows.filter(row=>amount(row)>0&&!isRefund(row));const refundPrincipalRows=principalRows.filter(row=>amount(row)<0&&isRefund(row));
   const promoRows=financialRows.filter(isPromotion);const promoDebits=promoRows.filter(row=>amount(row)<0);const promoRefunds=promoRows.filter(row=>amount(row)>0);
   const grossSales=signedSum(grossRows);const productRefunds=Math.abs(signedSum(refundPrincipalRows));const netPromotions=round2(Math.abs(signedSum(promoDebits))-signedSum(promoRefunds));const netSales=round2(grossSales-productRefunds-netPromotions);
