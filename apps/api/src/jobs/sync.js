@@ -225,10 +225,16 @@ async function saveGstInvoices(tenantId, content, invoiceType) {
 }
 
 /** @param {string} tenantId @param {string} content */
+// Amazon names the returned-unit column differently across return report
+// generations and between FBA and seller-fulfilled returns, and pick() only
+// matches names it is given. A name we do not list arrives as a null quantity,
+// which used to blank Net Qty and Return Rate entirely.
+const RETURN_QUANTITY_FIELDS = Object.freeze(['quantity', 'quantity-returned', 'return quantity', 'return-quantity', 'returnQuantity', 'quantity-shipped', 'units', 'unit-count', 'item-quantity']);
+
 async function saveReturns(tenantId, content) {
   const rows = z.array(ReportRowSchema).parse(parseReportRows('GET_FBA_FULFILLMENT_CUSTOMER_RETURNS_DATA', content));
   await withTenantTransaction(tenantId, async client => {
-    const batch = rows.map(row => [tenantId, text(pick(row, ['order-id', 'order id', 'amazon-order-id', 'amazonOrderId'])), text(pick(row, ['reason', 'return-reason', 'return reason', 'returnReason'])), text(pick(row, ['disposition', 'detailed-disposition', 'detailed disposition'])), 'yet_to_receive', text(pick(row, ['return-date', 'return date', 'returnDate', 'date'])) ?? null, pick(row, ['quantity', 'quantity-returned', 'return quantity']) == null ? null : integer(pick(row, ['quantity', 'quantity-returned', 'return quantity'])), row, sourceKey(row, [pick(row, ['order-id', 'order id', 'amazon-order-id', 'amazonOrderId']), pick(row, ['return-date', 'return date', 'returnDate', 'date']), pick(row, ['reason', 'return-reason', 'return reason', 'returnReason']), pick(row, ['disposition', 'detailed-disposition', 'detailed disposition'])])]);
+    const batch = rows.map(row => [tenantId, text(pick(row, ['order-id', 'order id', 'amazon-order-id', 'amazonOrderId'])), text(pick(row, ['reason', 'return-reason', 'return reason', 'returnReason'])), text(pick(row, ['disposition', 'detailed-disposition', 'detailed disposition'])), 'yet_to_receive', text(pick(row, ['return-date', 'return date', 'returnDate', 'date'])) ?? null, pick(row, RETURN_QUANTITY_FIELDS) == null ? null : integer(pick(row, RETURN_QUANTITY_FIELDS)), row, sourceKey(row, [pick(row, ['order-id', 'order id', 'amazon-order-id', 'amazonOrderId']), pick(row, ['return-date', 'return date', 'returnDate', 'date']), pick(row, ['reason', 'return-reason', 'return reason', 'returnReason']), pick(row, ['disposition', 'detailed-disposition', 'detailed disposition'])])]);
     // Same reasoning as settlement_rows: source_key, not the business
     // columns, is the deterministic identity of a source row, and is what
     // the ON CONFLICT target must actually be to update-not-error on re-sync.

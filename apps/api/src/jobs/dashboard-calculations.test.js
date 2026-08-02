@@ -152,3 +152,32 @@ test('an order is never counted twice when both order items and settlement carry
   assert.equal(r.metrics.netQty.value,2);
   assert.equal(r.metrics.netQty.source,'Orders + Returns');
 });
+
+test('one return without a quantity no longer blanks Net Qty and Return Rate',()=>{
+  // Live case: 9 return rows, 8 with quantities. Requiring every row to carry
+  // one made Net Qty and Return Rate report Unavailable even though Amazon had
+  // stated 218 shipped units and 8 returned units. The KPI worked on a 30-day
+  // range and broke on a narrower one that happened to include the row Amazon
+  // had not put a quantity on.
+  const range={start:'2026-07-01T00:00:00Z',end:'2026-07-30T00:00:00Z'};
+  const ret=(id,quantity)=>({source_row_id:id,order_id:`o-${id}`,return_date:'2026-07-12',quantity,raw:{eventId:id}});
+  const base={
+    orders:[{amazon_order_id:'order-a',status:'Shipped',order_date:'2026-07-05T00:00:00Z'}],
+    orderItems:[{source_row_id:'i1',amazon_order_id:'order-a',quantity_ordered:100,raw:{'order-item-id':'i1'}}],
+    reimbursements:[],gstInvoices:[],settlementHeaders:[],financeItems:[],settledOrderIdsAllTime:[],settlementRows:[]
+  };
+  const partial=calculateDashboardMetrics({...base,returns:[ret('r1',3),ret('r2',5),ret('r3',null)]},range);
+  assert.equal(partial.metrics.returns.value,8);
+  assert.equal(partial.metrics.netQty.value,92);
+  assert.equal(partial.metrics.returnRate.value,8);
+  assert.match(partial.metrics.returns.status,/1 of 3 returns have no quantity/);
+  // No quantity anywhere is still honestly unavailable - never assumed to be one.
+  const none=calculateDashboardMetrics({...base,returns:[ret('r1',null)]},range);
+  assert.equal(none.metrics.returns.value,null);
+  assert.equal(none.metrics.netQty.value,null);
+  assert.match(none.metrics.netQty.status,/^Unavailable\b/);
+  // No returns at all is zero, not unavailable.
+  const clean=calculateDashboardMetrics({...base,returns:[]},range);
+  assert.equal(clean.metrics.netQty.value,100);
+  assert.equal(clean.metrics.returnRate.value,0);
+});

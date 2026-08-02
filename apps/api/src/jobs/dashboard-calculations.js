@@ -137,9 +137,21 @@ export function calculateDashboardMetrics(input,range){
     ordersCountedFromSettlement+=1;
   }
   const ordersWithoutQuantity=eligibleOrders.filter(order=>!unitsByOrder.has(order.amazon_order_id)).length;
-  const returnsAvailable=returnAudit.included.length>0?returnAudit.included.every(row=>num(row.quantity)!=null):true;
+  // Returns get the same treatment as shipped units. Requiring EVERY return
+  // row to carry a quantity meant a single row Amazon had not put a quantity
+  // on blanked Net Qty and Return Rate outright - seen live with 9 return
+  // rows where 8 had quantities, and confirmed by the KPI working on a
+  // 30-day range and going Unavailable on a narrower one that happened to
+  // include the incomplete row. Sum the quantities Amazon did state, and
+  // report the rows it did not. Still no guessing: a row without a quantity
+  // contributes nothing rather than being assumed to be one unit, and if
+  // Amazon stated no quantity anywhere the figure stays honestly unavailable.
+  const returnRowsWithQuantity=returnAudit.included.filter(row=>num(row.quantity)!=null);
+  const returnRowsMissingQuantity=returnAudit.included.length-returnRowsWithQuantity.length;
   const shippedUnits=unitsByOrder.size?[...unitsByOrder.values()].reduce((sum,units)=>sum+units,0):null;
-  const returnedUnits=returnsAvailable?returnAudit.included.reduce((s,r)=>s+num(r.quantity),0):null;
+  const returnedUnits=!returnAudit.included.length?0
+    :returnRowsWithQuantity.length?returnRowsWithQuantity.reduce((s,r)=>s+num(r.quantity),0)
+    :null;
   const netQty=shippedUnits==null||returnedUnits==null?null:shippedUnits-returnedUnits;
   const unitsSource=!unitsByOrder.size?'Orders + Returns'
     :ordersCountedFromSettlement?`Orders + Returns (${ordersCountedFromSettlement} order${ordersCountedFromSettlement===1?'':'s'} counted from Amazon settlement quantity-purchased)`
@@ -148,7 +160,9 @@ export function calculateDashboardMetrics(input,range){
   const unitsCoverageNote=shippedUnits==null?'Unavailable - Amazon has not returned order items or settlement quantities for this range yet'
     :ordersWithoutQuantity?`${ordersWithoutQuantity} of ${eligibleOrders.length} orders still awaiting quantity from Amazon`
     :null;
-  const returnsNote=returnedUnits==null?'Unavailable - a synced return is missing its quantity':null;
+  const returnsNote=returnedUnits==null?'Unavailable - Amazon has not stated a quantity on any return in this range'
+    :returnRowsMissingQuantity?`${returnRowsMissingQuantity} of ${returnAudit.included.length} returns have no quantity from Amazon yet`
+    :null;
   const settlementComplete=settlementAudit.included.some(row=>isPrincipal(row)||isProductGst(row)||isFee(row)||isTransfer(row))&&settlementAudit.included.some(row=>row.settlement_id||row.raw?.['settlement-id']||row.raw?.['settlement id']);
   // Deferred (not-yet-released) Finance API activity is deliberately NOT
   // added to the statement. It was added on the theory that Amazon's Account
