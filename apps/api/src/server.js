@@ -784,9 +784,27 @@ async function loadDashboardCalculations(db, tenantId, range) {
   const orders = await db.query('select id source_row_id,amazon_order_id,status,order_date,total_amount,raw from orders where tenant_id=$1 and order_date >= $2 and order_date < $3',[tenantId,range.start,range.end]);
   const orderItems = await db.query(`select oi.id source_row_id,oi.amazon_order_id,oi.asin,oi.sku,oi.title,oi.quantity_ordered,oi.item_price,oi.promotion_discount,oi.raw,o.status,o.order_date from order_items oi join orders o on o.tenant_id=oi.tenant_id and o.amazon_order_id=oi.amazon_order_id where oi.tenant_id=$1 and o.order_date >= $2 and o.order_date < $3`,[tenantId,range.start,range.end]);
   const returns = await db.query('select id source_row_id,order_id,return_date,return_reason,disposition,status,quantity,raw from returns where tenant_id=$1 and return_date >= $2::date and return_date < $3::date',[tenantId,range.start,range.end]);
-  const settlementRows = await db.query(`select id source_row_id,settlement_id,order_id,amount_type,amount_description,amount,posted_date,raw,
-      coalesce(raw->>'transaction-type',raw->>'transaction type',raw->>'transactionType') parent_transaction_type
-      from settlement_rows where tenant_id=$1 and posted_date >= $2 and posted_date < $3`,[tenantId,range.start,range.end]);
+  // Dated by the ORDER, not by when the settlement posted the line. Amazon's
+  // Account Activity statement reports a sale when the sale happened; a
+  // settlement line for that same sale carries the date the settlement
+  // recorded it, which can be weeks later. Filtering settlement lines on
+  // posted_date therefore pulls old orders into a window Amazon has already
+  // reported them outside of.
+  //
+  // Measured on a real seller for 21-29 Jul 2026: five orders were placed in
+  // the window and four older ones merely settled during it. Amazon counts the
+  // five (425.70). Dating by posted_date counted the four instead (567.60) -
+  // not a different amount for the same orders, a different set of orders.
+  //
+  // Rows with no order (service fees, storage, adjustments, transfers) keep
+  // posted_date, which is their own transaction date.
+  const settlementRows = await db.query(`select sr.id source_row_id,sr.settlement_id,sr.order_id,sr.amount_type,sr.amount_description,sr.amount,sr.posted_date,sr.raw,
+      coalesce(sr.raw->>'transaction-type',sr.raw->>'transaction type',sr.raw->>'transactionType') parent_transaction_type
+      from settlement_rows sr
+      left join orders o on o.tenant_id=sr.tenant_id and o.amazon_order_id=sr.order_id
+      where sr.tenant_id=$1
+        and coalesce(o.order_date, sr.posted_date) >= $2
+        and coalesce(o.order_date, sr.posted_date) < $3`,[tenantId,range.start,range.end]);
   const settlementHeaders = await db.query(`select settlement_id,coalesce(raw->>'deposit-date',raw->>'deposit date',raw->>'depositDate') deposit_date,coalesce(raw->>'settlement-start-date',raw->>'settlement start date',raw->>'settlementStartDate') settlement_start_date,coalesce(raw->>'settlement-end-date',raw->>'settlement end date',raw->>'settlementEndDate') settlement_end_date,coalesce(nullif(raw->>'total-amount',''),nullif(raw->>'total amount',''),nullif(raw->>'totalAmount','')) total_amount,coalesce(raw->>'transaction-type',raw->>'transaction type') transaction_type,raw from settlement_rows where tenant_id=$1 and (coalesce(raw->>'deposit-date',raw->>'deposit date',raw->>'depositDate','')<>'' or coalesce(raw->>'settlement-start-date',raw->>'settlement start date',raw->>'settlementStartDate','')<>'')`,[tenantId]);
   // order_id here is deliberately ft.related_order_id (the transaction-level
   // identifier, extracted by financeRelatedValue matching an exact
