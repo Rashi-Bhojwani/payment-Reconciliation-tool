@@ -2,7 +2,7 @@ import { createHash } from 'node:crypto';
 import cron from 'node-cron';
 import pLimit from 'p-limit';
 import { z } from 'zod';
-import { assertActiveTenant, pool, withTenant } from '@recon/db';
+import { assertActiveTenant, pool, withTenant, withTenantTransaction } from '@recon/db';
 import { getSpApiEndpoint, REPORT_TYPES, SpApiClient } from '@recon/sp-api-client';
 import { decryptSecret } from '../config/crypto.js';
 import { putRawReport } from '../storage/s3.js';
@@ -182,7 +182,7 @@ function parseReportRows(reportType, content) {
 /** @param {string} tenantId @param {string} content */
 async function saveSettlementRows(tenantId, content) {
   const rows = z.array(ReportRowSchema).parse(parseReportRows('GET_V2_SETTLEMENT_REPORT_DATA_FLAT_FILE_V2', content));
-  await withTenant(tenantId, async client => {
+  await withTenantTransaction(tenantId, async client => {
     const batch = rows.map(row => {
       const amount = number(pick(row, ['amount']));
       return [tenantId, text(pick(row, ['settlement-id', 'settlement id', 'settlementId'])), text(pick(row, ['order-id', 'order id', 'amazon-order-id', 'amazonOrderId'])), text(pick(row, ['amount-type', 'amount type', 'amountType'])), text(pick(row, ['amount-description', 'amount description', 'amountDescription'])), amount, reportDate(pick(row, ['posted-date', 'posted date', 'postedDate'])), row, sourceKey(row, [pick(row, ['settlement-id', 'settlement id', 'settlementId']), pick(row, ['transaction-type', 'transaction type', 'transactionType']), pick(row, ['order-id', 'order id', 'amazon-order-id', 'amazonOrderId']), pick(row, ['amount-type', 'amount type', 'amountType']), pick(row, ['amount-description', 'amount description', 'amountDescription']), pick(row, ['posted-date', 'posted date', 'postedDate']), amount])];
@@ -211,7 +211,7 @@ async function saveSettlementRows(tenantId, content) {
 /** @param {string} tenantId @param {string} content @param {'b2b'|'b2c'} invoiceType */
 async function saveGstInvoices(tenantId, content, invoiceType) {
   const rows = z.array(ReportRowSchema).parse(parseReportRows(invoiceType === 'b2b' ? 'GET_GST_MTR_B2B_CUSTOM' : 'GET_GST_MTR_B2C_CUSTOM', content));
-  await withTenant(tenantId, async client => {
+  await withTenantTransaction(tenantId, async client => {
     const batch = rows.map(row => [tenantId, invoiceType, text(pick(row, ['order-id', 'order id', 'amazon-order-id', 'amazonOrderId'])), number(pick(row, ['cgst', 'cgst tax', 'cgst amount'])), number(pick(row, ['sgst', 'sgst tax', 'sgst amount'])), number(pick(row, ['igst', 'igst tax', 'igst amount'])), number(pick(row, ['taxable-value', 'taxable value', 'taxableValue', 'taxable amount'])), text(pick(row, ['invoice-date', 'invoice date', 'invoiceDate', 'transaction-date', 'transaction date'])) ?? null, row]);
     await batchUpsert(client, {
       table: 'gst_invoices',
@@ -227,7 +227,7 @@ async function saveGstInvoices(tenantId, content, invoiceType) {
 /** @param {string} tenantId @param {string} content */
 async function saveReturns(tenantId, content) {
   const rows = z.array(ReportRowSchema).parse(parseReportRows('GET_FBA_FULFILLMENT_CUSTOMER_RETURNS_DATA', content));
-  await withTenant(tenantId, async client => {
+  await withTenantTransaction(tenantId, async client => {
     const batch = rows.map(row => [tenantId, text(pick(row, ['order-id', 'order id', 'amazon-order-id', 'amazonOrderId'])), text(pick(row, ['reason', 'return-reason', 'return reason', 'returnReason'])), text(pick(row, ['disposition', 'detailed-disposition', 'detailed disposition'])), 'yet_to_receive', text(pick(row, ['return-date', 'return date', 'returnDate', 'date'])) ?? null, pick(row, ['quantity', 'quantity-returned', 'return quantity']) == null ? null : integer(pick(row, ['quantity', 'quantity-returned', 'return quantity'])), row, sourceKey(row, [pick(row, ['order-id', 'order id', 'amazon-order-id', 'amazonOrderId']), pick(row, ['return-date', 'return date', 'returnDate', 'date']), pick(row, ['reason', 'return-reason', 'return reason', 'returnReason']), pick(row, ['disposition', 'detailed-disposition', 'detailed disposition'])])]);
     // Same reasoning as settlement_rows: source_key, not the business
     // columns, is the deterministic identity of a source row, and is what
@@ -246,7 +246,7 @@ async function saveReturns(tenantId, content) {
 /** @param {string} tenantId @param {string} content */
 async function saveReimbursements(tenantId, content) {
   const rows = z.array(ReportRowSchema).parse(parseReportRows('GET_FBA_REIMBURSEMENTS_DATA', content));
-  await withTenant(tenantId, async client => {
+  await withTenantTransaction(tenantId, async client => {
     const batch = rows.map(row => {
       const amount = number(pick(row, ['amount', 'total-amount', 'total amount', 'reimbursement amount']));
       const reason = text(pick(row, ['reason', 'reason-code', 'reason code', 'approval-reason']));
@@ -267,7 +267,7 @@ async function saveReimbursements(tenantId, content) {
 async function saveInventorySnapshots(tenantId, content) {
   const rows = z.array(ReportRowSchema).parse(parseReportRows('GET_FBA_MYI_UNSUPPRESSED_INVENTORY_DATA', content));
   const snapshotDate = new Date().toISOString().slice(0, 10);
-  await withTenant(tenantId, async client => {
+  await withTenantTransaction(tenantId, async client => {
     const batch = rows
       .map(row => [row, text(pick(row, ['sku', 'seller-sku', 'seller sku']))])
       .filter(([, sku]) => sku)
@@ -287,7 +287,7 @@ async function saveInventorySnapshots(tenantId, content) {
 async function saveSalesTrafficDaily(tenantId, content, range) {
   const rows = z.array(ReportRowSchema).parse(parseReportRows('GET_SALES_AND_TRAFFIC_REPORT', content));
   const fallbackDate = range?.start ? new Date(range.start).toISOString().slice(0, 10) : null;
-  await withTenant(tenantId, async client => {
+  await withTenantTransaction(tenantId, async client => {
     const batch = rows
       .map(row => [row, text(pick(row, ['date', 'startDate', 'start-date'])) ?? fallbackDate])
       .filter(([, date]) => date)
@@ -349,7 +349,7 @@ export async function syncReportForTenant(params) {
       const s3Key = await putRawReport({ tenantId: parsed.tenantId, reportType: parsed.reportType, reportId: report.reportId, content: report.content });
       const rowsImported = await saveStructuredRows(parsed.tenantId, parsed.reportType, report.content, range);
       if (report.documentIds?.length) {
-        await withTenant(parsed.tenantId, db => batchUpsert(db, {
+        await withTenantTransaction(parsed.tenantId, db => batchUpsert(db, {
           table: 'processed_report_documents',
           columns: ['tenant_id', 'report_document_id', 'report_type'],
           rows: report.documentIds.map(documentId => [parsed.tenantId, documentId, parsed.reportType])
@@ -614,23 +614,34 @@ async function syncRecentApiDataForTenantDirect(tenantId, options = {}) {
             reimbursementRows.push([parsedTenantId, component.amount, component.description ?? 'Finance reimbursement', component.sku ?? component.orderId ?? transactionId, component.postedDate ?? transaction.postedDate ?? transaction.PostedDate ?? null]);
           }
         }
-        await batchUpsert(db, {
-          table: 'finance_transactions',
-          columns: ['tenant_id', 'transaction_id', 'transaction_type', 'posted_date', 'total_amount', 'currency', 'related_order_id', 'raw'],
-          conflictColumns: ['tenant_id', 'transaction_id'],
-          updateColumns: ['transaction_type', 'posted_date', 'total_amount', 'currency', 'related_order_id', 'raw'],
-          rows: financeTransactionRows
-        });
-        if (financeTransactionIds.length) await db.query('delete from finance_transaction_items where tenant_id=$1 and transaction_id = any($2::text[])', [parsedTenantId, financeTransactionIds]);
-        await batchUpsert(db, {
-          table: 'finance_transaction_items',
-          columns: ['tenant_id', 'transaction_id', 'order_id', 'sku', 'asin', 'category', 'amount_description', 'amount', 'currency', 'posted_date', 'raw', 'source_key'],
-          rows: financeItemRows
-        });
-        reimbursementsImported = await batchUpsert(db, {
-          table: 'reimbursements',
-          columns: ['tenant_id', 'amount', 'reason', 'sku', 'reimbursement_date'],
-          rows: reimbursementRows
+        // finance_transaction_items is refreshed by deleting a transaction's
+        // rows and re-inserting them. Outside a transaction those are separate
+        // autocommitted statements, so any dashboard request landing between
+        // the delete and the insert reads a table with rows missing and
+        // silently reports wrong money for the duration of the sync. Observed
+        // live on one tenant and date range across consecutive renders: 4038
+        // finance rows, then 1426, then 4038 again. All of it is pure DB work
+        // with no Amazon calls in between, so one short transaction makes the
+        // refresh atomic without holding a connection across the network.
+        await withTenantTransaction(parsedTenantId, async tx => {
+          await batchUpsert(tx, {
+            table: 'finance_transactions',
+            columns: ['tenant_id', 'transaction_id', 'transaction_type', 'posted_date', 'total_amount', 'currency', 'related_order_id', 'raw'],
+            conflictColumns: ['tenant_id', 'transaction_id'],
+            updateColumns: ['transaction_type', 'posted_date', 'total_amount', 'currency', 'related_order_id', 'raw'],
+            rows: financeTransactionRows
+          });
+          if (financeTransactionIds.length) await tx.query('delete from finance_transaction_items where tenant_id=$1 and transaction_id = any($2::text[])', [parsedTenantId, financeTransactionIds]);
+          await batchUpsert(tx, {
+            table: 'finance_transaction_items',
+            columns: ['tenant_id', 'transaction_id', 'order_id', 'sku', 'asin', 'category', 'amount_description', 'amount', 'currency', 'posted_date', 'raw', 'source_key'],
+            rows: financeItemRows
+          });
+          reimbursementsImported = await batchUpsert(tx, {
+            table: 'reimbursements',
+            columns: ['tenant_id', 'amount', 'reason', 'sku', 'reimbursement_date'],
+            rows: reimbursementRows
+          });
         });
       });
       console.log(`[${logLabel}] completed in ${Date.now() - startedAt}ms - ${ordersImported} orders, ${transactionsImported} finance transactions, ${inventoryImported} inventory rows, ${reimbursementsImported} reimbursements` + (ordersWarning ? ` (orders warning: ${ordersWarning})` : '') + (financeResponse?.syncError ? ` (finance warning: ${financeResponse.syncError})` : '') + (inventoryResponse?.syncError ? ` (inventory warning: ${inventoryResponse.syncError})` : ''));
