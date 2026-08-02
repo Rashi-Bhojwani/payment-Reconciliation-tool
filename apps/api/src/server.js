@@ -355,6 +355,44 @@ async function findReusableSync(tenantId, reportType, range, windowMs = SYNC_REU
 // dashboard is opened for that range.
 const AUTO_SYNC_FRESHNESS_WINDOW_MS = 60 * 60 * 1000;
 const AUTO_SYNC_REPORT_TYPES = Object.freeze(['DIRECT_SP_API_SYNC', 'GET_V2_SETTLEMENT_REPORT_DATA_FLAT_FILE_V2', 'GET_SALES_AND_TRAFFIC_REPORT', 'GET_GST_MTR_B2B_CUSTOM', 'GET_GST_MTR_B2C_CUSTOM', 'GET_FBA_MYI_UNSUPPRESSED_INVENTORY_DATA', 'GET_FBA_REIMBURSEMENTS_DATA', 'GET_FBA_FULFILLMENT_CUSTOMER_RETURNS_DATA']);
+// Nothing below this line may let the app call Amazon more often than a
+// careful human would. A seller's SP-API quota is shared across their whole
+// account, and sustained pointless traffic is exactly what gets an
+// application throttled or its access reviewed. Two independent runaway paths
+// existed and are closed here.
+//
+// 1. A report type the account is not authorised for (seen live: repeated
+//    "GET_SALES_AND_TRAFFIC_REPORT failed: Create report failed: 403") never
+//    records a completed sync, so the "is it already synced?" check could
+//    never be satisfied and it was re-requested on every single dashboard
+//    load, for as long as the dashboard stayed open. A 403 is a permission
+//    answer, not a transient error, and re-asking cannot change it.
+// 2. The in-flight check reads sync_jobs, but two dashboard requests arriving
+//    before the first has inserted its 'running' row both see nothing running
+//    and both start a full sync. The dashboard takes seconds to answer, so
+//    that window is wide open in practice.
+const SYNC_RETRY_BASE_MS = 15 * 60 * 1000;
+const SYNC_RETRY_MAX_MS = 6 * 60 * 60 * 1000;
+// How long to wait before auto-retrying a report type that keeps failing.
+// Backs off exponentially from 15 minutes to a 6 hour ceiling, so a
+// permanently unauthorised report settles at 4 attempts a day instead of one
+// per page load, while a genuinely transient failure still recovers quickly.
+async function autoSyncBackoffRemainingMs(tenantId, reportType) {
+  const { rows } = await pool.query(
+    `select status, coalesce(completed_at, started_at) as at_time from sync_jobs
+     where tenant_id=$1 and report_type=$2 and status in ('completed','failed')
+     order by coalesce(completed_at, started_at) desc limit 12`,
+    [tenantId, reportType]
+  );
+  let consecutiveFailures = 0;
+  for (const row of rows) {
+    if (row.status !== 'failed') break;
+    consecutiveFailures += 1;
+  }
+  if (!consecutiveFailures || !rows[0]?.at_time) return 0;
+  const wait = Math.min(SYNC_RETRY_MAX_MS, SYNC_RETRY_BASE_MS * 2 ** (consecutiveFailures - 1));
+  return Math.max(0, wait - (Date.now() - new Date(rows[0].at_time).getTime()));
+}
 async function findMissingReportTypes(tenantId, range) {
   if (!range?.start || !range?.end) return [];
   const missing = [];
@@ -366,14 +404,32 @@ async function findMissingReportTypes(tenantId, range) {
       [tenantId, reportType]
     );
     if (running.rowCount) continue;
+    if (inFlightSyncs.has(`${tenantId}:${reportType}`)) continue;
+    const backoffMs = await autoSyncBackoffRemainingMs(tenantId, reportType);
+    if (backoffMs > 0) {
+      console.log(`[sync ${tenantId.slice(0, 8)}:${reportType}] skipped - backing off after repeated failures, next auto-retry in ${Math.ceil(backoffMs / 60000)} min`);
+      continue;
+    }
     missing.push(reportType);
   }
   return missing;
 }
+// One run per tenant+report type per process, no matter how many requests ask
+// for it. Callers join the run already talking to Amazon instead of starting a
+// second one, which is what the sync_jobs check alone cannot guarantee.
+const inFlightSyncs = new Map();
+function runExclusiveSync(tenantId, reportType, start) {
+  const key = `${tenantId}:${reportType}`;
+  const existing = inFlightSyncs.get(key);
+  if (existing) return existing;
+  const task = Promise.resolve().then(start).finally(() => inFlightSyncs.delete(key));
+  inFlightSyncs.set(key, task);
+  return task;
+}
 function triggerBackgroundSync(tenantId, reportType, range) {
-  const task = reportType === 'DIRECT_SP_API_SYNC'
+  const task = runExclusiveSync(tenantId, reportType, () => reportType === 'DIRECT_SP_API_SYNC'
     ? syncRecentApiDataForTenant(tenantId, { range, maxOrderPages: 2, maxOrderItems: 20 })
-    : syncReportForSellerRequest({ tenantId, reportType }, range);
+    : syncReportForSellerRequest({ tenantId, reportType }, range));
   task.catch(error => app.log.warn({ err: error, tenantId, reportType }, 'Automatic background sync failed'));
 }
 
@@ -652,14 +708,20 @@ app.post('/api/tenants/:tenantId/sync', async request => {
   await assertActiveTenant(tenantId);
   const body = SellerSyncSchema.parse(request.body ?? {});
   const results = [];
+  // This route called Amazon unconditionally: no reuse check, no in-flight
+  // check. Every click, retry or duplicate request started another full sync
+  // of the same range on top of the ones already running. A seller's SP-API
+  // quota is account-wide, so that is a real risk to them, not just wasted
+  // work. An explicit sync still bypasses the freshness window - the seller
+  // asked for fresh data - but it can no longer stack concurrent runs.
   try {
-    const result = await syncRecentApiDataForTenant(tenantId, { range: body.range, maxOrderPages: 2, maxOrderItems: 20 });
+    const result = await runExclusiveSync(tenantId, 'DIRECT_SP_API_SYNC', () => syncRecentApiDataForTenant(tenantId, { range: body.range, maxOrderPages: 2, maxOrderItems: 20 }));
     results.push({ reportType: 'DIRECT_SP_API_SYNC', status: 'completed', ...result });
   } catch (error) {
     results.push({ reportType: 'DIRECT_SP_API_SYNC', status: 'failed', error: error instanceof Error ? error.message : 'unknown error' });
   }
   for (const reportType of body.reportTypes) {
-    results.push(await syncReportForSellerRequest({ tenantId, reportType }, body.range));
+    results.push(await runExclusiveSync(tenantId, reportType, () => syncReportForSellerRequest({ tenantId, reportType }, body.range)));
   }
   return { results };
 });
