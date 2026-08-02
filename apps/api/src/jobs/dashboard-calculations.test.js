@@ -67,32 +67,52 @@ test('uses Amazon settlement header period and date formats for transfers',()=>{
   assert.equal(withStatementPeriod.statement.transfers.value,-131801.69);
 });
 
-test('never merges Deferred Finance activity into the statement, but does measure it',()=>{
-  // Verified against a real seller's own Account Activity Statement PDF for
-  // 1-25 Jul 2026. Merging Deferred activity moved every bucket further from
-  // Amazon (Income 1,53,912.04 vs Amazon 1,32,046.97 where settlement-only
-  // gives 1,22,980.13) and tripled the total absolute error, so the statement
-  // stays settlement-only - while the pending pipeline is still reported, to
-  // keep "Amazon counts money we do not hold" distinguishable from "we
-  // misclassify money we do hold".
-  const range={start:'2026-07-01T00:00:00Z',end:'2026-07-30T00:00:00Z'};
+test('builds the Account Activity sections from the Finances API, matching a real statement exactly',()=>{
+  // Live proof, seller a3f58d33, 21-29 Jul 2026. Four orders were settled and
+  // five were not. Amazon's statement counts the five, because the settled
+  // four transacted before 21 Jul even though their settlement lines posted
+  // inside the window. Amazon dates by transaction; settlement lines are dated
+  // by when the settlement posted them.
+  //
+  //              Finances API   Amazon statement   settlement rows
+  //   Income          425.70            425.70            567.60
+  //   Expenses       -200.37           -200.37           -267.16
+  //   GST              21.30             21.30             28.40
+  const range={start:'2026-07-20T18:30:00Z',end:'2026-07-29T18:30:00Z'};
+  const posted='2026-07-24T00:00:00Z';
+  const fin=(id,order,desc,amount,category)=>({source_row_id:id,transaction_id:`tx-${id}`,order_id:order,transaction_status:'DEFERRED',category,amount_description:desc,amount,posted_date:posted,raw:{}});
+  const sale=(n,order)=>[
+    fin(`${n}a`,order,'OurPricePrincipal',141.9,'item_price'),
+    fin(`${n}b`,order,'OurPriceTax',7.1,'tax'),
+    fin(`${n}c`,order,'TCS-IGST',-0.71,'tax'),
+    fin(`${n}d`,order,'FixedClosingFee Base',-1,'closing_fee'),
+    fin(`${n}e`,order,'FixedClosingFee Tax',-0.18,'closing_fee'),
+    fin(`${n}f`,order,'MFNPostageFee Base',-55,'other'),
+    fin(`${n}g`,order,'MFNPostageFee Tax',-9.9,'tax')
+  ];
+  const refund=[
+    fin('r1','408-6233315','OurPricePrincipal',-141.9,'item_price'),
+    fin('r2','408-6233315','OurPriceTax',-7.1,'tax'),
+    fin('r3','408-6233315','TCS-IGST',0.71,'tax'),
+    fin('r4','408-6233315','FixedClosingFee Base',1,'closing_fee'),
+    fin('r5','408-6233315','FixedClosingFee Tax',0.18,'closing_fee'),
+    fin('r6','408-6233315','AmazonFees',64.9,'other')
+  ];
   const r=calculateDashboardMetrics({
-    orders:[],orderItems:[],returns:[],reimbursements:[],gstInvoices:[],settlementHeaders:[],settledOrderIdsAllTime:[],
-    settlementRows:[line('sale','Principal',1000,'Order',{order_id:'order-settled',amount_type:'ItemPrice'})],
-    financeItems:[
-      {source_row_id:'f1',transaction_id:'tx-1',order_id:'order-pending',transaction_status:'Deferred',category:'item_price',amount_description:'OurPricePrincipal',amount:250,posted_date:'2026-07-10T00:00:00Z',raw:{}},
-      {source_row_id:'f2',transaction_id:'tx-1',order_id:'order-pending',transaction_status:'Deferred',category:'tax',amount_description:'OurPriceTax',amount:45,posted_date:'2026-07-10T00:00:00Z',raw:{}}
-    ]
+    orders:[],orderItems:[],returns:[],reimbursements:[],gstInvoices:[],settledOrderIdsAllTime:[],
+    // Settlement holds the four already-settled orders. Amazon excludes them
+    // from this window; dating by settlement posting wrongly included them.
+    settlementRows:[line('s1','Principal',567.60,'Order',{order_id:'settled-1',amount_type:'ItemPrice'}),
+                    line('s2','Product Tax',28.40,'Order',{order_id:'settled-1',amount_type:'ItemPrice'})],
+    settlementHeaders:[{settlement_id:'s',deposit_date:'2026-07-28T00:00:00Z',total_amount:246.63}],
+    financeItems:[...sale(1,'406-9335734'),...sale(2,'405-5487794'),...sale(3,'405-7211617'),...sale(4,'406-8074232'),...refund]
   },range);
-  assert.equal(r.statement.income.value,1000);
-  assert.equal(r.statement.gst.value,0);
-  assert.equal(r.metrics.netSales.source,'Amazon Settlement report');
-  const summary=r.diagnostics.pendingMergeSummary;
-  assert.equal(summary.merged,false);
-  assert.equal(summary.pendingOrders,1);
-  assert.equal(summary.pendingExcludedTotals.income,250);
-  assert.equal(summary.pendingExcludedTotals.gst,45);
-  assert.equal(summary.settlementBaselineTotals.income,1000);
+  assert.equal(r.statement.income.value,425.70);
+  assert.equal(r.statement.expenses.value,-200.37);
+  assert.equal(r.statement.gst.value,21.30);
+  assert.equal(r.statement.tax.value,0);
+  assert.equal(r.statement.transfers.value,-246.63);
+  assert.match(r.metrics.netSales.source,/Finances API/);
 });
 
 test('an order with settlement lines anywhere is never reported as pending',()=>{

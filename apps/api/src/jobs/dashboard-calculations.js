@@ -205,9 +205,41 @@ export function calculateDashboardMetrics(input,range){
   // without letting it corrupt the statement.
   const settledOrderIds=new Set([...(input.settledOrderIdsAllTime??[]),...settlementAudit.included.map(row=>row.order_id)].filter(Boolean));
   const pendingFinanceRows=financeAudit.included.filter(row=>row.order_id&&!settledOrderIds.has(row.order_id)&&row.transaction_status&&!/released/i.test(row.transaction_status));
-  const financialRows=settlementComplete?settlementAudit.included:financeAudit.included;
-  const financialDuplicates=settlementComplete?settlementAudit.duplicates:financeAudit.duplicates;
-  const financialSource=settlementComplete?'Amazon Settlement report':'Amazon Finances API';
+  // THE SOURCE FOR THE ACCOUNT ACTIVITY SECTIONS IS THE FINANCES API, NOT
+  // SETTLEMENT. Amazon's "Account activity from X through Y" statement is
+  // dated by TRANSACTION date. Settlement lines are dated by when the
+  // settlement posted them, which is a different date for the same money, so
+  // filtering settlement lines to the viewed window selects a different set of
+  // orders than Amazon's statement covers.
+  //
+  // Proven on a live seller for 21-29 Jul 2026. Four orders were settled and
+  // five were not. Amazon's statement counts the five; settlement gave us the
+  // four, because those four transacted before 21 Jul but their settlement
+  // lines posted inside the window:
+  //
+  //              Finances API   Amazon statement   settlement rows
+  //   Income          425.70            425.70            567.60
+  //   Expenses       -200.37           -200.37           -267.16
+  //   GST              21.30             21.30             28.40
+  //
+  // The Finances API reproduces all three sections exactly; settlement matches
+  // none of them. It is also the only source that carries not-yet-settled
+  // activity at all - the refund that made the difference here had no
+  // settlement line anywhere, because it has not been paid out yet, and no
+  // amount of re-syncing settlement reports could ever have found it.
+  //
+  // Settlement remains the fallback for accounts with no Finances data, and
+  // Transfers still comes from settlement headers, which is genuinely
+  // settlement information: money actually moved to the bank.
+  // "Has Finances data" is not enough: a single stray finance row must never
+  // override a complete settlement history. Finance data qualifies only when
+  // it looks like a statement in its own right - product sales AND the fees or
+  // tax that always accompany them - which is the same bar settlementComplete
+  // applies to settlement rows.
+  const financeComplete=financeAudit.included.some(isPrincipal)&&financeAudit.included.some(row=>isFee(row)||isProductGst(row));
+  const financialRows=financeComplete?financeAudit.included:settlementAudit.included;
+  const financialDuplicates=financeComplete?financeAudit.duplicates:settlementAudit.duplicates;
+  const financialSource=financeComplete?'Amazon Finances API (transaction-dated, matches Account Activity)':'Amazon Settlement report';
   const principalRows=financialRows.filter(isPrincipal);const grossRows=principalRows.filter(row=>amount(row)>0&&!isRefund(row));const refundPrincipalRows=principalRows.filter(row=>amount(row)<0&&isRefund(row));
   const promoRows=financialRows.filter(isPromotion);const promoDebits=promoRows.filter(row=>amount(row)<0);const promoRefunds=promoRows.filter(row=>amount(row)>0);
   const grossSales=signedSum(grossRows);const productRefunds=Math.abs(signedSum(refundPrincipalRows));const netPromotions=round2(Math.abs(signedSum(promoDebits))-signedSum(promoRefunds));const netSales=round2(grossSales-productRefunds-netPromotions);
