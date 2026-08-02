@@ -2,7 +2,7 @@ import { createHash } from 'node:crypto';
 import cron from 'node-cron';
 import pLimit from 'p-limit';
 import { z } from 'zod';
-import { assertActiveTenant, pool, withTenant, withTenantTransaction } from '@recon/db';
+import { assertActiveTenant, pool, withTenant } from '@recon/db';
 import { getSpApiEndpoint, REPORT_TYPES, SpApiClient } from '@recon/sp-api-client';
 import { decryptSecret } from '../config/crypto.js';
 import { putRawReport } from '../storage/s3.js';
@@ -65,6 +65,46 @@ function sourceKey(row, parts = []) {
   if (explicit) return explicit;
   const material = parts.map(part => text(part) ?? '').join('|') || JSON.stringify(row);
   return createHash('sha256').update(material).digest('hex').slice(0, 48);
+}
+
+/**
+ * withTenant, but the whole callback runs inside one Postgres transaction, so
+ * no other connection can observe a partially applied write set.
+ *
+ * Any sync that refreshes a table by deleting rows and re-inserting them needs
+ * this. Without a transaction those are separate autocommitted statements, and
+ * a dashboard request landing between the delete and the insert reads a table
+ * with rows missing - producing money figures that are silently wrong for the
+ * duration of the sync. Observed live: the same tenant and date range reported
+ * 4038 finance rows on one render and 1426 on the next.
+ *
+ * Built from `pool` here rather than exported from @recon/db so this file
+ * cannot fail to start against an older or locally modified copy of that
+ * package - it only needs the pool, which has always been exported.
+ *
+ * set_config's third argument is true so the tenant setting is scoped to the
+ * transaction and released by COMMIT/ROLLBACK instead of lingering on a pooled
+ * connection.
+ * @template T
+ * @param {string} tenantId
+ * @param {(client: import('pg').PoolClient) => Promise<T>} fn
+ * @returns {Promise<T>}
+ */
+async function withTenantTransaction(tenantId, fn) {
+  const client = await pool.connect();
+  try {
+    await client.query('begin');
+    await client.query('select set_config($1,$2,true)', ['app.current_tenant_id', tenantId]);
+    const result = await fn(client);
+    await client.query('commit');
+    return result;
+  } catch (error) {
+    await client.query('rollback').catch(() => undefined);
+    throw error;
+  } finally {
+    await client.query("select set_config('app.current_tenant_id','',false)").catch(() => undefined);
+    client.release();
+  }
 }
 
 function pick(row, names) {

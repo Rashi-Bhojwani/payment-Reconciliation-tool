@@ -42,44 +42,6 @@ export async function withTenant(tenantId, fn) {
   }
 }
 
-/**
- * Same tenant context as withTenant, but the whole callback runs inside one
- * Postgres transaction, so no other connection can observe a partially applied
- * write set.
- *
- * This matters for any sync that refreshes a table by deleting rows and
- * re-inserting them. Without a transaction those are separate autocommitted
- * statements, and a dashboard request landing between the delete and the
- * insert reads a table with rows missing - producing money figures that are
- * silently, invisibly wrong for the duration of the sync. Observed live: the
- * same tenant and date range reported 4038 finance rows on one render and
- * 1426 on the next, because finance_transaction_items was mid-refresh.
- *
- * set_config's third argument is true here so the tenant setting is scoped to
- * the transaction and is released by COMMIT/ROLLBACK rather than lingering on
- * a pooled connection.
- * @template T
- * @param {string} tenantId
- * @param {(client: import('pg').PoolClient) => Promise<T>} fn
- * @returns {Promise<T>}
- */
-export async function withTenantTransaction(tenantId, fn) {
-  const client = await pool.connect();
-  try {
-    await client.query('begin');
-    await client.query('select set_config($1,$2,true)', ['app.current_tenant_id', tenantId]);
-    const result = await fn(client);
-    await client.query('commit');
-    return result;
-  } catch (error) {
-    await client.query('rollback').catch(() => undefined);
-    throw error;
-  } finally {
-    await client.query("select set_config('app.current_tenant_id','',false)").catch(() => undefined);
-    client.release();
-  }
-}
-
 /** @param {string} tenantId */
 export async function assertActiveTenant(tenantId) {
   const result = await pool.query('select status from tenants where id = $1', [tenantId]);
