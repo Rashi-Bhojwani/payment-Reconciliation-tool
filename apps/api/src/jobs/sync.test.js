@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { batchUpsert, withTenantSyncMutex } from './sync.js';
+import { batchUpsert, ordinalsWithinGroup, withTenantSyncMutex } from './sync.js';
 
 function fakeClient() {
   const calls = [];
@@ -115,4 +115,45 @@ test('withTenantSyncMutex keeps queuing later calls even after an earlier one re
   await assert.rejects(withTenantSyncMutex('tenant-c', async () => { throw new Error('boom'); }), /boom/);
   await withTenantSyncMutex('tenant-c', async () => { secondRan = true; });
   assert.equal(secondRan, true);
+});
+
+test('two byte-identical settlement lines keep separate identities', () => {
+  // An order shipping two units of one SKU at one price emits two identical
+  // settlement lines. Hashing their content produced one key, so the in-chunk
+  // pre-merge and "on conflict do update" kept only one - and the lost line
+  // took its own tax line with it, which is why a real seller's shortfall sat
+  // at exactly India's 18% GST ratio.
+  const line = { 'settlement-id': 'S1', 'order-id': 'o1', 'amount-type': 'ItemPrice', 'amount-description': 'Principal', amount: '141.90' };
+  const rows = [{ ...line }, { ...line }, { 'settlement-id': 'S2', ...line, 'settlement-id': 'S2' }];
+  const ordinals = ordinalsWithinGroup(rows, row => row['settlement-id']);
+  assert.deepEqual(ordinals, [1, 2, 1]);
+  // Ordinals restart per settlement document, so re-importing one immutable
+  // document yields the same values regardless of what else was fetched.
+  assert.notEqual(ordinals[0], ordinals[1]);
+});
+
+test('batchUpsert refuses to silently drop rows from a financial ledger', async () => {
+  const calls = [];
+  const client = { query: async (sql, values) => { calls.push({ sql, values }); return { rows: [] }; } };
+  const duplicate = ['tenant', 'same-key'];
+  await assert.rejects(
+    () => batchUpsert(client, {
+      table: 'settlement_rows',
+      columns: ['tenant_id', 'source_key'],
+      conflictColumns: ['tenant_id', 'source_key'],
+      updateColumns: ['source_key'],
+      rows: [duplicate, [...duplicate]]
+    }),
+    /Refusing to silently drop financial rows/
+  );
+  assert.equal(calls.length, 0, 'nothing may be written when rows would be lost');
+  // A non-ledger table still warns rather than failing the whole sync.
+  const imported = await batchUpsert(client, {
+    table: 'inventory_snapshots',
+    columns: ['tenant_id', 'source_key'],
+    conflictColumns: ['tenant_id', 'source_key'],
+    updateColumns: ['source_key'],
+    rows: [duplicate, [...duplicate]]
+  });
+  assert.equal(imported, 1);
 });

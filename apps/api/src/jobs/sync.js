@@ -68,6 +68,35 @@ function sourceKey(row, parts = []) {
 }
 
 /**
+ * Assigns each row its position within its own group, so identity can be
+ * structural rather than value-based.
+ *
+ * A content hash can never tell apart two lines Amazon legitimately sent as
+ * identical - an order shipping two units of one SKU at one price emits two
+ * byte-identical settlement lines. Hashing them produced one key, and both the
+ * in-chunk pre-merge and "on conflict do update" then kept only one. The lost
+ * line took its tax line with it, which is why a real seller's shortfall sat
+ * at exactly India's 18% GST ratio: a principal and its own tax disappearing
+ * together.
+ *
+ * The group is the settlement document, not the sync, so "the Nth line of
+ * settlement S" stays stable no matter which other documents were merged into
+ * the same fetch. Settlement documents are immutable, so re-importing one
+ * yields the same ordinals and the upsert stays idempotent.
+ * @param {Array<Record<string, unknown>>} rows
+ * @param {(row: Record<string, unknown>) => string} groupOf
+ */
+export function ordinalsWithinGroup(rows, groupOf) {
+  const counters = new Map();
+  return rows.map(row => {
+    const group = groupOf(row) ?? '';
+    const next = (counters.get(group) ?? 0) + 1;
+    counters.set(group, next);
+    return next;
+  });
+}
+
+/**
  * withTenant, but the whole callback runs inside one Postgres transaction, so
  * no other connection can observe a partially applied write set.
  *
@@ -117,6 +146,8 @@ function pick(row, names) {
 }
 
 const BATCH_UPSERT_CHUNK_SIZE = 500;
+// Tables where a dropped row is missing money, not just a missing detail.
+const LEDGER_TABLES = new Set(['settlement_rows', 'returns', 'reimbursements', 'finance_transaction_items']);
 
 /**
  * Inserts many rows in a handful of multi-row statements instead of one
@@ -155,6 +186,20 @@ export async function batchUpsert(client, { table, columns, conflictColumns, upd
         const key = keyParts.some(value => value == null) ? `row${rowIndex}` : JSON.stringify(keyParts);
         seen.set(key, row);
       });
+      // Silent row loss in a financial ledger is unacceptable. This pre-merge
+      // exists because one INSERT cannot touch the same conflict target twice,
+      // but if it ever drops a row that means two rows Amazon sent as distinct
+      // collapsed to one key - money quietly leaving the ledger. It cost a real
+      // seller whole order lines (a principal AND its tax, giving a shortfall
+      // at exactly India's 18% GST ratio) before anyone noticed, because
+      // nothing said a word.
+      const dropped = chunk.length - seen.size;
+      if (dropped > 0) {
+        const collapsed = [...seen.entries()].filter(([, row], _index, entries) => entries.length < chunk.length).slice(0, 3).map(([key]) => key);
+        const detail = `${dropped} row(s) in ${table} shared a conflict key within one batch and were merged; keys e.g. ${collapsed.join(' | ') || '(null key components)'}`;
+        if (LEDGER_TABLES.has(table)) throw new Error(`Refusing to silently drop financial rows: ${detail}`);
+        console.warn(`[batchUpsert] ${detail}`);
+      }
       chunk = [...seen.values()];
     }
     const values = [];
@@ -222,10 +267,35 @@ function parseReportRows(reportType, content) {
 /** @param {string} tenantId @param {string} content */
 async function saveSettlementRows(tenantId, content) {
   const rows = z.array(ReportRowSchema).parse(parseReportRows('GET_V2_SETTLEMENT_REPORT_DATA_FLAT_FILE_V2', content));
+  // Position within the settlement document this line belongs to.
+  const ordinals = ordinalsWithinGroup(rows, row => text(pick(row, ['settlement-id', 'settlement id', 'settlementId'])));
+  let persisted = 0;
   await withTenantTransaction(tenantId, async client => {
-    const batch = rows.map(row => {
+    const batch = rows.map((row, rowIndex) => {
       const amount = number(pick(row, ['amount']));
-      return [tenantId, text(pick(row, ['settlement-id', 'settlement id', 'settlementId'])), text(pick(row, ['order-id', 'order id', 'amazon-order-id', 'amazonOrderId'])), text(pick(row, ['amount-type', 'amount type', 'amountType'])), text(pick(row, ['amount-description', 'amount description', 'amountDescription'])), amount, reportDate(pick(row, ['posted-date', 'posted date', 'postedDate'])), row, sourceKey(row, [pick(row, ['settlement-id', 'settlement id', 'settlementId']), pick(row, ['transaction-type', 'transaction type', 'transactionType']), pick(row, ['order-id', 'order id', 'amazon-order-id', 'amazonOrderId']), pick(row, ['amount-type', 'amount type', 'amountType']), pick(row, ['amount-description', 'amount description', 'amountDescription']), pick(row, ['posted-date', 'posted date', 'postedDate']), amount])];
+      return [tenantId, text(pick(row, ['settlement-id', 'settlement id', 'settlementId'])), text(pick(row, ['order-id', 'order id', 'amazon-order-id', 'amazonOrderId'])), text(pick(row, ['amount-type', 'amount type', 'amountType'])), text(pick(row, ['amount-description', 'amount description', 'amountDescription'])), amount, reportDate(pick(row, ['posted-date', 'posted date', 'postedDate'])), row, sourceKey(row, [
+        pick(row, ['settlement-id', 'settlement id', 'settlementId']),
+        pick(row, ['transaction-type', 'transaction type', 'transactionType']),
+        pick(row, ['order-id', 'order id', 'amazon-order-id', 'amazonOrderId']),
+        pick(row, ['amount-type', 'amount type', 'amountType']),
+        pick(row, ['amount-description', 'amount description', 'amountDescription']),
+        pick(row, ['posted-date', 'posted date', 'postedDate']),
+        amount,
+        // Every discriminator Amazon supplies. Without these, two units of one
+        // SKU on one order collapse to a single row and take their tax with them.
+        pick(row, ['order-item-code', 'order item code', 'orderItemCode']),
+        pick(row, ['merchant-order-item-id', 'merchant order item id', 'merchantOrderItemId']),
+        pick(row, ['merchant-adjustment-item-id', 'merchant adjustment item id']),
+        pick(row, ['shipment-id', 'shipment id', 'shipmentId']),
+        pick(row, ['adjustment-id', 'adjustment id', 'adjustmentId']),
+        pick(row, ['sku', 'seller-sku', 'sellerSku']),
+        pick(row, ['quantity-purchased', 'quantity purchased', 'quantityPurchased']),
+        pick(row, ['promotion-id', 'promotion id', 'promotionId']),
+        pick(row, ['posted-date-time', 'posted date time', 'postedDateTime']),
+        // Structural tiebreak: Amazon can legitimately emit two fully identical
+        // lines, and no hash of their content can ever separate them.
+        `#${ordinals[rowIndex]}`
+      ])];
     });
     // source_key is deterministic per settlement/transaction line, and is
     // the real conflict identity here - not the business columns. Settlement
@@ -237,15 +307,23 @@ async function saveSettlementRows(tenantId, content) {
     // produces the exact same source_key both times - so source_key is what
     // actually needs to drive the update-vs-insert decision, refreshing
     // deposit metadata on re-sync instead of erroring or duplicating.
-    await batchUpsert(client, {
+    persisted = await batchUpsert(client, {
       table: 'settlement_rows',
       columns: ['tenant_id', 'settlement_id', 'order_id', 'amount_type', 'amount_description', 'amount', 'posted_date', 'raw', 'source_key'],
       conflictColumns: ['tenant_id', 'source_key'],
       updateColumns: ['settlement_id', 'order_id', 'amount_type', 'amount_description', 'amount', 'posted_date', 'raw'],
       rows: batch
     });
+    // Distinct keys must equal parsed rows. If two lines Amazon sent as
+    // separate share a key, one overwrites the other and the money is gone -
+    // and because the document is then recorded as processed and never
+    // re-downloaded, no later sync can heal it.
+    const distinctKeys = new Set(batch.map(row => row[row.length - 1])).size;
+    if (distinctKeys !== rows.length) {
+      throw new Error(`Settlement import would lose rows: ${rows.length} parsed but only ${distinctKeys} distinct source_key values`);
+    }
   });
-  return rows.length;
+  return { parsed: rows.length, persisted };
 }
 
 /** @param {string} tenantId @param {string} content @param {'b2b'|'b2c'} invoiceType */
@@ -273,8 +351,9 @@ const RETURN_QUANTITY_FIELDS = Object.freeze(['quantity', 'quantity-returned', '
 
 async function saveReturns(tenantId, content) {
   const rows = z.array(ReportRowSchema).parse(parseReportRows('GET_FBA_FULFILLMENT_CUSTOMER_RETURNS_DATA', content));
+  const ordinals = ordinalsWithinGroup(rows, row => text(pick(row, ['order-id', 'order id', 'amazon-order-id', 'amazonOrderId'])));
   await withTenantTransaction(tenantId, async client => {
-    const batch = rows.map(row => [tenantId, text(pick(row, ['order-id', 'order id', 'amazon-order-id', 'amazonOrderId'])), text(pick(row, ['reason', 'return-reason', 'return reason', 'returnReason'])), text(pick(row, ['disposition', 'detailed-disposition', 'detailed disposition'])), 'yet_to_receive', text(pick(row, ['return-date', 'return date', 'returnDate', 'date'])) ?? null, pick(row, RETURN_QUANTITY_FIELDS) == null ? null : integer(pick(row, RETURN_QUANTITY_FIELDS)), row, sourceKey(row, [pick(row, ['order-id', 'order id', 'amazon-order-id', 'amazonOrderId']), pick(row, ['return-date', 'return date', 'returnDate', 'date']), pick(row, ['reason', 'return-reason', 'return reason', 'returnReason']), pick(row, ['disposition', 'detailed-disposition', 'detailed disposition'])])]);
+    const batch = rows.map((row, rowIndex) => [tenantId, text(pick(row, ['order-id', 'order id', 'amazon-order-id', 'amazonOrderId'])), text(pick(row, ['reason', 'return-reason', 'return reason', 'returnReason'])), text(pick(row, ['disposition', 'detailed-disposition', 'detailed disposition'])), 'yet_to_receive', text(pick(row, ['return-date', 'return date', 'returnDate', 'date'])) ?? null, pick(row, RETURN_QUANTITY_FIELDS) == null ? null : integer(pick(row, RETURN_QUANTITY_FIELDS)), row, sourceKey(row, [pick(row, ['order-id', 'order id', 'amazon-order-id', 'amazonOrderId']), pick(row, ['return-date', 'return date', 'returnDate', 'date']), pick(row, ['reason', 'return-reason', 'return reason', 'returnReason']), pick(row, ['disposition', 'detailed-disposition', 'detailed disposition']), pick(row, ['sku', 'seller-sku', 'sellerSku']), pick(row, ['asin']), pick(row, ['license-plate-number', 'lpn']), pick(row, RETURN_QUANTITY_FIELDS), `#${ordinals[rowIndex]}`])]);
     // Same reasoning as settlement_rows: source_key, not the business
     // columns, is the deterministic identity of a source row, and is what
     // the ON CONFLICT target must actually be to update-not-error on re-sync.
@@ -292,13 +371,20 @@ async function saveReturns(tenantId, content) {
 /** @param {string} tenantId @param {string} content */
 async function saveReimbursements(tenantId, content) {
   const rows = z.array(ReportRowSchema).parse(parseReportRows('GET_FBA_REIMBURSEMENTS_DATA', content));
+  const ordinals = ordinalsWithinGroup(rows, row => text(pick(row, ['reimbursement-id', 'reimbursement id', 'approval-date', 'reimbursement-date'])));
   await withTenantTransaction(tenantId, async client => {
-    const batch = rows.map(row => {
+    const batch = rows.map((row, rowIndex) => {
       const amount = number(pick(row, ['amount', 'total-amount', 'total amount', 'reimbursement amount']));
       const reason = text(pick(row, ['reason', 'reason-code', 'reason code', 'approval-reason']));
       const sku = text(pick(row, ['sku', 'seller-sku', 'seller sku']));
       const reimbursementDate = text(pick(row, ['reimbursement-date', 'reimbursement date', 'approval-date', 'approval date'])) ?? null;
-      return [tenantId, amount, reason, sku, reimbursementDate, sourceKey(row, [sku, reimbursementDate, amount, reason])];
+      return [tenantId, amount, reason, sku, reimbursementDate, sourceKey(row, [sku, reimbursementDate, amount, reason,
+        pick(row, ['reimbursement-id', 'reimbursement id', 'reimbursementId']),
+        pick(row, ['case-id', 'case id', 'caseId']),
+        pick(row, ['amazon-order-id', 'order-id', 'order id']),
+        pick(row, ['fnsku']), pick(row, ['asin']),
+        pick(row, ['quantity-reimbursed-total', 'quantity-reimbursed-cash', 'quantity']),
+        `#${ordinals[rowIndex]}`])];
     });
     await batchUpsert(client, {
       table: 'reimbursements',
@@ -352,7 +438,7 @@ async function saveSalesTrafficDaily(tenantId, content, range) {
 /** @param {string} tenantId @param {string} reportType @param {string} content */
 async function saveStructuredRows(tenantId, reportType, content, range) {
   switch (reportType) {
-    case 'GET_V2_SETTLEMENT_REPORT_DATA_FLAT_FILE_V2': return saveSettlementRows(tenantId, content);
+    case 'GET_V2_SETTLEMENT_REPORT_DATA_FLAT_FILE_V2': return saveSettlementRows(tenantId, content).then(result => result.parsed);
     case 'GET_GST_MTR_B2B_CUSTOM': return saveGstInvoices(tenantId, content, 'b2b');
     case 'GET_GST_MTR_B2C_CUSTOM': return saveGstInvoices(tenantId, content, 'b2c');
     case 'GET_FBA_FULFILLMENT_CUSTOMER_RETURNS_DATA': return saveReturns(tenantId, content);
@@ -393,6 +479,12 @@ export async function syncReportForTenant(params) {
         return { rowsImported: 0, alreadyUpToDate: true };
       }
       const s3Key = await putRawReport({ tenantId: parsed.tenantId, reportType: parsed.reportType, reportId: report.reportId, content: report.content });
+      // If saveStructuredRows throws - which it now does when a settlement
+      // import would lose rows - control never reaches the line below, so the
+      // documents stay unprocessed and the next sync re-downloads them. That
+      // ordering is the whole point: a document recorded as processed is never
+      // fetched again, so recording one whose rows were dropped makes the loss
+      // permanent and unrecoverable by re-syncing.
       const rowsImported = await saveStructuredRows(parsed.tenantId, parsed.reportType, report.content, range);
       if (report.documentIds?.length) {
         await withTenantTransaction(parsed.tenantId, db => batchUpsert(db, {
