@@ -229,3 +229,27 @@ test('reports when settlement history is incomplete rather than showing confiden
   assert.equal(calculateDashboardMetrics(base,range).diagnostics.outstandingSettlementSyncs,0);
   assert.equal(calculateDashboardMetrics({...base,outstandingSettlementSyncs:2},range).diagnostics.outstandingSettlementSyncs,2);
 });
+
+test('diagnostics cannot claim exclusion while the rows are actually included',()=>{
+  // The regression this guards against shipped live: sourcePolicy read
+  // "settlement only; N Deferred Finance API row(s) measured but excluded"
+  // and pendingMergeSummary.merged was hardcoded false, while the code
+  // immediately below merged those very rows into financialRows. Every
+  // diagnostic anyone would use to debug the totals reported the opposite of
+  // what the code did. This asserts the invariant directly.
+  const range={start:'2026-07-01T00:00:00Z',end:'2026-07-30T00:00:00Z'};
+  const r=calculateDashboardMetrics({
+    orders:[],orderItems:[],returns:[],reimbursements:[],gstInvoices:[],settlementHeaders:[],settledOrderIdsAllTime:[],
+    settlementRows:[line('s1','Principal',1000,'Order',{order_id:'settled',amount_type:'ItemPrice'}),
+                    line('s2','Commission',-100,'Order',{order_id:'settled',amount_type:'ItemFees'})],
+    financeItems:[{source_row_id:'f1',transaction_id:'tx1',order_id:'pending',transaction_status:'DEFERRED',category:'item_price',amount_description:'OurPricePrincipal',amount:250,posted_date:'2026-07-10T00:00:00Z',raw:{}}]
+  },range);
+  const claimsExclusion=/excluded/i.test(r.diagnostics.sourcePolicy.financial);
+  const settlementOnly=r.metrics.netSales.rows.every(row=>row.settlement_id!=null);
+  assert.ok(claimsExclusion,'settlement-complete tenants should report the pending rows as excluded');
+  assert.equal(r.diagnostics.pendingMergeSummary.merged,false);
+  assert.ok(settlementOnly,'financialRows must contain settlement rows only while diagnostics claim exclusion');
+  // The pending rows are still measured, just never counted.
+  assert.equal(r.diagnostics.pendingMergeSummary.pendingExcludedTotals.income,250);
+  assert.equal(r.statement.income.value,1000);
+});

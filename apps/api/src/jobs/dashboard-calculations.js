@@ -173,36 +173,35 @@ export function calculateDashboardMetrics(input,range){
     :returnRowsMissingQuantity?`${returnRowsMissingQuantity} of ${returnAudit.included.length} returns have no quantity from Amazon yet`
     :null;
   const settlementComplete=settlementAudit.included.some(row=>isPrincipal(row)||isProductGst(row)||isFee(row)||isTransfer(row))&&settlementAudit.included.some(row=>row.settlement_id||row.raw?.['settlement-id']||row.raw?.['settlement id']);
-  // Deferred (not-yet-released) Finance API activity is deliberately NOT
-  // added to the statement. It was added on the theory that Amazon's Account
-  // Activity Statement is accrual-based; that theory was tested against a
-  // real seller's own statement PDF for 1-25 Jul 2026 and is wrong. Measured
-  // against Amazon's published section totals for that period:
+  // The settlement report is the source. The Finances API is a FALLBACK ONLY,
+  // used when there is no usable settlement data at all - never as an additive
+  // supplement.
   //
-  //                  settlement-only      merged        Amazon
-  //   Income            1,22,980.13   1,53,912.04   1,32,046.97
-  //   Expenses           -43,881.11    -52,429.16    -42,314.88
-  //   GST                 22,059.79     27,627.53     23,691.75
+  // The two are two views of the same ledger, so adding "unsettled" Finance
+  // rows on top of settlement rows produces an accrual/cash hybrid that
+  // matches no Amazon report. Measured on a real seller for 21-29 Jul 2026,
+  // that merge inflated Income, Expenses and GST by an identical factor of
+  // 7/3 - and 993.30 - 425.70 = 567.60, exactly the settlement figure. Three
+  // independent buckets cannot share one ratio through a classification bug;
+  // it can only be the same population counted twice.
   //
-  // Merging Deferred activity moves EVERY bucket further from Amazon and
-  // multiplies the total absolute error by 2.93x. Amazon's own Expenses
-  // (-42,314.88) is *less* negative than settlement-only (-43,881.11) while
-  // Deferred fees alone are -8,471.75, so the statement demonstrably does not
-  // carry the bulk of Deferred activity.
+  // The merge was attempted because settlement's 567.60 was read as
+  // disagreeing with Amazon's Income of 425.70. It does not. Amazon's own
+  // sub-lines for that window are product sales 567.60 and product sale
+  // refunds -141.90, netting to 425.70. Settlement's 567.60 WAS Amazon's
+  // gross, to the paisa; only the refund row was missing from ingestion. A
+  // gross figure was compared against a net one and an ingestion gap was
+  // misdiagnosed as a source and date-basis error. Never compare a section
+  // total against a sub-line.
   //
-  // The settlement path is independently confirmed exact: hand-mapping
-  // Amazon's own Income sub-lines (product sales, sale refunds, shipping
-  // credits, promotional rebates, FBA inventory credit, SAFE-T) onto
-  // settlement labels reproduces 1,22,980.13 to the paisa, and Amazon's
-  // Transaction View "Released" product total for orders we hold settlement
-  // lines for is 1,23,072.64 - exactly our settlement Principal net.
+  // Amazon's Date Range / Custom Unified Summary report is POSTED-DATE based:
+  // orders placed before the window but posted inside it appear in Amazon's
+  // own PDF for that window. Settlement rows are therefore scoped by
+  // posted_date, matching Amazon, and must not be re-dated to the order.
   //
-  // What remains is a clean, well-characterised residual: Income is short
-  // 9,066.84 and GST short 1,631.96 - a ratio of 17.999%, i.e. India's GST
-  // rate, so the gap is whole order lines (principal plus its own tax) that
-  // are absent from our settlement data, not a misclassification of rows we
-  // already have. pendingMergeSummary below measures that gap on every render
-  // without letting it corrupt the statement.
+  // pendingFinanceRows is computed for measurement only - it is reported in
+  // diagnostics so the size of not-yet-settled activity stays visible, and it
+  // never reaches financialRows.
   const settledOrderIds=new Set([...(input.settledOrderIdsAllTime??[]),...settlementAudit.included.map(row=>row.order_id)].filter(Boolean));
   const pendingFinanceRows=financeAudit.included.filter(row=>row.order_id&&!settledOrderIds.has(row.order_id)&&row.transaction_status&&!/released/i.test(row.transaction_status));
   const financialRows=settlementComplete?settlementAudit.included:financeAudit.included;
