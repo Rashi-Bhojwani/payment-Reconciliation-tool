@@ -640,12 +640,7 @@ function DashboardOverview({ data, channelData, tenantId }) {
 
     <ExplanationGrid summary={summary} tenantId={tenantId} />
 
-    <Card className="profit-control-card">
-      <PanelHeader title="Amazon Account Activity" subtitle="Matches Amazon statement sections" />
-      <div className="profit-kpi-grid account-activity-grid">
-        {['income','expenses','tax','transfers','gst'].map(metric=><DrillMetric key={metric} to={`/seller?tenantId=${tenantId}&view=metric-detail&metric=${metric}`} title={metric==='gst'?'Goods and Services Tax':metric[0].toUpperCase()+metric.slice(1)} value={formatCurrency(data?.dashboardCalculations?.statement?.[metric]?.value)} hint="Open Amazon source rows and formula" />)}
-      </div>
-    </Card>
+    <AccountActivity data={data} tenantId={tenantId} />
 
     <SalesAnalytics data={data} channelData={channelData} />
 
@@ -658,6 +653,31 @@ function DashboardOverview({ data, channelData, tenantId }) {
 
 
 function DrillMetric({ to, title, value, hint }) { return <NavLink to={to} className="mini-metric drill-metric"><span>{title}</span><strong>{value}</strong>{trendHint(hint)}<em>View calculation →</em></NavLink>; }
+
+// "Matches Amazon statement sections" is a claim about the data, not a label,
+// so it is only shown when the API can prove the data behind it is whole.
+// While anything is outstanding the panel says so and lists what, because a
+// seller cannot otherwise tell a matched figure from a provisional one
+// without opening Seller Central and checking by hand.
+function AccountActivity({ data, tenantId }) {
+  const completeness = data?.dashboardCalculations?.diagnostics?.completeness;
+  const provisional = completeness?.provisional ?? true;
+  const reasons = completeness?.reasons ?? ['Waiting for the dashboard calculation to report what it is based on.'];
+  return (
+    <Card className="profit-control-card">
+      <PanelHeader title="Amazon Account Activity" subtitle={provisional ? 'Provisional — not yet reconciled to Amazon' : 'Matches Amazon statement sections'} />
+      {provisional && (
+        <div className="activity-provisional">
+          <b>These sections are not yet a match for your Amazon statement.</b>
+          <ul>{reasons.map(reason => <li key={reason}>{reason}</li>)}</ul>
+        </div>
+      )}
+      <div className="profit-kpi-grid account-activity-grid">
+        {['income','expenses','tax','transfers','gst'].map(metric=><DrillMetric key={metric} to={`/seller?tenantId=${tenantId}&view=metric-detail&metric=${metric}`} title={metric==='gst'?'Goods and Services Tax':metric[0].toUpperCase()+metric.slice(1)} value={formatCurrency(data?.dashboardCalculations?.statement?.[metric]?.value)} hint="Open Amazon source rows and formula" />)}
+      </div>
+    </Card>
+  );
+}
 function ExplanationGrid({ summary, tenantId }) {
   const cards = [
     ['Fee impact', summary.feeImpact==null?'Unavailable':`${Number(summary.feeImpact).toLocaleString('en-IN',{maximumFractionDigits:2})}%`, 'Net Amazon fees excluding TCS/TDS as a percentage of gross product sales.', 'feeImpact'],

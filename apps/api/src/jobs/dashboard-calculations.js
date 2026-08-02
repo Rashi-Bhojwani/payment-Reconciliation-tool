@@ -273,10 +273,29 @@ export function calculateDashboardMetrics(input,range){
     settledOrderIdsKnown:settledOrderIds.size,
     ordersWithMultipleTransactions:[...pendingByOrder].filter(([,entry])=>entry.transactions.size>1).map(([orderId,entry])=>({order_id:orderId,total:entry.total,transactions:[...entry.transactions].map(([transactionId,total])=>({transaction_id:transactionId,total}))}))
   };
-  const diagnostics={sourcePolicy:{financial:`${financialSource} (${settlementComplete?`settlement only; ${pendingFinanceRows.length} Deferred Finance API row(s) measured but excluded - Amazon's statement does not carry them`:'settlement incomplete; Finances fallback'})`,reimbursements:financeReimbursements.length?financialSource:'Reimbursements report fallback',gst:'Imported GST B2B/B2C rows only',settled:'Settlement headers filtered by deposit_date'},includedRows:financialRows.length,excludedRows:(settlementComplete?excludedFinanceRows:settlementAudit.included.length),duplicateRows:financialDuplicates.length+itemAudit.duplicates.length+returnAudit.duplicates.length+gstAudit.duplicates.length,categoryTotals:{grossSales,productRefunds,netPromotions,expenseDebits,expenseCredits,tcsTds,operationalFees,gst,tax,transfers},pendingFinanceRowsDetail,pendingMergeSummary,outstandingSettlementSyncs:Number(input.outstandingSettlementSyncs??0),
+  // The Account Activity panel claims to match Amazon's own statement
+  // sections. Until it demonstrably does, saying so is a lie the seller has
+  // no way to catch - they would have to open Seller Central and compare by
+  // hand, which is the work this tool exists to remove. So the claim is
+  // conditional on the data behind it being provably whole, and every reason
+  // it is not travels with the numbers instead of being buried in a log.
+  const settlementIntegrityRows=(input.settlementIntegrity??[]).map(row=>({settlement_id:row.settlement_id,row_count:Number(row.row_count),rows_total:Number(row.rows_total),header_total:Number(row.header_total),difference:round2(Number(row.rows_total)-Number(row.header_total))}));
+  const outstandingSettlementSyncs=Number(input.outstandingSettlementSyncs??0);
+  const provisionalReasons=[];
+  if(!settlementComplete)provisionalReasons.push('No settlement report covers this range yet, so the sections are built from the Finances API - a different view of the same ledger, not the one Amazon\'s statement is drawn from.');
+  if(outstandingSettlementSyncs>0)provisionalReasons.push(`${outstandingSettlementSyncs} settlement sync(s) did not finish, so some of Amazon's documents for this range have not been read yet.`);
+  if(settlementIntegrityRows.length)provisionalReasons.push(`${settlementIntegrityRows.length} settlement(s) hold fewer lines than Amazon's own document total accounts for (largest gap ${round2(Math.max(...settlementIntegrityRows.map(row=>Math.abs(row.difference))))}).`);
+  // Deferred activity is deliberately excluded (see above), but "deliberate"
+  // is not the same as "certainly right": Seller B's own Amazon statement for
+  // 21-29 Jul carries a -141.90 refund that the Finances API reports as
+  // Deferred and no settlement document contains. Until that is resolved, the
+  // honest position is that these sections may be short by this much.
+  if(pendingFinanceRows.length)provisionalReasons.push(`${pendingFinanceRows.length} Deferred row(s) totalling ${round2(pendingFinanceRows.reduce((sum,row)=>sum+amount(row),0))} are excluded because no settlement document carries them; if Amazon's statement for this range includes any, these sections are short by that much.`);
+  const completeness={provisional:provisionalReasons.length>0,reasons:provisionalReasons};
+  const diagnostics={completeness,sourcePolicy:{financial:`${financialSource} (${settlementComplete?`settlement only; ${pendingFinanceRows.length} Deferred Finance API row(s) measured but excluded - Amazon's statement does not carry them`:'settlement incomplete; Finances fallback'})`,reimbursements:financeReimbursements.length?financialSource:'Reimbursements report fallback',gst:'Imported GST B2B/B2C rows only',settled:'Settlement headers filtered by deposit_date'},includedRows:financialRows.length,excludedRows:(settlementComplete?excludedFinanceRows:settlementAudit.included.length),duplicateRows:financialDuplicates.length+itemAudit.duplicates.length+returnAudit.duplicates.length+gstAudit.duplicates.length,categoryTotals:{grossSales,productRefunds,netPromotions,expenseDebits,expenseCredits,tcsTds,operationalFees,gst,tax,transfers},pendingFinanceRowsDetail,pendingMergeSummary,outstandingSettlementSyncs,
     // Settlements whose own lines do not add up to the total Amazon stamped on
     // the document. Empty means every settlement held is provably complete.
-    settlementIntegrity:(input.settlementIntegrity??[]).map(row=>({settlement_id:row.settlement_id,row_count:Number(row.row_count),rows_total:Number(row.rows_total),header_total:Number(row.header_total),difference:round2(Number(row.rows_total)-Number(row.header_total))}))};
+    settlementIntegrity:settlementIntegrityRows};
   const metric=(value,unit,formula,components,rows,source=financialSource,status=value==null?'Unavailable':null)=>({value,unit,formula,components,rows,source,status,range,diagnostics});
   const metrics={
     netSales:metric(netSales,'amount','Gross product Principal sales − Refund Principal lines − net seller-funded promotions',[component('gross_sales','Gross product sales',grossSales,grossRows),component('product_refunds','Product refunds',-productRefunds,refundPrincipalRows,'−'),component('promotions','Net seller-funded promotions',-netPromotions,promoRows,'−')],[...grossRows,...refundPrincipalRows,...promoRows]),

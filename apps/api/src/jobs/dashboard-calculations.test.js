@@ -273,3 +273,34 @@ test('diagnostics cannot claim exclusion while the rows are actually included',(
   assert.equal(r.diagnostics.pendingMergeSummary.pendingExcludedTotals.income,250);
   assert.equal(r.statement.income.value,1000);
 });
+
+test('the statement only claims to match Amazon once it can prove it does',()=>{
+  const range={start:'2026-07-01T00:00:00Z',end:'2026-07-26T00:00:00Z'};
+  const clean={orders:[],orderItems:[],returns:[],reimbursements:[],gstInvoices:[],settlementHeaders:[],financeItems:[],settledOrderIdsAllTime:[],
+    settlementRows:[line('sale','Principal',1000,'Order',{order_id:'o1',amount_type:'ItemPrice'})]};
+  assert.deepEqual(calculateDashboardMetrics(clean,range).diagnostics.completeness,{provisional:false,reasons:[]});
+
+  const reasonsFor=input=>calculateDashboardMetrics({...clean,...input},range).diagnostics.completeness;
+
+  const unfinished=reasonsFor({outstandingSettlementSyncs:2});
+  assert.equal(unfinished.provisional,true);
+  assert.match(unfinished.reasons.join(' '),/2 settlement sync\(s\) did not finish/);
+
+  const torn=reasonsFor({settlementIntegrity:[{settlement_id:'s1',row_count:40,rows_total:900,header_total:1000}]});
+  assert.equal(torn.provisional,true);
+  assert.match(torn.reasons.join(' '),/largest gap 100/);
+
+  // Amazon's own 21-29 Jul statement for Seller B carries a -141.90 refund
+  // that the Finances API marks Deferred and no settlement document holds, so
+  // excluded-Deferred activity has to be surfaced as a caveat rather than
+  // treated as certainly irrelevant.
+  const deferred=reasonsFor({financeItems:[{source_row_id:'f1',transaction_id:'tx',order_id:'o2',transaction_status:'Deferred',category:'item_price',amount_description:'OurPricePrincipal',amount:-141.9,posted_date:'2026-07-10T00:00:00Z',raw:{}}]});
+  assert.equal(deferred.provisional,true);
+  assert.match(deferred.reasons.join(' '),/1 Deferred row\(s\) totalling -141\.9/);
+
+  // No settlement report at all: the sections come from a different ledger
+  // view than the one Amazon's statement is drawn from.
+  const noSettlement=calculateDashboardMetrics({...clean,settlementRows:[],financeItems:[line('f','Principal',1000,'Order')]},range).diagnostics.completeness;
+  assert.equal(noSettlement.provisional,true);
+  assert.match(noSettlement.reasons.join(' '),/No settlement report covers this range/);
+});
