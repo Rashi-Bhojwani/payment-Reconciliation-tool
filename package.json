@@ -15,7 +15,8 @@
     "test": "npm run check",
     "check": "node --check apps/api/src/server.js && node --check apps/api/src/jobs/sync.js && node --check apps/api/src/jobs/fee-audit.js && node --check apps/api/src/jobs/finance-components.js && node --check apps/api/src/jobs/sync-queue.js && node --check apps/api/src/jobs/reporting-calendar.js && node --check apps/api/src/jobs/dashboard-calculations.js && node --check packages/sp-api-client/src/index.js && node --check packages/db/src/index.js && node --test apps/api/src/jobs/finance-components.test.js apps/api/src/jobs/dashboard-calculations.test.js apps/api/src/jobs/sync.test.js apps/api/src/jobs/sync-queue.test.js apps/api/src/jobs/reporting-calendar.test.js packages/sp-api-client/src/index.test.js",
     "db:migrate": "npm --workspace @recon/db run migrate",
-    "check:sql": "node apps/api/scripts/check-sql.mjs"
+    "check:sql": "node apps/api/scripts/check-sql.mjs",
+    "repair:settlements": "node apps/api/scripts/repair-duplicated-settlements.mjs"
   },
   "devDependencies": {
     "concurrently": "^8.2.2"
