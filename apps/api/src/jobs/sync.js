@@ -493,7 +493,9 @@ export async function syncReportForTenant(params) {
           rows: report.documentIds.map(documentId => [parsed.tenantId, documentId, parsed.reportType])
         }));
       }
-      const outstandingDocuments = report.reportsTruncated ? report.reportsAvailable - (report.reportsMerged ?? 0) : 0;
+      const outstandingDocuments = report.reportsTruncated
+        ? (report.reportsOutstanding ?? report.reportsAvailable - (report.reportsMerged ?? 0))
+        : 0;
       console.log(`[${logLabel}] completed in ${Date.now() - startedAt}ms - ${rowsImported} rows imported from ${report.reportsMerged ?? 0} of ${report.reportsAvailable} document(s) Amazon has for this range` + (outstandingDocuments ? ` - ${outstandingDocuments} STILL OUTSTANDING, figures are incomplete until they are fetched` : ''));
       // A truncated sync fetched only part of what Amazon has, so it must not
       // be recorded as a sync that covers this range. It used to be stored

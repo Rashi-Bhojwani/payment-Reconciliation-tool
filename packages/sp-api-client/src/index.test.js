@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { normalizeReportRange, throttleRetryDelayMs } from './index.js';
+import { normalizeReportRange, SpApiClient, throttleRetryDelayMs } from './index.js';
 
 test('caps a future exclusive report end before the current time', () => {
   const now = Date.parse('2026-07-27T12:00:00.000Z');
@@ -47,4 +47,62 @@ test('a fast bucket still backs off exponentially rather than at its floor', () 
   // that, or a genuinely overloaded endpoint gets hammered at a fixed rate.
   const waits = [0, 1, 2, 3].map(attempt => throttleRetryDelayMs({ method: 'GET', path: '/orders/v0/orders', attempt }));
   assert.deepEqual(waits, [2200, 4000, 8000, 16_000]);
+});
+
+function settlementClient({ documents, failAt }) {
+  const client = new SpApiClient('refresh-token', { clientId: 'id', clientSecret: 'secret' });
+  client.request = async () => ({
+    ok: true,
+    json: async () => ({ reports: documents.map((id, index) => ({ reportId: `r${index}`, reportDocumentId: id, dataStartTime: '2026-07-01T00:00:00Z', dataEndTime: '2026-07-25T00:00:00Z' })) })
+  });
+  const downloaded = [];
+  client.downloadReportDocument = async id => {
+    if (id === failAt) throw new Error(`SP-API request failed after retries: GET /reports/2021-06-30/documents/${id}`);
+    downloaded.push(id);
+    return { content: `header\n${id}-row` };
+  };
+  return { client, downloaded };
+}
+const SETTLEMENT_RANGE = { start: '2026-07-01T00:00:00Z', end: '2026-07-25T00:00:00Z' };
+const TENANT = '2c10fe2c-dfcd-4a34-9bd2-6638e4be2c55';
+
+test('a throttled document keeps every document already downloaded in that run', async () => {
+  // Each document costs a 45s slot of Amazon's quota. Failing the whole run
+  // on document 3 used to discard documents 1 and 2 as well, so a backlog
+  // could never converge.
+  const { client, downloaded } = settlementClient({ documents: ['doc-a', 'doc-b', 'doc-c', 'doc-d'], failAt: 'doc-c' });
+  const report = await client.fetchReport('GET_V2_SETTLEMENT_REPORT_DATA_FLAT_FILE_V2', TENANT, SETTLEMENT_RANGE);
+
+  assert.deepEqual(downloaded, ['doc-a', 'doc-b']);
+  assert.equal(report.reportsMerged, 2);
+  assert.equal(report.reportsOutstanding, 2, 'doc-c and doc-d are still to fetch');
+  assert.equal(report.reportsTruncated, true);
+  assert.deepEqual(report.documentIds, ['doc-a', 'doc-b'], 'only imported documents may be recorded as processed');
+  assert.match(report.content, /doc-a-row/);
+  assert.match(report.content, /doc-b-row/);
+});
+
+test('a run where nothing downloaded still surfaces the real failure', async () => {
+  const { client } = settlementClient({ documents: ['doc-a', 'doc-b'], failAt: 'doc-a' });
+  await assert.rejects(
+    client.fetchReport('GET_V2_SETTLEMENT_REPORT_DATA_FLAT_FILE_V2', TENANT, SETTLEMENT_RANGE),
+    /SP-API request failed after retries/,
+    'an empty run must not be reported as a partial success'
+  );
+});
+
+test('a fully successful run reports nothing outstanding', async () => {
+  const { client, downloaded } = settlementClient({ documents: ['doc-a', 'doc-b'], failAt: null });
+  const report = await client.fetchReport('GET_V2_SETTLEMENT_REPORT_DATA_FLAT_FILE_V2', TENANT, SETTLEMENT_RANGE);
+  assert.deepEqual(downloaded, ['doc-a', 'doc-b']);
+  assert.equal(report.reportsTruncated, false);
+  assert.equal(report.reportsOutstanding, 0);
+});
+
+test('documents already stored are not counted as outstanding', async () => {
+  const { client, downloaded } = settlementClient({ documents: ['doc-a', 'doc-b', 'doc-c'], failAt: null });
+  const report = await client.fetchReport('GET_V2_SETTLEMENT_REPORT_DATA_FLAT_FILE_V2', TENANT, SETTLEMENT_RANGE, undefined, { skipDocumentIds: new Set(['doc-a', 'doc-b']) });
+  assert.deepEqual(downloaded, ['doc-c']);
+  assert.equal(report.reportsOutstanding, 0, 'reportsAvailable - reportsMerged would wrongly say 2');
+  assert.equal(report.reportsTruncated, false);
 });

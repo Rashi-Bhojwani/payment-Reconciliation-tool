@@ -286,18 +286,48 @@ export class SpApiClient {
       // request; anything past it is picked up by the *next* sync instead
       // (nothing here is skipped forever - only already-processed).
       const boundedReports = newReports.slice(0, SETTLEMENT_REPORT_DOWNLOAD_CAP);
+      // Each document here costs a 45s slot of Amazon's quota, and a long
+      // backlog means many of them. Letting one throttled document throw out
+      // of this loop threw away every document already paid for in the same
+      // run - so a seller whose account needs, say, twelve documents could
+      // fail on the ninth and import none of the eight that did arrive, over
+      // and over, never converging. Keeping what was fetched turns every run
+      // into guaranteed forward progress: the imported documents are recorded
+      // as processed, the rest are reported as outstanding, and the next sync
+      // resumes from there instead of starting over.
       const documents = [];
-      for (const report of boundedReports) documents.push(await this.downloadReportDocument(report.reportDocumentId));
+      const fetched = [];
+      let downloadError = null;
+      for (const report of boundedReports) {
+        try {
+          documents.push(await this.downloadReportDocument(report.reportDocumentId));
+          fetched.push(report);
+        } catch (error) {
+          downloadError = error;
+          break;
+        }
+      }
+      // Nothing arrived at all - there is no partial success to report, so the
+      // caller must see the real failure rather than an empty "completed".
+      if (!documents.length) throw downloadError ?? new Error('No settlement document could be downloaded');
+      if (downloadError) {
+        console.warn(`[${this.label}] settlement download stopped after ${fetched.length} of ${boundedReports.length} document(s): ${downloadError instanceof Error ? downloadError.message : downloadError} - keeping the ${fetched.length} already fetched, ${newReports.length - fetched.length} left for the next sync`);
+      }
       const content = documents.map((document, index) => index === 0 ? document.content : document.content.split(/\r?\n/).slice(1).join('\n')).join('\n');
       return {
-        reportId: boundedReports[0].reportId,
-        reportDocumentId: boundedReports[0].reportDocumentId,
+        reportId: fetched[0].reportId,
+        reportDocumentId: fetched[0].reportDocumentId,
         content,
         compressionAlgorithm: 'MERGED_SETTLEMENT_REPORTS',
-        reportsMerged: boundedReports.length,
+        reportsMerged: fetched.length,
         reportsAvailable: matchingReports.length,
-        reportsTruncated: newReports.length > boundedReports.length,
-        documentIds: boundedReports.map(item => item.reportDocumentId)
+        // Documents Amazon has for this range that this run did not import -
+        // whether the cap stopped it or a download did. reportsAvailable minus
+        // reportsMerged would overcount, since it also counts documents that
+        // were skipped precisely because they are already stored.
+        reportsOutstanding: newReports.length - fetched.length,
+        reportsTruncated: newReports.length > fetched.length,
+        documentIds: fetched.map(item => item.reportDocumentId)
       };
     }
     const reportOptions = parsedReportType === 'GET_SALES_AND_TRAFFIC_REPORT'
