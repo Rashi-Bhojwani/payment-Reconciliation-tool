@@ -161,3 +161,35 @@ test('an unreadable error body never masks the status', async () => {
     : { ok: true, json: async () => ({}) };
   await assert.rejects(client.fetchReport('GET_SALES_AND_TRAFFIC_REPORT', TENANT, SETTLEMENT_RANGE), /Create report failed: 403/);
 });
+
+test('a failed token exchange says which kind of failure it was', async () => {
+  // Verified against the live LWA endpoint: a valid application presented with
+  // a seller token minted for a different application answers 400
+  // unauthorized_client, while the same application with a wrong secret
+  // answers 401 invalid_client. Those need opposite fixes, and the bare status
+  // code told them apart not at all.
+  const original = globalThis.fetch;
+  const reply = (status, body) => { globalThis.fetch = async () => ({ ok: false, status, text: async () => JSON.stringify(body) }); };
+  try {
+    reply(400, { error: 'unauthorized_client', error_description: 'Not authorized for requested operation' });
+    await assert.rejects(new SpApiClient('token', { clientId: 'id', clientSecret: 'secret' }).getAccessToken(), error => {
+      assert.match(error.message, /LWA token exchange failed: 400/);
+      assert.match(error.message, /unauthorized_client: Not authorized for requested operation/);
+      assert.match(error.message, /not issued to this SP-API application/);
+      assert.match(error.message, /must connect the account again/);
+      return true;
+    });
+
+    reply(401, { error: 'invalid_client', error_description: 'Client authentication failed' });
+    await assert.rejects(new SpApiClient('token', { clientId: 'id', clientSecret: 'nope' }).getAccessToken(), error => {
+      assert.match(error.message, /client id and secret do not match/);
+      assert.doesNotMatch(error.message, /revoked its authorization/, 'a credential problem must not be reported as a seller problem');
+      return true;
+    });
+
+    reply(400, { error: 'some_new_code_amazon_added' });
+    await assert.rejects(new SpApiClient('token', { clientId: 'id', clientSecret: 's' }).getAccessToken(), /some_new_code_amazon_added/);
+  } finally {
+    globalThis.fetch = original;
+  }
+});

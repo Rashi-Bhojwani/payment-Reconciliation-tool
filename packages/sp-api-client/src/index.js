@@ -121,6 +121,42 @@ export function throttleRetryDelayMs({ method, path, attempt, retryAfterSeconds,
   return Math.min(SP_API_MAX_BACKOFF_MS, Math.max(headerBackoffMs, intervalMs));
 }
 
+// A failed token exchange is where every other symptom starts - no token
+// means every report, every order and every finance call fails after it - and
+// "LWA token exchange failed: 400" says nothing about which of several very
+// different problems it is. Amazon names it in the response body, and the
+// three that matter are not remotely alike:
+//
+//   unauthorized_client  the refresh token was not issued to THIS application,
+//                        or the seller's authorization for it was revoked. New
+//                        credentials will not help; the seller must re-authorize.
+//   invalid_client       the client id/secret pair itself is wrong.
+//   invalid_grant        the refresh token is expired or malformed.
+//
+// Confirmed against the live endpoint: a valid app with a mismatched seller
+// token answers 400 unauthorized_client, while the same app with a deliberately
+// wrong secret answers 401 invalid_client - so the body genuinely separates
+// "wrong credentials" from "right credentials, wrong seller".
+const LWA_ERROR_HELP = Object.freeze({
+  unauthorized_client: 'the refresh token was not issued to this SP-API application, or the seller has revoked its authorization - the seller must connect the account again to mint a new token',
+  invalid_client: 'the LWA client id and secret do not match a live application',
+  invalid_grant: 'the refresh token is expired, revoked or malformed - the seller must connect the account again',
+  invalid_scope: 'the application is not approved for the scope this token was minted with'
+});
+/** @param {Response} response */
+async function describeLwaFailure(response) {
+  try {
+    const body = await response.text();
+    const parsed = body && body.trim().startsWith('{') ? JSON.parse(body) : null;
+    if (!parsed) return body ? ` - ${body.slice(0, 200)}` : '';
+    const code = parsed.error ?? '';
+    const help = LWA_ERROR_HELP[code];
+    return ` (${code}${parsed.error_description ? `: ${parsed.error_description}` : ''})${help ? ` - ${help}` : ''}`;
+  } catch {
+    return '';
+  }
+}
+
 // Roles Amazon requires on the *application* for a report type, beyond the
 // ones the working reports already prove are granted. These are granted in
 // Developer Central against the SP-API app, not in the seller's own account -
@@ -206,7 +242,7 @@ export class SpApiClient {
       headers: { 'content-type': 'application/x-www-form-urlencoded' },
       body: new URLSearchParams({ grant_type: 'refresh_token', refresh_token: this.refreshToken, client_id: this.cfg.clientId ?? '', client_secret: this.cfg.clientSecret ?? '' })
     });
-    if (!res.ok) throw new Error(`LWA token exchange failed: ${res.status}`);
+    if (!res.ok) throw new Error(`LWA token exchange failed: ${res.status}${await describeLwaFailure(res)}`);
     const body = z.object({ access_token: z.string().min(1), expires_in: z.number().default(3600) }).parse(await res.json());
     this.cachedToken = { accessToken: body.access_token, expiresIn: body.expires_in, expiresAt: Date.now() + body.expires_in * 1000 };
     return this.cachedToken;
