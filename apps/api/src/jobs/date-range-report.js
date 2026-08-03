@@ -12,22 +12,36 @@
 //
 // CRITICAL: a manually downloaded Date Range export cannot be assumed
 // complete, so it must never be treated as the canonical financial source.
-// Proved by two exports of the SAME account taken from Seller Central:
+// Two exports of the SAME account taken from Seller Central disagree:
 //
-//   1 - 25 Jul : 455 rows over 25 days
-//   1 - 30 Jul : 313 rows over 30 days
+//   1 - 25 Jul : 455 rows over 25 days   (has an Account Type column)
+//   1 - 30 Jul : 313 rows over 30 days   (no Account Type column)
 //
-// The longer period returns fewer rows, and the shortfall is not at the edges
-// - every single day from 1 to 25 Jul has fewer rows in the 30-day export, 205
-// rows missing in total (22 on 3 Jul, 23 on 4 Jul, 29 on 24 Jul). Both files
-// parse cleanly, both cover every day of their range, and both have a per-row
-// control drift of exactly 0, so nothing in the file itself reveals the loss.
-// Only holding two exports side by side does.
+// 205 rows present in the first are absent from the second on days both
+// cover, and nothing is present in the second that is missing from the first.
+// Amazon is NOT silently truncating - both differences were traced to cause:
 //
-// That is why assessCoverage() below reports completeness as UNKNOWABLE from
-// one file. A truncated export is indistinguishable from a complete one, and
-// building statement totals on it would silently under-report a seller's
-// money - the exact failure this tool exists to prevent.
+//   176 rows are the Cash On Delivery population, dropped by the export
+//        FILTER rather than by Amazon. 57 of the 59 COD orders are wholly
+//        absent from the second file while 136 of 152 Electronic orders are
+//        present, and the second file has no Account Type column at all,
+//        because it was requested for one payment rail only.
+//
+//    29 rows are all Deferred, dated 20 - 25 Jul, and appear nowhere in the
+//        later export - not even on 26 - 30 Jul. Deferred is a MOVING
+//        population: a row leaves it when Amazon releases the money, and is
+//        then reported on its release date, which for these fell past 30 Jul.
+//
+// So a Date Range export is a point-in-time snapshot of a moving population,
+// and its row set also depends on export-time filters the file itself may not
+// record. Re-exporting the same range on a different day legitimately returns
+// a different answer. That is why assessCoverage() below never returns
+// "complete": both effects leave every requested day populated and a per-row
+// control drift of exactly 0, so no inspection of one file reveals them.
+//
+// One of the two IS detectable, and is reported: an export whose header
+// carries no Account Type column cannot show whether every payment rail was
+// included, and on this account that silently hid 176 COD rows.
 //
 // What this file is NOT: a reproduction of the Custom Unified Summary PDF.
 // Verified against the real pair for the same seller and range - only the
@@ -249,15 +263,32 @@ export function assessCoverage(rows, expected = {}) {
       if (!days.includes(iso)) missingDays.push(iso);
     }
   }
+  // The one gap a single file CAN prove. Without this column the export
+  // cannot show which payment rails it was requested for, and on the real
+  // pair that concealed all 176 Cash On Delivery rows.
+  const accountTypes = [...new Set(rows.map(row => row.accountType).filter(Boolean))].sort();
+  const warnings = [];
+  if (!accountTypes.length) {
+    warnings.push('This export carries no Account Type column, so it cannot show whether every payment rail was included. The matching export that did carry one held 176 Cash On Delivery rows.');
+  }
+  const deferredRowCount = rows.filter(row => /deferred/i.test(row.status)).length;
+  if (deferredRowCount) {
+    warnings.push(`${deferredRowCount} row(s) are Deferred. Deferred is a moving population - re-exporting this same range later returns a different set, because released rows move to their release date.`);
+  }
   return {
     rowCount: rows.length,
     dayCount: days.length,
     firstDay,
     lastDay,
     missingDays,
-    // Never true. A Seller Central export can silently omit rows on days it
-    // does report, so "every day is present" proves nothing about the rows.
+    accountTypes,
+    deferredRowCount,
+    warnings,
+    // Never true. Both proven causes of divergence - an export-time payment
+    // rail filter, and deferred rows leaving the range as they release -
+    // leave every requested day populated and the control drift at 0, so
+    // "every day is present" proves nothing about the rows on those days.
     canBeTreatedAsComplete: false,
-    whyNot: 'A downloaded Date Range export can omit rows on days it still reports - two exports of one account differed by 205 rows across days both covered. Completeness must be corroborated against Amazon-stated totals, never assumed from the file.'
+    whyNot: 'A Date Range export is a point-in-time snapshot of a moving population, and its rows also depend on export-time filters the file may not record. Two exports of one account, same days, differed by 205 rows: 176 excluded by a payment-rail filter and 29 deferred rows that had since released past the range. Completeness must be corroborated against Amazon-stated totals, never assumed from the file.'
   };
 }

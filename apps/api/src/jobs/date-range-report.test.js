@@ -119,11 +119,11 @@ test('a bare CSV parse keeps empty trailing fields', () => {
   assert.deepEqual(parseCsv('a,b,c\n1,,3')[1], ['1', '', '3']);
 });
 
-test('coverage never claims completeness, because a truncated export looks whole', () => {
-  // Two real exports of one account: 1-25 Jul gave 455 rows, 1-30 Jul gave 313
-  // - fewer rows for a longer period, short on every single overlapping day.
-  // Both parsed cleanly with zero control drift, so the file cannot be trusted
-  // to declare itself complete.
+test('coverage reports days and gaps but never certifies completeness', () => {
+  // Two real exports of one account, 1-25 Jul (455 rows) against 1-30 Jul
+  // (313 rows), differed by 205 rows on days both covered: 176 excluded by an
+  // export-time payment-rail filter, 29 deferred rows that had since released
+  // past the range. Both parsed cleanly with zero control drift.
   const csv = [HEADER, ORDER, DEFERRED].join('\n');
   const coverage = assessCoverage(parseDateRangeReport(csv).rows, { start: '2026-07-24', end: '2026-07-26' });
   assert.equal(coverage.rowCount, 2);
@@ -131,7 +131,7 @@ test('coverage never claims completeness, because a truncated export looks whole
   assert.equal(coverage.firstDay, '2026-07-25');
   assert.deepEqual(coverage.missingDays, ['2026-07-24', '2026-07-26']);
   assert.equal(coverage.canBeTreatedAsComplete, false, 'must never be true, whatever the file looks like');
-  assert.match(coverage.whyNot, /omit rows on days it still reports/);
+  assert.match(coverage.whyNot, /point-in-time snapshot of a moving population/);
 });
 
 test('a full-looking export still refuses to certify itself', () => {
@@ -139,4 +139,33 @@ test('a full-looking export still refuses to certify itself', () => {
   const coverage = assessCoverage(parseDateRangeReport(csv).rows, { start: '2026-07-25', end: '2026-07-25' });
   assert.deepEqual(coverage.missingDays, [], 'every requested day is present');
   assert.equal(coverage.canBeTreatedAsComplete, false, 'and it still cannot be called complete');
+});
+
+test('an export with no Account Type column is flagged, because that hid 176 COD rows', () => {
+  // The real 1-30 Jul export had no Account Type column and was missing 57 of
+  // the account's 59 Cash On Delivery orders entirely. The file gives no other
+  // sign of it, so the absent column is itself the evidence.
+  const noAccountType = '"Date","Transaction Status","Transaction type","Order ID","Product Details","Total product charges","Total promotional rebates","Amazon fees","Other","Total (INR)"';
+  const bare = row(['25/7/2026', 'Released', 'Order Payment', 'ORD-1', 'Widget', '583.9', '-33.9', '-152.22', '135.49', '533.27']);
+  const coverage = assessCoverage(parseDateRangeReport([noAccountType, bare].join('\n')).rows);
+  assert.deepEqual(coverage.accountTypes, [], 'the column is simply not there');
+  assert.match(coverage.warnings.join(' '), /no Account Type column/);
+  assert.match(coverage.warnings.join(' '), /Cash On Delivery/);
+});
+
+test('an export that does carry Account Type reports the rails it covers', () => {
+  const coverage = assessCoverage(parseDateRangeReport([HEADER, ORDER, DEFERRED].join('\n')).rows);
+  assert.deepEqual(coverage.accountTypes, ['Electronic Transactions (Credit Card/Net Banking/GC)']);
+  assert.equal(coverage.warnings.some(w => /no Account Type column/.test(w)), false);
+});
+
+test('deferred rows are flagged as a moving population, not a stable one', () => {
+  // 29 deferred rows dated 20-25 Jul in the earlier export appeared nowhere in
+  // the later one - not even on 26-30 Jul - because they released past it.
+  const coverage = assessCoverage(parseDateRangeReport([HEADER, ORDER, DEFERRED].join('\n')).rows);
+  assert.equal(coverage.deferredRowCount, 1);
+  assert.match(coverage.warnings.join(' '), /moving population/);
+  const released = assessCoverage(parseDateRangeReport([HEADER, ORDER].join('\n')).rows);
+  assert.equal(released.deferredRowCount, 0);
+  assert.equal(released.warnings.some(w => /moving population/.test(w)), false, 'no warning when there is nothing deferred');
 });
