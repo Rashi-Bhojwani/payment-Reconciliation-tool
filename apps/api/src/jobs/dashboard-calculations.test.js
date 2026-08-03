@@ -433,9 +433,11 @@ test("Seller C's real transfers reproduce Amazon's statement exactly",()=>{
     transfer('2026-07-22T12:01:22Z',113872.28), transfer('2026-07-26T06:43:56Z',59707.76),
     transfer('2026-07-30T06:55:54Z',66743.04)
   ];
+  // The window the UI actually sends for 1-30 Jul: IST midnight to IST
+  // midnight, exactly as Amazon's own PDF header states both ends.
   const r=calculateDashboardMetrics({...statementBase,financeTransactions,
     settlementHeaders:[{settlement_id:'late',deposit_date:'31.07.2026 12:36:29 UTC',total_amount:66743.04}]},
-    {start:'2026-06-30T18:30:00Z',end:'2026-07-31T00:00:00Z'});
+    {start:'2026-06-30T18:30:00Z',end:'2026-07-30T18:30:00Z'});
   assert.equal(r.statement.transfers.value,-759003.33);
   assert.equal(r.metrics.settled.value,759003.33);
   assert.equal(r.statement.transfers.source,'Amazon Finances API transfers');

@@ -221,23 +221,20 @@ function startOfDay(d) { const { year, month, date } = istParts(d); return new D
 function addDays(d, n) { return new Date(new Date(d).getTime() + n * 864e5); }
 function formatShort(d) { return d.toLocaleDateString('en-IN', { month: 'short', day: 'numeric', timeZone: IST_TIME_ZONE }); }
 function formatDateParam(date) { return startOfDay(date).toISOString(); }
-// Amazon's Custom Unified Summary does not run midnight-to-midnight in one
-// zone, and its own PDF header says so outright:
-//   "Account activity from Jul 1, 2026 00:00 GMT+5:30 through Jul 30, 2026 23:59 GMT"
-// Start in IST, end in GMT. Ending the window at IST midnight instead left a
-// 5 hour 29 minute blind spot at the close of every range. Confirmed live: a
-// seller's 1-30 Jul statement showed Transfers of -7,59,003.33 against the
-// tool's -6,92,260.29, and the missing 66,743.04 was a single payout that
-// appeared only when the range was widened to 31 Jul - it had landed inside
-// that blind spot. Deposits for that account are stamped as late as 19:30
-// UTC, comfortably past the 18:30 cutoff.
+// Amazon's Custom Unified Summary runs IST midnight to IST midnight. Its own
+// PDF header states both ends in the same zone:
+//   "Account activity from Jul 1, 2026 00:00 GMT+5:30
+//                   through Jul 25, 2026 23:59 GMT+5:30"
 //
-// Widening to 31 Jul is not the fix: that overshoots Amazon by 18.5 hours in
-// the other direction and would wrongly count a deposit made early on the
-// 31st. The window has to end where Amazon ends it.
+// An earlier version of this ended the window at 23:59 GMT instead, on the
+// strength of a screenshot in which the trailing "+5:30" was cut off. Reading
+// the PDF file itself settled it: both ends are GMT+5:30, the window is
+// symmetric, and there is no blind spot to compensate for. Extracting the
+// text rather than trusting a rendered image is the only reason this was
+// caught, and it is why the boundary is quoted here verbatim.
 function endOfRangeParam(lastDay) {
   const { year, month, date } = istParts(lastDay);
-  return new Date(Date.UTC(year, month, date + 1)).toISOString();
+  return new Date(Date.UTC(year, month, date + 1) - IST_OFFSET_MS).toISOString();
 }
 function rangeQuery(range) { return `start=${encodeURIComponent(formatDateParam(range.start))}&end=${encodeURIComponent(endOfRangeParam(range.end))}`; }
 function formatRangeLabel(start, end) {
