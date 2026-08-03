@@ -25,6 +25,11 @@ const REPORT_DATA_LAG_MS = 2 * 60 * 1000;
 const REPORT_POLL_INTERVAL_MS = 15_000;
 const REPORT_POLL_ATTEMPTS = 20;
 const SETTLEMENT_REPORT_LIST_MAX_PAGES = 20;
+// How far before a window a settlement may have closed and still pay out
+// inside it. The observed lag is exactly two days on every settlement of both
+// accounts measured; ten gives room for a slower payout schedule without
+// pulling in documents that could not possibly be relevant.
+const SETTLEMENT_PAYOUT_LOOKBACK_MS = 10 * 864e5;
 // Bounds a single sync call's wall-clock time (Amazon's real ~45s/document
 // limit on this operation, minus the 10-document burst allowance, means this
 // is roughly 10 minutes worst case for one request) rather than how much
@@ -327,7 +332,20 @@ export class SpApiClient {
       const requestedStart = new Date(parsedRange.start).getTime();
       const requestedEnd = new Date(parsedRange.end).getTime();
       const matchingReports = reports
-        .filter(item => item.reportDocumentId && (!item.dataEndTime || new Date(item.dataEndTime).getTime() >= requestedStart) && (!item.dataStartTime || new Date(item.dataStartTime).getTime() <= requestedEnd))
+        // A settlement pays out AFTER its period closes - measured on two real
+        // accounts, exactly two days after, without exception across 29
+        // settlements. So a settlement whose period ended shortly before the
+        // window can still deposit inside it, and requiring dataEndTime to
+        // fall in the window meant those documents were never downloaded at
+        // all. Confirmed live on a real account viewing 1-25 Jul: two
+        // settlements closing 29 Jun and depositing 1 Jul, worth 11,433.75
+        // between them, were invisible to every sync - and nothing downstream
+        // can select a payout from a document it never fetched.
+        //
+        // The lookback only widens what is FETCHED. Which settlements count
+        // towards a figure is decided later, against data that is now
+        // complete rather than silently truncated at the window's edge.
+        .filter(item => item.reportDocumentId && (!item.dataEndTime || new Date(item.dataEndTime).getTime() >= requestedStart - SETTLEMENT_PAYOUT_LOOKBACK_MS) && (!item.dataStartTime || new Date(item.dataStartTime).getTime() <= requestedEnd))
         .sort((a, b) => new Date(b.dataEndTime ?? b.createdTime ?? 0).getTime() - new Date(a.dataEndTime ?? a.createdTime ?? 0).getTime());
       if (!matchingReports.length) throw new Error('No completed Amazon settlement report is available for this date range yet');
       // A settlement report document is immutable once generated - Amazon

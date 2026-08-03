@@ -193,3 +193,25 @@ test('a failed token exchange says which kind of failure it was', async () => {
     globalThis.fetch = original;
   }
 });
+
+test('a settlement that closed before the window but pays out inside it is still fetched', async () => {
+  // Live case: two settlements closing 29 Jun and depositing 1 Jul, worth
+  // 11,433.75, were never downloaded for a 1-25 Jul window - so no rule
+  // downstream could count them, right or wrong.
+  const client = new SpApiClient('refresh-token', { clientId: 'id', clientSecret: 'secret' });
+  client.request = async () => ({ ok: true, json: async () => ({ reports: [
+    { reportId: 'closed-before-window', reportDocumentId: 'doc-before', dataStartTime: '2026-06-27T00:00:00Z', dataEndTime: '2026-06-29T02:45:30Z' },
+    { reportId: 'inside-window',        reportDocumentId: 'doc-inside', dataStartTime: '2026-07-03T00:00:00Z', dataEndTime: '2026-07-06T00:00:00Z' },
+    { reportId: 'ancient',              reportDocumentId: 'doc-old',    dataStartTime: '2026-05-01T00:00:00Z', dataEndTime: '2026-05-03T00:00:00Z' }
+  ] }) });
+  const fetched = [];
+  client.downloadReportDocument = async id => { fetched.push(id); return { content: `header\n${id}` }; };
+
+  const report = await client.fetchReport('GET_V2_SETTLEMENT_REPORT_DATA_FLAT_FILE_V2', TENANT,
+    { start: '2026-06-30T18:30:00Z', end: '2026-07-26T00:00:00Z' });
+
+  assert.ok(fetched.includes('doc-before'), 'a settlement closing just before the window can still deposit inside it');
+  assert.ok(fetched.includes('doc-inside'));
+  assert.ok(!fetched.includes('doc-old'), 'the lookback is bounded, not unlimited');
+  assert.equal(report.reportsMerged, 2);
+});
