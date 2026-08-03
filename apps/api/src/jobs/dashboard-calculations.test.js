@@ -305,3 +305,31 @@ test('the statement only claims to match Amazon once it can prove it does',()=>{
   assert.equal(noSettlement.provisional,true);
   assert.match(noSettlement.reasons.join(' '),/No settlement report covers this range/);
 });
+
+test('a settlement chain that stops before the window ends says so',()=>{
+  // Real shape, from a live account: an unbroken settlement chain that simply
+  // does not reach the end of the range being viewed. Nothing is missing from
+  // the middle, so no integrity check fires - but five days of the window
+  // have no settlement document behind them, and a settlement-only figure for
+  // that window is a partial period.
+  const range={start:'2026-06-30T18:30:00Z',end:'2026-07-30T18:30:00Z'};
+  const input={orders:[],orderItems:[],returns:[],reimbursements:[],gstInvoices:[],financeItems:[],settledOrderIdsAllTime:[],
+    settlementRows:[line('sale','Principal',1000,'Order',{order_id:'o1',amount_type:'ItemPrice'})],
+    settlementHeaders:[
+      {settlement_id:'s7',deposit_date:'23.07.2026 17:45:05 UTC',settlement_start_date:'17.07.2026 14:46:26 UTC',settlement_end_date:'21.07.2026 17:45:05 UTC',total_amount:113872.28},
+      {settlement_id:'s8',deposit_date:'27.07.2026 10:44:14 UTC',settlement_start_date:'21.07.2026 17:45:05 UTC',settlement_end_date:'25.07.2026 10:44:14 UTC',total_amount:59707.76}
+    ]};
+  const reasons=calculateDashboardMetrics(input,range).diagnostics.completeness.reasons.join(' ');
+  assert.match(reasons,/Settlement documents reach only 2026-07-25/);
+  assert.match(reasons,/this range runs to 2026-07-30/);
+  assert.match(reasons,/last 5 day\(s\)/);
+});
+
+test('a settlement chain covering the whole window raises nothing',()=>{
+  const range={start:'2026-06-30T18:30:00Z',end:'2026-07-30T18:30:00Z'};
+  const input={orders:[],orderItems:[],returns:[],reimbursements:[],gstInvoices:[],financeItems:[],settledOrderIdsAllTime:[],
+    settlementRows:[line('sale','Principal',1000,'Order',{order_id:'o1',amount_type:'ItemPrice'})],
+    settlementHeaders:[{settlement_id:'s9',deposit_date:'29.07.2026 10:00:00 UTC',settlement_start_date:'25.07.2026 10:44:14 UTC',settlement_end_date:'31.07.2026 00:00:00 UTC',total_amount:66743.04}]};
+  const reasons=calculateDashboardMetrics(input,range).diagnostics.completeness.reasons.join(' ');
+  assert.doesNotMatch(reasons,/Settlement documents reach only/);
+});

@@ -301,6 +301,32 @@ export function calculateDashboardMetrics(input,range){
     const direction=netDifference>0?'more than':'less than';
     provisionalReasons.push(`${settlementIntegrityRows.length} settlement(s) do not add up to Amazon's own document total - stored rows sum to ${Math.abs(netDifference)} ${direction} Amazon says they should (${absoluteDifference} in dispute, largest single gap ${largestGap}). This counts every date in those settlements, not just this range, so it does not translate directly into a section gap.`);
   }
+  // The single most useful thing to know about a settlement-based figure, and
+  // it was invisible: how far the settlement documents actually reach.
+  //
+  // Confirmed on a real account (1-30 Jul window): eight settlements forming
+  // an unbroken chain from 28 Jun to 25 Jul, each one starting exactly where
+  // the last ended, each paying out exactly two days after it closed. The
+  // chain is complete - nothing is missing from the middle - it simply stops
+  // five days before the window does. Everything the seller sold between 25
+  // and 30 Jul is on Amazon's statement and in no settlement document,
+  // because Amazon had not settled it yet.
+  //
+  // That is the same activity the Finances API marks Deferred, seen from the
+  // other side, and it is why the sections can be wrong in either direction:
+  // an uncovered tail heavy with sales leaves them short, one heavy with
+  // refunds leaves them high. A seller looking at a settlement-only figure
+  // for a window that runs past the last settlement is looking at a partial
+  // period without being told so.
+  const settlementCoverageEnd=(input.settlementHeaders??[])
+    .map(row=>utcDate(row.settlement_end_date))
+    .filter(date=>!Number.isNaN(date.getTime()))
+    .reduce((latest,date)=>date>latest?date:latest,null);
+  const rangeEndsAt=rangeDates(range).end;
+  if(settlementComplete&&settlementCoverageEnd&&settlementCoverageEnd<rangeEndsAt){
+    const uncoveredDays=Math.max(1,Math.round((rangeEndsAt-settlementCoverageEnd)/864e5));
+    provisionalReasons.push(`Settlement documents reach only ${settlementCoverageEnd.toISOString().slice(0,10)}, but this range runs to ${rangeEndsAt.toISOString().slice(0,10)} - the last ${uncoveredDays} day(s) are on Amazon's statement with no settlement document behind them yet, so whatever happened in them is missing from these sections.`);
+  }
   // Deferred activity is deliberately excluded (see above), but "deliberate"
   // is not the same as "certainly right": Seller B's own Amazon statement for
   // 21-29 Jul carries a -141.90 refund that the Finances API reports as
