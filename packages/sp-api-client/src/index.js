@@ -34,6 +34,10 @@ const SETTLEMENT_REPORT_LIST_MAX_PAGES = 20;
 const SETTLEMENT_REPORT_DOWNLOAD_CAP = 20;
 const REPORT_DOCUMENT_DOWNLOAD_TIMEOUT_MS = 5 * 60 * 1000;
 const SP_API_MAX_ATTEMPTS = 6;
+// Long enough for the slowest published bucket (45s/request) to reopen with
+// room to spare, short enough that six attempts stay inside a background
+// job's patience rather than pinning a sync for half an hour.
+const SP_API_MAX_BACKOFF_MS = 120_000;
 const DOCUMENT_DOWNLOAD_MAX_ATTEMPTS = 4;
 
 /**
@@ -93,6 +97,28 @@ function rateLimitBucket(method, path) {
   const pathname = path.split('?')[0];
   const match = SP_API_OPERATION_LIMITS.find(item => (!item.method || item.method === method) && item.pattern.test(pathname));
   return { key: match?.key ?? (pathname.split('/').filter(Boolean)[0] ?? 'default'), intervalMs: match?.intervalMs ?? DEFAULT_SP_API_INTERVAL_MS, burst: match?.burst ?? 1 };
+}
+
+// How long to wait after Amazon throttles a request.
+//
+// The floor has to be this operation's own steady-state interval.
+// x-amzn-RateLimit-Limit is absent on many 429s, and the 0.5/s default that
+// stands in for it means 2s - so against reports:document, which Amazon paces
+// at one request per 45s, the first five retries all fired inside a single
+// closed window and could not have succeeded. Confirmed live on a real
+// Settlement re-sync:
+//   429 (waited 2000ms), 429 (waited 4000ms), 429 (waited 8000ms),
+//   429 (waited 16000ms), 429 (waited 32000ms), 429 (waited 64000ms)
+//   gave up after 6 attempts ... failed after 248215ms
+// Six attempts, four minutes, and the seller's settlement documents never
+// downloaded. Amazon's own Retry-After still wins whenever it asks for longer.
+/** @param {{method:string,path:string,attempt:number,retryAfterSeconds?:number,rateLimitPerSecond?:number}} params */
+export function throttleRetryDelayMs({ method, path, attempt, retryAfterSeconds, rateLimitPerSecond }) {
+  const { intervalMs } = rateLimitBucket(method, path);
+  const headerBackoffMs = Number.isFinite(retryAfterSeconds) && retryAfterSeconds > 0
+    ? retryAfterSeconds * 1000
+    : (1000 / Math.max(Number(rateLimitPerSecond) || 0.5, 0.05)) * 2 ** attempt;
+  return Math.min(SP_API_MAX_BACKOFF_MS, Math.max(headerBackoffMs, intervalMs));
 }
 
 export class SpApiClient {
@@ -164,9 +190,13 @@ export class SpApiClient {
         if (attempt > 0) console.log(`[${this.label}] ${method} ${path} succeeded (${res.status}) on attempt ${attempt + 1}/${SP_API_MAX_ATTEMPTS} after: ${attemptLog.join(', ')}`);
         return res;
       }
-      const retryAfter = Number(res.headers.get('retry-after'));
-      const backoffMs = Number.isFinite(retryAfter) && retryAfter > 0 ? retryAfter * 1000 : (1000 / Math.max(rateLimit, 0.05)) * 2 ** attempt;
-      const waitMs = Math.min(120_000, backoffMs);
+      const { key: bucketKey } = rateLimitBucket(method, path);
+      // A 429 is proof the bucket is empty right now, whatever our local token
+      // count believed. Drain it so waitForSlot paces the retry instead of
+      // waving it straight through on a stale burst token.
+      const bucket = this.rateLimitState.get(bucketKey);
+      if (bucket) { bucket.tokens = 0; bucket.lastRefillAt = Date.now(); }
+      const waitMs = throttleRetryDelayMs({ method, path, attempt, retryAfterSeconds: Number(res.headers.get('retry-after')), rateLimitPerSecond: rateLimit });
       attemptLog.push(`${res.status} (waited ${Math.round(waitMs)}ms)`);
       console.warn(`[${this.label}] ${method} ${path} -> ${res.status}, retry ${attempt + 1}/${SP_API_MAX_ATTEMPTS} in ${Math.round(waitMs)}ms`);
       await new Promise(resolve => setTimeout(resolve, waitMs));
