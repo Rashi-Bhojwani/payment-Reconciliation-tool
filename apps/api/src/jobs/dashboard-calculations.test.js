@@ -333,3 +333,28 @@ test('a settlement chain covering the whole window raises nothing',()=>{
   const reasons=calculateDashboardMetrics(input,range).diagnostics.completeness.reasons.join(' ');
   assert.doesNotMatch(reasons,/Settlement documents reach only/);
 });
+
+test('a deposit stamped in local time is placed at the instant it happened',()=>{
+  // 30 Jul 23:59 GMT+5:30 is 30 Jul 18:29 UTC - inside a window ending at
+  // 30 Jul 18:30 UTC by one minute. Read as if it were UTC it lands five and
+  // a half hours later, outside the window, and a whole payout disappears.
+  const base={orders:[],orderItems:[],returns:[],financeItems:[],reimbursements:[],gstInvoices:[],settledOrderIdsAllTime:[],
+    settlementRows:[line('sale','Principal',10,'Order',{amount_type:'ItemPrice'})]};
+  const window={start:'2026-06-30T18:30:00Z',end:'2026-07-30T18:30:00Z'};
+
+  const localStamp=calculateDashboardMetrics({...base,settlementHeaders:[{settlement_id:'ist',deposit_date:'30.07.2026 23:59:00 GMT+5:30',total_amount:66743.04}]},window);
+  assert.equal(localStamp.statement.transfers.value,-66743.04,'23:59 IST on 30 Jul is inside a window ending at IST midnight');
+
+  const utcStamp=calculateDashboardMetrics({...base,settlementHeaders:[{settlement_id:'utc',deposit_date:'30.07.2026 19:30:30 UTC',total_amount:66743.04}]},window);
+  assert.equal(utcStamp.statement.transfers.value,0,'19:30 UTC is genuinely past the window end');
+});
+
+test('settlement date zone suffixes are read, not discarded',()=>{
+  const base={orders:[],orderItems:[],returns:[],financeItems:[],reimbursements:[],gstInvoices:[],settledOrderIdsAllTime:[],
+    settlementRows:[line('sale','Principal',10,'Order',{amount_type:'ItemPrice'})]};
+  // A one-second window around the true instant of 30.07.2026 12:00:00 GMT-8,
+  // which is 30 Jul 20:00:00 UTC.
+  const r=calculateDashboardMetrics({...base,settlementHeaders:[{settlement_id:'west',deposit_date:'30.07.2026 12:00:00 GMT-8',total_amount:500}]},
+    {start:'2026-07-30T20:00:00Z',end:'2026-07-30T20:00:01Z'});
+  assert.equal(r.statement.transfers.value,-500);
+});

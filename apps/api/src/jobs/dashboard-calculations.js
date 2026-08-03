@@ -85,10 +85,33 @@ const isTransfer=row=>/transfer|deposit|bank account|withdrawal/.test(text(row))
 const round2=value=>Math.round((Number(value)+Number.EPSILON)*100)/100;
 const signedSum=rows=>round2(rows.reduce((sum,row)=>sum+amount(row),0));
 const component=(category,label,value,rows,operation='+')=>({category,label,amount:value,count:rows.length,operation});
+// Amazon stamps settlement dates as "02.07.2026 19:30:30 UTC", and on some
+// accounts as "29.07.2026 23:59:00 GMT+5:30". The pattern below used to stop
+// at the seconds and discard whatever followed, so *every* stamp was read as
+// UTC - a GMT+5:30 deposit was placed 5 hours 30 minutes later than it
+// actually happened. That is invisible in the middle of a month and decisive
+// at its edge: it is more than enough to push a deposit out of the window it
+// belongs to, or pull in one that does not, and the amounts involved are
+// whole payouts. The offset is now read when Amazon states one, and the
+// absence of one still means UTC.
+const ZONE_OFFSET_MINUTES=zone=>{
+  const text=String(zone??'').trim();
+  if(!text||/^(utc|gmt|z)$/i.test(text))return 0;
+  const m=text.match(/^(?:utc|gmt)?\s*([+-])(\d{1,2})(?::?(\d{2}))?$/i);
+  if(!m)return null;
+  return (m[1]==='-'?-1:1)*(Number(m[2])*60+Number(m[3]??0));
+};
 const utcDate=value=>{
   const s=String(value??'').trim();
-  const m=s.match(/^(\d{1,2})[./-](\d{1,2})[./-](\d{4})(?:\s+(\d{1,2}):(\d{2})(?::(\d{2}))?)?/);
-  if(m)return new Date(Date.UTC(+m[3],+m[2]-1,+m[1],+(m[4]??0),+(m[5]??0),+(m[6]??0)));
+  const m=s.match(/^(\d{1,2})[./-](\d{1,2})[./-](\d{4})(?:[\sT]+(\d{1,2}):(\d{2})(?::(\d{2}))?)?\s*(.*)$/);
+  if(m){
+    const offsetMinutes=ZONE_OFFSET_MINUTES(m[7]);
+    // An offset we do not recognise is not the same as no offset. Guessing UTC
+    // there is how a silent 5.5-hour shift got in; hand it to Date instead,
+    // which either understands it or reports it as invalid.
+    if(offsetMinutes==null)return new Date(s);
+    return new Date(Date.UTC(+m[3],+m[2]-1,+m[1],+(m[4]??0),+(m[5]??0),+(m[6]??0))-offsetMinutes*60000);
+  }
   return new Date(s);
 };
 const rangeDates=range=>({start:new Date(range.start),end:new Date(range.end)});
