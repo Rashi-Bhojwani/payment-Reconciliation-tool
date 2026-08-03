@@ -45,13 +45,33 @@ const money = value => Number(value ?? 0);
 const round2 = value => Math.round((value + Number.EPSILON) * 100) / 100;
 const inr = value => value.toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
 
-// Everything source_key is built from except the ordinal. Two rows agreeing on
-// all of it are exactly the rows the ordinal was invented to keep apart - so
-// they are also exactly the rows a repeated import could have duplicated.
-const IDENTITY = `settlement_id, order_id, amount_type, amount_description, amount, posted_date,
-  raw->>'transaction-type', raw->>'order-item-code', raw->>'merchant-order-item-id',
-  raw->>'merchant-adjustment-item-id', raw->>'shipment-id', raw->>'adjustment-id',
-  raw->>'sku', raw->>'quantity-purchased', raw->>'promotion-id', raw->>'posted-date-time'`;
+// Copies of one Amazon line are matched on the columns that describe the line
+// itself. Which columns those are is not obvious, because the same line
+// re-imported months apart can be stored slightly differently: this codebase
+// changed how a settlement date is parsed more than once, so one physical
+// Amazon row can sit in the database as two rows differing only in
+// posted_date. Grouping on everything then sees them as two distinct lines,
+// keeps one of each, and leaves the duplicate in place.
+//
+// Measured on a real database, every unrepairable settlement had exactly one
+// row more than Amazon's own document: 15 rows in the file against 16 groups
+// stored, 97 against 98, 257 against 258. One line split in two, every time.
+//
+// So identity is tried from strictest to loosest. A looser identity risks
+// collapsing lines Amazon really did send twice - and that is exactly what
+// the checksum catches, because collapsing a real line makes the settlement
+// come up short and the attempt is rejected.
+const IDENTITIES = {
+  'exact row': `settlement_id, order_id, amount_type, amount_description, amount, posted_date,
+    raw->>'transaction-type', raw->>'order-item-code', raw->>'merchant-order-item-id',
+    raw->>'merchant-adjustment-item-id', raw->>'shipment-id', raw->>'adjustment-id',
+    raw->>'sku', raw->>'quantity-purchased', raw->>'promotion-id', raw->>'posted-date-time'`,
+  'ignoring how the date was parsed': `settlement_id, order_id, amount_type, amount_description, amount,
+    raw->>'transaction-type', raw->>'order-item-code', raw->>'merchant-order-item-id',
+    raw->>'merchant-adjustment-item-id', raw->>'shipment-id', raw->>'adjustment-id', raw->>'sku'`,
+  'the line Amazon describes': `settlement_id, order_id, amount_type, amount_description, amount,
+    raw->>'order-item-code', raw->>'adjustment-id'`
+};
 
 const isLocal = /host=\/|@localhost|@127\.0\.0\.1/.test(connectionString);
 const pool = new pg.Pool({ connectionString, ssl: isLocal ? false : { rejectUnauthorized: false } });
@@ -62,12 +82,12 @@ const storedTotal = async (tenantId, settlementId) => money((await client.query(
   [tenantId, settlementId]
 )).rows[0]?.total);
 
-// Keep `keepExpr` copies of every identical group, delete the rest.
-const trimTo = (tenantId, settlementId, keepExpr) => client.query(`
+// Keep `keepExpr` copies of every group, delete the rest.
+const trimTo = (tenantId, settlementId, identity, keepExpr) => client.query(`
   with ranked as (
     select id,
-           row_number() over (partition by ${IDENTITY} order by id) copy_number,
-           count(*)     over (partition by ${IDENTITY}) copies_present
+           row_number() over (partition by ${identity} order by id) copy_number,
+           count(*)     over (partition by ${identity}) copies_present
       from settlement_rows
      where tenant_id = $1 and settlement_id = $2
   )
@@ -113,18 +133,20 @@ try {
       continue;
     }
 
-    // Candidate repairs, least destructive first. Each is checked against
-    // Amazon's own total and abandoned if it does not land exactly.
+    // Candidate repairs, strictest identity and least destructive rule first.
+    // Every one is checked against Amazon's own total and abandoned unless it
+    // lands on it exactly.
     const copies = header === 0 ? 0 : Math.round(stored / header);
-    const strategies = [
-      ['one copy of each identical line', '1'],
-      ...(copies >= 2 ? [[`one copy in ${copies} of each identical line`, `copies_present / ${copies}`]] : [])
-    ];
+    const strategies = [];
+    for (const [identityName, identity] of Object.entries(IDENTITIES)) {
+      strategies.push([`one copy of each line, matched on ${identityName}`, identity, '1']);
+      if (copies >= 2) strategies.push([`one copy in ${copies}, matched on ${identityName}`, identity, `copies_present / ${copies}`]);
+    }
 
     let fixed = null;
-    for (const [label, keepExpr] of strategies) {
+    for (const [label, identity, keepExpr] of strategies) {
       await client.query('savepoint attempt');
-      const deleted = await trimTo(tenantId, settlementId, keepExpr);
+      const deleted = await trimTo(tenantId, settlementId, identity, keepExpr);
       const after = await storedTotal(tenantId, settlementId);
       if (Math.abs(after - header) <= 0.01) {
         await client.query('release savepoint attempt');
@@ -142,7 +164,7 @@ try {
       const spread = await client.query(`
         select copies_present, count(*) groups from (
           select count(*) copies_present from settlement_rows
-           where tenant_id=$1 and settlement_id=$2 group by ${IDENTITY}
+           where tenant_id=$1 and settlement_id=$2 group by ${Object.values(IDENTITIES)[0]}
         ) t group by copies_present order by copies_present`, [tenantId, settlementId]);
       const shape = spread.rows.map(r => `${r.groups} group(s) x${r.copies_present}`).join(', ');
       stuck.push({ ...row, why: `no de-duplication lands on ${inr(header)}; copies per identical line: ${shape}` });
