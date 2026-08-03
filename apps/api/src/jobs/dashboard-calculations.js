@@ -284,7 +284,10 @@ export function calculateDashboardMetrics(input,range){
   const provisionalReasons=[];
   if(!settlementComplete)provisionalReasons.push('No settlement report covers this range yet, so the sections are built from the Finances API - a different view of the same ledger, not the one Amazon\'s statement is drawn from.');
   if(outstandingSettlementSyncs>0)provisionalReasons.push(`${outstandingSettlementSyncs} settlement sync(s) did not finish, so some of Amazon's documents for this range have not been read yet.`);
-  if(settlementIntegrityRows.length)provisionalReasons.push(`${settlementIntegrityRows.length} settlement(s) hold fewer lines than Amazon's own document total accounts for (largest gap ${round2(Math.max(...settlementIntegrityRows.map(row=>Math.abs(row.difference))))}).`);
+  // The total matters more than the largest: if the sections are short by
+  // roughly this much, the shortfall is missing settlement lines rather than
+  // anything about how the lines we do hold are classified.
+  if(settlementIntegrityRows.length)provisionalReasons.push(`${settlementIntegrityRows.length} settlement(s) hold fewer lines than Amazon's own document total accounts for - ${round2(settlementIntegrityRows.reduce((sum,row)=>sum+Math.abs(row.difference),0))} missing in total, largest single gap ${round2(Math.max(...settlementIntegrityRows.map(row=>Math.abs(row.difference))))}.`);
   // Deferred activity is deliberately excluded (see above), but "deliberate"
   // is not the same as "certainly right": Seller B's own Amazon statement for
   // 21-29 Jul carries a -141.90 refund that the Finances API reports as
