@@ -10,6 +10,25 @@
 // of that seller's own statement (28,816.51). Nothing is lost in parsing,
 // dedup or joins - settlement documents simply never contained it.
 //
+// CRITICAL: a manually downloaded Date Range export cannot be assumed
+// complete, so it must never be treated as the canonical financial source.
+// Proved by two exports of the SAME account taken from Seller Central:
+//
+//   1 - 25 Jul : 455 rows over 25 days
+//   1 - 30 Jul : 313 rows over 30 days
+//
+// The longer period returns fewer rows, and the shortfall is not at the edges
+// - every single day from 1 to 25 Jul has fewer rows in the 30-day export, 205
+// rows missing in total (22 on 3 Jul, 23 on 4 Jul, 29 on 24 Jul). Both files
+// parse cleanly, both cover every day of their range, and both have a per-row
+// control drift of exactly 0, so nothing in the file itself reveals the loss.
+// Only holding two exports side by side does.
+//
+// That is why assessCoverage() below reports completeness as UNKNOWABLE from
+// one file. A truncated export is indistinguishable from a complete one, and
+// building statement totals on it would silently under-report a seller's
+// money - the exact failure this tool exists to prevent.
+//
 // What this file is NOT: a reproduction of the Custom Unified Summary PDF.
 // Verified against the real pair for the same seller and range - only the
 // Expenses section reconciles (-42,315.60 here against -42,314.88 on the PDF,
@@ -205,5 +224,40 @@ export function summariseDateRangeRows(rows) {
     totals: asRupees(totals),
     byStatus: Object.fromEntries([...byStatus].map(([k, v]) => [k, asRupees(v)])),
     byType: Object.fromEntries([...byType].map(([k, v]) => [k, asRupees(v)]))
+  };
+}
+
+/**
+ * What a parsed export demonstrably covers, and what it cannot prove.
+ *
+ * Row counts and day coverage look identical whether an export is whole or
+ * truncated - see the two real exports quoted at the top of this file - so
+ * this deliberately never returns "complete". Corroboration has to come from
+ * outside the file: a settlement document's own stated total, or a second
+ * export of the same range.
+ * @param {ReturnType<typeof parseDateRangeReport>['rows']} rows
+ * @param {{ start?: string, end?: string }} [expected] inclusive YYYY-MM-DD bounds
+ */
+export function assessCoverage(rows, expected = {}) {
+  const days = [...new Set(rows.map(row => row.day))].sort();
+  const firstDay = days[0] ?? null;
+  const lastDay = days[days.length - 1] ?? null;
+  const missingDays = [];
+  if (expected.start && expected.end) {
+    for (let day = new Date(`${expected.start}T00:00:00Z`); day <= new Date(`${expected.end}T00:00:00Z`); day.setUTCDate(day.getUTCDate() + 1)) {
+      const iso = day.toISOString().slice(0, 10);
+      if (!days.includes(iso)) missingDays.push(iso);
+    }
+  }
+  return {
+    rowCount: rows.length,
+    dayCount: days.length,
+    firstDay,
+    lastDay,
+    missingDays,
+    // Never true. A Seller Central export can silently omit rows on days it
+    // does report, so "every day is present" proves nothing about the rows.
+    canBeTreatedAsComplete: false,
+    whyNot: 'A downloaded Date Range export can omit rows on days it still reports - two exports of one account differed by 205 rows across days both covered. Completeness must be corroborated against Amazon-stated totals, never assumed from the file.'
   };
 }

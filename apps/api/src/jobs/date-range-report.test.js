@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { fileDigest, mapColumns, parseCsv, parseDateRangeReport, summariseDateRangeRows, toCalendarDay, toPaise } from './date-range-report.js';
+import { assessCoverage, fileDigest, mapColumns, parseCsv, parseDateRangeReport, summariseDateRangeRows, toCalendarDay, toPaise } from './date-range-report.js';
 
 // Shaped from a real 455-row "Transactions for time period" export, with the
 // seller's order IDs and product titles replaced. Column names, order, date
@@ -117,4 +117,26 @@ test('the same bytes hash the same, so a re-import is recognisable', () => {
 
 test('a bare CSV parse keeps empty trailing fields', () => {
   assert.deepEqual(parseCsv('a,b,c\n1,,3')[1], ['1', '', '3']);
+});
+
+test('coverage never claims completeness, because a truncated export looks whole', () => {
+  // Two real exports of one account: 1-25 Jul gave 455 rows, 1-30 Jul gave 313
+  // - fewer rows for a longer period, short on every single overlapping day.
+  // Both parsed cleanly with zero control drift, so the file cannot be trusted
+  // to declare itself complete.
+  const csv = [HEADER, ORDER, DEFERRED].join('\n');
+  const coverage = assessCoverage(parseDateRangeReport(csv).rows, { start: '2026-07-24', end: '2026-07-26' });
+  assert.equal(coverage.rowCount, 2);
+  assert.equal(coverage.dayCount, 1);
+  assert.equal(coverage.firstDay, '2026-07-25');
+  assert.deepEqual(coverage.missingDays, ['2026-07-24', '2026-07-26']);
+  assert.equal(coverage.canBeTreatedAsComplete, false, 'must never be true, whatever the file looks like');
+  assert.match(coverage.whyNot, /omit rows on days it still reports/);
+});
+
+test('a full-looking export still refuses to certify itself', () => {
+  const csv = [HEADER, ORDER, DEFERRED].join('\n');
+  const coverage = assessCoverage(parseDateRangeReport(csv).rows, { start: '2026-07-25', end: '2026-07-25' });
+  assert.deepEqual(coverage.missingDays, [], 'every requested day is present');
+  assert.equal(coverage.canBeTreatedAsComplete, false, 'and it still cannot be called complete');
 });
