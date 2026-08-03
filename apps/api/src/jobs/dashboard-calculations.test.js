@@ -288,7 +288,7 @@ test('the statement only claims to match Amazon once it can prove it does',()=>{
 
   const torn=reasonsFor({settlementIntegrity:[{settlement_id:'s1',row_count:40,rows_total:900,header_total:1000}]});
   assert.equal(torn.provisional,true);
-  assert.match(torn.reasons.join(' '),/net -100 against Amazon \(100 in dispute across all of them, largest single gap 100\)/);
+  assert.match(torn.reasons.join(' '),/stored rows sum to 100 less than Amazon says they should/);
 
   // Amazon's own 21-29 Jul statement for Seller B carries a -141.90 refund
   // that the Finances API marks Deferred and no settlement document holds, so
@@ -297,6 +297,7 @@ test('the statement only claims to match Amazon once it can prove it does',()=>{
   const deferred=reasonsFor({financeItems:[{source_row_id:'f1',transaction_id:'tx',order_id:'o2',transaction_status:'Deferred',category:'item_price',amount_description:'OurPricePrincipal',amount:-141.9,posted_date:'2026-07-10T00:00:00Z',raw:{}}]});
   assert.equal(deferred.provisional,true);
   assert.match(deferred.reasons.join(' '),/1 Deferred row\(s\) totalling -141\.9/);
+  assert.match(deferred.reasons.join(' '),/by section: income -141\.9/,'the split is what makes it comparable to the Income gap');
 
   // No settlement report at all: the sections come from a different ledger
   // view than the one Amazon's statement is drawn from.

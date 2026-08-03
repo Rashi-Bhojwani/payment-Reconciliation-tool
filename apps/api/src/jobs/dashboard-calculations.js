@@ -284,25 +284,45 @@ export function calculateDashboardMetrics(input,range){
   const provisionalReasons=[];
   if(!settlementComplete)provisionalReasons.push('No settlement report covers this range yet, so the sections are built from the Finances API - a different view of the same ledger, not the one Amazon\'s statement is drawn from.');
   if(outstandingSettlementSyncs>0)provisionalReasons.push(`${outstandingSettlementSyncs} settlement sync(s) did not finish, so some of Amazon's documents for this range have not been read yet.`);
-  // Two different totals, and only one of them is comparable to a section gap.
-  // The absolute total says how much line-level data is in question; the
-  // signed net says which way the stored rows actually pull, because a
-  // settlement holding too much and one holding too little cancel in the
-  // dashboard but both count in the absolute. If the sections are short by
-  // roughly the signed net, the shortfall is missing lines rather than
-  // anything about how the lines already held are classified.
+  // This total is NOT comparable to a section gap, and reporting it as though
+  // it were was a mistake worth recording. The check sums every row a
+  // settlement has, on any date; the sections sum only rows posted inside the
+  // selected window. A settlement straddling the window's edge, or a duplicate
+  // row left outside it by an earlier reset, moves this number without moving
+  // Income by a paisa. Measured live on Seller A: net +20,445.84 here while
+  // Income sat 9,066.84 *short* - opposite signs, so one cannot be explaining
+  // the other. What it does say, unambiguously, is that stored rows sum to
+  // more than Amazon's own document totals, in the same direction on all of
+  // them: rows this tool holds that Amazon's documents do not account for.
   if(settlementIntegrityRows.length){
     const netDifference=round2(settlementIntegrityRows.reduce((sum,row)=>sum+row.difference,0));
     const absoluteDifference=round2(settlementIntegrityRows.reduce((sum,row)=>sum+Math.abs(row.difference),0));
     const largestGap=round2(Math.max(...settlementIntegrityRows.map(row=>Math.abs(row.difference))));
-    provisionalReasons.push(`${settlementIntegrityRows.length} settlement(s) do not add up to Amazon's own document total - net ${netDifference >= 0 ? '+' : ''}${netDifference} against Amazon (${absoluteDifference} in dispute across all of them, largest single gap ${largestGap}).`);
+    const direction=netDifference>0?'more than':'less than';
+    provisionalReasons.push(`${settlementIntegrityRows.length} settlement(s) do not add up to Amazon's own document total - stored rows sum to ${Math.abs(netDifference)} ${direction} Amazon says they should (${absoluteDifference} in dispute, largest single gap ${largestGap}). This counts every date in those settlements, not just this range, so it does not translate directly into a section gap.`);
   }
   // Deferred activity is deliberately excluded (see above), but "deliberate"
   // is not the same as "certainly right": Seller B's own Amazon statement for
   // 21-29 Jul carries a -141.90 refund that the Finances API reports as
   // Deferred and no settlement document contains. Until that is resolved, the
   // honest position is that these sections may be short by this much.
-  if(pendingFinanceRows.length)provisionalReasons.push(`${pendingFinanceRows.length} Deferred row(s) totalling ${round2(pendingFinanceRows.reduce((sum,row)=>sum+amount(row),0))} are excluded because no settlement document carries them; if Amazon's statement for this range includes any, these sections are short by that much.`);
+  //
+  // One number for all of it cannot be checked against anything. Split by the
+  // section each row would land in and the comparison becomes direct: if the
+  // Deferred income matches how far Income sits from Amazon, and the Deferred
+  // GST matches the GST gap, then Amazon's statement *does* carry this
+  // activity and excluding it is the whole error - no classifier is at fault.
+  // If they do not match, excluding Deferred is right and the gap is
+  // elsewhere. That is the measurement that decides it, so it has to be
+  // visible rather than inferred.
+  if(pendingFinanceRows.length){
+    const pendingTotals=bucketTotals(pendingFinanceRows);
+    const bySection=['income','gst','expenses','tax','transfer']
+      .filter(bucket=>pendingTotals[bucket]!=null&&pendingTotals[bucket]!==0)
+      .map(bucket=>`${bucket} ${pendingTotals[bucket]>=0?'+':''}${pendingTotals[bucket]}`)
+      .join(', ');
+    provisionalReasons.push(`${pendingFinanceRows.length} Deferred row(s) totalling ${round2(pendingFinanceRows.reduce((sum,row)=>sum+amount(row),0))} are excluded because no settlement document carries them - by section: ${bySection || 'nothing that lands in a section'}. If Amazon's statement for this range includes any, those sections are short by exactly those amounts.`);
+  }
   const completeness={provisional:provisionalReasons.length>0,reasons:provisionalReasons};
   const diagnostics={completeness,sourcePolicy:{financial:`${financialSource} (${settlementComplete?`settlement only; ${pendingFinanceRows.length} Deferred Finance API row(s) measured but excluded - Amazon's statement does not carry them`:'settlement incomplete; Finances fallback'})`,reimbursements:financeReimbursements.length?financialSource:'Reimbursements report fallback',gst:'Imported GST B2B/B2C rows only',settled:'Settlement headers filtered by deposit_date'},includedRows:financialRows.length,excludedRows:(settlementComplete?excludedFinanceRows:settlementAudit.included.length),duplicateRows:financialDuplicates.length+itemAudit.duplicates.length+returnAudit.duplicates.length+gstAudit.duplicates.length,categoryTotals:{grossSales,productRefunds,netPromotions,expenseDebits,expenseCredits,tcsTds,operationalFees,gst,tax,transfers},pendingFinanceRowsDetail,pendingMergeSummary,outstandingSettlementSyncs,
     // Settlements whose own lines do not add up to the total Amazon stamped on
