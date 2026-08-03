@@ -272,8 +272,33 @@ export function calculateDashboardMetrics(input,range){
   // Seller A's transfers moved -1,09,260.18 -> -1,17,288.92 across reloads
   // with nothing about transfers having changed. Both are fixed together;
   // neither is meaningful to measure while the other is live.
+  // Amazon's Transfers section is the Finances API's own Transfer
+  // transactions, posted in the window. Not settlement headers - and that
+  // distinction is the whole reason no rule built on them ever matched.
+  //
+  // Verified live against both accounts that have a Custom Unified Summary to
+  // check against, on windows of different lengths:
+  //   Seller A, 1-25 Jul: 14 Transfer transactions = 1,07,559.21 = Amazon
+  //   Seller C, 1-30 Jul:  9 Transfer transactions = 7,59,003.33 = Amazon
+  //
+  // The Finances API posts a transfer about a day EARLIER than the settlement
+  // file stamps its deposit-date, so the two disagree at every window edge.
+  // Seller C's last transfer posts 30 Jul 06:55 - inside a 1-30 Jul window -
+  // while its settlement says deposit-date 31 Jul 12:36, which is outside;
+  // that single settlement, worth 66,743.04, was the entire gap. Seller A had
+  // the mirror image: two settlements the deposit rule wanted to include whose
+  // transfers actually posted before the window began.
+  //
+  // Settlement headers remain the fallback for a range the Finances API has
+  // not been synced for, where an approximate figure beats none - but where
+  // real transfer transactions exist they are the answer, not a hint.
+  const financeTransfers=dedupe((input.financeTransactions??[]).filter(row=>/^transfer$/i.test(String(row.transaction_type??'').trim())&&inRange(row.posted_date,range)),row=>row.transaction_id??keyOf(row));
   const headerAudit=dedupe((input.settlementHeaders??[]).filter(row=>!/failed/.test(text(row))&&row.deposit_date&&inRange(row.deposit_date,range)),row=>row.settlement_id??keyOf(row));
-  const transferRows=headerAudit.included.map(row=>({...row,amount:-Math.abs(Number(row.total_amount??row.amount??0))}));const settled=Math.abs(signedSum(transferRows));
+  const transferSource=financeTransfers.included.length?'Amazon Finances API transfers':'Settlement headers';
+  const transferRows=financeTransfers.included.length
+    ?financeTransfers.included.map(row=>({...row,amount:-Math.abs(Number(row.total_amount??row.amount??0))}))
+    :headerAudit.included.map(row=>({...row,amount:-Math.abs(Number(row.total_amount??row.amount??0))}));
+  const settled=Math.abs(signedSum(transferRows));
   // Every deposit this window did NOT count, and how far outside it fell.
   //
   // Twice now a Transfers gap has been chased by reasoning about which
@@ -413,7 +438,7 @@ export function calculateDashboardMetrics(input,range){
     provisionalReasons.push(`${pendingFinanceRows.length} Deferred row(s) totalling ${round2(pendingFinanceRows.reduce((sum,row)=>sum+amount(row),0))} are excluded because no settlement document carries them - by section: ${bySection || 'nothing that lands in a section'}. If Amazon's statement for this range includes any, those sections are short by exactly those amounts.`);
   }
   const completeness={provisional:provisionalReasons.length>0,reasons:provisionalReasons};
-  const diagnostics={completeness,sourcePolicy:{financial:`${financialSource} (${settlementComplete?`settlement only; ${pendingFinanceRows.length} Deferred Finance API row(s) measured but excluded - Amazon's statement does not carry them`:'settlement incomplete; Finances fallback'})`,reimbursements:financeReimbursements.length?financialSource:'Reimbursements report fallback',gst:'Imported GST B2B/B2C rows only',settled:'Settlement headers filtered by deposit_date'},includedRows:financialRows.length,excludedRows:(settlementComplete?excludedFinanceRows:settlementAudit.included.length),duplicateRows:financialDuplicates.length+itemAudit.duplicates.length+returnAudit.duplicates.length+gstAudit.duplicates.length,categoryTotals:{grossSales,productRefunds,netPromotions,expenseDebits,expenseCredits,tcsTds,operationalFees,gst,tax,transfers},pendingFinanceRowsDetail,pendingMergeSummary,outstandingSettlementSyncs,depositsOutsideRange,
+  const diagnostics={completeness,sourcePolicy:{financial:`${financialSource} (${settlementComplete?`settlement only; ${pendingFinanceRows.length} Deferred Finance API row(s) measured but excluded - Amazon's statement does not carry them`:'settlement incomplete; Finances fallback'})`,reimbursements:financeReimbursements.length?financialSource:'Reimbursements report fallback',gst:'Imported GST B2B/B2C rows only',settled:`${transferSource} in the selected range`},includedRows:financialRows.length,excludedRows:(settlementComplete?excludedFinanceRows:settlementAudit.included.length),duplicateRows:financialDuplicates.length+itemAudit.duplicates.length+returnAudit.duplicates.length+gstAudit.duplicates.length,categoryTotals:{grossSales,productRefunds,netPromotions,expenseDebits,expenseCredits,tcsTds,operationalFees,gst,tax,transfers},pendingFinanceRowsDetail,pendingMergeSummary,outstandingSettlementSyncs,depositsOutsideRange,
     // Settlements whose own lines do not add up to the total Amazon stamped on
     // the document. Empty means every settlement held is provably complete.
     settlementIntegrity:settlementIntegrityRows};
@@ -423,7 +448,7 @@ export function calculateDashboardMetrics(input,range){
     netQty:metric(netQty,'quantity','Shipped units − physically returned units; exact cancelled, pending/unshipped, and replacement statuses excluded',[component('shipped_units','Shipped units',shippedUnits,itemAudit.included),component('returned_units','Returned units',returnedUnits==null?null:-returnedUnits,returnAudit.included,'−')],[...itemAudit.included,...returnAudit.included],unitsSource,unitsCoverageNote??returnsNote),
     orders:metric(eligibleOrders.length,'quantity','Distinct eligible Amazon order IDs by order_date; cancelled, pending/unshipped, and replacement statuses excluded',[component('eligible_orders','Eligible distinct orders',eligibleOrders.length,eligibleOrders)],eligibleOrders,'Orders API'),
     returns:metric(returnedUnits,'quantity','Sum of Amazon return quantity; no missing quantity is guessed as one',[component('returned_units','Returned quantity',returnedUnits,returnAudit.included)],returnAudit.included,'Returns report',returnsNote),
-    settled:metric(settled,'amount','Absolute value of successful bank deposits with deposit_date in the selected range',[component('successful_transfers','Successful bank transfers',settled,headerAudit.included)],headerAudit.included,'Settlement headers'),
+    settled:metric(settled,'amount','Absolute value of the money Amazon actually transferred to the bank in the selected range',[component('successful_transfers','Successful bank transfers',settled,transferRows)],transferRows,transferSource),
     deductions:metric(deductions,'amount','Gross expense debits − expense refunds/credits (includes TCS/TDS)',[component('expense_debits','Gross expense debits',expenseDebits,expenseRows.filter(r=>amount(r)<0)),component('expense_credits','Expense refunds/credits',-expenseCredits,expenseRows.filter(r=>amount(r)>0),'−'),component('tcs_tds','TCS/TDS included',tcsTds,withholdingRows),component('operational_fees','Operational fees excluding TCS/TDS',operationalFees,expenseRows.filter(r=>!isWithholding(r)))],expenseRows),
     reimbursements:metric(reimbursements,'amount','Reimbursement credits − reimbursement reversals',[component('net_reimbursements','Net reimbursements',reimbursements,reimbursementRows)],reimbursementRows,financeReimbursements.length?financialSource:'Reimbursements report'),
     drr:metric(round2(netSales/days),'amount',`Net Sales ÷ ${days} calendar days derived from the half-open range`,[component('net_sales','Net Sales',netSales,[]),component('days','Calendar days',days,[])],[]),
@@ -433,6 +458,6 @@ export function calculateDashboardMetrics(input,range){
     gstValue:metric(gstInvoiceValue,'amount','Genuine GST sales-invoice taxable value − genuine credit-note/refund taxable value',[component('net_taxable_value','Net taxable invoice value',gstInvoiceValue,gstAudit.included)],gstAudit.included,'Imported GST B2B/B2C reports',gstAvailable?null:'Unavailable - GST B2B/B2C invoice reports have not been imported for this range')
   };
   const group=rows=>{const map=new Map();for(const row of rows){const name=row.amount_description??row.category??row.transaction_type??'Other';const old=map.get(name)??{category:norm(name).replaceAll(' ','_'),label:name,amount:0,count:0};old.amount+=amount(row);old.count++;map.set(name,old);}return[...map.values()];};
-  const statement={income:metric(income,'amount','Net Amazon Income statement lines',group(incomeRows),incomeRows),expenses:metric(expenses,'amount','Expense debits plus expense refunds/credits; includes TCS/TDS',group(expenseRows),expenseRows),tax:metric(tax,'amount','Amazon generic Tax section only',group(genericTaxRows),genericTaxRows),transfers:metric(transfers,'amount','Signed successful bank transfers by deposit_date',group(transferRows),transferRows,'Settlement headers'),gst:metric(gst,'amount','Product/shipping/gift-wrap GST collected plus GST refunds',group(productGstRows),productGstRows)};
+  const statement={income:metric(income,'amount','Net Amazon Income statement lines',group(incomeRows),incomeRows),expenses:metric(expenses,'amount','Expense debits plus expense refunds/credits; includes TCS/TDS',group(expenseRows),expenseRows),tax:metric(tax,'amount','Amazon generic Tax section only',group(genericTaxRows),genericTaxRows),transfers:metric(transfers,'amount','Signed money Amazon transferred to the bank, posted in the selected range',group(transferRows),transferRows,transferSource),gst:metric(gst,'amount','Product/shipping/gift-wrap GST collected plus GST refunds',group(productGstRows),productGstRows)};
   return{metrics,statement,diagnostics};
 }

@@ -413,3 +413,63 @@ test('deposits just outside the window are named, with how far outside they fell
   assert.match(reasons,/2 deposit\(s\) sit just outside this window/);
   assert.match(reasons,/66743\.04 \(1 day\(s\) after this range ends, for the settlement ending 29\.07\.2026/);
 });
+
+// Transfers comes from the Finances API's own Transfer transactions, verified
+// live against both accounts that have an Amazon Custom Unified Summary to
+// check against. Settlement deposit-dates disagree with it at every window
+// edge, which is why no rule built on them ever matched either account.
+const transfer = (postedDate, total, id) => ({ transaction_id: id ?? `t-${postedDate}-${total}`, transaction_type: 'Transfer', posted_date: postedDate, total_amount: total });
+const statementBase = { orders:[],orderItems:[],returns:[],reimbursements:[],gstInvoices:[],financeItems:[],settledOrderIdsAllTime:[],
+  settlementRows:[line('sale','Principal',10,'Order',{amount_type:'ItemPrice'})] };
+
+test("Seller C's real transfers reproduce Amazon's statement exactly",()=>{
+  // 1-30 Jul 2026. Amazon: -7,59,003.33. The last transfer posts 30 Jul 06:55
+  // while its settlement stamps deposit-date 31 Jul 12:36 - counting the
+  // deposit instead lost 66,743.04, which was the entire gap.
+  const financeTransactions=[
+    transfer('2026-07-01T13:47:13Z',40634.25), transfer('2026-07-04T11:47:21Z',138337.07),
+    transfer('2026-07-06T10:04:33Z',72447.75), transfer('2026-07-13T09:03:52Z',146676.49),
+    transfer('2026-07-16T04:48:02Z',57884.01), transfer('2026-07-18T09:05:27Z',62700.68),
+    transfer('2026-07-22T12:01:22Z',113872.28), transfer('2026-07-26T06:43:56Z',59707.76),
+    transfer('2026-07-30T06:55:54Z',66743.04)
+  ];
+  const r=calculateDashboardMetrics({...statementBase,financeTransactions,
+    settlementHeaders:[{settlement_id:'late',deposit_date:'31.07.2026 12:36:29 UTC',total_amount:66743.04}]},
+    {start:'2026-06-30T18:30:00Z',end:'2026-07-31T00:00:00Z'});
+  assert.equal(r.statement.transfers.value,-759003.33);
+  assert.equal(r.metrics.settled.value,759003.33);
+  assert.equal(r.statement.transfers.source,'Amazon Finances API transfers');
+});
+
+test("Seller A's real transfers reproduce Amazon's statement exactly",()=>{
+  // 1-25 Jul 2026. Amazon: -1,07,559.21. Two settlements the deposit rule
+  // wanted had transfers posting before the window began.
+  const financeTransactions=[
+    transfer('2026-07-01T09:19:33Z',1377.59), transfer('2026-07-01T09:25:03Z',6651.15),
+    transfer('2026-07-03T20:15:09Z',1890.26), transfer('2026-07-03T20:15:28Z',6547.31),
+    transfer('2026-07-05T12:16:00Z',7105.33), transfer('2026-07-07T09:45:41Z',4074.10),
+    transfer('2026-07-07T09:46:13Z',5345.91), transfer('2026-07-12T21:52:18Z',5205.50),
+    transfer('2026-07-12T21:55:23Z',16581.64), transfer('2026-07-15T21:02:45Z',15948.67),
+    transfer('2026-07-15T21:11:00Z',712.17), transfer('2026-07-19T07:33:56Z',14344.72),
+    transfer('2026-07-19T14:00:54Z',5842.27), transfer('2026-07-22T12:47:55Z',15932.59),
+    transfer('2026-06-29T02:45:30Z',4546.81), transfer('2026-07-27T13:16:11Z',4.17)
+  ];
+  const r=calculateDashboardMetrics({...statementBase,financeTransactions,settlementHeaders:[]},
+    {start:'2026-06-30T18:30:00Z',end:'2026-07-26T00:00:00Z'});
+  assert.equal(r.statement.transfers.value,-107559.21,'the 29 Jun and 27 Jul transfers are outside the window');
+});
+
+test('settlement headers still answer when no transfer transactions are synced',()=>{
+  const r=calculateDashboardMetrics({...statementBase,financeTransactions:[],
+    settlementHeaders:[{settlement_id:'s1',deposit_date:'22.07.2026 12:01:22 UTC',total_amount:113872.28}]},
+    {start:'2026-06-30T18:30:00Z',end:'2026-07-31T00:00:00Z'});
+  assert.equal(r.statement.transfers.value,-113872.28);
+  assert.equal(r.statement.transfers.source,'Settlement headers','and it says which source it used');
+});
+
+test('a repeated transfer transaction is counted once',()=>{
+  const t=transfer('2026-07-10T00:00:00Z',5000,'same-id');
+  const r=calculateDashboardMetrics({...statementBase,financeTransactions:[t,{...t}],settlementHeaders:[]},
+    {start:'2026-06-30T18:30:00Z',end:'2026-07-31T00:00:00Z'});
+  assert.equal(r.statement.transfers.value,-5000);
+});
