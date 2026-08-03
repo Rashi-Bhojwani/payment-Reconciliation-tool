@@ -358,3 +358,31 @@ test('settlement date zone suffixes are read, not discarded',()=>{
     {start:'2026-07-30T20:00:00Z',end:'2026-07-30T20:00:01Z'});
   assert.equal(r.statement.transfers.value,-500);
 });
+
+test('the day count follows the seller calendar, not the boundary convention',()=>{
+  // Same 30 selected days, expressed both ways: the old IST-midnight end and
+  // the new 23:59-GMT end. DRR divides by this, so it must not move.
+  assert.equal(inclusiveDays('2026-06-30T18:30:00Z','2026-07-30T18:30:00Z'),30,'old convention');
+  assert.equal(inclusiveDays('2026-06-30T18:30:00Z','2026-07-31T00:00:00Z'),30,'new convention, same 30 days');
+  assert.equal(inclusiveDays('2026-06-30T18:30:00Z','2026-07-26T00:00:00Z'),25,'1-25 Jul');
+});
+
+test('the Amazon window end includes a late deposit the IST-midnight end missed',()=>{
+  // The live case: 66,743.04 landing after 18:30 UTC on the last day.
+  const base={orders:[],orderItems:[],returns:[],financeItems:[],reimbursements:[],gstInvoices:[],settledOrderIdsAllTime:[],
+    settlementRows:[line('sale','Principal',10,'Order',{amount_type:'ItemPrice'})],
+    settlementHeaders:[{settlement_id:'late',deposit_date:'30.07.2026 19:30:30 UTC',total_amount:66743.04}]};
+  const istMidnightEnd=calculateDashboardMetrics(base,{start:'2026-06-30T18:30:00Z',end:'2026-07-30T18:30:00Z'});
+  assert.equal(istMidnightEnd.statement.transfers.value,0,'what the seller saw before');
+  const amazonEnd=calculateDashboardMetrics(base,{start:'2026-06-30T18:30:00Z',end:'2026-07-31T00:00:00Z'});
+  assert.equal(amazonEnd.statement.transfers.value,-66743.04,'what Amazon counted');
+});
+
+test('the Amazon window end still stops short of the next day',()=>{
+  // Widening to 31 Jul overshoots by 18.5 hours and would count this one.
+  const base={orders:[],orderItems:[],returns:[],financeItems:[],reimbursements:[],gstInvoices:[],settledOrderIdsAllTime:[],
+    settlementRows:[line('sale','Principal',10,'Order',{amount_type:'ItemPrice'})],
+    settlementHeaders:[{settlement_id:'next-day',deposit_date:'31.07.2026 09:00:00 UTC',total_amount:50000}]};
+  const r=calculateDashboardMetrics(base,{start:'2026-06-30T18:30:00Z',end:'2026-07-31T00:00:00Z'});
+  assert.equal(r.statement.transfers.value,0,'a 31 Jul deposit is not in a 1-30 Jul statement');
+});

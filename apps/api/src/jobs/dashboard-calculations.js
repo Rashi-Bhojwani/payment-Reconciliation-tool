@@ -1,3 +1,4 @@
+import { calendarDay } from './reporting-calendar.js';
 const num = value => value == null || value === '' ? null : Number(value);
 const amount = row => Number(row?.amount ?? row?.total_amount ?? 0) || 0;
 // Settlement labels are already space-separated English ("Product Tax",
@@ -122,7 +123,18 @@ const returnKey=row=>rawField(row.raw,['return-event-id','event-id','rma-id'])??
 const financialKey=row=>`${row.transaction_id??row.settlement_id??''}|${row.order_id??''}|${rawField(row.raw,['order-item-id','orderItemId','order-item-code'])??row.order_item_id??row.sku??''}|${row.category??row.amount_type??''}|${row.amount_description??''}|${row.posted_date??''}|${amount(row)}`;
 const gstKey=row=>`${rawField(row.raw,['invoice-number','invoice number','document-number','credit-note-number'])??row.document_number??row.source_row_id??row.id}|${rawField(row.raw,['line-item-id','invoice-line-id','order-item-id'])??row.line_id??row.sku??''}`;
 
-export function inclusiveDays(start,end){const a=new Date(start),b=new Date(end);return Math.max(1,Math.round((Date.UTC(b.getUTCFullYear(),b.getUTCMonth(),b.getUTCDate())-Date.UTC(a.getUTCFullYear(),a.getUTCMonth(),a.getUTCDate()))/864e5));}
+// Counted in the seller's own calendar, not in whatever the window's
+// boundaries happen to look like in UTC. The two are not the same: the range
+// now ends at 23:59 GMT of the last day (Amazon's convention) rather than at
+// IST midnight, which moves the end into the *next* UTC calendar day and
+// would have quietly turned a 30-day window into 31 - dividing DRR by the
+// wrong number without anything visibly changing. Reading both boundaries as
+// IST days makes this invariant to the boundary convention entirely.
+export function inclusiveDays(start,end){
+  const a=Date.parse(`${calendarDay(start)}T00:00:00Z`);
+  const b=Date.parse(`${calendarDay(end)}T00:00:00Z`);
+  return Math.max(1,Math.round((b-a)/864e5));
+}
 
 export function calculateDashboardMetrics(input,range){
   const orderAudit=dedupe(input.orders??[],row=>row.amazon_order_id);const eligibleOrders=orderAudit.included.filter(row=>statusEligible(row.status));const eligibleIds=new Set(eligibleOrders.map(row=>row.amazon_order_id));

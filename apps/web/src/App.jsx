@@ -108,7 +108,7 @@ function readAmazonTokenCache(tenantId) { const cached = JSON.parse(localStorage
 async function getAmazonAccessToken(tenantId) { const cached = readAmazonTokenCache(tenantId); if (cached) return cached; const fresh = await api(`/api/tenants/${tenantId}/amazon/access-token`); localStorage.setItem(`${ACCESS_TOKEN_CACHE_PREFIX}${tenantId}`, JSON.stringify(fresh)); return fresh; }
 async function beginAmazonAuthorization(tenantId) { const { url } = await api(`/api/auth/amazon/start?tenantId=${tenantId}&json=1`); window.location.assign(url); }
 async function syncAmazonSource(tenantId, reportType, range) {
-  const payload = { method: 'POST', body: JSON.stringify({ range: { start: formatDateParam(range.start), end: formatDateParam(addDays(range.end, 1)) } }) };
+  const payload = { method: 'POST', body: JSON.stringify({ range: { start: formatDateParam(range.start), end: endOfRangeParam(range.end) } }) };
   return api(`/api/tenants/${tenantId}/sync/${reportType}`, payload);
 }
 // Deletes stored settlement rows for the visible range and re-fetches them
@@ -118,7 +118,7 @@ async function syncAmazonSource(tenantId, reportType, range) {
 // immutable, so nothing is permanently lost; this only exists as an
 // explicit, confirmed action because it does delete stored rows first.
 async function resetSettlementData(tenantId, range) {
-  const payload = { method: 'POST', body: JSON.stringify({ range: { start: formatDateParam(range.start), end: formatDateParam(addDays(range.end, 1)) }, confirm: true }) };
+  const payload = { method: 'POST', body: JSON.stringify({ range: { start: formatDateParam(range.start), end: endOfRangeParam(range.end) }, confirm: true }) };
   return api(`/api/tenants/${tenantId}/settlement-data/reset`, payload);
 }
 
@@ -221,7 +221,25 @@ function startOfDay(d) { const { year, month, date } = istParts(d); return new D
 function addDays(d, n) { return new Date(new Date(d).getTime() + n * 864e5); }
 function formatShort(d) { return d.toLocaleDateString('en-IN', { month: 'short', day: 'numeric', timeZone: IST_TIME_ZONE }); }
 function formatDateParam(date) { return startOfDay(date).toISOString(); }
-function rangeQuery(range) { return `start=${encodeURIComponent(formatDateParam(range.start))}&end=${encodeURIComponent(formatDateParam(addDays(range.end, 1)))}`; }
+// Amazon's Custom Unified Summary does not run midnight-to-midnight in one
+// zone, and its own PDF header says so outright:
+//   "Account activity from Jul 1, 2026 00:00 GMT+5:30 through Jul 30, 2026 23:59 GMT"
+// Start in IST, end in GMT. Ending the window at IST midnight instead left a
+// 5 hour 29 minute blind spot at the close of every range. Confirmed live: a
+// seller's 1-30 Jul statement showed Transfers of -7,59,003.33 against the
+// tool's -6,92,260.29, and the missing 66,743.04 was a single payout that
+// appeared only when the range was widened to 31 Jul - it had landed inside
+// that blind spot. Deposits for that account are stamped as late as 19:30
+// UTC, comfortably past the 18:30 cutoff.
+//
+// Widening to 31 Jul is not the fix: that overshoots Amazon by 18.5 hours in
+// the other direction and would wrongly count a deposit made early on the
+// 31st. The window has to end where Amazon ends it.
+function endOfRangeParam(lastDay) {
+  const { year, month, date } = istParts(lastDay);
+  return new Date(Date.UTC(year, month, date + 1)).toISOString();
+}
+function rangeQuery(range) { return `start=${encodeURIComponent(formatDateParam(range.start))}&end=${encodeURIComponent(endOfRangeParam(range.end))}`; }
 function formatRangeLabel(start, end) {
   const startStr = formatShort(start);
   const endStr = istParts(start).year === istParts(end).year ? formatShort(end) : end.toLocaleDateString('en-IN', { month: 'short', day: 'numeric', year: 'numeric', timeZone: IST_TIME_ZONE });
@@ -614,7 +632,7 @@ function FeeLeakAudit({tenantId}) {
   const {range}=useContext(DateRangeContext); const [result,setResult]=useState({flags:[],totalOvercharged:0}); const [busy,setBusy]=useState(false); const [error,setError]=useState('');
   async function load(){setResult(await api(`/api/tenants/${tenantId}/fee-leaks?${rangeQuery(range)}`));}
   useEffect(()=>{load().catch(e=>setError(e.message));},[tenantId,range.start,range.end]);
-  async function audit(){setBusy(true);setError('');try{await api(`/api/tenants/${tenantId}/fee-audit`,{method:'POST',body:JSON.stringify({range:{start:formatDateParam(range.start),end:formatDateParam(addDays(range.end,1))},varianceThreshold:5})});await load();}catch(e){setError(e.message)}finally{setBusy(false)}}
+  async function audit(){setBusy(true);setError('');try{await api(`/api/tenants/${tenantId}/fee-audit`,{method:'POST',body:JSON.stringify({range:{start:formatDateParam(range.start),end:endOfRangeParam(range.end)},varianceThreshold:5})});await load();}catch(e){setError(e.message)}finally{setBusy(false)}}
   return <><Card className="fee-audit-hero"><div><span className="live-source">AMAZON FEES ESTIMATE API</span><h2>{formatCurrency(result.totalOvercharged)} potential overcharge</h2><p>Expected Amazon fees compared with itemized fees actually deducted. Slab fallback is clearly identified when used.</p></div><Button onClick={audit} disabled={busy}>{busy?'Auditing…':'Run fee audit'}</Button></Card>{error&&<p className="alert error">{error}</p>}<TableCard title="Flagged fee discrepancies" rows={result.flags} columns={['order_id','sku','source','expected_fee','actual_fee','variance','flagged_at','resolved']} pageSize={15}/></>;
 }
 function DashboardOverview({ data, channelData, tenantId }) {
