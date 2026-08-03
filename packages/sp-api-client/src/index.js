@@ -121,6 +121,44 @@ export function throttleRetryDelayMs({ method, path, attempt, retryAfterSeconds,
   return Math.min(SP_API_MAX_BACKOFF_MS, Math.max(headerBackoffMs, intervalMs));
 }
 
+// Roles Amazon requires on the *application* for a report type, beyond the
+// ones the working reports already prove are granted. These are granted in
+// Developer Central against the SP-API app, not in the seller's own account -
+// a seller who can open Business Reports in Seller Central has proved nothing
+// about what the app may fetch on their behalf, and the two are routinely
+// confused because the symptom is identical.
+const REPORT_TYPE_REQUIRED_ROLES = Object.freeze({
+  GET_SALES_AND_TRAFFIC_REPORT: 'Brand Analytics',
+  GET_GST_MTR_B2B_CUSTOM: 'Tax Invoicing',
+  GET_GST_MTR_B2C_CUSTOM: 'Tax Invoicing'
+});
+
+/**
+ * A bare "Create report failed: 403" says nothing a seller can act on, and
+ * Amazon's response body usually names the missing role outright - it was
+ * being read past and thrown away. Surface it, plus the step that is missed
+ * far more often than the role itself: a refresh token carries the roles that
+ * were granted when it was issued, so adding a role in Developer Central does
+ * nothing until the seller re-authorizes and a new token is minted.
+ * @param {Response} response @param {string} reportType
+ */
+async function describeCreateReportFailure(response, reportType) {
+  let detail = '';
+  try {
+    const body = await response.text();
+    const parsed = body && body.trim().startsWith('{') ? JSON.parse(body) : null;
+    const amazonMessage = parsed?.errors?.map(error => [error.code, error.message, error.details].filter(Boolean).join(': ')).join(' | ') ?? body;
+    if (amazonMessage) detail += ` - Amazon says: ${String(amazonMessage).slice(0, 400)}`;
+  } catch {
+    // The body is optional colour; never let reading it mask the real status.
+  }
+  const role = REPORT_TYPE_REQUIRED_ROLES[reportType];
+  if (response.status === 403 && role) {
+    detail += ` - ${reportType} requires the "${role}" role on the SP-API application (granted in Developer Central, not in Seller Central). If that role was added recently, the seller must re-authorize the app: the existing refresh token still carries only the roles granted when it was issued.`;
+  }
+  return detail;
+}
+
 export class SpApiClient {
   /** @param {string} refreshToken @param {{ clientId?: string, clientSecret?: string, baseUrl?: string, label?: string }} [cfg] */
   constructor(refreshToken, cfg = {}) {
@@ -350,7 +388,7 @@ export class SpApiClient {
         body: JSON.stringify({ reportType: parsedReportType, marketplaceIds: [marketplaceId] })
       });
     }
-    if (!create.ok) throw new Error(`Create report failed: ${create.status}`);
+    if (!create.ok) throw new Error(`Create report failed: ${create.status}${await describeCreateReportFailure(create, parsedReportType)}`);
     const { reportId } = z.object({ reportId: z.string().min(1) }).parse(await create.json());
 
     let reportDocumentId = '';

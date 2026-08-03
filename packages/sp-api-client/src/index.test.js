@@ -106,3 +106,58 @@ test('documents already stored are not counted as outstanding', async () => {
   assert.equal(report.reportsOutstanding, 0, 'reportsAvailable - reportsMerged would wrongly say 2');
   assert.equal(report.reportsTruncated, false);
 });
+
+function createReportClient(status, body) {
+  const client = new SpApiClient('refresh-token', { clientId: 'id', clientSecret: 'secret' });
+  client.request = async (path, init) => init?.method === 'POST' && path === '/reports/2021-06-30/reports'
+    ? { ok: false, status, text: async () => body }
+    : { ok: true, json: async () => ({}) };
+  return client;
+}
+
+test('a 403 on create report repeats what Amazon actually said', async () => {
+  // The body names the problem; it was being read past and discarded, leaving
+  // the seller with a bare "Create report failed: 403".
+  const client = createReportClient(403, JSON.stringify({ errors: [{ code: 'Unauthorized', message: 'Access to requested resource is denied.' }] }));
+  await assert.rejects(
+    client.fetchReport('GET_SALES_AND_TRAFFIC_REPORT', TENANT, SETTLEMENT_RANGE),
+    error => {
+      assert.match(error.message, /Create report failed: 403/);
+      assert.match(error.message, /Unauthorized: Access to requested resource is denied\./);
+      return true;
+    }
+  );
+});
+
+test('a 403 names the application role the report type needs, and the re-authorization', async () => {
+  const client = createReportClient(403, '');
+  await assert.rejects(
+    client.fetchReport('GET_GST_MTR_B2B_CUSTOM', TENANT, SETTLEMENT_RANGE),
+    error => {
+      assert.match(error.message, /"Tax Invoicing" role/);
+      assert.match(error.message, /Developer Central, not in Seller Central/);
+      assert.match(error.message, /re-authorize/);
+      return true;
+    }
+  );
+});
+
+test('a non-403 failure is not blamed on a missing role', async () => {
+  const client = createReportClient(503, JSON.stringify({ errors: [{ code: 'ServiceUnavailable', message: 'Try again later.' }] }));
+  await assert.rejects(
+    client.fetchReport('GET_SALES_AND_TRAFFIC_REPORT', TENANT, SETTLEMENT_RANGE),
+    error => {
+      assert.match(error.message, /Try again later\./);
+      assert.doesNotMatch(error.message, /role/);
+      return true;
+    }
+  );
+});
+
+test('an unreadable error body never masks the status', async () => {
+  const client = new SpApiClient('refresh-token', { clientId: 'id', clientSecret: 'secret' });
+  client.request = async (path, init) => init?.method === 'POST' && path === '/reports/2021-06-30/reports'
+    ? { ok: false, status: 403, text: async () => { throw new Error('stream already consumed'); } }
+    : { ok: true, json: async () => ({}) };
+  await assert.rejects(client.fetchReport('GET_SALES_AND_TRAFFIC_REPORT', TENANT, SETTLEMENT_RANGE), /Create report failed: 403/);
+});
