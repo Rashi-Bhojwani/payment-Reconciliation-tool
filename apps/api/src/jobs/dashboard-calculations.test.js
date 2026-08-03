@@ -386,3 +386,30 @@ test('the Amazon window end still stops short of the next day',()=>{
   const r=calculateDashboardMetrics(base,{start:'2026-06-30T18:30:00Z',end:'2026-07-31T00:00:00Z'});
   assert.equal(r.statement.transfers.value,0,'a 31 Jul deposit is not in a 1-30 Jul statement');
 });
+
+test('deposits just outside the window are named, with how far outside they fell',()=>{
+  // The live shape: a settlement closing 29 Jul that pays out on 31 Jul,
+  // against a window ending 31 Jul 00:00 UTC. Reasoning about which deposits
+  // "should" be in range was wrong twice; this makes it a lookup.
+  const range={start:'2026-06-30T18:30:00Z',end:'2026-07-31T00:00:00Z'};
+  const input={orders:[],orderItems:[],returns:[],reimbursements:[],gstInvoices:[],financeItems:[],settledOrderIdsAllTime:[],
+    settlementRows:[line('sale','Principal',10,'Order',{amount_type:'ItemPrice'})],
+    settlementHeaders:[
+      {settlement_id:'in',deposit_date:'27.07.2026 10:44:14 UTC',settlement_end_date:'25.07.2026 10:44:14 UTC',total_amount:59707.76},
+      {settlement_id:'after',deposit_date:'31.07.2026 10:44:14 UTC',settlement_end_date:'29.07.2026 10:44:14 UTC',total_amount:66743.04},
+      {settlement_id:'before',deposit_date:'29.06.2026 09:00:00 UTC',settlement_end_date:'27.06.2026 09:00:00 UTC',total_amount:12345.67},
+      {settlement_id:'far',deposit_date:'30.09.2026 09:00:00 UTC',settlement_end_date:'28.09.2026 09:00:00 UTC',total_amount:999}
+    ]};
+  const r=calculateDashboardMetrics(input,range);
+  assert.equal(r.statement.transfers.value,-59707.76,'only the in-window deposit counts');
+
+  const outside=r.diagnostics.depositsOutsideRange;
+  assert.deepEqual(outside.map(row=>row.settlement_id),['after','before'],'the distant one is not noise worth showing');
+  assert.equal(outside[0].amount,66743.04);
+  assert.equal(outside[0].days_outside,1,'one day after the range ends');
+  assert.ok(outside[1].days_outside<0,'the earlier one reads as before the start');
+
+  const reasons=r.diagnostics.completeness.reasons.join(' ');
+  assert.match(reasons,/2 deposit\(s\) sit just outside this window/);
+  assert.match(reasons,/66743\.04 \(1 day\(s\) after this range ends, for the settlement ending 29\.07\.2026/);
+});

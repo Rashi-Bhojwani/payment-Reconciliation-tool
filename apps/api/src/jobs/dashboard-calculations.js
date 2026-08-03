@@ -274,6 +274,28 @@ export function calculateDashboardMetrics(input,range){
   // neither is meaningful to measure while the other is live.
   const headerAudit=dedupe((input.settlementHeaders??[]).filter(row=>!/failed/.test(text(row))&&row.deposit_date&&inRange(row.deposit_date,range)),row=>row.settlement_id??keyOf(row));
   const transferRows=headerAudit.included.map(row=>({...row,amount:-Math.abs(Number(row.total_amount??row.amount??0))}));const settled=Math.abs(signedSum(transferRows));
+  // Every deposit this window did NOT count, and how far outside it fell.
+  //
+  // Twice now a Transfers gap has been chased by reasoning about which
+  // deposits *should* be in range, and twice the reasoning was wrong - first
+  // blaming missing settlement documents, then a 5.5-hour boundary that
+  // turned out to be empty. The tool holds the answer either way: it knows
+  // every deposit it has and which ones it rejected. Showing the rejected
+  // ones with their dates turns "why is Transfers short" from an argument
+  // into a lookup, and the seller can read it off the screen instead of
+  // exporting rows.
+  const dayOffsetFromRange=value=>{
+    const at=utcDate(value);const{start,end}=rangeDates(range);
+    if(Number.isNaN(at.getTime()))return null;
+    if(at<start)return -Math.ceil((start-at)/864e5);
+    if(at>=end)return Math.floor((at-end)/864e5)+1;
+    return 0;
+  };
+  const depositsOutsideRange=dedupe((input.settlementHeaders??[]).filter(row=>!/failed/.test(text(row))&&row.deposit_date&&!inRange(row.deposit_date,range)),row=>row.settlement_id??keyOf(row))
+    .included
+    .map(row=>({settlement_id:row.settlement_id,deposit_date:row.deposit_date,settlement_start_date:row.settlement_start_date,settlement_end_date:row.settlement_end_date,amount:round2(Math.abs(Number(row.total_amount??row.amount??0))),days_outside:dayOffsetFromRange(row.deposit_date)}))
+    .filter(row=>row.days_outside!=null&&Math.abs(row.days_outside)<=7&&row.amount>0)
+    .sort((a,b)=>Math.abs(a.days_outside)-Math.abs(b.days_outside));
 
   const gstImported=(input.gstInvoices??[]).filter(row=>Object.keys(row.raw??{}).length>0&&!/synthetic|order item estimate/.test(norm(`${row.source??''} ${JSON.stringify(row.raw??{})}`)));const gstAudit=dedupe(gstImported,gstKey);
   const gstAvailable=gstAudit.included.length>0;const gstInvoiceValue=gstAvailable?gstAudit.included.reduce((sum,row)=>{const kind=norm(`${rawField(row.raw,['document-type','invoice-type','transaction-type'])??row.document_type??''}`);return sum+(/credit|refund/.test(kind)?-Math.abs(Number(row.taxable_value??0)):Number(row.taxable_value??0));},0):null;
@@ -362,6 +384,12 @@ export function calculateDashboardMetrics(input,range){
     const uncoveredDays=Math.max(1,Math.round((rangeEndsAt-settlementCoverageEnd)/864e5));
     provisionalReasons.push(`Settlement documents reach only ${settlementCoverageEnd.toISOString().slice(0,10)}, but this range runs to ${rangeEndsAt.toISOString().slice(0,10)} - the last ${uncoveredDays} day(s) are on Amazon's statement with no settlement document behind them yet, so whatever happened in them is missing from these sections.`);
   }
+  if(depositsOutsideRange.length){
+    const nearest=depositsOutsideRange.slice(0,3)
+      .map(row=>`${row.deposit_date} ${row.amount} (${row.days_outside>0?`${row.days_outside} day(s) after this range ends`:`${Math.abs(row.days_outside)} day(s) before it starts`}${row.settlement_end_date?`, for the settlement ending ${row.settlement_end_date}`:''})`)
+      .join('; ');
+    provisionalReasons.push(`${depositsOutsideRange.length} deposit(s) sit just outside this window and are not in Transfers: ${nearest}. If Amazon's statement counts one of these, it dates transfers by something other than when the money actually landed.`);
+  }
   // Deferred activity is deliberately excluded (see above), but "deliberate"
   // is not the same as "certainly right": Seller B's own Amazon statement for
   // 21-29 Jul carries a -141.90 refund that the Finances API reports as
@@ -385,7 +413,7 @@ export function calculateDashboardMetrics(input,range){
     provisionalReasons.push(`${pendingFinanceRows.length} Deferred row(s) totalling ${round2(pendingFinanceRows.reduce((sum,row)=>sum+amount(row),0))} are excluded because no settlement document carries them - by section: ${bySection || 'nothing that lands in a section'}. If Amazon's statement for this range includes any, those sections are short by exactly those amounts.`);
   }
   const completeness={provisional:provisionalReasons.length>0,reasons:provisionalReasons};
-  const diagnostics={completeness,sourcePolicy:{financial:`${financialSource} (${settlementComplete?`settlement only; ${pendingFinanceRows.length} Deferred Finance API row(s) measured but excluded - Amazon's statement does not carry them`:'settlement incomplete; Finances fallback'})`,reimbursements:financeReimbursements.length?financialSource:'Reimbursements report fallback',gst:'Imported GST B2B/B2C rows only',settled:'Settlement headers filtered by deposit_date'},includedRows:financialRows.length,excludedRows:(settlementComplete?excludedFinanceRows:settlementAudit.included.length),duplicateRows:financialDuplicates.length+itemAudit.duplicates.length+returnAudit.duplicates.length+gstAudit.duplicates.length,categoryTotals:{grossSales,productRefunds,netPromotions,expenseDebits,expenseCredits,tcsTds,operationalFees,gst,tax,transfers},pendingFinanceRowsDetail,pendingMergeSummary,outstandingSettlementSyncs,
+  const diagnostics={completeness,sourcePolicy:{financial:`${financialSource} (${settlementComplete?`settlement only; ${pendingFinanceRows.length} Deferred Finance API row(s) measured but excluded - Amazon's statement does not carry them`:'settlement incomplete; Finances fallback'})`,reimbursements:financeReimbursements.length?financialSource:'Reimbursements report fallback',gst:'Imported GST B2B/B2C rows only',settled:'Settlement headers filtered by deposit_date'},includedRows:financialRows.length,excludedRows:(settlementComplete?excludedFinanceRows:settlementAudit.included.length),duplicateRows:financialDuplicates.length+itemAudit.duplicates.length+returnAudit.duplicates.length+gstAudit.duplicates.length,categoryTotals:{grossSales,productRefunds,netPromotions,expenseDebits,expenseCredits,tcsTds,operationalFees,gst,tax,transfers},pendingFinanceRowsDetail,pendingMergeSummary,outstandingSettlementSyncs,depositsOutsideRange,
     // Settlements whose own lines do not add up to the total Amazon stamped on
     // the document. Empty means every settlement held is provably complete.
     settlementIntegrity:settlementIntegrityRows};
