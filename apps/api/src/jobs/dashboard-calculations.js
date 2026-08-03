@@ -284,10 +284,19 @@ export function calculateDashboardMetrics(input,range){
   const provisionalReasons=[];
   if(!settlementComplete)provisionalReasons.push('No settlement report covers this range yet, so the sections are built from the Finances API - a different view of the same ledger, not the one Amazon\'s statement is drawn from.');
   if(outstandingSettlementSyncs>0)provisionalReasons.push(`${outstandingSettlementSyncs} settlement sync(s) did not finish, so some of Amazon's documents for this range have not been read yet.`);
-  // The total matters more than the largest: if the sections are short by
-  // roughly this much, the shortfall is missing settlement lines rather than
-  // anything about how the lines we do hold are classified.
-  if(settlementIntegrityRows.length)provisionalReasons.push(`${settlementIntegrityRows.length} settlement(s) hold fewer lines than Amazon's own document total accounts for - ${round2(settlementIntegrityRows.reduce((sum,row)=>sum+Math.abs(row.difference),0))} missing in total, largest single gap ${round2(Math.max(...settlementIntegrityRows.map(row=>Math.abs(row.difference))))}.`);
+  // Two different totals, and only one of them is comparable to a section gap.
+  // The absolute total says how much line-level data is in question; the
+  // signed net says which way the stored rows actually pull, because a
+  // settlement holding too much and one holding too little cancel in the
+  // dashboard but both count in the absolute. If the sections are short by
+  // roughly the signed net, the shortfall is missing lines rather than
+  // anything about how the lines already held are classified.
+  if(settlementIntegrityRows.length){
+    const netDifference=round2(settlementIntegrityRows.reduce((sum,row)=>sum+row.difference,0));
+    const absoluteDifference=round2(settlementIntegrityRows.reduce((sum,row)=>sum+Math.abs(row.difference),0));
+    const largestGap=round2(Math.max(...settlementIntegrityRows.map(row=>Math.abs(row.difference))));
+    provisionalReasons.push(`${settlementIntegrityRows.length} settlement(s) do not add up to Amazon's own document total - net ${netDifference >= 0 ? '+' : ''}${netDifference} against Amazon (${absoluteDifference} in dispute across all of them, largest single gap ${largestGap}).`);
+  }
   // Deferred activity is deliberately excluded (see above), but "deliberate"
   // is not the same as "certainly right": Seller B's own Amazon statement for
   // 21-29 Jul carries a -141.90 refund that the Finances API reports as

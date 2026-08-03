@@ -288,7 +288,7 @@ test('the statement only claims to match Amazon once it can prove it does',()=>{
 
   const torn=reasonsFor({settlementIntegrity:[{settlement_id:'s1',row_count:40,rows_total:900,header_total:1000}]});
   assert.equal(torn.provisional,true);
-  assert.match(torn.reasons.join(' '),/100 missing in total, largest single gap 100/);
+  assert.match(torn.reasons.join(' '),/net -100 against Amazon \(100 in dispute across all of them, largest single gap 100\)/);
 
   // Amazon's own 21-29 Jul statement for Seller B carries a -141.90 refund
   // that the Finances API marks Deferred and no settlement document holds, so
