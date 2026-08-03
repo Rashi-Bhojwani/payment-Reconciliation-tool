@@ -265,10 +265,104 @@ function parseReportRows(reportType, content) {
 }
 
 /** @param {string} tenantId @param {string} content */
+const settlementIdOf = row => text(pick(row, ['settlement-id', 'settlement id', 'settlementId']));
+
+// Amazon puts a checksum in every settlement document and it has never once
+// been wrong: the lines of a settlement sum exactly to the total-amount on
+// its header row. Verified across 52 settlements in five real documents - 52
+// balanced, 0 did not, to the paisa.
+//
+// So there is no need to guess whether an import is sound. Any duplication,
+// truncation, dropped line or misparsed amount breaks this equality, and it
+// costs one pass over rows already in memory. Refusing the import is the
+// right response: a settlement stored wrong is money reported wrong, and
+// because the document is then marked processed and never re-downloaded, no
+// later sync would heal it.
+export function settlementBalanceErrors(rows, idOf = settlementIdOf) {
+  const totals = new Map();
+  for (const row of rows) {
+    const id = idOf(row);
+    if (id == null) continue;
+    const entry = totals.get(id) ?? { header: null, sum: 0 };
+    // The header is the row that *states* a total-amount - not the row with a
+    // blank transaction-type. Amazon leaves transaction-type empty on real
+    // money rows too: a settlement's FBAInboundTransportationFee and its
+    // CGST/SGST all carry amounts with no transaction-type at all. Testing
+    // for the blank field instead matched those, and since number('') is 0
+    // rather than null it overwrote a genuine 5,205.50 header with zero and
+    // reported a balanced settlement as broken.
+    const statedTotal = text(pick(row, ['total-amount', 'total amount', 'totalAmount']));
+    if (statedTotal != null) entry.header = number(statedTotal);
+    entry.sum += number(pick(row, ['amount']));
+    totals.set(id, entry);
+  }
+  const errors = [];
+  for (const [id, { header, sum }] of totals) {
+    if (header == null) continue;
+    const difference = Math.round((sum - header) * 100) / 100;
+    if (Math.abs(difference) > 0.01) errors.push({ settlement_id: id, header_total: header, rows_total: Math.round(sum * 100) / 100, difference });
+  }
+  return errors;
+}
+function assertSettlementsBalance(rows, tenantId) {
+  const errors = settlementBalanceErrors(rows);
+  if (!errors.length) return;
+  const detail = errors.slice(0, 5).map(e => `${e.settlement_id}: lines total ${e.rows_total} against Amazon's stated ${e.header_total} (${e.difference > 0 ? '+' : ''}${e.difference})`).join('; ');
+  throw new Error(`Refusing to store settlement data that disagrees with Amazon's own document totals - ${errors.length} settlement(s) out of balance for tenant ${tenantId.slice(0, 8)}: ${detail}`);
+}
+
+// Amazon's settlement documents are not one-settlement-each: every report is
+// a rolling window that repeats the settlements the previous reports already
+// contained. Verified against five real documents from one account - they
+// hold 1, 10, 10, 15 and 16 settlements, and 13 settlements appear in up to
+// four documents at once, byte-for-byte identical.
+//
+// The downloader merges the documents of one fetch into a single blob before
+// parsing, so a repeated settlement arrives twice in the same parse. Its rows
+// are identical, but the ordinal tiebreak - which exists so that two
+// genuinely identical Amazon lines stay two rows - numbers the second copy
+// differently, giving it a different source_key. The upsert then cannot
+// collapse them and both copies persist. Measured on two real overlapping
+// documents: 2,009 real rows became 3,350 persisted, and all 8 shared
+// settlements landed at exactly 2.00x their true value - 72,456.77 of
+// invented money out of 89,643.18.
+//
+// Keeping the first copy is safe because the repeats are identical. The block
+// boundary is the header row - the one that states a total-amount - because
+// every settlement begins with exactly one (verified: 15 headers for 15
+// settlements in the largest document, with no unattributed rows). Watching
+// for the settlement-id to *change* instead is not enough: when one document
+// ends with the settlement the next begins with, the two copies sit side by
+// side and the id never changes between them, so both survive.
+//
+// Across separate syncs no dedup is needed: each blob then holds one copy,
+// the ordinals come out the same, and source_key makes the re-import
+// idempotent by itself.
+export function dropRepeatedSettlements(rows, idOf = settlementIdOf) {
+  const seen = new Set();
+  const kept = [];
+  let skipping = false;
+  for (const row of rows) {
+    const startsBlock = text(pick(row, ['total-amount', 'total amount', 'totalAmount'])) != null;
+    if (startsBlock) {
+      const id = idOf(row);
+      skipping = id != null && seen.has(id);
+      if (id != null) seen.add(id);
+    }
+    if (!skipping) kept.push(row);
+  }
+  return kept;
+}
+
 async function saveSettlementRows(tenantId, content) {
-  const rows = z.array(ReportRowSchema).parse(parseReportRows('GET_V2_SETTLEMENT_REPORT_DATA_FLAT_FILE_V2', content));
+  const parsed = z.array(ReportRowSchema).parse(parseReportRows('GET_V2_SETTLEMENT_REPORT_DATA_FLAT_FILE_V2', content));
+  const rows = dropRepeatedSettlements(parsed);
+  if (rows.length !== parsed.length) {
+    console.log(`[sync ${tenantId.slice(0, 8)}:settlement] ${parsed.length - rows.length} row(s) dropped - documents in this fetch repeated settlements Amazon had already included in an earlier one`);
+  }
+  assertSettlementsBalance(rows, tenantId);
   // Position within the settlement document this line belongs to.
-  const ordinals = ordinalsWithinGroup(rows, row => text(pick(row, ['settlement-id', 'settlement id', 'settlementId'])));
+  const ordinals = ordinalsWithinGroup(rows, settlementIdOf);
   let persisted = 0;
   await withTenantTransaction(tenantId, async client => {
     const batch = rows.map((row, rowIndex) => {

@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { batchUpsert, ordinalsWithinGroup, withTenantSyncMutex } from './sync.js';
+import { batchUpsert, dropRepeatedSettlements, ordinalsWithinGroup, settlementBalanceErrors, withTenantSyncMutex } from './sync.js';
 
 function fakeClient() {
   const calls = [];
@@ -156,4 +156,68 @@ test('batchUpsert refuses to silently drop rows from a financial ledger', async 
     rows: [duplicate, [...duplicate]]
   });
   assert.equal(imported, 1);
+});
+
+// Shaped from five real Amazon settlement documents for one seller. Those
+// documents hold 1, 10, 10, 15 and 16 settlements respectively, and 13
+// settlements appear in up to four of them at once, byte-for-byte identical -
+// Amazon's settlement report is a rolling window, not one document per
+// settlement.
+const settlementDoc = (id, total, lines) => [
+  { 'settlement-id': id, 'settlement-start-date': '21.07.2026 18:28:59 UTC', 'settlement-end-date': '25.07.2026 17:22:30 UTC', 'deposit-date': '27.07.2026 17:22:30 UTC', 'total-amount': total, 'transaction-type': '', 'amount': '' },
+  ...lines.map(([desc, amount]) => ({ 'settlement-id': id, 'total-amount': '', 'transaction-type': 'Order', 'amount-description': desc, 'amount': amount }))
+];
+
+test('a settlement repeated by a later document in the same fetch is stored once', () => {
+  // The downloader merges every document of one fetch into a single blob
+  // before parsing, so an overlapping settlement arrives twice in one parse.
+  const docA = settlementDoc('S1', '100.00', [['Principal', '120.00'], ['Commission', '-20.00']]);
+  const docB = [...settlementDoc('S1', '100.00', [['Principal', '120.00'], ['Commission', '-20.00']]),
+                ...settlementDoc('S2', '50.00', [['Principal', '50.00']])];
+
+  const kept = dropRepeatedSettlements([...docA, ...docB]);
+  assert.deepEqual(kept.map(r => r['settlement-id']), ['S1', 'S1', 'S1', 'S2', 'S2']);
+  assert.deepEqual(settlementBalanceErrors(kept), [], 'each settlement now sums to what Amazon says it should');
+});
+
+test('the ordinal tiebreak is what let the duplicate through, so it must survive dedup', () => {
+  // Two genuinely identical Amazon lines in ONE document must stay two rows;
+  // that is why the ordinal exists. It is also why a repeated settlement got
+  // different source_keys and could not be collapsed by the upsert.
+  const doc = settlementDoc('S1', '20.00', [['Principal', '10.00'], ['Principal', '10.00']]);
+  const kept = dropRepeatedSettlements([...doc, ...doc]);
+  assert.equal(kept.length, 3, 'one header plus the two identical lines, kept once');
+  const ordinals = ordinalsWithinGroup(kept, row => row['settlement-id']);
+  assert.deepEqual(ordinals, [1, 2, 3], 'the two identical lines remain distinguishable');
+  assert.deepEqual(settlementBalanceErrors(kept), []);
+});
+
+test("Amazon's own document total is used as the checksum on every import", () => {
+  const short = settlementDoc('S1', '100.00', [['Principal', '120.00']]);
+  assert.deepEqual(settlementBalanceErrors(short), [
+    { settlement_id: 'S1', header_total: 100, rows_total: 120, difference: 20 }
+  ]);
+  const exact = settlementDoc('S1', '100.00', [['Principal', '120.00'], ['Commission', '-20.00']]);
+  assert.deepEqual(settlementBalanceErrors(exact), []);
+});
+
+test('a money row with no transaction-type is not mistaken for the header', () => {
+  // Real settlements carry FBAInboundTransportationFee and its CGST/SGST with
+  // the transaction-type column empty. Treating "blank transaction-type" as
+  // the header read their empty total-amount as 0 - number('') is 0, not null
+  // - and reported a balanced settlement as broken by its full value.
+  const doc = [
+    { 'settlement-id': 'S1', 'total-amount': '5205.50', 'transaction-type': '', 'amount': '' },
+    { 'settlement-id': 'S1', 'total-amount': '', 'transaction-type': '', 'amount-description': 'FBAInboundTransportationFee', 'amount': '-718.08' },
+    { 'settlement-id': 'S1', 'total-amount': '', 'transaction-type': '', 'amount-description': 'CGST', 'amount': '-64.63' },
+    { 'settlement-id': 'S1', 'total-amount': '', 'transaction-type': '', 'amount-description': 'SGST', 'amount': '-64.63' },
+    { 'settlement-id': 'S1', 'total-amount': '', 'transaction-type': 'Order', 'amount-description': 'Principal', 'amount': '6052.84' }
+  ];
+  assert.deepEqual(settlementBalanceErrors(doc), []);
+});
+
+test('settlements that were never repeated are left exactly as they came', () => {
+  const doc = [...settlementDoc('S1', '10.00', [['Principal', '10.00']]),
+               ...settlementDoc('S2', '20.00', [['Principal', '20.00']])];
+  assert.deepEqual(dropRepeatedSettlements(doc), doc);
 });
