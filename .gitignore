@@ -16,3 +16,4 @@ apps/api/storage/
 .probe*.mjs
 *.settlement.txt
 .seed_buggy.mjs
+.seed_messy.mjs
