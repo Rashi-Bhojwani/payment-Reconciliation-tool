@@ -70,7 +70,13 @@ const isPromotion=row=>/promotion|promo rebate/.test(text(row))&&!isProductGst(r
 // isReimbursement's own Reimbursements KPI - it is simply an Income line
 // with no more specific category), keeps both aligned with the real
 // statement sections without changing what counts as a "reimbursement".
-const isWithholding=row=>/\b(tcs|tds)\b/.test(text(row))&&!/reimburse/.test(text(row));
+// "TaxWithholding" is the Finances API's own name for the TDS Amazon deducts;
+// settlement calls the same thing "Tax Withheld". It carries neither "tcs" nor
+// "tds" as a word, so it fell past this test and past isFee into the generic
+// Tax bucket - which Amazon does not use: on both reconciled accounts every
+// line of its Tax section is 0, while TDS appears under Expenses as "TDS -
+// Section 194-O Net".
+const isWithholding=row=>/\b(tcs|tds)\b|withholding|tax withheld/.test(text(row))&&!/reimburse/.test(text(row));
 const isReimbursement=row=>/reimburse|safe t|lost|damaged|clawback/.test(text(row));
 // Shipping and gift wrap CREDITS are Income - they are money the buyer paid.
 // The matching charges ("shipping chargeback", "gift wrap fee", a purchased
@@ -81,7 +87,11 @@ const isReimbursement=row=>/reimburse|safe t|lost|damaged|clawback/.test(text(ro
 // Tax on either belongs to GST, never here.
 const isShippingOrGiftWrapCredit=row=>/shipping|gift wrap/.test(text(row))
   &&!isFee(row)&&!isProductGst(row)&&!isWithholding(row)&&!isPromotion(row)&&!isTransfer(row);
-const isFee=row=>/itemfees|itemtcs|itemtds|other transaction|fee|commission|closing|storage|shipping label|service|advertis|adjustment|easy ship charges|postagepurchase|tcs|tds/.test(text(row))&&!isReimbursement(row)&&!isPrincipal(row)&&!isPromotion(row);
+// "cancellation" earns its place: Amazon charges an OrderCancellationCharge and
+// GST on it, and the tax leaf ("OrderCancellationCharge Tax") contains no other
+// fee word, so without this it landed in the generic Tax bucket instead of
+// Expenses alongside the charge it is tax on.
+const isFee=row=>/itemfees|itemtcs|itemtds|other transaction|fee|commission|closing|storage|shipping label|service|advertis|adjustment|easy ship charges|postagepurchase|cancellation|tcs|tds/.test(text(row))&&!isReimbursement(row)&&!isPrincipal(row)&&!isPromotion(row);
 // "our price tax" is the Finance API's own name (after camelCase splitting)
 // for what settlement calls "Product Tax" - the tax on the item's own sale
 // price, as distinct from "shipping tax"/"gift wrap tax". Without this

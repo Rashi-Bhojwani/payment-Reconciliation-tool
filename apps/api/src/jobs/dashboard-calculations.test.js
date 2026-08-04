@@ -570,3 +570,38 @@ test('a real promotion is still a promotion, not swallowed by the GST rule',()=>
   assert.equal(r.statement.income.value,-135.56,'promotional rebates stay in Income');
   assert.equal(r.statement.gst.value,0);
 });
+
+test('Amazon has no generic Tax section, so nothing may invent one',()=>{
+  // Both reconciled accounts report every line of Amazon's Tax section as 0,
+  // while TDS appears under Expenses as "TDS - Section 194-O Net". Two real
+  // Finances API labels were landing in a generic Tax bucket instead:
+  // "TaxWithholding" (-499.24) carries neither "tcs" nor "tds" as a word, and
+  // "OrderCancellationCharge Tax" (-201.89) carries no fee word at all. Their
+  // parent charge, "OrderCancellationCharge Base", matched nothing and was
+  // left unclassified entirely.
+  const fin=(description,amount,category)=>({source_row_id:description,transaction_id:'t1',order_id:'o1',category,
+    amount_description:description,amount,posted_date:'2026-07-10T00:00:00Z',transaction_status:'RELEASED',raw:{}});
+  const r=calculateDashboardMetrics({
+    orders:[],orderItems:[],returns:[],reimbursements:[],gstInvoices:[],settlementHeaders:[],settledOrderIdsAllTime:[],settlementRows:[],
+    financeItems:[fin('OurPricePrincipal',1000,'item_price'),fin('TaxWithholding',-499.24,'tax'),
+                  fin('OrderCancellationCharge Base',-1121.58,'other'),fin('OrderCancellationCharge Tax',-201.89,'tax')]
+  },range);
+  assert.equal(r.statement.tax.value,0,'Amazon states this section is 0');
+  assert.equal(r.statement.expenses.value,-1822.71,'withholding and the cancellation charge are Expenses');
+  assert.equal(r.statement.income.value,1000,'and none of it is Income');
+  assert.deepEqual(r.diagnostics.completeness.reasons.filter(x=>/match no statement section/.test(x)),[],
+    'the cancellation charge must no longer be sectionless');
+});
+
+test('a genuine product tax is still GST, not withholding',()=>{
+  // Guards the widened withholding rule from swallowing ordinary GST.
+  const fin=(description,amount,category)=>({source_row_id:description,transaction_id:'t1',order_id:'o1',category,
+    amount_description:description,amount,posted_date:'2026-07-10T00:00:00Z',transaction_status:'RELEASED',raw:{}});
+  const r=calculateDashboardMetrics({
+    orders:[],orderItems:[],returns:[],reimbursements:[],gstInvoices:[],settlementHeaders:[],settledOrderIdsAllTime:[],settlementRows:[],
+    financeItems:[fin('OurPriceTax',180,'tax'),fin('ShippingTax',18,'tax')]
+  },range);
+  assert.equal(r.statement.gst.value,198);
+  assert.equal(r.statement.expenses.value,0);
+  assert.equal(r.statement.tax.value,0);
+});
