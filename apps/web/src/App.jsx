@@ -538,7 +538,14 @@ function SellerDashboard() {
     {view === 'returns' && <TableCard title="Return Details" rows={data?.returns ?? []} columns={['order_id', 'return_reason', 'disposition', 'status', 'return_date']} downloadFilename="returns.csv" />}
     {view === 'reimbursements' && <TableCard title="Reimbursement Details" rows={data?.reimbursements ?? []} columns={['sku', 'amount', 'reason', 'reimbursement_date']} downloadFilename="reimbursements.csv" />}
     {view === 'tax' && <TableCard title="GST Invoice Details" rows={data?.invoices ?? []} columns={['invoice_type', 'order_id', 'taxable_value', 'cgst', 'sgst', 'igst', 'invoice_date']} downloadFilename="gst-invoices.csv" />}
-    {view === 'reports' && <ReportsExplorer tenantId={tenantId} data={data} />}
+    {view === 'reports' && <>
+      <ReportsExplorer tenantId={tenantId} data={data} />
+      {/* Also on Payouts, but this is the page people look for raw exports on.
+          It is the only view of the Finances API half of the ledger - the half
+          that carries deferred activity and that Amazon builds its own
+          statement from - so when a section disagrees, this is what says why. */}
+      <TableCard title="Finance API Lines (itemized)" rows={data?.financeLines ?? []} columns={['posted_date', 'maturity_dates', 'transaction_status', 'transaction_type', 'transaction_id', 'order_id', 'sku', 'fulfillment_networks', 'category', 'amount_description', 'amount', 'deferral_reasons', 'context_types']} pageSize={10} downloadFilename="finance-lines.csv" />
+    </>}
     {view === 'rawData' && <RawApiDataExplorer data={data} />}
     {view === 'report-detail' && <ReportDetail data={data} reportType={params.get('reportType')} />}
     {view === 'metric-detail' && <MetricDetail metric={params.get('metric')} tenantId={tenantId} />}
