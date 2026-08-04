@@ -91,7 +91,25 @@ const isShippingOrGiftWrapCredit=row=>/shipping|gift wrap/.test(text(row))
 // GST on it, and the tax leaf ("OrderCancellationCharge Tax") contains no other
 // fee word, so without this it landed in the generic Tax bucket instead of
 // Expenses alongside the charge it is tax on.
-const isFee=row=>/itemfees|itemtcs|itemtds|other transaction|fee|commission|closing|storage|shipping label|service|advertis|adjustment|easy ship charges|postagepurchase|cancellation|tcs|tds/.test(text(row))&&!isReimbursement(row)&&!isPrincipal(row)&&!isPromotion(row);
+// A leaf Amazon labels only "Base" or "Tax" is a COMPONENT of the fee above it,
+// not a line of its own. flattenFinanceTransaction prefixes the parent's name
+// when Amazon supplies one - "Commission Base" - but Amazon does not always
+// supply one, and the row then arrives as a bare "Base" or "Tax" that matches
+// no rule at all: the Base landed in no section, and the Tax in a generic Tax
+// section Amazon does not use.
+//
+// Measured on a real account, 380 such rows, every parent type fee-bearing:
+//   ProductAdsPayment  Base  -9,974.35   Tax  -1,795.39   (Cost of Advertising)
+//   Shipment           Base -12,059.47   Tax  -2,170.74
+//   ServiceFee         Base  -3,150.25   Tax    -567.05
+//   Refund             Base    -428.25   Tax     -77.08
+//
+// Tax on a fee belongs with the fee - Amazon reports "Commission Tax" inside
+// Expenses, not GST - so both components are Expenses. The guards keep this
+// away from anything that is genuinely a sale, a promotion or a transfer.
+const isGenericFeeComponent=row=>/^(base|tax|amount|fee|total)$/.test(norm(row.amount_description??''))
+  &&!isPrincipal(row)&&!isPromotion(row)&&!isReimbursement(row)&&!isTransfer(row);
+const isFee=row=>/itemfees|itemtcs|itemtds|other transaction|fee|commission|closing|storage|shipping label|service|advertis|adjustment|easy ship charges|postagepurchase|cancellation|tcs|tds/.test(text(row))&&!isReimbursement(row)&&!isPrincipal(row)&&!isPromotion(row)||isGenericFeeComponent(row);
 // "our price tax" is the Finance API's own name (after camelCase splitting)
 // for what settlement calls "Product Tax" - the tax on the item's own sale
 // price, as distinct from "shipping tax"/"gift wrap tax". Without this
@@ -203,7 +221,7 @@ const gstKey=row=>`${rawField(row.raw,['invoice-number','invoice number','docume
 // stale numbers with total confidence. Bump this whenever the statement maths
 // changes, and the running build can be read off the dashboard instead of
 // inferred from the numbers it produces.
-export const CALCULATION_REVISION = 'instant-ordering-2026-08-04';
+export const CALCULATION_REVISION = 'fee-components-2026-08-04';
 export const MINIMUM_DEDUPE_LOOKBACK_DAYS = 30;
 // The instant a row was posted, for ordering. Never compare posted_date as a
 // string: it arrives as a Date from Postgres and as an ISO string from an

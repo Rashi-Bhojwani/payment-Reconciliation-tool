@@ -767,3 +767,47 @@ test('Date objects and ISO strings produce identical figures',()=>{
   assert.equal(asDates.gst.value,asStrings.gst.value);
   assert.equal(asDates.expenses.value,asStrings.expenses.value);
 });
+
+test('a bare Base/Tax leaf is a fee component, not a section of its own',()=>{
+  // flattenFinanceTransaction prefixes a generic leaf with its parent's name
+  // ("Commission Base"), but Amazon does not always supply a parent, and the
+  // row then arrives as a bare "Base" or "Tax". Those matched no rule: the Base
+  // was counted in NO section and the Tax landed in a generic Tax section
+  // Amazon reports as 0. Measured on a real account, 380 such rows worth
+  // -22,135.38 of Base uncounted and -3,984.41 of Tax miscounted, every parent
+  // type fee-bearing - ProductAdsPayment (Cost of Advertising), Shipment,
+  // ServiceFee and Refund.
+  const range={start:'2026-07-01T00:00:00Z',end:'2026-07-30T00:00:00Z'};
+  const row=(id,parent,description,amountValue,category)=>({source_row_id:id,transaction_id:id,order_id:'o1',
+    category,amount_description:description,amount:amountValue,posted_date:new Date('2026-07-10T00:00:00Z'),
+    parent_transaction_type:parent,transaction_status:'RELEASED',raw:{}});
+  const r=calculateDashboardMetrics({
+    orders:[],orderItems:[],returns:[],reimbursements:[],gstInvoices:[],settlementHeaders:[],settledOrderIdsAllTime:[],settlementRows:[],
+    financeItems:[row('p','Shipment','OurPricePrincipal',1000,'item_price'),
+                  row('ads','ProductAdsPayment','Base',-500,'other'),
+                  row('adstax','ProductAdsPayment','Tax',-90,'tax'),
+                  row('svc','ServiceFee','Base',-100,'other'),
+                  row('svctax','ServiceFee','Tax',-18,'tax')]
+  },range);
+  assert.equal(r.statement.tax.value,0,'Amazon reports no generic Tax section');
+  assert.equal(r.statement.expenses.value,-708,'fee and the tax on it both belong to Expenses');
+  assert.equal(r.statement.income.value,1000,'and none of it touches Income');
+  assert.deepEqual(r.diagnostics.completeness.reasons.filter(x=>/match no statement section/.test(x)),[],
+    'a fee component must never be left sectionless');
+});
+
+test('a named tax line is still GST, not swallowed by the fee-component rule',()=>{
+  // Guards the rule from over-reaching: only a BARE generic label is a
+  // component. "OurPriceTax" names itself and stays product GST.
+  const range={start:'2026-07-01T00:00:00Z',end:'2026-07-30T00:00:00Z'};
+  const row=(id,description,amountValue,category)=>({source_row_id:id,transaction_id:id,order_id:'o1',
+    category,amount_description:description,amount:amountValue,posted_date:new Date('2026-07-10T00:00:00Z'),
+    parent_transaction_type:'Shipment',transaction_status:'RELEASED',raw:{}});
+  const r=calculateDashboardMetrics({
+    orders:[],orderItems:[],returns:[],reimbursements:[],gstInvoices:[],settlementHeaders:[],settledOrderIdsAllTime:[],settlementRows:[],
+    financeItems:[row('p','OurPricePrincipal',1000,'item_price'),row('t','OurPriceTax',180,'tax'),row('s','ShippingTax',18,'tax')]
+  },range);
+  assert.equal(r.statement.gst.value,198);
+  assert.equal(r.statement.expenses.value,0);
+  assert.equal(r.statement.income.value,1000);
+});
