@@ -531,7 +531,7 @@ function SellerDashboard() {
           activity and lag the posted date Amazon builds its own statement on,
           so when a section does not match Amazon these are the rows that say
           why - they are the only place Deferred activity exists. */}
-      <TableCard title="Finance API Lines (itemized)" rows={data?.financeLines ?? []} columns={['posted_date', 'transaction_status', 'transaction_type', 'transaction_id', 'order_id', 'sku', 'category', 'amount_description', 'amount']} pageSize={10} downloadFilename="finance-lines.csv" />
+      <TableCard title="Finance API Lines (itemized)" rows={data?.financeLines ?? []} columns={['posted_date', 'release_date', 'transaction_status', 'transaction_type', 'transaction_id', 'order_id', 'sku', 'category', 'amount_description', 'amount', 'raw_keys']} pageSize={10} downloadFilename="finance-lines.csv" />
     </>}
     {view === 'brand' && <TableCard title="Product Performance" rows={data?.products ?? []} columns={['asin', 'units', 'sales', 'buy_box']} downloadFilename="product-performance.csv" />}
     {view === 'feeAudit' && <FeeLeakAudit tenantId={tenantId} />}

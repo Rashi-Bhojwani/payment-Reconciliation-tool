@@ -1241,7 +1241,18 @@ app.get('/api/tenants/:tenantId/dashboard', async request => {
     const financeLines = (await client.query(`select fi.transaction_id, fi.posted_date, fi.order_id, fi.sku, fi.category,
         fi.amount_description, fi.amount,
         coalesce(ft.raw->>'transactionStatus',ft.raw->>'TransactionStatus','Unknown') transaction_status,
-        ft.transaction_type
+        ft.transaction_type,
+        -- A transaction that was deferred and has since been released is counted
+        -- by Amazon on the date the money was RELEASED, not the date it posted,
+        -- so the two dates decide whether it belongs in the window being viewed.
+        -- Amazon's own statement column is "Transaction Release Date"; the API
+        -- has used several names for it, so every one seen is tried.
+        coalesce(ft.raw->>'transactionReleaseDate',ft.raw->>'TransactionReleaseDate',
+                 ft.raw->>'releaseDate',ft.raw->>'ReleaseDate',
+                 ft.raw#>>'{sellingPartnerMetadata,releaseDate}') release_date,
+        -- Which keys the stored payload actually has. Costs one small string per
+        -- row and removes the guesswork when Amazon renames or adds a field.
+        (select string_agg(k,'|' order by k) from jsonb_object_keys(coalesce(ft.raw,'{}'::jsonb)) k) raw_keys
       from finance_transaction_items fi
       left join finance_transactions ft on ft.tenant_id=fi.tenant_id and ft.transaction_id=fi.transaction_id
       where fi.tenant_id=$1 and fi.posted_date >= $2 and fi.posted_date < $3
