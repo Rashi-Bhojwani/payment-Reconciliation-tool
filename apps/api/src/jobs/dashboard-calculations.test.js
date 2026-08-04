@@ -322,9 +322,21 @@ test('the statement only claims to match Amazon once it can prove it does',()=>{
   // ledger Amazon builds the statement from - posted-date indexed and carrying
   // deferred activity, neither of which a settlement document does - so having
   // only that is the normal, better case, not a degraded one.
-  const noSettlement=calculateDashboardMetrics({...clean,settlementRows:[],financeItems:[line('f','Principal',1000,'Order')]},range).diagnostics.completeness;
+  // Enough history behind it that re-posted payments can be matched to their
+  // originals - see the lookback assertion below.
+  const withHistory=[{source_row_id:'old',transaction_id:'old',order_id:'o-old',category:'item_price',
+    amount_description:'OurPricePrincipal',amount:1,posted_date:'2026-05-01T00:00:00Z',transaction_status:'RELEASED',raw:{}},
+    line('f','Principal',1000,'Order')];
+  const noSettlement=calculateDashboardMetrics({...clean,settlementRows:[],financeItems:withHistory},range).diagnostics.completeness;
   assert.equal(noSettlement.provisional,false,'Finances-sourced sections are not provisional for lacking settlement');
   assert.deepEqual(noSettlement.reasons,[]);
+
+  // Too little history to match a re-post against its original: the sections can
+  // read HIGH, and must say so rather than quietly over-count.
+  const shortHistory=calculateDashboardMetrics({...clean,settlementRows:[],financeItems:[line('f','Principal',1000,'Order')]},range).diagnostics.completeness;
+  assert.equal(shortHistory.provisional,true);
+  assert.match(shortHistory.reasons.join(' '),/may read HIGH/);
+  assert.match(shortHistory.reasons.join(' '),/Sync a wider range/);
 
   // Neither source carrying the range still is a caveat.
   const nothing=calculateDashboardMetrics({...clean,settlementRows:[],financeItems:[]},range).diagnostics.completeness;
@@ -632,26 +644,28 @@ test('a genuine product tax is still GST, not withholding',()=>{
   assert.equal(r.statement.tax.value,0);
 });
 
-test('the same payment under two transaction ids is counted once, whatever the statuses',()=>{
-  // Amazon re-posts money instead of updating it. "Drop anything marked
-  // DEFERRED_RELEASED" only catches accounts whose duplication follows the
-  // deferral lifecycle: on a second real seller Income and GST were BOTH
-  // 1.797x, with the released half alone 2.25x - two independent sections
-  // cannot drift by an identical factor through a classification fault, and
-  // those duplicates are not all DEFERRED_RELEASED. So identity is economic:
-  // same order + byte-identical line set = one payment.
+test('a re-post is collapsed across stages, but genuine repeats within a stage survive',()=>{
+  // A real order settles this: a 12,000 sale with TWO identical 6,000 refunds,
+  // each of the three events posted once as DEFERRED_RELEASED and again as
+  // RELEASED - six transactions for three events. Keeping one per signature
+  // would have deleted a genuine refund, so the number of real events is the
+  // largest count any single status reaches: 2 DEFERRED_RELEASED + 2 RELEASED
+  // means two refunds, and 1 + 1 means one sale.
   const range={start:'2026-07-01T00:00:00Z',end:'2026-07-30T00:00:00Z'};
   const tx=(id,status,day,lines)=>lines.map(([description,amountValue,category],i)=>({
     source_row_id:`${id}-${i}`,transaction_id:id,order_id:'order-1',category,amount_description:description,
     amount:amountValue,posted_date:`2026-07-${day}T00:00:00Z`,transaction_status:status,raw:{}}));
-  const lines=[['OurPricePrincipal',1000,'item_price'],['Commission Base',-100,'referral_commission']];
+  const refund=[['OurPricePrincipal',-6000,'item_price'],['Commission Base',378,'referral_commission']];
   const r=calculateDashboardMetrics({
     orders:[],orderItems:[],returns:[],reimbursements:[],gstInvoices:[],settlementHeaders:[],settledOrderIdsAllTime:[],settlementRows:[],
-    // two RELEASED copies - the shape the status rule is blind to
-    financeItems:[...tx('a','RELEASED','10',lines),...tx('b','RELEASED','20',lines)]
+    financeItems:[
+      // two real refunds, each re-posted on release: 2 + 2 -> two survive
+      ...tx('d1','DEFERRED_RELEASED','07',refund),...tx('d2','DEFERRED_RELEASED','08',refund),
+      ...tx('r1','RELEASED','25',refund),...tx('r2','RELEASED','25',refund)
+    ]
   },range);
-  assert.equal(r.statement.income.value,1000,'one payment, not two');
-  assert.equal(r.statement.expenses.value,-100);
+  assert.equal(r.statement.income.value,-12000,'both refunds count, neither twice');
+  assert.equal(r.statement.expenses.value,756);
 });
 
 test('a transaction with no order id is never collapsed',()=>{
@@ -686,13 +700,17 @@ test('a transaction differing by one line is a different event and survives',()=
   assert.equal(r.statement.expenses.value,-100);
 });
 
-test('dedupeRepostedTransactions keeps the record furthest through the lifecycle',()=>{
+test('dedupeRepostedTransactions keeps the ORIGINAL posting, not the released copy',()=>{
+  // Amazon dates money by where it first appeared in the ledger; the re-post at
+  // release time is the copy. Verified on a real account with a full month of
+  // history: keeping the original reproduces its statement exactly, while
+  // keeping the released copy gives 950,003.27 against 528,614.89.
   const rows=[
-    {source_row_id:'d',transaction_id:'d',order_id:'o',category:'item_price',amount_description:'P',amount:10,transaction_status:'DEFERRED_RELEASED',posted_date:'2026-07-10T00:00:00Z'},
-    {source_row_id:'r',transaction_id:'r',order_id:'o',category:'item_price',amount_description:'P',amount:10,transaction_status:'RELEASED',posted_date:'2026-07-20T00:00:00Z'}
+    {source_row_id:'r',transaction_id:'r',order_id:'o',category:'item_price',amount_description:'P',amount:10,transaction_status:'RELEASED',posted_date:'2026-07-25T00:00:00Z'},
+    {source_row_id:'d',transaction_id:'d',order_id:'o',category:'item_price',amount_description:'P',amount:10,transaction_status:'DEFERRED_RELEASED',posted_date:'2026-07-07T00:00:00Z'}
   ];
   const {kept,dropped}=dedupeRepostedTransactions(rows);
   assert.equal(kept.length,1);
-  assert.equal(kept[0].transaction_status,'RELEASED','Amazon dates the money by the settled record');
+  assert.equal(kept[0].posted_date,'2026-07-07T00:00:00Z','the earliest posting is the one Amazon dates by');
   assert.equal(dropped,1);
 });

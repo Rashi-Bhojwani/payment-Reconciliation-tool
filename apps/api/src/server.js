@@ -879,12 +879,26 @@ async function loadDashboardCalculations(db, tenantId, range) {
   // avoids, using related_order_id for the same reason. Falling back to
   // fi.order_id only when related_order_id is unavailable keeps a value for
   // rows whose parent transaction genuinely lacks one.
+// Amazon re-posts a deferred payment when it matures, so a payment posted in
+// June appears again in July under a new transaction id. De-duplicating them
+// requires seeing the original, which sits BEFORE the window being viewed - so
+// finance rows are fetched with a lookback and narrowed to the range after
+// de-duplication, never by this query.
+//
+// The size is set by how long Amazon actually defers. Observed on real accounts:
+// a DD7 reason with maturity dates running up to about a month out. 60 days
+// covers that with margin, and costs only rows that are discarded a moment
+// later. Measured: an account with a full month of lookback reconciles to its
+// statement exactly, while the same code on five days of lookback over-counts
+// Income by 63,963.29 - the originals simply were not there to match against.
+const FINANCE_LOOKBACK_DAYS = 60;
+
   const financeItems = await db.query(`select fi.id source_row_id,fi.transaction_id,coalesce(ft.related_order_id,fi.order_id) order_id,fi.sku,fi.asin,fi.category,fi.amount_description,fi.amount,fi.currency,fi.posted_date,fi.raw,
       ft.transaction_type parent_transaction_type,
       coalesce(ft.raw->>'transactionStatus',ft.raw->>'TransactionStatus') transaction_status,
       coalesce(ft.raw->>'accountType',ft.raw->>'AccountType',ft.raw#>>'{sellingPartnerMetadata,accountType}') account_type
       from finance_transaction_items fi left join finance_transactions ft on ft.tenant_id=fi.tenant_id and ft.transaction_id=fi.transaction_id
-      where fi.tenant_id=$1 and fi.posted_date >= $2 and fi.posted_date < $3`,[tenantId,range.start,range.end]);
+      where fi.tenant_id=$1 and fi.posted_date >= ($2::timestamptz - interval '${FINANCE_LOOKBACK_DAYS} days') and fi.posted_date < $3`,[tenantId,range.start,range.end]);
   const financeTransactions = await db.query('select transaction_id,transaction_type,posted_date,total_amount,currency,related_order_id,raw from finance_transactions where tenant_id=$1 and posted_date >= $2 and posted_date < $3',[tenantId,range.start,range.end]);
   // Deliberately NOT range-filtered. "Has this order ever been settled?" is a
   // property of the order, not of the selected window: an order's settlement

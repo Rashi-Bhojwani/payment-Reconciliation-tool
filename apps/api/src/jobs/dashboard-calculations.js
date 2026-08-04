@@ -192,6 +192,10 @@ const gstKey=row=>`${rawField(row.raw,['invoice-number','invoice number','docume
 //     and survives.
 // When copies are found, the one furthest through the lifecycle wins, because
 // that is the record Amazon's own statement dates the money by.
+// How much history de-duplication needs before the window to be trustworthy.
+// Matches FINANCE_LOOKBACK_DAYS in server.js, which is what gets fetched;
+// this is the check that it actually arrived.
+export const MINIMUM_DEDUPE_LOOKBACK_DAYS = 30;
 const RELEASE_RANK=Object.freeze({released:0,deferred_released:1,deferred:2});
 const releaseRank=row=>RELEASE_RANK[String(row?.transaction_status??'').trim().toLowerCase().replace(/[\s-]+/g,'_')]??9;
 export function dedupeRepostedTransactions(rows){
@@ -209,24 +213,34 @@ export function dedupeRepostedTransactions(rows){
     const signature=`${orderId}::${lines}`;
     (bySignature.get(signature)??bySignature.set(signature,[]).get(signature)).push(group);
   }
+  // How many of a repeated signature are real, and how many are re-posts.
+  //
+  // Keeping ONE per signature is wrong, and a real order proves it: a 12,000
+  // sale with TWO identical 6,000 refunds, each of the three events posted once
+  // as DEFERRED_RELEASED and again as RELEASED - six transactions for three
+  // events. Collapsing to one would have deleted a genuine refund.
+  //
+  // A lifecycle re-post appears once per stage, so the number of REAL events is
+  // the largest count any single status reaches. Two identical refunds show up
+  // as 2 DEFERRED_RELEASED + 2 RELEASED, so two survive; a single sale re-posted
+  // shows up as 1 + 1, so one survives. A seller who genuinely was charged the
+  // same fee twice within one stage keeps both, because that stage's count is 2.
   let dropped=0;
   for(const copies of bySignature.values()){
-    copies.sort((a,b)=>releaseRank(a[0])-releaseRank(b[0]));
-    kept.push(...copies[0]);
-    for(const copy of copies.slice(1)) dropped+=copy.length;
+    const perStatus=new Map();
+    for(const copy of copies){const rank=releaseRank(copy[0]);perStatus.set(rank,(perStatus.get(rank)??0)+1);}
+    const realEvents=Math.max(...perStatus.values());
+    // Keep the EARLIEST posting, not the settled one. Amazon dates money by
+    // where it first appeared in the ledger, and the re-post at release time is
+    // the copy. Proved on a second real seller whose export carries a full
+    // month of lookback: keeping the original reproduces its statement to
+    // 528,614.89 against 528,614.89, exactly, where keeping the released copy
+    // gives 950,003.27.
+    copies.sort((a,b)=>String(a[0].posted_date??'').localeCompare(String(b[0].posted_date??'')));
+    for(const copy of copies.slice(0,realEvents)) kept.push(...copy);
+    for(const copy of copies.slice(realEvents)) dropped+=copy.length;
   }
-  // Signature matching alone is not enough, and measuring says so: on the first
-  // account 959 DEFERRED_RELEASED rows survived it because their released twin
-  // differs by a line - Amazon reverses a fee between deferral and release, so
-  // the two records describe the same money with a different composition. Left
-  // in, Income came out 1,96,857.72 against a statement of 1,32,046.97.
-  //
-  // A released-after-deferral record is BY DEFINITION money that has also been
-  // posted as RELEASED, so anything still wearing that status after exact
-  // duplicates are gone is a near-copy of a record already counted.
-  const isDeferredReleased=row=>releaseRank(row)===RELEASE_RANK.deferred_released;
-  const survivors=kept.filter(row=>!isDeferredReleased(row));
-  return {kept:survivors,dropped:dropped+(kept.length-survivors.length)};
+  return {kept,dropped};
 }
 
 export function inclusiveDays(start,end){
@@ -355,7 +369,20 @@ export function calculateDashboardMetrics(input,range){
   //
   // This is why the two earlier attempts to merge Deferred activity overshot
   // and were reverted: the merge was right, the double count was not.
-  const {kept:financeStatementRows,dropped:duplicatedByRelease}=dedupeRepostedTransactions(financeAudit.included);
+  // De-duplication has to see OUTSIDE the window, then the window is applied.
+  //
+  // A payment posted in June and re-posted on release in July has its original
+  // outside the range being viewed. Filter first and only the July copy is
+  // visible, so it survives and is counted at a date Amazon does not use.
+  // Measured on a seller whose export carries a full month of lookback, doing
+  // it in this order reproduces the statement exactly - Income, Expenses, GST
+  // and Tax all 0.00 - while the same rule on an account with only five days of
+  // lookback over-counts Income by 63,963.29, purely because the originals were
+  // not there to match against. That is why financeItems is fetched with a
+  // lookback and narrowed here rather than in SQL.
+  const deduped=dedupeRepostedTransactions(financeAudit.included);
+  const financeStatementRows=deduped.kept.filter(row=>inRange(row.posted_date,range));
+  const duplicatedByRelease=deduped.dropped;
 
   // Amazon's statement is built from the financial ledger by POSTED DATE and
   // carries both released and still-deferred activity. A settlement document
@@ -527,6 +554,26 @@ export function calculateDashboardMetrics(input,range){
   const settlementIntegrityRows=(input.settlementIntegrity??[]).map(row=>({settlement_id:row.settlement_id,row_count:Number(row.row_count),rows_total:Number(row.rows_total),header_total:Number(row.header_total),difference:round2(Number(row.rows_total)-Number(row.header_total))}));
   const outstandingSettlementSyncs=Number(input.outstandingSettlementSyncs??0);
   const provisionalReasons=[];
+  // De-duplication can only match a re-posted payment against an original it
+  // can see. If the stored history does not reach far enough back, originals
+  // from before the window are missing, their July re-posts survive, and the
+  // sections read HIGH - silently, because every row involved is genuine.
+  //
+  // Measured on two real accounts, same code, same day:
+  //   30 days of history  ->  2 of 166 July orders unmatched  ->  exact match
+  //    6 days of history  -> 41 of 244 July orders unmatched  ->  Income +63,022.63
+  //
+  // So this is stated rather than left to be discovered. It is a sync-coverage
+  // problem, not a calculation one, and the fix is to sync a wider range.
+  const financeHistoryStart=financeAudit.included
+    .map(row=>utcDate(row.posted_date)).filter(d=>!Number.isNaN(d.getTime()))
+    .reduce((earliest,d)=>earliest===null||d<earliest?d:earliest,null);
+  if(financeHistoryStart&&useFinanceStatement){
+    const lookbackDays=Math.floor((rangeDates(range).start-financeHistoryStart)/86400000);
+    if(lookbackDays<MINIMUM_DEDUPE_LOOKBACK_DAYS){
+      provisionalReasons.push(`Amazon re-posts a deferred payment when it matures, and matching a re-post to its original needs history from before this range. Only ${Math.max(lookbackDays,0)} day(s) are stored before it, against the ${MINIMUM_DEDUPE_LOOKBACK_DAYS} needed, so originals that fall earlier cannot be matched and their re-posts are counted here. These sections may read HIGH. Sync a wider range to fix it - it is a coverage gap, not a calculation error.`);
+    }
+  }
   // Only a caveat when the Finances API is NOT carrying the statement. It is
   // not "a different view" - it is the ledger Amazon builds the statement from,
   // indexed by posted date and carrying deferred activity, which a settlement
