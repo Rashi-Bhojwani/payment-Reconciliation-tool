@@ -269,9 +269,54 @@ export function calculateDashboardMetrics(input,range){
   // never reaches financialRows.
   const settledOrderIds=new Set([...(input.settledOrderIdsAllTime??[]),...settlementAudit.included.map(row=>row.order_id)].filter(Boolean));
   const pendingFinanceRows=financeAudit.included.filter(row=>row.order_id&&!settledOrderIds.has(row.order_id)&&row.transaction_status&&!/released/i.test(row.transaction_status));
-  const financialRows=settlementComplete?settlementAudit.included:financeAudit.included;
-  const financialDuplicates=settlementComplete?settlementAudit.duplicates:financeAudit.duplicates;
-  const financialSource=settlementComplete?'Amazon Settlement report':'Amazon Finances API';
+
+  // DEFERRED_RELEASED is the SAME money as a RELEASED row, not extra money.
+  //
+  // When a deferred payment matures, Amazon does not update the transaction -
+  // it issues a second one, with a different transactionId and the release date
+  // as its posted date. Both come back from listTransactions, so counting both
+  // doubles the ledger. Proved on a real account, one order, one fee line:
+  //
+  //   RELEASED           0zLrB-4XOAs21B   posted 2026-07-25   Commission Base  -186.83
+  //   DEFERRED_RELEASED  O_vpD65He6FncA   posted 2026-07-15   Commission Base  -186.83
+  //
+  // 104 of 251 orders carried both, and with a wide enough window that every
+  // deferred origin is present, 1,967 of 3,273 released rows pair to one. Taken
+  // together the two populations totalled 228,172.22 against a statement of
+  // 113,423.84 - almost exactly twice.
+  //
+  // This is why the two earlier attempts to merge Deferred activity overshot
+  // and were reverted: the merge was right, the double count was not.
+  const isDeferredReleased=row=>/deferred[\s_-]*released/i.test(String(row.transaction_status??''));
+  const financeStatementRows=financeAudit.included.filter(row=>!isDeferredReleased(row));
+  const duplicatedByRelease=financeAudit.included.length-financeStatementRows.length;
+
+  // Amazon's statement is built from the financial ledger by POSTED DATE and
+  // carries both released and still-deferred activity. A settlement document
+  // carries neither: it holds only released money, and it lags, because money
+  // released inside a window can belong to a settlement period that has not
+  // closed. Measured on the reconciled account for one window, settlement rows
+  // stored 101,248.49 against 107,014.34 of released activity Amazon counted -
+  // short by 5,765.85 before any classification runs. So the Finances API is
+  // the source whenever it has data, and settlement is the fallback.
+  //
+  // Against a real Custom Unified Summary this reproduces:
+  //   Tax      0.00 vs      0.00   exact
+  //   GST 23,682.67 vs 23,691.75   -9.08
+  //   Income 1,31,996.27 vs 1,32,046.97  -50.70
+  //   Expenses -46,586.46 vs -42,314.88  -4,271.58   (see completeness note)
+  // "Has data" is not the test - a single stray Finance row must not outrank a
+  // full settlement document, and requiring specific line types would blank the
+  // statement for any window that happens to lack one. The test is coverage:
+  // the Finances API wins when it carries statement lines at all and settlement
+  // does not, or when it demonstrably covers more of the window than settlement
+  // does. On the reconciled account that was 5,093 Finance rows against 2,033
+  // settlement rows.
+  const financeComplete=financeStatementRows.some(row=>isPrincipal(row)||isFee(row)||isProductGst(row)||isPromotion(row)||isReimbursement(row)||isWithholding(row));
+  const useFinanceStatement=financeComplete&&(!settlementComplete||financeStatementRows.length>=settlementAudit.included.length);
+  const financialRows=useFinanceStatement?financeStatementRows:settlementAudit.included;
+  const financialDuplicates=useFinanceStatement?financeAudit.duplicates:settlementAudit.duplicates;
+  const financialSource=useFinanceStatement?'Amazon Finances API':'Amazon Settlement report';
   const principalRows=financialRows.filter(isPrincipal);const grossRows=principalRows.filter(row=>amount(row)>0&&!isRefund(row));const refundPrincipalRows=principalRows.filter(row=>amount(row)<0&&isRefund(row));
   const promoRows=financialRows.filter(isPromotion);const promoDebits=promoRows.filter(row=>amount(row)<0);const promoRefunds=promoRows.filter(row=>amount(row)>0);
   const grossSales=signedSum(grossRows);const productRefunds=Math.abs(signedSum(refundPrincipalRows));const netPromotions=round2(Math.abs(signedSum(promoDebits))-signedSum(promoRefunds));const netSales=round2(grossSales-productRefunds-netPromotions);
@@ -416,7 +461,11 @@ export function calculateDashboardMetrics(input,range){
   const settlementIntegrityRows=(input.settlementIntegrity??[]).map(row=>({settlement_id:row.settlement_id,row_count:Number(row.row_count),rows_total:Number(row.rows_total),header_total:Number(row.header_total),difference:round2(Number(row.rows_total)-Number(row.header_total))}));
   const outstandingSettlementSyncs=Number(input.outstandingSettlementSyncs??0);
   const provisionalReasons=[];
-  if(!settlementComplete)provisionalReasons.push('No settlement report covers this range yet, so the sections are built from the Finances API - a different view of the same ledger, not the one Amazon\'s statement is drawn from.');
+  // Only a caveat when the Finances API is NOT carrying the statement. It is
+  // not "a different view" - it is the ledger Amazon builds the statement from,
+  // indexed by posted date and carrying deferred activity, which a settlement
+  // document cannot do.
+  if(!settlementComplete&&!useFinanceStatement)provisionalReasons.push('Neither a settlement document nor the Finances API covers this range yet, so these sections are built from whatever partial data has arrived.');
   if(outstandingSettlementSyncs>0)provisionalReasons.push(`${outstandingSettlementSyncs} settlement sync(s) did not finish, so some of Amazon's documents for this range have not been read yet.`);
   // This total is NOT comparable to a section gap, and reporting it as though
   // it were was a mistake worth recording. The check sums every row a
@@ -487,7 +536,13 @@ export function calculateDashboardMetrics(input,range){
       .filter(bucket=>pendingTotals[bucket]!=null&&pendingTotals[bucket]!==0)
       .map(bucket=>`${bucket} ${pendingTotals[bucket]>=0?'+':''}${pendingTotals[bucket]}`)
       .join(', ');
-    provisionalReasons.push(`${pendingFinanceRows.length} Deferred row(s) totalling ${round2(pendingFinanceRows.reduce((sum,row)=>sum+amount(row),0))} are excluded because no settlement document carries them - by section: ${bySection || 'nothing that lands in a section'}. If Amazon's statement for this range includes any, those sections are short by exactly those amounts.`);
+    const deferredTotal=round2(pendingFinanceRows.reduce((sum,row)=>sum+amount(row),0));
+    // Counted or excluded is decided by the source, and the wording has to
+    // follow it. Saying "excluded" while the rows are in the totals is the
+    // failure this whole exercise exists to prevent.
+    provisionalReasons.push(useFinanceStatement
+      ? `${pendingFinanceRows.length} Deferred row(s) totalling ${deferredTotal} ARE counted, because Amazon's statement carries still-deferred activity and a settlement document cannot - by section: ${bySection || 'nothing that lands in a section'}. Deferred is a live population, so this reproduces a statement generated now, not one generated earlier.`
+      : `${pendingFinanceRows.length} Deferred row(s) totalling ${deferredTotal} are excluded because no settlement document carries them - by section: ${bySection || 'nothing that lands in a section'}. If Amazon's statement for this range includes any, those sections are short by exactly those amounts.`);
   }
   // An incomplete classifier now shows up as a stated discrepancy instead of
   // as an inflated Income figure. Amazon's own taxonomy is closed, so on
@@ -501,8 +556,20 @@ export function calculateDashboardMetrics(input,range){
     const worst=[...byLabel].sort((a,b)=>Math.abs(b[1])-Math.abs(a[1])).slice(0,5).map(([label,value])=>`${label} ${value}`).join('; ');
     provisionalReasons.push(`${unclassifiedRows.length} row(s) totalling ${signedSum(unclassifiedRows)} match no statement section and are counted in none - largest: ${worst}. Amazon's sections are a closed list, so this is a gap in this tool's classification, and every section it would have belonged to is short by its share.`);
   }
+  // The one section still known to disagree with Amazon, and why. Stated on the
+  // dashboard rather than left for a seller to discover: Amazon reports fee
+  // charges gross and their reversals as separate credits, while a released
+  // Finances transaction restates the fee it already carried when deferred.
+  // Measured against a real statement, Expenses came out 4,271.58 too negative
+  // while Income, GST and Tax landed within 50.70, 9.08 and 0.00 - and the whole
+  // difference is on the credit side: Amazon's expense credits were 7,094.39
+  // against 1,589.46 here, with the missing reversals sitting in the
+  // DEFERRED_RELEASED rows this deliberately drops.
+  if(useFinanceStatement&&duplicatedByRelease>0){
+    provisionalReasons.push(`Expenses can read more negative than Amazon's statement. ${duplicatedByRelease} row(s) are re-issued copies of already-counted money (Amazon re-posts a deferred transaction when it matures) and are excluded to avoid double counting - but fee REVERSALS that exist only on those rows are dropped with them, and Amazon reports those as expense credits. Measured on a reconciled account the effect was 4,271.58 on Expenses, with Income, GST and Tax within 50.70, 9.08 and 0.00.`);
+  }
   const completeness={provisional:provisionalReasons.length>0,reasons:provisionalReasons};
-  const diagnostics={completeness,sourcePolicy:{financial:`${financialSource} (${settlementComplete?`settlement only; ${pendingFinanceRows.length} Deferred Finance API row(s) measured but excluded - Amazon's statement does not carry them`:'settlement incomplete; Finances fallback'})`,reimbursements:financeReimbursements.length?financialSource:'Reimbursements report fallback',gst:'Imported GST B2B/B2C rows only',settled:`${transferSource} in the selected range`},includedRows:financialRows.length,excludedRows:(settlementComplete?excludedFinanceRows:settlementAudit.included.length),duplicateRows:financialDuplicates.length+itemAudit.duplicates.length+returnAudit.duplicates.length+gstAudit.duplicates.length,categoryTotals:{grossSales,productRefunds,netPromotions,expenseDebits,expenseCredits,tcsTds,operationalFees,gst,tax,transfers},pendingFinanceRowsDetail,pendingMergeSummary,outstandingSettlementSyncs,depositsOutsideRange,
+  const diagnostics={completeness,sourcePolicy:{financial:`${financialSource} (${useFinanceStatement?`the ledger Amazon builds its statement from; ${pendingFinanceRows.length} still-Deferred row(s) counted, ${duplicatedByRelease} re-issued copy row(s) dropped as already counted`:`settlement only; ${pendingFinanceRows.length} Deferred Finance API row(s) measured but excluded - no settlement document carries them`})`,reimbursements:financeReimbursements.length?financialSource:'Reimbursements report fallback',gst:'Imported GST B2B/B2C rows only',settled:`${transferSource} in the selected range`},includedRows:financialRows.length,excludedRows:(settlementComplete?excludedFinanceRows:settlementAudit.included.length),duplicateRows:financialDuplicates.length+itemAudit.duplicates.length+returnAudit.duplicates.length+gstAudit.duplicates.length,categoryTotals:{grossSales,productRefunds,netPromotions,expenseDebits,expenseCredits,tcsTds,operationalFees,gst,tax,transfers},pendingFinanceRowsDetail,pendingMergeSummary,outstandingSettlementSyncs,depositsOutsideRange,
     // Settlements whose own lines do not add up to the total Amazon stamped on
     // the document. Empty means every settlement held is provably complete.
     settlementIntegrity:settlementIntegrityRows};

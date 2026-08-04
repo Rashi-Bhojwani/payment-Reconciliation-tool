@@ -87,32 +87,51 @@ test('a settlement whose period overlaps the window is not a transfer in it',()=
   assert.equal(depositedInside.statement.transfers.value,-131801.69);
 });
 
-test('never merges Deferred Finance activity into the statement, but does measure it',()=>{
-  // Verified against a real seller's own Account Activity Statement PDF for
-  // 1-25 Jul 2026. Merging Deferred activity moved every bucket further from
-  // Amazon (Income 1,53,912.04 vs Amazon 1,32,046.97 where settlement-only
-  // gives 1,22,980.13) and tripled the total absolute error, so the statement
-  // stays settlement-only - while the pending pipeline is still reported, to
-  // keep "Amazon counts money we do not hold" distinguishable from "we
-  // misclassify money we do hold".
+test('a released re-issue of deferred money is not counted twice',()=>{
+  // When deferred money matures Amazon does not update the transaction, it
+  // issues a second one with a new id and the release date as its posted date.
+  // Both come back from listTransactions. Proved on a real account, one order,
+  // one fee line:
+  //   RELEASED          0zLrB-4XOAs21B  posted 2026-07-25  Commission Base -186.83
+  //   DEFERRED_RELEASED O_vpD65He6FncA  posted 2026-07-15  Commission Base -186.83
+  // 104 of 251 orders carried both, and the two populations together totalled
+  // 228,172.22 against a statement of 113,423.84 - almost exactly twice. That
+  // double count, not the merge itself, is why two earlier attempts to include
+  // Deferred activity overshot and were reverted.
   const range={start:'2026-07-01T00:00:00Z',end:'2026-07-30T00:00:00Z'};
+  const fin=(id,status,description,amount,category)=>({source_row_id:id,transaction_id:id,order_id:'order-1',
+    category,amount_description:description,amount,posted_date:'2026-07-10T00:00:00Z',transaction_status:status,raw:{}});
   const r=calculateDashboardMetrics({
-    orders:[],orderItems:[],returns:[],reimbursements:[],gstInvoices:[],settlementHeaders:[],settledOrderIdsAllTime:[],
-    settlementRows:[line('sale','Principal',1000,'Order',{order_id:'order-settled',amount_type:'ItemPrice'})],
+    orders:[],orderItems:[],returns:[],reimbursements:[],gstInvoices:[],settlementHeaders:[],settledOrderIdsAllTime:[],settlementRows:[],
     financeItems:[
-      {source_row_id:'f1',transaction_id:'tx-1',order_id:'order-pending',transaction_status:'Deferred',category:'item_price',amount_description:'OurPricePrincipal',amount:250,posted_date:'2026-07-10T00:00:00Z',raw:{}},
-      {source_row_id:'f2',transaction_id:'tx-1',order_id:'order-pending',transaction_status:'Deferred',category:'tax',amount_description:'OurPriceTax',amount:45,posted_date:'2026-07-10T00:00:00Z',raw:{}}
+      fin('rel','RELEASED','OurPricePrincipal',1000,'item_price'),
+      fin('rel-fee','RELEASED','Commission Base',-100,'referral_commission'),
+      // the same money, re-posted at its release date - must not be added again
+      fin('dr','DEFERRED_RELEASED','OurPricePrincipal',1000,'item_price'),
+      fin('dr-fee','DEFERRED_RELEASED','Commission Base',-100,'referral_commission'),
+      // genuinely still deferred - Amazon's statement DOES carry this
+      fin('def','DEFERRED','OurPricePrincipal',250,'item_price')
     ]
   },range);
-  assert.equal(r.statement.income.value,1000);
-  assert.equal(r.statement.gst.value,0);
-  assert.equal(r.metrics.netSales.source,'Amazon Settlement report');
-  const summary=r.diagnostics.pendingMergeSummary;
-  assert.equal(summary.merged,false);
-  assert.equal(summary.pendingOrders,1);
-  assert.equal(summary.pendingExcludedTotals.income,250);
-  assert.equal(summary.pendingExcludedTotals.gst,45);
-  assert.equal(summary.settlementBaselineTotals.income,1000);
+  assert.equal(r.statement.income.value,1250,'released 1000 + still-deferred 250, the re-issue counted once');
+  assert.equal(r.statement.expenses.value,-100,'the fee counted once, not twice');
+  assert.equal(r.diagnostics.sourcePolicy.financial.startsWith('Amazon Finances API'),true);
+});
+
+test('still-deferred activity is counted, because Amazon\'s statement carries it',()=>{
+  // Reconciled against a real Custom Unified Transaction report, the Deferred
+  // population contributed Income +7,152.59, Expenses -2,030.55 and GST
+  // +1,287.46 - exactly what a settlement-only figure was short by.
+  const range={start:'2026-07-01T00:00:00Z',end:'2026-07-30T00:00:00Z'};
+  const fin=(id,status,description,amount,category)=>({source_row_id:id,transaction_id:id,order_id:`o-${id}`,
+    category,amount_description:description,amount,posted_date:'2026-07-10T00:00:00Z',transaction_status:status,raw:{}});
+  const base=[fin('r1','RELEASED','OurPricePrincipal',1000,'item_price'),fin('r2','RELEASED','Commission Base',-100,'referral_commission')];
+  const withDeferred=calculateDashboardMetrics({
+    orders:[],orderItems:[],returns:[],reimbursements:[],gstInvoices:[],settlementHeaders:[],settledOrderIdsAllTime:[],settlementRows:[],
+    financeItems:[...base,fin('d1','DEFERRED','OurPricePrincipal',250,'item_price'),fin('d2','DEFERRED','OurPriceTax',45,'tax')]
+  },range);
+  assert.equal(withDeferred.statement.income.value,1250);
+  assert.equal(withDeferred.statement.gst.value,45);
 });
 
 test('an order with settlement lines anywhere is never reported as pending',()=>{
@@ -299,11 +318,18 @@ test('the statement only claims to match Amazon once it can prove it does',()=>{
   assert.match(deferred.reasons.join(' '),/1 Deferred row\(s\) totalling -141\.9/);
   assert.match(deferred.reasons.join(' '),/by section: income -141\.9/,'the split is what makes it comparable to the Income gap');
 
-  // No settlement report at all: the sections come from a different ledger
-  // view than the one Amazon's statement is drawn from.
+  // No settlement report is NOT a caveat any more. The Finances API is the
+  // ledger Amazon builds the statement from - posted-date indexed and carrying
+  // deferred activity, neither of which a settlement document does - so having
+  // only that is the normal, better case, not a degraded one.
   const noSettlement=calculateDashboardMetrics({...clean,settlementRows:[],financeItems:[line('f','Principal',1000,'Order')]},range).diagnostics.completeness;
-  assert.equal(noSettlement.provisional,true);
-  assert.match(noSettlement.reasons.join(' '),/No settlement report covers this range/);
+  assert.equal(noSettlement.provisional,false,'Finances-sourced sections are not provisional for lacking settlement');
+  assert.deepEqual(noSettlement.reasons,[]);
+
+  // Neither source carrying the range still is a caveat.
+  const nothing=calculateDashboardMetrics({...clean,settlementRows:[],financeItems:[]},range).diagnostics.completeness;
+  assert.equal(nothing.provisional,true);
+  assert.match(nothing.reasons.join(' '),/Neither a settlement document nor the Finances API covers this range/);
 });
 
 test('a settlement chain that stops before the window ends says so',()=>{
