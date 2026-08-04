@@ -1095,3 +1095,8 @@ td { padding: 13px 14px; color:#344054; }
 .fee-audit-hero { display: flex; justify-content: space-between; align-items: center; gap: 24px; padding: 28px; }
 .fee-audit-hero h2 { margin: 5px 0; }
 @media(max-width:800px){.order-detail-grid,.understand-grid,.reconciliation-summary,.transaction-filters>div{grid-template-columns:1fr}.journey-cards{grid-template-columns:1fr}.journey-cards>b{text-align:center}.fee-audit-hero,.transaction-ledger-intro,.transaction-filters{display:block}.transaction-ledger-actions{margin-top:12px;text-align:left}.calculation-components>div{grid-template-columns:1fr auto}.calculation-components small{display:none}}
+
+/* Which calculation build produced the figures on screen. Small and quiet -
+   it only matters when numbers disagree with Amazon and the first question is
+   whether the API was restarted after a pull. */
+.activity-revision { font-family: var(--mono, ui-monospace, monospace); font-size: 11px; opacity: 0.55; margin: -4px 0 8px; }

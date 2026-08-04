@@ -690,9 +690,15 @@ function AccountActivity({ data, tenantId }) {
   const completeness = data?.dashboardCalculations?.diagnostics?.completeness;
   const provisional = completeness?.provisional ?? true;
   const reasons = completeness?.reasons ?? ['Waiting for the dashboard calculation to report what it is based on.'];
+  // Which build produced these figures. Node does not hot-reload, so an API
+  // left running after a pull reports stale numbers with complete confidence -
+  // that cost a full debugging round trip once. Showing it means the running
+  // build can be read rather than inferred from the numbers themselves.
+  const revision = data?.dashboardCalculations?.diagnostics?.calculationRevision;
   return (
     <Card className="profit-control-card">
       <PanelHeader title="Amazon Account Activity" subtitle={provisional ? 'Provisional — not yet reconciled to Amazon' : 'Matches Amazon statement sections'} />
+      {revision && <div className="activity-revision">calculation build: {revision}</div>}
       {provisional && (
         <div className="activity-provisional">
           <b>These sections are not yet a match for your Amazon statement.</b>

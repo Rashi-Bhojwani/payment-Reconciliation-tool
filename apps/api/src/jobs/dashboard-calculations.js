@@ -195,6 +195,15 @@ const gstKey=row=>`${rawField(row.raw,['invoice-number','invoice number','docume
 // How much history de-duplication needs before the window to be trustworthy.
 // Matches FINANCE_LOOKBACK_DAYS in server.js, which is what gets fetched;
 // this is the check that it actually arrived.
+// A build marker, surfaced in diagnostics.
+//
+// Chasing a figure the dashboard showed but no committed build reproduced cost
+// a full round trip, and the answer was simply that the API process had not been
+// restarted after a pull. Node does not hot-reload, so a stale process reports
+// stale numbers with total confidence. Bump this whenever the statement maths
+// changes, and the running build can be read off the dashboard instead of
+// inferred from the numbers it produces.
+export const CALCULATION_REVISION = 'line-level-dedupe-2026-08-04';
 export const MINIMUM_DEDUPE_LOOKBACK_DAYS = 30;
 const RELEASE_RANK=Object.freeze({released:0,deferred_released:1,deferred:2});
 const releaseRank=row=>RELEASE_RANK[String(row?.transaction_status??'').trim().toLowerCase().replace(/[\s-]+/g,'_')]??9;
@@ -690,7 +699,7 @@ export function calculateDashboardMetrics(input,range){
     provisionalReasons.push(`Expenses can read more negative than Amazon's statement. ${duplicatedByRelease} row(s) are re-issued copies of already-counted money (Amazon re-posts a deferred transaction when it matures) and are excluded to avoid double counting - but fee REVERSALS that exist only on those rows are dropped with them, and Amazon reports those as expense credits. Measured on a reconciled account the effect was 4,271.58 on Expenses, with Income, GST and Tax within 50.70, 9.08 and 0.00.`);
   }
   const completeness={provisional:provisionalReasons.length>0,reasons:provisionalReasons};
-  const diagnostics={completeness,sourcePolicy:{financial:`${financialSource} (${useFinanceStatement?`the ledger Amazon builds its statement from; ${pendingFinanceRows.length} still-Deferred row(s) counted, ${duplicatedByRelease} re-issued copy row(s) dropped as already counted`:`settlement only; ${pendingFinanceRows.length} Deferred Finance API row(s) measured but excluded - no settlement document carries them`})`,reimbursements:financeReimbursements.length?financialSource:'Reimbursements report fallback',gst:'Imported GST B2B/B2C rows only',settled:`${transferSource} in the selected range`},includedRows:financialRows.length,excludedRows:(settlementComplete?excludedFinanceRows:settlementAudit.included.length),duplicateRows:financialDuplicates.length+itemAudit.duplicates.length+returnAudit.duplicates.length+gstAudit.duplicates.length,categoryTotals:{grossSales,productRefunds,netPromotions,expenseDebits,expenseCredits,tcsTds,operationalFees,gst,tax,transfers},pendingFinanceRowsDetail,pendingMergeSummary,outstandingSettlementSyncs,depositsOutsideRange,
+  const diagnostics={completeness,calculationRevision:CALCULATION_REVISION,sourcePolicy:{financial:`${financialSource} (${useFinanceStatement?`the ledger Amazon builds its statement from; ${pendingFinanceRows.length} still-Deferred row(s) counted, ${duplicatedByRelease} re-issued copy row(s) dropped as already counted`:`settlement only; ${pendingFinanceRows.length} Deferred Finance API row(s) measured but excluded - no settlement document carries them`})`,reimbursements:financeReimbursements.length?financialSource:'Reimbursements report fallback',gst:'Imported GST B2B/B2C rows only',settled:`${transferSource} in the selected range`},includedRows:financialRows.length,excludedRows:(settlementComplete?excludedFinanceRows:settlementAudit.included.length),duplicateRows:financialDuplicates.length+itemAudit.duplicates.length+returnAudit.duplicates.length+gstAudit.duplicates.length,categoryTotals:{grossSales,productRefunds,netPromotions,expenseDebits,expenseCredits,tcsTds,operationalFees,gst,tax,transfers},pendingFinanceRowsDetail,pendingMergeSummary,outstandingSettlementSyncs,depositsOutsideRange,
     // Settlements whose own lines do not add up to the total Amazon stamped on
     // the document. Empty means every settlement held is provably complete.
     settlementIntegrity:settlementIntegrityRows};
