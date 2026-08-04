@@ -1230,6 +1230,22 @@ app.get('/api/tenants/:tenantId/dashboard', async request => {
     // computations for any account with more settlement lines than the cap
     // in the selected range (confirmed: one real account had 700+ lines in a
     // 25-day window, well past the old limit of 250).
+    // The Finances API side of the ledger, itemised, alongside the settlement
+    // side. Settlement documents only ever carry RELEASED activity and they lag
+    // the posted date Amazon's own statement is built on, so a settlement-only
+    // view is structurally short - measured on a real account, 101,248.49 stored
+    // against 107,014.34 of released activity for the same window, before any
+    // classification. These are the rows that close that gap, and having them
+    // downloadable next to the settlement lines is what makes the two sides
+    // comparable when a section does not match Amazon.
+    const financeLines = (await client.query(`select fi.transaction_id, fi.posted_date, fi.order_id, fi.sku, fi.category,
+        fi.amount_description, fi.amount,
+        coalesce(ft.raw->>'transactionStatus',ft.raw->>'TransactionStatus','Unknown') transaction_status,
+        ft.transaction_type
+      from finance_transaction_items fi
+      left join finance_transactions ft on ft.tenant_id=fi.tenant_id and ft.transaction_id=fi.transaction_id
+      where fi.tenant_id=$1 and fi.posted_date >= $2 and fi.posted_date < $3
+      order by fi.posted_date desc nulls last, fi.transaction_id limit 20000`, [tenantId, start, end])).rows;
     const settlementLines = (await client.query(`select id source_row_id, settlement_id, order_id, amount_type, amount_description, amount, posted_date,
         coalesce(raw->>'transaction-type',raw->>'transaction type',raw->>'transactionType') transaction_type,
         coalesce(raw->>'order-item-code',raw->>'order item code') order_item_code,
@@ -1310,7 +1326,7 @@ app.get('/api/tenants/:tenantId/dashboard', async request => {
       for (const row of pendingDetail) console.log(`${label}   [excluded] order=${row.order_id} status=${row.transaction_status} category=${row.category} amount_desc=${row.amount_description ?? ''} amount=${row.amount} -> would be ${row.bucket}`);
     }
     const hasImportedData = Number(orders.orders ?? 0) > 0 || Number(kpis.net_settled ?? 0) !== 0 || products.length > 0 || payments.length > 0 || inventory.length > 0;
-    return { seller, amazonAuth, hasImportedData, kpis, orders, orderRows, orderPayments, paymentComponents, paymentSummary, dashboardCalculations, businessReportRows, products, trend, payments, settlementLines, financialComponents, financialSummary, jobs, inventory, returns, reimbursements, invoices, orderItems, financeTransactions, autoSyncing: autoSyncReportTypes };
+    return { seller, amazonAuth, hasImportedData, kpis, orders, orderRows, orderPayments, paymentComponents, paymentSummary, dashboardCalculations, businessReportRows, products, trend, payments, settlementLines, financeLines, financialComponents, financialSummary, jobs, inventory, returns, reimbursements, invoices, orderItems, financeTransactions, autoSyncing: autoSyncReportTypes };
   });
 });
 

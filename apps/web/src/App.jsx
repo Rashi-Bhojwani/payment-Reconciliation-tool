@@ -527,6 +527,11 @@ function SellerDashboard() {
     {view === 'payouts' && <>
       <TableCard title="Payout Activity" rows={data?.payments ?? []} columns={['posted_date', 'settlement_id', 'net_amount', 'lines']} downloadFilename="payout-activity.csv" />
       <TableCard title="Settlement Lines (itemized)" rows={data?.settlementLines ?? []} columns={['source_row_id', 'posted_date', 'posted_date_time', 'settlement_id', 'order_id', 'transaction_type', 'order_item_code', 'merchant_order_item_id', 'adjustment_id', 'sku', 'quantity_purchased', 'amount_type', 'amount_description', 'amount', 'source_key']} pageSize={10} downloadFilename="settlement-lines.csv" />
+      {/* The other half of the ledger. Settlement documents carry only Released
+          activity and lag the posted date Amazon builds its own statement on,
+          so when a section does not match Amazon these are the rows that say
+          why - they are the only place Deferred activity exists. */}
+      <TableCard title="Finance API Lines (itemized)" rows={data?.financeLines ?? []} columns={['posted_date', 'transaction_status', 'transaction_type', 'transaction_id', 'order_id', 'sku', 'category', 'amount_description', 'amount']} pageSize={10} downloadFilename="finance-lines.csv" />
     </>}
     {view === 'brand' && <TableCard title="Product Performance" rows={data?.products ?? []} columns={['asin', 'units', 'sales', 'buy_box']} downloadFilename="product-performance.csv" />}
     {view === 'feeAudit' && <FeeLeakAudit tenantId={tenantId} />}
