@@ -724,3 +724,46 @@ test('dedupeRepostedTransactions keeps the ORIGINAL posting, not the released co
   assert.equal(kept[0].posted_date,'2026-07-07T00:00:00Z','the earliest posting is the one Amazon dates by');
   assert.equal(dropped,1);
 });
+
+test('dates are ordered as instants, not as strings',()=>{
+  // Postgres returns timestamptz as a Date object, and String(date) is
+  // "Wed Jul 01 2026 ...", so a lexicographic sort orders by WEEKDAY NAME:
+  // Fri, Sat, Sun, Thu, Wed. "Keep the earliest posting" therefore kept an
+  // effectively random copy in production while behaving perfectly in tests,
+  // which pass ISO strings. On a real account it moved Income from 5,64,126.22
+  // to 8,19,913.31 and made Tax non-zero. Every fixture here uses Date objects
+  // deliberately - that is the shape the server passes.
+  const range={start:'2026-07-01T00:00:00Z',end:'2026-07-30T00:00:00Z'};
+  // 1 Jul is a Wednesday and 3 Jul a Friday, so "Fri" sorts before "Wed" and the
+  // wrong copy wins unless the comparison uses the instant.
+  const tx=(id,status,iso,amountValue)=>({source_row_id:id,transaction_id:id,order_id:'order-1',
+    category:'item_price',amount_description:'OurPricePrincipal',amount:amountValue,
+    posted_date:new Date(iso),transaction_status:status,raw:{}});
+  const r=calculateDashboardMetrics({
+    orders:[],orderItems:[],returns:[],reimbursements:[],gstInvoices:[],settlementHeaders:[],settledOrderIdsAllTime:[],settlementRows:[],
+    financeItems:[tx('original','DEFERRED_RELEASED','2026-07-01T00:00:00Z',1000),
+                  tx('repost','RELEASED','2026-07-03T00:00:00Z',1000)]
+  },range);
+  assert.equal(r.statement.income.value,1000,'one payment, counted once');
+  const {kept}=dedupeRepostedTransactions([tx('repost','RELEASED','2026-07-03T00:00:00Z',1000),
+                                           tx('original','DEFERRED_RELEASED','2026-07-01T00:00:00Z',1000)]);
+  assert.equal(kept.length,1);
+  assert.equal(kept[0].transaction_id,'original','1 Jul (Wed) is earlier than 3 Jul (Fri), whatever the strings say');
+});
+
+test('Date objects and ISO strings produce identical figures',()=>{
+  // The same rows in the two shapes the code actually receives - Date objects
+  // from Postgres, ISO strings from an import - must not disagree.
+  const range={start:'2026-07-01T00:00:00Z',end:'2026-07-30T00:00:00Z'};
+  const build=asDate=>[['a','DEFERRED_RELEASED','2026-07-02T00:00:00Z',500],['a2','RELEASED','2026-07-06T00:00:00Z',500],
+    ['b','RELEASED','2026-07-04T00:00:00Z',250],['c','DEFERRED','2026-07-08T00:00:00Z',125]]
+    .map(([id,status,iso,amountValue])=>({source_row_id:id,transaction_id:id,order_id:'o1',category:'item_price',
+      amount_description:'OurPricePrincipal',amount:amountValue,posted_date:asDate?new Date(iso):iso,
+      transaction_status:status,raw:{}}));
+  const base={orders:[],orderItems:[],returns:[],reimbursements:[],gstInvoices:[],settlementHeaders:[],settledOrderIdsAllTime:[],settlementRows:[]};
+  const asDates=calculateDashboardMetrics({...base,financeItems:build(true)},range).statement;
+  const asStrings=calculateDashboardMetrics({...base,financeItems:build(false)},range).statement;
+  assert.equal(asDates.income.value,asStrings.income.value);
+  assert.equal(asDates.gst.value,asStrings.gst.value);
+  assert.equal(asDates.expenses.value,asStrings.expenses.value);
+});

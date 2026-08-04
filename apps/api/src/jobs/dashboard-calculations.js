@@ -203,8 +203,12 @@ const gstKey=row=>`${rawField(row.raw,['invoice-number','invoice number','docume
 // stale numbers with total confidence. Bump this whenever the statement maths
 // changes, and the running build can be read off the dashboard instead of
 // inferred from the numbers it produces.
-export const CALCULATION_REVISION = 'line-level-dedupe-2026-08-04';
+export const CALCULATION_REVISION = 'instant-ordering-2026-08-04';
 export const MINIMUM_DEDUPE_LOOKBACK_DAYS = 30;
+// The instant a row was posted, for ordering. Never compare posted_date as a
+// string: it arrives as a Date from Postgres and as an ISO string from an
+// import, and only one of those sorts correctly that way.
+const postedAt=row=>{const t=utcDate(row?.posted_date).getTime();return Number.isNaN(t)?Infinity:t;};
 const RELEASE_RANK=Object.freeze({released:0,deferred_released:1,deferred:2});
 const releaseRank=row=>RELEASE_RANK[String(row?.transaction_status??'').trim().toLowerCase().replace(/[\s-]+/g,'_')]??9;
 export function dedupeRepostedTransactions(rows){
@@ -244,7 +248,14 @@ export function dedupeRepostedTransactions(rows){
     // account with a full month of history: keeping the original reproduces its
     // statement exactly, keeping the released copy gives 9,50,003.27 against
     // 5,28,614.89.
-    copies.sort((a,b)=>String(a.posted_date??'').localeCompare(String(b.posted_date??'')));
+    // Order by INSTANT, never by the string form. Postgres hands back
+    // timestamptz as a Date object, and String(date) is "Wed Jul 01 2026 ...",
+    // so a lexicographic sort orders by weekday name - Fri, Sat, Sun, Thu, Wed.
+    // "Keep the earliest" then kept an effectively random copy. It was invisible
+    // in tests, which pass ISO strings that happen to sort correctly, and cost a
+    // long hunt: on a real account it moved Income from 5,64,126.22 to
+    // 8,19,913.31 and made Tax non-zero, purely through picking the wrong copy.
+    copies.sort((a,b)=>postedAt(a)-postedAt(b));
     kept.push(...copies.slice(0,realEvents));
     dropped+=copies.length-realEvents;
   }
