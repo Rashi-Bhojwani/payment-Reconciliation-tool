@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { calculateDashboardMetrics, inclusiveDays } from './dashboard-calculations.js';
+import { calculateDashboardMetrics, dedupeRepostedTransactions, inclusiveDays } from './dashboard-calculations.js';
 const range={start:'2026-06-27T00:00:00Z',end:'2026-07-27T00:00:00Z'};
 const line=(id,description,amount,parent='Order',extra={})=>({settlement_id:'statement',source_row_id:id,amount_description:description,amount,parent_transaction_type:parent,posted_date:'2026-07-10T00:00:00Z',...extra});
 function mindcircusFixture(){return{
@@ -630,4 +630,69 @@ test('a genuine product tax is still GST, not withholding',()=>{
   assert.equal(r.statement.gst.value,198);
   assert.equal(r.statement.expenses.value,0);
   assert.equal(r.statement.tax.value,0);
+});
+
+test('the same payment under two transaction ids is counted once, whatever the statuses',()=>{
+  // Amazon re-posts money instead of updating it. "Drop anything marked
+  // DEFERRED_RELEASED" only catches accounts whose duplication follows the
+  // deferral lifecycle: on a second real seller Income and GST were BOTH
+  // 1.797x, with the released half alone 2.25x - two independent sections
+  // cannot drift by an identical factor through a classification fault, and
+  // those duplicates are not all DEFERRED_RELEASED. So identity is economic:
+  // same order + byte-identical line set = one payment.
+  const range={start:'2026-07-01T00:00:00Z',end:'2026-07-30T00:00:00Z'};
+  const tx=(id,status,day,lines)=>lines.map(([description,amountValue,category],i)=>({
+    source_row_id:`${id}-${i}`,transaction_id:id,order_id:'order-1',category,amount_description:description,
+    amount:amountValue,posted_date:`2026-07-${day}T00:00:00Z`,transaction_status:status,raw:{}}));
+  const lines=[['OurPricePrincipal',1000,'item_price'],['Commission Base',-100,'referral_commission']];
+  const r=calculateDashboardMetrics({
+    orders:[],orderItems:[],returns:[],reimbursements:[],gstInvoices:[],settlementHeaders:[],settledOrderIdsAllTime:[],settlementRows:[],
+    // two RELEASED copies - the shape the status rule is blind to
+    financeItems:[...tx('a','RELEASED','10',lines),...tx('b','RELEASED','20',lines)]
+  },range);
+  assert.equal(r.statement.income.value,1000,'one payment, not two');
+  assert.equal(r.statement.expenses.value,-100);
+});
+
+test('a transaction with no order id is never collapsed',()=>{
+  // Transfers, service fees and withholding legitimately repeat with identical
+  // lines - one real account carries 51 identical order-less rows that must all
+  // count. Collapsing those would delete real money.
+  const range={start:'2026-07-01T00:00:00Z',end:'2026-07-30T00:00:00Z'};
+  const fee=id=>({source_row_id:id,transaction_id:id,order_id:null,category:'other',
+    amount_description:'Service Fee',amount:-59,posted_date:'2026-07-10T00:00:00Z',transaction_status:'RELEASED',raw:{}});
+  const sale={source_row_id:'s',transaction_id:'s',order_id:'o1',category:'item_price',
+    amount_description:'OurPricePrincipal',amount:1000,posted_date:'2026-07-10T00:00:00Z',transaction_status:'RELEASED',raw:{}};
+  const r=calculateDashboardMetrics({
+    orders:[],orderItems:[],returns:[],reimbursements:[],gstInvoices:[],settlementHeaders:[],settledOrderIdsAllTime:[],settlementRows:[],
+    financeItems:[sale,fee('f1'),fee('f2'),fee('f3')]
+  },range);
+  assert.equal(r.statement.expenses.value,-177,'all three identical service fees count');
+});
+
+test('a transaction differing by one line is a different event and survives',()=>{
+  // A partial refund or a fee reversal changes the line set. Collapsing on a
+  // looser key than the whole set would delete it.
+  const range={start:'2026-07-01T00:00:00Z',end:'2026-07-30T00:00:00Z'};
+  const row=(id,description,amountValue,category,status='RELEASED')=>({source_row_id:`${id}-${description}`,transaction_id:id,
+    order_id:'order-1',category,amount_description:description,amount:amountValue,
+    posted_date:'2026-07-10T00:00:00Z',transaction_status:status,raw:{}});
+  const r=calculateDashboardMetrics({
+    orders:[],orderItems:[],returns:[],reimbursements:[],gstInvoices:[],settlementHeaders:[],settledOrderIdsAllTime:[],settlementRows:[],
+    financeItems:[row('a','OurPricePrincipal',1000,'item_price'),row('a','Commission Base',-100,'referral_commission'),
+                  row('b','OurPricePrincipal',1000,'item_price')]
+  },range);
+  assert.equal(r.statement.income.value,2000,'the second transaction is not an exact copy, so it counts');
+  assert.equal(r.statement.expenses.value,-100);
+});
+
+test('dedupeRepostedTransactions keeps the record furthest through the lifecycle',()=>{
+  const rows=[
+    {source_row_id:'d',transaction_id:'d',order_id:'o',category:'item_price',amount_description:'P',amount:10,transaction_status:'DEFERRED_RELEASED',posted_date:'2026-07-10T00:00:00Z'},
+    {source_row_id:'r',transaction_id:'r',order_id:'o',category:'item_price',amount_description:'P',amount:10,transaction_status:'RELEASED',posted_date:'2026-07-20T00:00:00Z'}
+  ];
+  const {kept,dropped}=dedupeRepostedTransactions(rows);
+  assert.equal(kept.length,1);
+  assert.equal(kept[0].transaction_status,'RELEASED','Amazon dates the money by the settled record');
+  assert.equal(dropped,1);
 });

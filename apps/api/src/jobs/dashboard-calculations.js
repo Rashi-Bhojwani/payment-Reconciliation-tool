@@ -161,6 +161,74 @@ const gstKey=row=>`${rawField(row.raw,['invoice-number','invoice number','docume
 // would have quietly turned a 30-day window into 31 - dividing DRR by the
 // wrong number without anything visibly changing. Reading both boundaries as
 // IST days makes this invariant to the boundary convention entirely.
+// Amazon re-posts money rather than updating it, so the same payment can reach
+// this tool under several transaction ids and be counted several times over.
+//
+// The obvious version of this rule - "drop anything marked DEFERRED_RELEASED" -
+// only works on accounts whose duplication happens to follow the deferral
+// lifecycle. Measured on two real sellers it does not generalise:
+//
+//   MINDCIRCUS         income 1.00x  (deferral re-issue only)
+//   NEERUCYCLETRADERS  income 1.797x, GST 1.797x, released half 2.25x
+//
+// Two independent sections drifting by the identical factor cannot be a
+// classification fault; it is one population counted more than once. On the
+// second account the duplicates are not all DEFERRED_RELEASED, so a rule keyed
+// on the status label cannot see them.
+//
+// So identity is economic, not lifecycle: two transactions carrying the SAME
+// ORDER and a byte-identical set of (category, description, amount) lines are
+// the same payment recorded twice, whatever status either one wears and
+// whatever dates they were posted on. Verified on the first account, where the
+// rule found the duplication without being told to look for it - 331 duplicate
+// signatures, 329 of them exactly a DEFERRED_RELEASED/RELEASED pair.
+//
+// Two deliberate limits keep it from eating real money:
+//   - a transaction with NO order id is never collapsed. Transfers, service
+//     fees and withholding legitimately repeat with identical lines, and one
+//     real account carries 51 identical order-less rows that must all count.
+//   - the whole line set must match. A partial refund, a fee reversal or any
+//     transaction that differs by a single line is a different economic event
+//     and survives.
+// When copies are found, the one furthest through the lifecycle wins, because
+// that is the record Amazon's own statement dates the money by.
+const RELEASE_RANK=Object.freeze({released:0,deferred_released:1,deferred:2});
+const releaseRank=row=>RELEASE_RANK[String(row?.transaction_status??'').trim().toLowerCase().replace(/[\s-]+/g,'_')]??9;
+export function dedupeRepostedTransactions(rows){
+  const transactions=new Map();
+  for(const row of rows){
+    const id=row.transaction_id??`row:${row.source_row_id??keyOf(row)}`;
+    (transactions.get(id)??transactions.set(id,[]).get(id)).push(row);
+  }
+  const bySignature=new Map();
+  const kept=[];
+  for(const group of transactions.values()){
+    const orderId=group.find(row=>row.order_id)?.order_id;
+    if(!orderId){kept.push(...group);continue;}
+    const lines=group.map(row=>`${row.category??row.amount_type??''}|${row.amount_description??''}|${amount(row)}`).sort().join(';');
+    const signature=`${orderId}::${lines}`;
+    (bySignature.get(signature)??bySignature.set(signature,[]).get(signature)).push(group);
+  }
+  let dropped=0;
+  for(const copies of bySignature.values()){
+    copies.sort((a,b)=>releaseRank(a[0])-releaseRank(b[0]));
+    kept.push(...copies[0]);
+    for(const copy of copies.slice(1)) dropped+=copy.length;
+  }
+  // Signature matching alone is not enough, and measuring says so: on the first
+  // account 959 DEFERRED_RELEASED rows survived it because their released twin
+  // differs by a line - Amazon reverses a fee between deferral and release, so
+  // the two records describe the same money with a different composition. Left
+  // in, Income came out 1,96,857.72 against a statement of 1,32,046.97.
+  //
+  // A released-after-deferral record is BY DEFINITION money that has also been
+  // posted as RELEASED, so anything still wearing that status after exact
+  // duplicates are gone is a near-copy of a record already counted.
+  const isDeferredReleased=row=>releaseRank(row)===RELEASE_RANK.deferred_released;
+  const survivors=kept.filter(row=>!isDeferredReleased(row));
+  return {kept:survivors,dropped:dropped+(kept.length-survivors.length)};
+}
+
 export function inclusiveDays(start,end){
   const a=Date.parse(`${calendarDay(start)}T00:00:00Z`);
   const b=Date.parse(`${calendarDay(end)}T00:00:00Z`);
@@ -287,9 +355,7 @@ export function calculateDashboardMetrics(input,range){
   //
   // This is why the two earlier attempts to merge Deferred activity overshot
   // and were reverted: the merge was right, the double count was not.
-  const isDeferredReleased=row=>/deferred[\s_-]*released/i.test(String(row.transaction_status??''));
-  const financeStatementRows=financeAudit.included.filter(row=>!isDeferredReleased(row));
-  const duplicatedByRelease=financeAudit.included.length-financeStatementRows.length;
+  const {kept:financeStatementRows,dropped:duplicatedByRelease}=dedupeRepostedTransactions(financeAudit.included);
 
   // Amazon's statement is built from the financial ledger by POSTED DATE and
   // carries both released and still-deferred activity. A settlement document
