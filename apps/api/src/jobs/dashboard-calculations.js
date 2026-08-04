@@ -87,6 +87,13 @@ const isReimbursement=row=>/reimburse|safe t|lost|damaged|clawback/.test(text(ro
 // Tax on either belongs to GST, never here.
 const isShippingOrGiftWrapCredit=row=>/shipping|gift wrap/.test(text(row))
   &&!isFee(row)&&!isProductGst(row)&&!isWithholding(row)&&!isPromotion(row)&&!isTransfer(row);
+// "holdback"/"shipping hb" earn theirs too. Amazon defines Other transaction
+// fees as "shipping chargebacks, shipping HOLDBACKS, and sales tax collection
+// fees", but a holdback arrives as "ShippingHB" - no fee word at all - so it
+// matched the shipping-CREDIT rule and was counted as Income, with its tax
+// landing in the generic Tax section. Measured on a real account: moving it
+// raises Income by 35.40 and lowers Expenses by 35.40, which were that
+// account's only two remaining differences from its statement.
 // "cancellation" earns its place: Amazon charges an OrderCancellationCharge and
 // GST on it, and the tax leaf ("OrderCancellationCharge Tax") contains no other
 // fee word, so without this it landed in the generic Tax bucket instead of
@@ -99,6 +106,13 @@ const isShippingOrGiftWrapCredit=row=>/shipping|gift wrap/.test(text(row))
 // section Amazon does not use.
 //
 // Measured on a real account, 380 such rows, every parent type fee-bearing:
+// "Promo" belongs to the same set. It arrives bare, always positive, always
+// under a fee-bearing parent (Shipment, ServiceFee), and is a DISCOUNT ON A FEE
+// rather than a promotional rebate to a buyer - settlement spells the same thing
+// "Discount on Fee". Measured on a real account it was 782.00 counted in no
+// section at all, which was that account's entire remaining Expenses gap.
+// A genuine buyer rebate says "Promotion" or "Promo rebates" and is claimed by
+// isPromotion before this rule is reached.
 //   ProductAdsPayment  Base  -9,974.35   Tax  -1,795.39   (Cost of Advertising)
 //   Shipment           Base -12,059.47   Tax  -2,170.74
 //   ServiceFee         Base  -3,150.25   Tax    -567.05
@@ -107,16 +121,23 @@ const isShippingOrGiftWrapCredit=row=>/shipping|gift wrap/.test(text(row))
 // Tax on a fee belongs with the fee - Amazon reports "Commission Tax" inside
 // Expenses, not GST - so both components are Expenses. The guards keep this
 // away from anything that is genuinely a sale, a promotion or a transfer.
-const isGenericFeeComponent=row=>/^(base|tax|amount|fee|total)$/.test(norm(row.amount_description??''))
+const isGenericFeeComponent=row=>/^(base|tax|amount|fee|total|promo)$/.test(norm(row.amount_description??''))
   &&!isPrincipal(row)&&!isPromotion(row)&&!isReimbursement(row)&&!isTransfer(row);
-const isFee=row=>/itemfees|itemtcs|itemtds|other transaction|fee|commission|closing|storage|shipping label|service|advertis|adjustment|easy ship charges|postagepurchase|cancellation|tcs|tds/.test(text(row))&&!isReimbursement(row)&&!isPrincipal(row)&&!isPromotion(row)||isGenericFeeComponent(row);
+const isFee=row=>/itemfees|itemtcs|itemtds|other transaction|fee|commission|closing|storage|shipping label|service|advertis|adjustment|easy ship charges|postagepurchase|cancellation|holdback|shipping hb|tcs|tds/.test(text(row))&&!isReimbursement(row)&&!isPrincipal(row)&&!isPromotion(row)||isGenericFeeComponent(row);
+// Amazon is not consistent about spacing, and norm() cannot repair it: it
+// splits camelCase, so "GiftwrapTax" becomes "giftwrap tax" - one word - while
+// settlement writes "Gift wrap tax". A pattern demanding the space missed the
+// Finance API spelling entirely, and that row then matched the gift-wrap CREDIT
+// rule as well, so a single 9.16 line was counted in Income AND in a Tax
+// section Amazon reports as 0, while GST was short by the same 9.16. "gift ?wrap"
+// accepts both spellings.
 // "our price tax" is the Finance API's own name (after camelCase splitting)
 // for what settlement calls "Product Tax" - the tax on the item's own sale
 // price, as distinct from "shipping tax"/"gift wrap tax". Without this
 // alias it does not contain the literal phrase "product tax" and falls
 // through to isGenericTax instead of GST, producing a phantom non-zero Tax
 // figure on Deferred orders even after the camelCase-splitting fix.
-const isProductGst=row=>/product tax|our price tax|shipping tax|gift wrap tax|tax discount|\bgst collected|\bgst refund/.test(text(row))&&!/fee|commission|service|itemtcs|itemtds|tcs|tds/.test(text(row));
+const isProductGst=row=>/product tax|our price tax|shipping tax|gift ?wrap tax|tax discount|\bgst collected|\bgst refund/.test(text(row))&&!/fee|commission|service|itemtcs|itemtds|tcs|tds/.test(text(row));
 // finance_transaction_items.category is not a raw Amazon label like
 // settlement's amount_type/amount_description - it is a normalized bucket
 // name from categorizeFinanceLabel() (finance-components.js), which
@@ -221,7 +242,7 @@ const gstKey=row=>`${rawField(row.raw,['invoice-number','invoice number','docume
 // stale numbers with total confidence. Bump this whenever the statement maths
 // changes, and the running build can be read off the dashboard instead of
 // inferred from the numbers it produces.
-export const CALCULATION_REVISION = 'fee-components-2026-08-04';
+export const CALCULATION_REVISION = 'label-spacing-2026-08-04';
 export const MINIMUM_DEDUPE_LOOKBACK_DAYS = 30;
 // The instant a row was posted, for ordering. Never compare posted_date as a
 // string: it arrives as a Date from Postgres and as an ISO string from an

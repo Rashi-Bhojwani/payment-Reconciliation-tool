@@ -811,3 +811,68 @@ test('a named tax line is still GST, not swallowed by the fee-component rule',()
   assert.equal(r.statement.expenses.value,0);
   assert.equal(r.statement.income.value,1000);
 });
+
+test('Amazon\'s inconsistent spacing does not change which section a line lands in',()=>{
+  // norm() splits camelCase, so the Finance API's "GiftwrapTax" becomes
+  // "giftwrap tax" - one word - while settlement writes "Gift wrap tax". A GST
+  // pattern demanding the space missed the API spelling entirely, and the row
+  // then also matched the gift-wrap CREDIT rule, so one 9.16 line was counted
+  // in Income AND in a Tax section Amazon reports as 0, while GST was short by
+  // the same 9.16. All three moved together on a real account.
+  const range={start:'2026-07-01T00:00:00Z',end:'2026-07-30T00:00:00Z'};
+  const row=(id,description,amountValue,category)=>({source_row_id:id,transaction_id:id,order_id:'o1',category,
+    amount_description:description,amount:amountValue,posted_date:new Date('2026-07-10T00:00:00Z'),
+    parent_transaction_type:'Shipment',transaction_status:'RELEASED',raw:{}});
+  for(const spelling of ['GiftwrapTax','Gift wrap tax','GiftWrapTax']){
+    const r=calculateDashboardMetrics({
+      orders:[],orderItems:[],returns:[],reimbursements:[],gstInvoices:[],settlementHeaders:[],settledOrderIdsAllTime:[],settlementRows:[],
+      financeItems:[row('p','OurPricePrincipal',1000,'item_price'),row('g',spelling,9.16,'gift_wrap')]
+    },range);
+    assert.equal(r.statement.gst.value,9.16,`${spelling} is GST`);
+    assert.equal(r.statement.tax.value,0,`${spelling} must not create a Tax section`);
+    assert.equal(r.statement.income.value,1000,`${spelling} must not also count as a gift wrap credit`);
+  }
+});
+
+test('a shipping holdback is a fee, not a shipping credit',()=>{
+  // Amazon defines Other transaction fees as "shipping chargebacks, shipping
+  // HOLDBACKS, and sales tax collection fees", but a holdback arrives as
+  // "ShippingHB" with no fee word, so it matched the shipping-CREDIT rule and
+  // was counted as Income while its tax went to a generic Tax section. On a real
+  // account moving it raised Income by 35.40 and lowered Expenses by 35.40 -
+  // that account's only two remaining differences from its statement.
+  const range={start:'2026-07-01T00:00:00Z',end:'2026-07-30T00:00:00Z'};
+  const row=(id,description,amountValue,category)=>({source_row_id:id,transaction_id:id,order_id:'o1',category,
+    amount_description:description,amount:amountValue,posted_date:new Date('2026-07-10T00:00:00Z'),
+    parent_transaction_type:'Shipment',transaction_status:'RELEASED',raw:{}});
+  const r=calculateDashboardMetrics({
+    orders:[],orderItems:[],returns:[],reimbursements:[],gstInvoices:[],settlementHeaders:[],settledOrderIdsAllTime:[],settlementRows:[],
+    financeItems:[row('p','OurPricePrincipal',1000,'item_price'),
+                  row('hb','ShippingHB',-30,'shipping_charge'),
+                  row('hbt','ShippingHB Tax',-5.40,'shipping_charge'),
+                  row('sc','ShippingPrincipal',50,'shipping_charge')]
+  },range);
+  assert.equal(r.statement.expenses.value,-35.40,'the holdback and its tax are Expenses');
+  assert.equal(r.statement.income.value,1050,'a genuine shipping credit is still Income');
+  assert.equal(r.statement.tax.value,0);
+});
+
+test('a bare Promo is a discount on a fee, not a buyer rebate',()=>{
+  // It arrives bare, always positive, always under a fee-bearing parent, and
+  // settlement spells the same thing "Discount on Fee". Measured on a real
+  // account it was 782.00 counted in no section, which was that account's whole
+  // remaining Expenses gap.
+  const range={start:'2026-07-01T00:00:00Z',end:'2026-07-30T00:00:00Z'};
+  const row=(id,parent,description,amountValue,category)=>({source_row_id:id,transaction_id:id,order_id:'o1',category,
+    amount_description:description,amount:amountValue,posted_date:new Date('2026-07-10T00:00:00Z'),
+    parent_transaction_type:parent,transaction_status:'RELEASED',raw:{}});
+  const r=calculateDashboardMetrics({
+    orders:[],orderItems:[],returns:[],reimbursements:[],gstInvoices:[],settlementHeaders:[],settledOrderIdsAllTime:[],settlementRows:[],
+    financeItems:[row('p','Shipment','OurPricePrincipal',1000,'item_price'),
+                  row('promo','Shipment','Promo',782,'other'),
+                  row('rebate','Shipment','PromoRebates',-50,'promotion')]
+  },range);
+  assert.equal(r.statement.expenses.value,782,'the fee discount is an Expenses credit');
+  assert.equal(r.statement.income.value,950,'a real buyer rebate stays a promotional rebate in Income');
+  assert.deepEqual(r.diagnostics.completeness.reasons.filter(x=>/match no statement section/.test(x)),[]);
+});
