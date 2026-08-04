@@ -48,7 +48,19 @@ const isRefund=row=>/refund/.test(text(row));
 // Rate and DRR all read off this. Only the line's own description (or the
 // normalized Finance API category) may decide that a row is a product sale.
 const isPrincipal=row=>/principal|item price/.test(norm(`${row.amount_description??''} ${row.category??''}`));
-const isPromotion=row=>/promotion|promo rebate/.test(text(row))&&!/product tax discount|shipping tax discount|gift wrap tax discount/.test(text(row));
+// A tax discount reduces the GST collected; it is not a promotional rebate.
+// The exclusion used to be a literal list of settlement's spellings ("product
+// tax discount", "shipping tax discount", "gift wrap tax discount"), which the
+// Finances API does not use - it says "OurPriceTaxDiscount". So that row
+// matched isPromotion AND isProductGst and was counted in Income and GST both.
+// Measured against Amazon's own statement on the Deferred population: Income
+// came out 7,146.50 against 7,152.59, short by exactly the -6.09 of
+// OurPriceTaxDiscount it had double counted.
+//
+// Deferring to isProductGst instead of restating its spellings means the two
+// can no longer disagree, whatever Amazon calls the line next. "OurPriceDiscount"
+// and "ShippingDiscount" carry no tax wording, so they remain promotions.
+const isPromotion=row=>/promotion|promo rebate/.test(text(row))&&!isProductGst(row);
 // Amazon's own Transaction/Account Activity statement puts TDS Reimbursement
 // and Chargebacks under Income - grouped with A-to-z Guarantee claims,
 // SAFE-T Reimbursements and Clawbacks as claims-related credits/debits,

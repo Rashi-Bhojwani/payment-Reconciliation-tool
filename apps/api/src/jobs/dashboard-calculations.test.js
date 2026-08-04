@@ -528,3 +528,45 @@ test('real settlement labels leave nothing unclassified',()=>{
   assert.deepEqual(r.diagnostics.completeness.reasons.filter(x=>/match no statement section/.test(x)),[],
     'a label Amazon really sends must never be left sectionless');
 });
+
+test('a tax discount is GST only, never GST and Income both',()=>{
+  // Sections are independent filters, so a row matching two of them is counted
+  // twice. isPromotion excluded settlement's spelling ("product tax discount")
+  // but not the Finances API's ("OurPriceTaxDiscount"), so that row landed in
+  // Income AND GST. Measured against Amazon's statement on the real Deferred
+  // population: Income came out 7,146.50 against 7,152.59 - short by exactly
+  // the -6.09 of OurPriceTaxDiscount double counted. With this fixed the whole
+  // Deferred population classifies to 0.00 on all three sections.
+  // Categories are what categorizeFinanceLabel() really assigns these labels.
+  const financeRow=(description,amount,category)=>({source_row_id:description,transaction_id:'t1',order_id:'o1',
+    category,amount_description:description,amount,
+    posted_date:'2026-07-10T00:00:00Z',transaction_status:'DEFERRED',raw:{}});
+  const r=calculateDashboardMetrics({
+    orders:[],orderItems:[],returns:[],reimbursements:[],gstInvoices:[],settlementHeaders:[],settledOrderIdsAllTime:[],settlementRows:[],
+    financeItems:[financeRow('OurPricePrincipal',1000,'item_price'),financeRow('OurPriceTax',180,'tax'),financeRow('OurPriceTaxDiscount',-6.09,'promotion')]
+  },range);
+  assert.equal(r.statement.gst.value,173.91,'the tax discount reduces GST');
+  assert.equal(r.statement.income.value,1000,'and must not also reduce Income');
+  // The settlement spelling of the same thing behaves identically.
+  const s=calculateDashboardMetrics({
+    orders:[],orderItems:[],returns:[],reimbursements:[],gstInvoices:[],settlementHeaders:[],settledOrderIdsAllTime:[],financeItems:[],
+    settlementRows:[line('p','Principal',1000,'Order',{order_id:'o1',amount_type:'ItemPrice'}),
+                    line('t','Product Tax',180,'Order',{order_id:'o1',amount_type:'ItemPrice'}),
+                    line('d','Product tax discount',-6.09,'Order',{order_id:'o1',amount_type:'Promotion'})]
+  },range);
+  assert.equal(s.statement.gst.value,173.91);
+  assert.equal(s.statement.income.value,1000);
+});
+
+test('a real promotion is still a promotion, not swallowed by the GST rule',()=>{
+  // Guards the fix from over-reaching: only tax discounts move to GST.
+  // "OurPriceDiscount" and "ShippingDiscount" carry no tax wording.
+  const promo=(description,amount)=>({source_row_id:description,transaction_id:'t1',order_id:'o1',category:'promotion',
+    amount_description:description,amount,posted_date:'2026-07-10T00:00:00Z',transaction_status:'DEFERRED',raw:{}});
+  const r=calculateDashboardMetrics({
+    orders:[],orderItems:[],returns:[],reimbursements:[],gstInvoices:[],settlementHeaders:[],settledOrderIdsAllTime:[],settlementRows:[],
+    financeItems:[promo('OurPriceDiscount',-33.86),promo('ShippingDiscount',-101.70)]
+  },range);
+  assert.equal(r.statement.income.value,-135.56,'promotional rebates stay in Income');
+  assert.equal(r.statement.gst.value,0);
+});
