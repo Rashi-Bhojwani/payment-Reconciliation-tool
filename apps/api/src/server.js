@@ -1243,16 +1243,25 @@ app.get('/api/tenants/:tenantId/dashboard', async request => {
         coalesce(ft.raw->>'transactionStatus',ft.raw->>'TransactionStatus','Unknown') transaction_status,
         ft.transaction_type,
         -- A transaction that was deferred and has since been released is counted
-        -- by Amazon on the date the money was RELEASED, not the date it posted,
-        -- so the two dates decide whether it belongs in the window being viewed.
-        -- Amazon's own statement column is "Transaction Release Date"; the API
-        -- has used several names for it, so every one seen is tried.
-        coalesce(ft.raw->>'transactionReleaseDate',ft.raw->>'TransactionReleaseDate',
-                 ft.raw->>'releaseDate',ft.raw->>'ReleaseDate',
-                 ft.raw#>>'{sellingPartnerMetadata,releaseDate}') release_date,
-        -- Which keys the stored payload actually has. Costs one small string per
-        -- row and removes the guesswork when Amazon renames or adds a field.
-        (select string_agg(k,'|' order by k) from jsonb_object_keys(coalesce(ft.raw,'{}'::jsonb)) k) raw_keys
+        -- by Amazon on the date the money matured, not the date it posted, so
+        -- the two dates decide whether it belongs in the window being viewed.
+        -- There is no release-date field: confirmed on a real account, every
+        -- transaction of every status carries exactly the same twelve top-level
+        -- keys and none of them is a release date. The date lives inside
+        -- "contexts", a polymorphic array where a DeferredContext carries
+        -- maturityDate and deferralReason.
+        --
+        -- Amazon nests contexts on the transaction OR on each item, and has
+        -- moved them before, so these search the payload at any depth rather
+        -- than assuming a path.
+        nullif(jsonb_path_query_array(coalesce(ft.raw,'{}'::jsonb),'$.**.maturityDate')::text,'[]') maturity_dates,
+        nullif(jsonb_path_query_array(coalesce(ft.raw,'{}'::jsonb),'$.**.deferralReason')::text,'[]') deferral_reasons,
+        -- The fulfilment channel (AFN/MFN). This is the only source in the
+        -- Finances API for Amazon's FBA vs seller-fulfilled split, and
+        -- flattenFinanceTransaction currently reads ProductContext for sku and
+        -- asin while discarding it.
+        nullif(jsonb_path_query_array(coalesce(ft.raw,'{}'::jsonb),'$.**.fulfillmentNetwork')::text,'[]') fulfillment_networks,
+        nullif(jsonb_path_query_array(coalesce(ft.raw,'{}'::jsonb),'$.**.contextType')::text,'[]') context_types
       from finance_transaction_items fi
       left join finance_transactions ft on ft.tenant_id=fi.tenant_id and ft.transaction_id=fi.transaction_id
       where fi.tenant_id=$1 and fi.posted_date >= $2 and fi.posted_date < $3
