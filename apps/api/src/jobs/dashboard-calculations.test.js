@@ -13,7 +13,12 @@ function mindcircusFixture(){return{
     line('fees','Selling fees',-56358.40,'ServiceFee'),line('fee-refund','Selling fee refunds',7397.65,'ServiceFeeRefund'),line('tds','TCS/TDS withholding',-1469.30,'Withholding'),
     line('gst-collected','Product Tax GST collected',38146.06),line('gst-refund','Product Tax GST refund',-10194.50,'Refund')
   ],
-  financeItems:[line('partial','Principal',999,'Order')],
+  // Deliberately empty: this fixture exercises the SETTLEMENT source. An
+  // account with one Finance row and thirteen settlement rows does not exist -
+  // both come from the same sync - and the Finances API is the statement source
+  // whenever it has data, so leaving a stub here would just test the fallback
+  // by accident.
+  financeItems:[],
   settlementHeaders:[{settlement_id:'transfer',deposit_date:'2026-07-20T00:00:00Z',total_amount:131801.69},{settlement_id:'failed',deposit_date:'2026-07-21T00:00:00Z',total_amount:500,transaction_type:'Failed transfer'}],
   reimbursements:[{sku:'duplicate-fallback',amount:999,reimbursement_date:'2026-07-10'}]
 };}
@@ -271,26 +276,31 @@ test('reports when settlement history is incomplete rather than showing confiden
 
 test('diagnostics cannot claim exclusion while the rows are actually included',()=>{
   // The regression this guards against shipped live: sourcePolicy read
-  // "settlement only; N Deferred Finance API row(s) measured but excluded"
-  // and pendingMergeSummary.merged was hardcoded false, while the code
-  // immediately below merged those very rows into financialRows. Every
-  // diagnostic anyone would use to debug the totals reported the opposite of
-  // what the code did. This asserts the invariant directly.
+  // "measured but excluded" while the code below merged those very rows into
+  // the totals. Every diagnostic anyone would use to debug the figures said the
+  // opposite of what the code did. The invariant is what matters, not which way
+  // round it happens to be - so it is asserted in both directions.
   const range={start:'2026-07-01T00:00:00Z',end:'2026-07-30T00:00:00Z'};
-  const r=calculateDashboardMetrics({
-    orders:[],orderItems:[],returns:[],reimbursements:[],gstInvoices:[],settlementHeaders:[],settledOrderIdsAllTime:[],
+  const base={orders:[],orderItems:[],returns:[],reimbursements:[],gstInvoices:[],settlementHeaders:[],settledOrderIdsAllTime:[],
     settlementRows:[line('s1','Principal',1000,'Order',{order_id:'settled',amount_type:'ItemPrice'}),
-                    line('s2','Commission',-100,'Order',{order_id:'settled',amount_type:'ItemFees'})],
-    financeItems:[{source_row_id:'f1',transaction_id:'tx1',order_id:'pending',transaction_status:'DEFERRED',category:'item_price',amount_description:'OurPricePrincipal',amount:250,posted_date:'2026-07-10T00:00:00Z',raw:{}}]
-  },range);
-  const claimsExclusion=/excluded/i.test(r.diagnostics.sourcePolicy.financial);
-  const settlementOnly=r.metrics.netSales.rows.every(row=>row.settlement_id!=null);
-  assert.ok(claimsExclusion,'settlement-complete tenants should report the pending rows as excluded');
-  assert.equal(r.diagnostics.pendingMergeSummary.merged,false);
-  assert.ok(settlementOnly,'financialRows must contain settlement rows only while diagnostics claim exclusion');
-  // The pending rows are still measured, just never counted.
-  assert.equal(r.diagnostics.pendingMergeSummary.pendingExcludedTotals.income,250);
-  assert.equal(r.statement.income.value,1000);
+                    line('s2','Commission',-100,'Order',{order_id:'settled',amount_type:'ItemFees'})]};
+  const deferredRow={source_row_id:'f1',transaction_id:'tx1',order_id:'pending',transaction_status:'DEFERRED',
+    category:'item_price',amount_description:'OurPricePrincipal',amount:250,posted_date:'2026-07-10T00:00:00Z',raw:{}};
+
+  // Finance data present: it is the statement source, and the Deferred row is
+  // counted - so nothing may say "excluded".
+  const counted=calculateDashboardMetrics({...base,financeItems:[deferredRow]},range);
+  assert.equal(counted.statement.income.value,250,'the Finances ledger is the source');
+  assert.equal(/excluded/i.test(counted.diagnostics.sourcePolicy.financial),false,
+    'nothing may claim exclusion while the rows are in the totals');
+  assert.match(counted.diagnostics.completeness.reasons.join(' '),/ARE counted/);
+
+  // No finance data: settlement is the fallback, and there is nothing pending
+  // to describe either way.
+  const settlementOnly=calculateDashboardMetrics({...base,financeItems:[]},range);
+  assert.equal(settlementOnly.statement.income.value,1000);
+  assert.equal(settlementOnly.diagnostics.sourcePolicy.financial.startsWith('Amazon Settlement report'),true);
+  assert.ok(settlementOnly.metrics.netSales.rows.every(row=>row.settlement_id!=null));
 });
 
 test('the statement only claims to match Amazon once it can prove it does',()=>{

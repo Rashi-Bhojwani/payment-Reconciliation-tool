@@ -398,15 +398,24 @@ export function calculateDashboardMetrics(input,range){
   //   GST 23,682.67 vs 23,691.75   -9.08
   //   Income 1,31,996.27 vs 1,32,046.97  -50.70
   //   Expenses -46,586.46 vs -42,314.88  -4,271.58   (see completeness note)
-  // "Has data" is not the test - a single stray Finance row must not outrank a
-  // full settlement document, and requiring specific line types would blank the
-  // statement for any window that happens to lack one. The test is coverage:
-  // the Finances API wins when it carries statement lines at all and settlement
-  // does not, or when it demonstrably covers more of the window than settlement
-  // does. On the reconciled account that was 5,093 Finance rows against 2,033
-  // settlement rows.
+  // The Finances API wins whenever it carries statement lines. Settlement is
+  // the fallback for an account that has no Finance data at all, and nothing
+  // else.
+  //
+  // This used to ALSO require the Finance side to hold more rows than the
+  // settlement side. That comparison is meaningless - the two describe the same
+  // money at different granularities, so their row counts say nothing about
+  // coverage - and it was actively wrong. On a real account with 6,876 Finance
+  // rows it silently fell back to settlement and reported Income 8,73,050.23
+  // where Amazon says 5,64,126.22, while the Finance path reproduces that
+  // statement to 0.00 on every section.
+  //
+  // There is no judgement to make here. A settlement document holds only
+  // released money and lags the posted date Amazon builds its statement on, so
+  // it cannot reproduce the statement even in principle. The Finances API is
+  // the ledger the statement is drawn from.
   const financeComplete=financeStatementRows.some(row=>isPrincipal(row)||isFee(row)||isProductGst(row)||isPromotion(row)||isReimbursement(row)||isWithholding(row));
-  const useFinanceStatement=financeComplete&&(!settlementComplete||financeStatementRows.length>=settlementAudit.included.length);
+  const useFinanceStatement=financeComplete;
   const financialRows=useFinanceStatement?financeStatementRows:settlementAudit.included;
   const financialDuplicates=useFinanceStatement?financeAudit.duplicates:settlementAudit.duplicates;
   const financialSource=useFinanceStatement?'Amazon Finances API':'Amazon Settlement report';
