@@ -215,3 +215,47 @@ test('a settlement that closed before the window but pays out inside it is still
   assert.ok(!fetched.includes('doc-old'), 'the lookback is bounded, not unlimited');
   assert.equal(report.reportsMerged, 2);
 });
+
+test('settlement listing never asks for reports older than Amazon retains', async () => {
+  // Amazon keeps report documents for 90 days and answers a getReports call
+  // with an older createdSince with a bare 400. The window used to be
+  // range.start minus 45 days with no floor, so selecting 1 Apr on 4 Aug asked
+  // for 15 Feb - 170 days back - and the whole settlement sync died with
+  // "List settlement reports failed: 400" for a seller who had done nothing
+  // wrong. Nothing older than the retention window exists to be listed, so the
+  // clamp is the limit itself rather than a workaround for it.
+  const client = new SpApiClient('refresh-token', { clientId: 'id', clientSecret: 'secret' });
+  const asked = [];
+  client.request = async path => {
+    asked.push(path);
+    return { ok: true, json: async () => ({ reports: [] }) };
+  };
+  client.downloadReportDocument = async () => '';
+  const longAgo = new Date(Date.now() - 300 * 864e5).toISOString();
+  const alsoLongAgo = new Date(Date.now() - 200 * 864e5).toISOString();
+  // An empty list makes fetchReport report that nothing is available, which is
+  // correct and beside the point - what matters is the window it asked for.
+  await client.fetchReport('GET_V2_SETTLEMENT_REPORT_DATA_FLAT_FILE_V2', '11111111-1111-1111-1111-111111111111',
+    { start: longAgo, end: alsoLongAgo }).catch(() => undefined);
+
+  const createdSince = new URL(`https://x${asked[0]}`).searchParams.get('createdSince');
+  assert.ok(createdSince, 'the listing call must state a createdSince');
+  const daysBack = (Date.now() - new Date(createdSince).getTime()) / 864e5;
+  assert.ok(daysBack <= 90, `createdSince was ${daysBack.toFixed(0)} days back; Amazon rejects anything past 90`);
+  assert.ok(daysBack > 80, 'but it must still reach as far back as Amazon allows');
+});
+
+test('a failed settlement listing repeats what Amazon actually said', async () => {
+  // A bare status number sent a seller hunting for a permissions problem that
+  // did not exist.
+  const client = new SpApiClient('refresh-token', { clientId: 'id', clientSecret: 'secret' });
+  client.request = async () => ({
+    ok: false, status: 400,
+    clone: () => ({ text: async () => JSON.stringify({ errors: [{ code: 'InvalidInput', message: 'createdSince is too far in the past' }] }) })
+  });
+  await assert.rejects(
+    () => client.fetchReport('GET_V2_SETTLEMENT_REPORT_DATA_FLAT_FILE_V2', '11111111-1111-1111-1111-111111111111',
+      { start: '2026-07-01T00:00:00Z', end: '2026-07-31T00:00:00Z' }),
+    /400.*Amazon says.*createdSince is too far in the past/s
+  );
+});
