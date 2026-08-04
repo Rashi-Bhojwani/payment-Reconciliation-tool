@@ -475,3 +475,56 @@ test('a repeated transfer transaction is counted once',()=>{
     {start:'2026-06-30T18:30:00Z',end:'2026-07-31T00:00:00Z'});
   assert.equal(r.statement.transfers.value,-5000);
 });
+
+test('Income is an allow-list, so an unknown line cannot inflate it',()=>{
+  // The residual classifier ("everything that is not a fee, tax, GST or
+  // transfer") swept every unrecognised row into Income. That is invisible on
+  // settlement rows, whose labels the classifiers were written against, and
+  // wrong on Finances API rows, whose labels differ - which is why both
+  // earlier attempts to merge Deferred activity overshot. Reconciled against a
+  // real Custom Unified Transaction report, Deferred is +7,152.59 of Income
+  // for that window; the residual classifier made it +30,931.91.
+  const r=calculateDashboardMetrics({
+    orders:[],orderItems:[],returns:[],reimbursements:[],gstInvoices:[],settlementHeaders:[],settledOrderIdsAllTime:[],financeItems:[],
+    settlementRows:[line('sale','Principal',1000,'Order',{order_id:'o1',amount_type:'ItemPrice'}),
+                    line('mystery','Some Future Amazon Line',500,'Order',{order_id:'o1',amount_type:'SomethingNew'})]
+  },range);
+  assert.equal(r.statement.income.value,1000,'the unknown 500 must NOT land in Income');
+  const reasons=r.diagnostics.completeness.reasons.join(' ');
+  assert.match(reasons,/match no statement section/,'but it must be reported, never dropped quietly');
+  assert.match(reasons,/Some Future Amazon Line 500/);
+  assert.equal(r.diagnostics.completeness.provisional,true);
+});
+
+test('shipping and gift wrap credits are Income; their charges stay Expenses',()=>{
+  // Amazon's statement keeps these as separate named lines: "Shipping
+  // credits"/"Gift wrap credits" under Income against the shipping and gift
+  // wrap fees under Expenses. Tax on either belongs to GST, never to Income.
+  const r=calculateDashboardMetrics({
+    orders:[],orderItems:[],returns:[],reimbursements:[],gstInvoices:[],settlementHeaders:[],settledOrderIdsAllTime:[],financeItems:[],
+    settlementRows:[line('ship','Shipping',100,'Order',{order_id:'o1',amount_type:'ItemPrice'}),
+                    line('wrap','Gift wrap',20,'Order',{order_id:'o1',amount_type:'ItemPrice'}),
+                    line('shipfee','Shipping chargeback',-30,'Order',{order_id:'o1',amount_type:'ItemFees'}),
+                    line('shiptax','Shipping tax',18,'Order',{order_id:'o1',amount_type:'ItemPrice'})]
+  },range);
+  assert.equal(r.statement.income.value,120,'credits only');
+  assert.equal(r.statement.expenses.value,-30,'the chargeback is an expense, not negative income');
+  assert.equal(r.statement.gst.value,18,'shipping tax is GST');
+  assert.deepEqual(r.diagnostics.completeness.reasons.filter(x=>/match no statement section/.test(x)),[]);
+});
+
+test('real settlement labels leave nothing unclassified',()=>{
+  // Guards the allow-list against being too narrow: every label below is one
+  // Amazon actually emitted on a real account, and each must find a section.
+  const labels=[['Principal','ItemPrice'],['Product Tax','ItemPrice'],['Shipping','ItemPrice'],['Shipping tax','ItemPrice'],
+    ['Commission','ItemFees'],['Fixed closing fee','ItemFees'],['FBA Pick & Pack Fee','ItemFees'],['FBA Weight Handling Fee','ItemFees'],
+    ['Promo rebates','Promotion'],['Shipping discount','Promotion'],['TCS-CGST','ItemTCS'],['TDS (Section 194-O)','ItemTDS'],
+    ['SAFE-T Reimbursement','Other Transactions'],['REVERSAL_REIMBURSEMENT','FBA Inventory Reimbursement'],
+    ['Amazon Easy Ship Charges','other-transaction'],['FBA Inventory Storage Fee','FBAFees']];
+  const r=calculateDashboardMetrics({
+    orders:[],orderItems:[],returns:[],reimbursements:[],gstInvoices:[],settlementHeaders:[],settledOrderIdsAllTime:[],financeItems:[],
+    settlementRows:labels.map(([description,amountType],i)=>line(`r${i}`,description,10,'Order',{order_id:'o1',amount_type:amountType}))
+  },range);
+  assert.deepEqual(r.diagnostics.completeness.reasons.filter(x=>/match no statement section/.test(x)),[],
+    'a label Amazon really sends must never be left sectionless');
+});

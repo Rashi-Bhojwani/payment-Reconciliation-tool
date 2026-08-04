@@ -60,6 +60,15 @@ const isPromotion=row=>/promotion|promo rebate/.test(text(row))&&!/product tax d
 // statement sections without changing what counts as a "reimbursement".
 const isWithholding=row=>/\b(tcs|tds)\b/.test(text(row))&&!/reimburse/.test(text(row));
 const isReimbursement=row=>/reimburse|safe t|lost|damaged|clawback/.test(text(row));
+// Shipping and gift wrap CREDITS are Income - they are money the buyer paid.
+// The matching charges ("shipping chargeback", "gift wrap fee", a purchased
+// shipping label) are Expenses, and isFee already claims those, so this must
+// not re-claim them. Amazon's statement keeps the two apart as separate named
+// lines: "Shipping credits" / "Gift wrap credits" under Income against
+// "Shipping label purchases" and the transaction fees under Expenses.
+// Tax on either belongs to GST, never here.
+const isShippingOrGiftWrapCredit=row=>/shipping|gift wrap/.test(text(row))
+  &&!isFee(row)&&!isProductGst(row)&&!isWithholding(row)&&!isPromotion(row)&&!isTransfer(row);
 const isFee=row=>/itemfees|itemtcs|itemtds|other transaction|fee|commission|closing|storage|shipping label|service|advertis|adjustment|easy ship charges|postagepurchase|tcs|tds/.test(text(row))&&!isReimbursement(row)&&!isPrincipal(row)&&!isPromotion(row);
 // "our price tax" is the Finance API's own name (after camelCase splitting)
 // for what settlement calls "Product Tax" - the tax on the item's own sale
@@ -325,7 +334,28 @@ export function calculateDashboardMetrics(input,range){
   const gstImported=(input.gstInvoices??[]).filter(row=>Object.keys(row.raw??{}).length>0&&!/synthetic|order item estimate/.test(norm(`${row.source??''} ${JSON.stringify(row.raw??{})}`)));const gstAudit=dedupe(gstImported,gstKey);
   const gstAvailable=gstAudit.included.length>0;const gstInvoiceValue=gstAvailable?gstAudit.included.reduce((sum,row)=>{const kind=norm(`${rawField(row.raw,['document-type','invoice-type','transaction-type'])??row.document_type??''}`);return sum+(/credit|refund/.test(kind)?-Math.abs(Number(row.taxable_value??0)):Number(row.taxable_value??0));},0):null;
   const productGstRows=financialRows.filter(isProductGst);const genericTaxRows=financialRows.filter(isGenericTax);
-  const incomeRows=financialRows.filter(row=>!isFee(row)&&!isWithholding(row)&&!isProductGst(row)&&!isGenericTax(row)&&!isTransfer(row));
+  // Income is an ALLOW-LIST, not a residual.
+  //
+  // It used to be "everything that is not a fee, tax, GST or transfer", which
+  // silently swept every row no classifier recognised into Income. That is
+  // invisible on settlement rows, whose labels the classifiers were written
+  // against, and badly wrong on Finances API rows, whose labels differ - which
+  // is why both previous attempts to merge Deferred activity overshot. Amazon's
+  // own statement, reconciled row-by-row from a Custom Unified Transaction
+  // report, puts Deferred at +7,152.59 of Income for the window measured; the
+  // residual classifier turned that into +30,931.91.
+  //
+  // Amazon's Income section is a closed list: product sales, shipping credits,
+  // gift wrap credits, promotional rebates, and claims-type credits (SAFE-T,
+  // reimbursements, clawbacks, A-to-z, chargebacks, TDS reimbursement). Nothing
+  // else belongs there, so nothing else is allowed in by default.
+  const isIncomeLine=row=>isPrincipal(row)||isPromotion(row)||isReimbursement(row)||isShippingOrGiftWrapCredit(row);
+  const incomeRows=financialRows.filter(isIncomeLine);
+  // Money no rule claims. It is deliberately NOT folded into Income - that is
+  // the bug being fixed - but it is never dropped quietly either: it is
+  // reported so an incomplete classifier shows up as a stated discrepancy
+  // rather than as a wrong Income figure.
+  const unclassifiedRows=financialRows.filter(row=>!isIncomeLine(row)&&!isFee(row)&&!isWithholding(row)&&!isProductGst(row)&&!isGenericTax(row)&&!isTransfer(row));
   const gst=signedSum(productGstRows),tax=signedSum(genericTaxRows),income=signedSum(incomeRows),expenses=signedSum(expenseRows),transfers=signedSum(transferRows);
   const days=inclusiveDays(range.start,range.end);const unitRate=returnedUnits==null?null:shippedUnits==null||shippedUnits===0?(returnedUnits>0?null:0):returnedUnits/shippedUnits*100;const refundValueRate=grossSales?productRefunds/grossSales*100:null;
   const excludedFinanceRows=settlementComplete?financeAudit.included.length-pendingFinanceRows.length:0;
@@ -436,6 +466,18 @@ export function calculateDashboardMetrics(input,range){
       .map(bucket=>`${bucket} ${pendingTotals[bucket]>=0?'+':''}${pendingTotals[bucket]}`)
       .join(', ');
     provisionalReasons.push(`${pendingFinanceRows.length} Deferred row(s) totalling ${round2(pendingFinanceRows.reduce((sum,row)=>sum+amount(row),0))} are excluded because no settlement document carries them - by section: ${bySection || 'nothing that lands in a section'}. If Amazon's statement for this range includes any, those sections are short by exactly those amounts.`);
+  }
+  // An incomplete classifier now shows up as a stated discrepancy instead of
+  // as an inflated Income figure. Amazon's own taxonomy is closed, so on
+  // correctly classified data this list is empty and nothing is reported.
+  if(unclassifiedRows.length){
+    const byLabel=new Map();
+    for(const row of unclassifiedRows){
+      const label=`${row.amount_type??row.category??''} ${row.amount_description??''}`.trim()||'(no label)';
+      byLabel.set(label,round2((byLabel.get(label)??0)+amount(row)));
+    }
+    const worst=[...byLabel].sort((a,b)=>Math.abs(b[1])-Math.abs(a[1])).slice(0,5).map(([label,value])=>`${label} ${value}`).join('; ');
+    provisionalReasons.push(`${unclassifiedRows.length} row(s) totalling ${signedSum(unclassifiedRows)} match no statement section and are counted in none - largest: ${worst}. Amazon's sections are a closed list, so this is a gap in this tool's classification, and every section it would have belonged to is short by its share.`);
   }
   const completeness={provisional:provisionalReasons.length>0,reasons:provisionalReasons};
   const diagnostics={completeness,sourcePolicy:{financial:`${financialSource} (${settlementComplete?`settlement only; ${pendingFinanceRows.length} Deferred Finance API row(s) measured but excluded - Amazon's statement does not carry them`:'settlement incomplete; Finances fallback'})`,reimbursements:financeReimbursements.length?financialSource:'Reimbursements report fallback',gst:'Imported GST B2B/B2C rows only',settled:`${transferSource} in the selected range`},includedRows:financialRows.length,excludedRows:(settlementComplete?excludedFinanceRows:settlementAudit.included.length),duplicateRows:financialDuplicates.length+itemAudit.duplicates.length+returnAudit.duplicates.length+gstAudit.duplicates.length,categoryTotals:{grossSales,productRefunds,netPromotions,expenseDebits,expenseCredits,tcsTds,operationalFees,gst,tax,transfers},pendingFinanceRowsDetail,pendingMergeSummary,outstandingSettlementSyncs,depositsOutsideRange,
