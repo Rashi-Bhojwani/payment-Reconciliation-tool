@@ -453,6 +453,7 @@ function SellerDashboard() {
   const [data, setData] = useState(null);
   const [error, setError] = useState('');
   const [loading, setLoading] = useState(false);
+  const [awaitingAmazon, setAwaitingAmazon] = useState(null);
   const rangeSyncRef = useRef({ key: '', requestId: 0 });
   // The server auto-syncs whatever a date range is missing in the background
   // and reports back which report types it kicked off (data.autoSyncing).
@@ -472,14 +473,20 @@ function SellerDashboard() {
       setData(dashboard);
       const rangeKey = `${targetRange.start}|${targetRange.end}`;
       if (autoPollRef.current.key !== rangeKey) autoPollRef.current = { key: rangeKey, attempts: 0 };
-      if (dashboard.autoSyncing?.length && autoPollRef.current.attempts < AUTO_POLL_MAX_ATTEMPTS) {
+      // The fetch is done, so the fetch spinner stops here - always. It used to
+      // stay lit for the whole polling window, which for a seller who had just
+      // connected Amazon meant a spinner that appeared to run forever while the
+      // page sat there. Waiting on Amazon is a different state from loading the
+      // page, and it says so, with its own copy and a visible attempt count.
+      setLoading(false);
+      const stillSyncing = Boolean(dashboard.autoSyncing?.length) && autoPollRef.current.attempts < AUTO_POLL_MAX_ATTEMPTS;
+      setAwaitingAmazon(stillSyncing ? { sources: dashboard.autoSyncing, attempt: autoPollRef.current.attempts + 1, of: AUTO_POLL_MAX_ATTEMPTS } : null);
+      if (stillSyncing) {
         autoPollRef.current.attempts += 1;
         setTimeout(() => { if (requestId === rangeSyncRef.current.requestId) void load(targetRange, requestId); }, AUTO_POLL_DELAY_MS);
-      } else {
-        setLoading(false);
       }
     } catch (e) {
-      if (requestId === rangeSyncRef.current.requestId) { setError(e.message); setLoading(false); }
+      if (requestId === rangeSyncRef.current.requestId) { setError(e.message); setLoading(false); setAwaitingAmazon(null); }
     }
   }
   useEffect(() => {
@@ -509,6 +516,7 @@ function SellerDashboard() {
       <div><h1>{viewTitle(view)}</h1><p>{viewDescription(view)}</p></div>
       <div className="actions">
         {loading && <span className="pill status-running range-loading-pill"><span className="spinner-dot" />Refreshing…</span>}
+        {!loading && awaitingAmazon && <span className="pill status-idle range-loading-pill"><span className="spinner-dot" />Amazon is preparing {awaitingAmazon.sources.length} report{awaitingAmazon.sources.length === 1 ? '' : 's'} · check {awaitingAmazon.attempt}/{awaitingAmazon.of}</span>}
         <AmazonConnectionPanel tenantId={tenantId} seller={data?.seller} onChange={load} setError={setError} />
       </div>
     </div>
@@ -1158,21 +1166,51 @@ function GlobalSearch({ tenantId }) {
 }
 
 // Seller-facing shell: sidebar + topbar. Admins never render this component.
+// The sidebar can be closed on any screen size, not just on a phone, and the
+// choice is remembered - someone who wants the full width for a wide
+// settlement table should not have to re-close it on every page. The topbar
+// toggle is always rendered, so the sidebar can never be closed with no way
+// back.
+const NAV_OPEN_KEY = 'wellsure_sidebar_open';
+function useSidebarOpen() {
+  const [open, setOpen] = useState(() => {
+    const stored = localStorage.getItem(NAV_OPEN_KEY);
+    if (stored === 'open') return true;
+    if (stored === 'closed') return false;
+    return typeof window === 'undefined' ? true : window.innerWidth > 980;
+  });
+  useEffect(() => { localStorage.setItem(NAV_OPEN_KEY, open ? 'open' : 'closed'); }, [open]);
+  return [open, setOpen];
+}
+
 function SellerShell({ session, setSession }) {
   function logout() { localStorage.removeItem('token'); setSession(null); }
   const [range, setRange] = useState(defaultDateRange);
-  const [mobileNavOpen, setMobileNavOpen] = useState(false);
-  return <div className="app-shell">
-    {mobileNavOpen && <div className="sidebar-overlay" onClick={() => setMobileNavOpen(false)} />}
-    <aside className={`sidebar${mobileNavOpen ? ' open' : ''}`}>
-      <div className="logo"><span>W</span><div><b>WELLSURE</b><small>Seller Intelligence</small></div></div>
+  const [navOpen, setNavOpen] = useSidebarOpen();
+  // On a phone the sidebar is an overlay drawer, so following a link should
+  // close it. On a desktop it sits beside the content and should stay put.
+  const closeOnNavigate = () => { if (window.innerWidth <= 980) setNavOpen(false); };
+  return <div className={`app-shell${navOpen ? '' : ' nav-closed'}`}>
+    {navOpen && <div className="sidebar-overlay" onClick={() => setNavOpen(false)} />}
+    <aside className={`sidebar${navOpen ? ' open' : ''}`} aria-hidden={!navOpen}>
+      <div className="sidebar-head">
+        <div className="logo"><span>W</span><div><b>WELLSURE</b><small>Seller Intelligence</small></div></div>
+        <button type="button" className="sidebar-close" aria-label="Close menu" title="Close menu" onClick={() => setNavOpen(false)}>✕</button>
+      </div>
       <nav>
-        {NAV_ITEMS.map(item => <SidebarLink key={item.view} icon={item.icon} to={`/seller?tenantId=${session?.tenantId ?? ''}&view=${item.view}`} onClick={() => setMobileNavOpen(false)}>{item.label}</SidebarLink>)}
+        {NAV_ITEMS.map(item => <SidebarLink key={item.view} icon={item.icon} to={`/seller?tenantId=${session?.tenantId ?? ''}&view=${item.view}`} onClick={closeOnNavigate}>{item.label}</SidebarLink>)}
       </nav>
     </aside>
     <main className="workspace">
       <header className="topbar">
-        <button type="button" className="hamburger-btn" aria-label="Open menu" onClick={() => setMobileNavOpen(o => !o)}>☰</button>
+        <button
+          type="button"
+          className="hamburger-btn"
+          aria-label={navOpen ? 'Close menu' : 'Open menu'}
+          aria-expanded={navOpen}
+          title={navOpen ? 'Hide menu' : 'Show menu'}
+          onClick={() => setNavOpen(o => !o)}
+        >☰</button>
         <GlobalSearch tenantId={session?.tenantId} />
         <select><option>Amazon.in</option></select>
         <DateRangePicker value={range} onChange={setRange} />
@@ -1210,9 +1248,38 @@ function AdminShell({ session, setSession }) {
   </div>;
 }
 
+// If the SP-API application is registered with a Redirect URI pointing at this
+// web app instead of at the API, Amazon lands the seller here holding a
+// one-time authorization code that only the API can exchange (it needs the LWA
+// client secret, which must never reach a browser). Rather than showing an
+// empty page, hand the whole query string to the API's callback and let the
+// normal flow finish. Nothing is read or stored here - it is a forward.
+function isAmazonCallbackPath() {
+  const path = window.location.pathname.replace(/\/+$/, '');
+  return path === '/oauth/callback' || path === '/api/auth/amazon/callback';
+}
+function forwardAmazonCallbackToApi() {
+  if (!isAmazonCallbackPath()) return false;
+  window.location.replace(`${API}/oauth/callback${window.location.search}`);
+  return true;
+}
+
 function App() {
   const [session, setSession] = useState(null);
-  useEffect(() => { const token = localStorage.getItem('token'); if (token) api('/api/auth/me').then(d => setSession(d.user)).catch(() => localStorage.removeItem('token')); }, []);
+  // null = still asking the API who we are. Rendering the login form during
+  // that check made a returning seller - including one coming back from
+  // Amazon's consent page - flash a login screen they had no reason to see.
+  const [booted, setBooted] = useState(() => !localStorage.getItem('token') && !isAmazonCallbackPath());
+  useEffect(() => {
+    if (forwardAmazonCallbackToApi()) return;
+    const token = localStorage.getItem('token');
+    if (!token) { setBooted(true); return; }
+    api('/api/auth/me')
+      .then(d => setSession(d.user))
+      .catch(() => localStorage.removeItem('token'))
+      .finally(() => setBooted(true));
+  }, []);
+  if (!booted) return <div className="boot-screen"><div className="brand-mark">W</div><p>Signing you in…</p></div>;
   if (!session) return <BrowserRouter><Login setSession={setSession} /></BrowserRouter>;
   return <BrowserRouter>{session.role === 'admin' ? <AdminShell session={session} setSession={setSession} /> : <SellerShell session={session} setSession={setSession} />}</BrowserRouter>;
 }

@@ -1100,3 +1100,128 @@ td { padding: 13px 14px; color:#344054; }
    it only matters when numbers disagree with Amazon and the first question is
    whether the API was restarted after a pull. */
 .activity-revision { font-family: var(--mono, ui-monospace, monospace); font-size: 11px; opacity: 0.55; margin: -4px 0 8px; }
+
+/* ==========================================================================
+   Collapsible sidebar
+   The sidebar used to be a drawer on phones only, and permanently pinned open
+   on a desktop. Reconciliation tables are wide - a settlement line has fifteen
+   columns - so the width matters, and it is now closable everywhere. Two rules
+   make that safe: the topbar toggle is always rendered (never a closed sidebar
+   with no way back), and the grid column animates to zero rather than the
+   sidebar being removed, so nothing reflows or remounts.
+   ========================================================================== */
+.app-shell {
+  transition: grid-template-columns 0.24s cubic-bezier(0.4, 0, 0.2, 1);
+}
+.app-shell.nav-closed { grid-template-columns: 0 minmax(0, 1fr); }
+.app-shell.nav-closed > .sidebar {
+  padding-left: 0;
+  padding-right: 0;
+  opacity: 0;
+  pointer-events: none;
+  visibility: hidden;
+  transition: opacity 0.16s ease, visibility 0s linear 0.24s;
+}
+.sidebar { transition: opacity 0.2s ease; }
+
+.sidebar-head { display: flex; align-items: center; justify-content: space-between; gap: 10px; padding-right: 2px; }
+.sidebar-close {
+  flex: 0 0 auto;
+  width: 30px; height: 30px;
+  display: inline-flex; align-items: center; justify-content: center;
+  border: 1px solid transparent;
+  border-radius: 9px;
+  background: transparent;
+  color: var(--muted);
+  font-size: 13px;
+  line-height: 1;
+  transition: background 0.12s ease, color 0.12s ease, border-color 0.12s ease;
+}
+.sidebar-close:hover { background: #fff; color: var(--violet-deep); border-color: #d9cdf1; }
+
+/* Always available, at every width - this is the only way back once closed. */
+.hamburger-btn { display: inline-flex; }
+.app-shell:not(.nav-closed) .hamburger-btn { color: var(--violet-deep); border-color: #d9cdf1; background: #f6f3ff; }
+
+/* On a phone the sidebar stays an overlay drawer: there is no room to sit it
+   beside the content, so the collapsed grid column is irrelevant there and the
+   transform (plus the dimming overlay) does the work instead. */
+@media (max-width: 980px) {
+  .app-shell, .app-shell.nav-closed { grid-template-columns: minmax(0, 1fr); }
+  .app-shell.nav-closed > .sidebar {
+    padding-left: 18px;
+    padding-right: 18px;
+    opacity: 1;
+    visibility: visible;
+    transform: translateX(-100%);
+    transition: transform 0.25s ease;
+  }
+  .sidebar.open { transform: translateX(0); }
+}
+
+.boot-screen {
+  min-height: 100dvh;
+  display: flex; flex-direction: column; align-items: center; justify-content: center;
+  gap: 16px;
+  color: var(--muted);
+  font-size: 14px;
+}
+.boot-screen .brand-mark { animation: boot-pulse 1.4s ease-in-out infinite; }
+@keyframes boot-pulse { 0%, 100% { transform: scale(0.94); opacity: 0.7; } 50% { transform: scale(1); opacity: 1; } }
+
+/* ==========================================================================
+   Palette consolidation
+   The stylesheet grew in layers and ended up mixing two schemes: a blue/violet
+   surface with warm marigold left over from an earlier direction. That reads
+   as unfinished rather than as a deliberate accent - a yellow focus ring on a
+   blue button, an orange glow under a blue one. Everything interactive is
+   settled on the blue -> violet ramp here; warm tones are kept only where they
+   carry meaning (a warning, a pending state).
+   ========================================================================== */
+:root {
+  --brand: #1769e8;
+  --brand-deep: #0b53c4;
+  --brand-soft: #eef4ff;
+  --violet-soft: #f4f0ff;
+  --ring: rgba(101, 84, 217, 0.28);
+}
+
+::selection { background: rgba(124, 58, 237, 0.18); }
+
+.input:focus, .btn:focus-visible, button:focus-visible, a:focus-visible,
+select:focus-visible, summary:focus-visible {
+  outline: 2px solid var(--violet);
+  outline-offset: 2px;
+}
+.input:focus { border-color: var(--violet); box-shadow: 0 0 0 3px var(--ring); }
+
+/* Was an orange glow under a blue button - a leftover, not a choice. */
+.btn-primary:hover:not(:disabled) { filter: brightness(1.04); box-shadow: 0 12px 26px rgba(22, 104, 232, 0.34); }
+
+/* .btn-dark darkened its background on hover but kept its dark text, so the
+   Logout label disappeared under the cursor. */
+.btn-dark { background: var(--violet-soft); color: var(--ink-deep); border: 1px solid #e0d8f6; }
+.btn-dark:hover:not(:disabled) { background: var(--ink-deep); color: #fff; border-color: var(--ink-deep); }
+
+/* ---------- Surface polish ---------- */
+body {
+  background:
+    radial-gradient(circle at 88% -12%, rgba(124, 58, 237, 0.07), transparent 38%),
+    radial-gradient(circle at -6% 8%, rgba(23, 105, 232, 0.06), transparent 34%),
+    var(--paper);
+}
+.topbar { gap: 12px; padding: 14px 20px; }
+.topbar select { border-radius: 11px; padding: 9px 12px; background: #fbfcff; }
+.topbar .avatar { background: linear-gradient(135deg, var(--brand), var(--violet)); color: #fff; }
+
+.card { border-radius: var(--radius); transition: box-shadow 0.16s ease, border-color 0.16s ease; }
+.panel-header span { background: var(--brand-soft); border-color: #dbe6ff; color: #3552a4; }
+
+.table-wrap table { border-collapse: separate; border-spacing: 0; }
+th:first-child { border-top-left-radius: var(--radius-sm); }
+th:last-child { border-top-right-radius: var(--radius-sm); }
+tbody tr { transition: background 0.1s ease; }
+tbody tr:hover td { background: var(--brand-soft); }
+
+.pill { border-radius: 999px; font-weight: 600; letter-spacing: 0.01em; }
+.alert { border-radius: var(--radius-sm); }

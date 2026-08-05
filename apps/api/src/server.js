@@ -613,24 +613,50 @@ app.get('/api/auth/amazon/start', async (request, reply) => {
   return reply.redirect(url.toString());
 });
 
+// Where the browser goes when Amazon sends the seller back. Every exit from
+// the callback goes through here, so the tab always lands somewhere real.
+const sellerLanding = (tenantId, params) =>
+  `${secrets.frontendOrigin}/seller?${new URLSearchParams({ ...(tenantId ? { tenantId } : {}), ...params })}`;
+
+// Amazon's redirect is a plain top-level browser navigation: whatever this
+// request answers with IS what the seller sees. So it must always answer, and
+// it must always answer with a redirect. Two things used to break that:
+// an unhandled throw (a missing tenant, a database hiccup) rendered a raw JSON
+// error in a blank tab, and anything that never settled left the tab spinning
+// with nothing to click. The wrapper below turns both into a landing page that
+// says what happened.
+function amazonCallbackFailure(reply, tenantId, error) {
+  const message = error instanceof Error ? error.message : String(error ?? 'Amazon authorization failed');
+  if (!tenantId) return reply.redirect(`${secrets.frontendOrigin}/login?amazon=error&message=${encodeURIComponent(message)}`);
+  return reply.redirect(sellerLanding(tenantId, { amazon: 'error', message }));
+}
+
 async function handleAmazonCallback(request, reply) {
+  // Parsed before the try so a tenant is available to redirect to even when the
+  // work below fails; a bad state is its own, separate landing.
+  let tenantIdForFailure = null;
+  try {
+    return await runAmazonCallback(request, reply, id => { tenantIdForFailure = id; });
+  } catch (error) {
+    request.log.error({ err: error, tenantId: tenantIdForFailure }, 'Amazon authorization callback failed');
+    return amazonCallbackFailure(reply, tenantIdForFailure, error);
+  }
+}
+
+async function runAmazonCallback(request, reply, rememberTenant) {
   const query = AmazonCallbackSchema.parse({ ...(request.body && typeof request.body === 'object' ? request.body : {}), ...request.query });
   let state;
   try { state = verifyAmazonState(query.state ?? query.amazon_state); }
   catch (error) {
     return reply.redirect(`${secrets.frontendOrigin}/login?amazon=error&message=${encodeURIComponent(error instanceof Error ? error.message : 'Invalid Amazon authorization state')}`);
   }
-  if (query.error) return reply.redirect(`${secrets.frontendOrigin}/seller?tenantId=${state.tenantId}&amazon=error&message=${encodeURIComponent(query.error_description ?? query.error)}`);
+  rememberTenant(state.tenantId);
+  if (query.error) return reply.redirect(sellerLanding(state.tenantId, { amazon: 'error', message: query.error_description ?? query.error }));
   const code = query.spapi_oauth_code ?? query.code;
-  if (!code) return reply.redirect(`${secrets.frontendOrigin}/seller?tenantId=${state.tenantId}&amazon=error&message=${encodeURIComponent('Missing authorization code from Amazon')}`);
+  if (!code) return reply.redirect(sellerLanding(state.tenantId, { amazon: 'error', message: 'Missing authorization code from Amazon' }));
   const tenant = (await pool.query('select id, company_name, default_marketplace_id from tenants where id=$1', [state.tenantId])).rows[0];
   if (!tenant) throw Object.assign(new Error('Tenant not found'), { statusCode: 404 });
-  let body;
-  try { body = await exchangeAmazonCode(code, validateAmazonRedirectUrl(query.redirect_uri ?? amazonCallbackUrl(request))); }
-  catch (error) {
-    const message = error instanceof Error ? error.message : 'Amazon token exchange failed';
-    return reply.redirect(`${secrets.frontendOrigin}/seller?tenantId=${state.tenantId}&amazon=error&message=${encodeURIComponent(message)}`);
-  }
+  const body = await exchangeAmazonCode(code, validateAmazonRedirectUrl(query.redirect_uri ?? amazonCallbackUrl(request)));
 
   const marketplace = tenant.default_marketplace_id ?? 'A21TJRUUN4KGV';
   const sellerId = query.selling_partner_id ?? `SELLER-${state.tenantId}`;
@@ -652,14 +678,19 @@ async function handleAmazonCallback(request, reply) {
     client.release();
   }
   queueInitialSellerSync(state.tenantId);
-  return reply.redirect(`${secrets.frontendOrigin}/seller?tenantId=${state.tenantId}&connected=1&auth=complete`);
+  return reply.redirect(sellerLanding(state.tenantId, { connected: '1', auth: 'complete' }));
 }
 
-app.route({
-  method: 'POST',
-  url: '/oauth/callback',
-  handler: handleAmazonCallback
-});
+// Amazon sends the seller back with a GET. That used to be served only by
+// falling through to the not-found handler further down this file - it worked,
+// but the single most important request in the product depended on a 404 path,
+// and any future change to that handler would have silently broken sign-up.
+// Both methods and both URLs are registered explicitly instead. The not-found
+// fallback stays as a safety net for a redirect URI registered with a
+// different path shape.
+for (const url of ['/oauth/callback', '/api/auth/amazon/callback']) {
+  app.route({ method: ['GET', 'POST'], url, handler: handleAmazonCallback });
+}
 
 
 app.get('/api/tenants/:tenantId/amazon/access-token', async request => {
@@ -1398,5 +1429,8 @@ if (!databaseUrlConfigured) {
     .catch(error => app.log.warn({ err: normalizeDatabaseError(error) }, 'Admin seed skipped; run migrations before first login'));
 }
 
-startScheduler();
-await app.listen({ port: 4000, host: '0.0.0.0' });
+const scheduler = startScheduler();
+// PORT is what every hosting platform hands a process; 4000 stays the default
+// so `npm run dev` and the web app's VITE_API_URL are unchanged.
+await app.listen({ port: Number(process.env.PORT ?? 4000), host: '0.0.0.0' });
+export { app, scheduler };

@@ -27,9 +27,35 @@ const { Pool } = pg;
 // same way as one with nothing set, instead of failing deep inside the driver.
 const databaseUrl = configuredDatabaseUrl();
 export const databaseUrlConfigured = Boolean(databaseUrl);
+
+// node-postgres waits FOREVER for a free connection by default: pool.connect()
+// returns a promise that simply never settles once all `max` clients are
+// checked out. A request that hits that never sends a response and never logs
+// an error - the browser tab just spins. That is not hypothetical here: the
+// Amazon OAuth callback checks out a client to store the refresh token at the
+// same moment the newly authorized seller's first background sync is running,
+// so the one request a seller cannot afford to lose is the one most likely to
+// queue. A bounded wait turns an invisible hang into an error we can redirect
+// on and a message we can show.
+const positiveEnvInt = (name, fallback) => {
+  const parsed = Number.parseInt(process.env[name] ?? '', 10);
+  return Number.isInteger(parsed) && parsed > 0 ? parsed : fallback;
+};
+export const poolSettings = {
+  max: positiveEnvInt('DATABASE_POOL_MAX', 10),
+  idleTimeoutMillis: positiveEnvInt('DATABASE_POOL_IDLE_TIMEOUT_MS', 30_000),
+  connectionTimeoutMillis: positiveEnvInt('DATABASE_POOL_CONNECTION_TIMEOUT_MS', 15_000)
+};
 export const pool = new Pool({
   connectionString: databaseUrlConfigured ? databaseUrl : undefined,
-  ssl: databaseUrlConfigured ? { rejectUnauthorized: false } : false
+  ssl: databaseUrlConfigured ? { rejectUnauthorized: false } : false,
+  ...poolSettings
+});
+// An idle client that dies (a dropped tunnel, a database restart) emits 'error'
+// on the pool. Without a listener that is an unhandled 'error' event, which
+// takes the whole API process down.
+pool.on('error', error => {
+  console.error('[db] idle client error:', error?.message ?? error);
 });
 
 /**

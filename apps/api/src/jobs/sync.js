@@ -957,8 +957,11 @@ async function syncActiveTenants(reportType) {
   )));
 }
 
+// Returns the scheduled task so a caller can stop it. Without that handle the
+// cron timer keeps the event loop alive forever, which is right for a server
+// and wrong for anything that boots the server and then wants to finish.
 export function startScheduler() {
-  cron.schedule('0 2 * * *', () => {
+  return cron.schedule('0 2 * * *', () => {
     Promise.all(NIGHTLY_REPORTS.map(reportType => syncActiveTenants(reportType)))
       .catch(error => console.error('Nightly sync scheduler run failed:', error instanceof Error ? error.message : error));
   });
