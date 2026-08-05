@@ -44,6 +44,7 @@ function codeClass(code) { return `code-${CODE_COLOR_KEY[code] ?? code.toLowerCa
 
 const NAV_ITEMS = [
   { view: 'dashboard', label: 'Dashboard', icon: '▦' },
+  { view: 'accountActivity', label: 'Account Activity', icon: '≣' },
   { view: 'orderPayments', label: 'Order Payments', icon: '₹' },
   { view: 'sales', label: 'Sales Analytics', icon: '↗' },
   { view: 'businessPerformance', label: 'Business Performance', icon: '▤' },
@@ -55,8 +56,7 @@ const NAV_ITEMS = [
   { view: 'returns', label: 'Returns', icon: '↩' },
   { view: 'reimbursements', label: 'Reimbursements', icon: '+' },
   { view: 'tax', label: 'GST & Tax', icon: '%' },
-  { view: 'reports', label: 'Reports', icon: '◎' },
-  { view: 'rawData', label: 'Raw API Data', icon: '{}' }
+  { view: 'reports', label: 'Reports', icon: '◎' }
 ];
 
 const VIEW_REPORT_TYPES = {
@@ -72,7 +72,7 @@ const VIEW_REPORT_TYPES = {
   reports: REPORTS.map(r => r.type),
   businessPerformance: ['GET_SALES_AND_TRAFFIC_REPORT', 'DIRECT_SP_API_SYNC', 'GET_FBA_FULFILLMENT_CUSTOMER_RETURNS_DATA'],
   productPerformance: ['GET_SALES_AND_TRAFFIC_REPORT'],
-  rawData: REPORTS.map(r => r.type)
+  accountActivity: ['DIRECT_SP_API_SYNC', 'GET_V2_SETTLEMENT_REPORT_DATA_FLAT_FILE_V2']
 };
 const VIEW_LEDGER_COPY = {
   orderPayments: { title: 'Real payment data sync', subtitle: 'Orders API + Finances API + final settlement report' },
@@ -87,7 +87,7 @@ const VIEW_LEDGER_COPY = {
   reports: { title: 'Sync ledger', subtitle: 'Pull one report at a time' },
   businessPerformance: { title: 'Business performance sync', subtitle: 'Sales, traffic and refunds' },
   productPerformance: { title: 'Product performance sync', subtitle: 'ASIN-level sales and traffic' },
-  rawData: { title: 'Raw API sync', subtitle: 'Pull one source at a time to respect limits' }
+  accountActivity: { title: 'Account activity sync', subtitle: 'Orders, finance and settlement data behind this statement' }
 };
 
 function authHeaders() { const token = localStorage.getItem('token'); return token ? { authorization: `Bearer ${token}` } : {}; }
@@ -528,6 +528,7 @@ function SellerDashboard() {
 
     {view === 'orderPayments' && <OrderReconciliation tenantId={tenantId} />}
     {view === 'dashboard' && <DashboardOverview data={data} channelData={channelData} tenantId={tenantId} />}
+    {view === 'accountActivity' && <AccountActivity data={data} tenantId={tenantId} />}
     {view === 'sales' && <SalesAnalytics data={data} channelData={channelData} />}
     {view === 'businessPerformance' && <BusinessPerformanceReport data={data} />}
     {view === 'productPerformance' && <ProductPerformanceReport data={data} />}
@@ -554,14 +555,13 @@ function SellerDashboard() {
           statement from - so when a section disagrees, this is what says why. */}
       <TableCard title="Finance API Lines (itemized)" rows={data?.financeLines ?? []} columns={['posted_date', 'maturity_dates', 'transaction_status', 'transaction_type', 'transaction_id', 'order_id', 'sku', 'fulfillment_networks', 'category', 'amount_description', 'amount', 'deferral_reasons', 'context_types']} pageSize={10} downloadFilename="finance-lines.csv" />
     </>}
-    {view === 'rawData' && <RawApiDataExplorer data={data} />}
     {view === 'report-detail' && <ReportDetail data={data} reportType={params.get('reportType')} />}
     {view === 'metric-detail' && <MetricDetail metric={params.get('metric')} tenantId={tenantId} />}
   </div>;
 }
 
-function viewTitle(view) { return ({ orderPayments: 'Order Payment Reconciliation', dashboard: 'Dashboard', sales: 'Sales Analytics', businessPerformance: 'Business Performance', productPerformance: 'Product Performance', inventory: 'Inventory', payouts: 'Payout Reconciliation', brand: 'Brand Analytics', feeAudit: 'Fee Leak Audit', returns: 'Returns', reimbursements: 'Reimbursements', tax: 'GST & Tax', reports: 'Reports', rawData: 'Raw API Data', 'report-detail': 'Report Detail', 'metric-detail': 'Calculation Detail' })[view] ?? 'Dashboard'; }
-function viewDescription(view) { return ({ orderPayments: 'See every rupee from customer order value, through Amazon deductions, to the final FBA or FBM seller receivable.', dashboard: 'Amazon-only reconciliation KPIs with explainable drill-downs.', sales: 'Revenue, order value, units and product sales trends from Amazon reports.', businessPerformance: 'Excel-style quarterly business performance report with analysed KPIs and matching graphs.', productPerformance: 'Excel-style product performance analysis with top products and written insights.', inventory: 'FBA inventory snapshots imported from SP-API inventory reports.', payouts: 'Settlement rows and payout reconciliation from Amazon settlement reports.', brand: 'ASIN-level product performance from synced Amazon order items, with Sales & Traffic metrics when available.', returns: 'Customer return reasons, status and disposition.', reimbursements: 'Amazon reimbursement credits for lost, damaged or adjusted inventory.', tax: 'GST B2B and B2C invoice rows in readable form.', reports: 'Open each fetched report and view human-readable data.', rawData: 'Inspect raw fields returned from each imported API/report source before finalizing calculations.', 'report-detail': 'Human-readable rows from the selected SP-API report.' })[view] ?? 'Live seller KPIs populated from synced SP-API orders and reports.'; }
+function viewTitle(view) { return ({ orderPayments: 'Order Payment Reconciliation', dashboard: 'Dashboard', accountActivity: 'Account Activity', sales: 'Sales Analytics', businessPerformance: 'Business Performance', productPerformance: 'Product Performance', inventory: 'Inventory', payouts: 'Payout Reconciliation', brand: 'Brand Analytics', feeAudit: 'Fee Leak Audit', returns: 'Returns', reimbursements: 'Reimbursements', tax: 'GST & Tax', reports: 'Reports', 'report-detail': 'Report Detail', 'metric-detail': 'Calculation Detail' })[view] ?? 'Dashboard'; }
+function viewDescription(view) { return ({ orderPayments: 'See every rupee from customer order value, through Amazon deductions, to the final FBA or FBM seller receivable.', dashboard: 'Amazon-only reconciliation KPIs with explainable drill-downs.', accountActivity: 'Income, Expenses, GST, Tax and Transfers — matched line-for-line to your Amazon statement.', sales: 'Revenue, order value, units and product sales trends from Amazon reports.', businessPerformance: 'Excel-style quarterly business performance report with analysed KPIs and matching graphs.', productPerformance: 'Excel-style product performance analysis with top products and written insights.', inventory: 'FBA inventory snapshots imported from SP-API inventory reports.', payouts: 'Settlement rows and payout reconciliation from Amazon settlement reports.', brand: 'ASIN-level product performance from synced Amazon order items, with Sales & Traffic metrics when available.', returns: 'Customer return reasons, status and disposition.', reimbursements: 'Amazon reimbursement credits for lost, damaged or adjusted inventory.', tax: 'GST B2B and B2C invoice rows in readable form.', reports: 'Open each fetched report and view human-readable data.', 'report-detail': 'Human-readable rows from the selected SP-API report.' })[view] ?? 'Live seller KPIs populated from synced SP-API orders and reports.'; }
 
 function OrderPayments({ data }) {
   const rows = data?.orderPayments ?? [];
@@ -675,8 +675,6 @@ function DashboardOverview({ data, channelData, tenantId }) {
 
     <ExplanationGrid summary={summary} tenantId={tenantId} />
 
-    <AccountActivity data={data} tenantId={tenantId} />
-
     <SalesAnalytics data={data} channelData={channelData} />
 
     <div className="dashboard-grid two">
@@ -698,15 +696,9 @@ function AccountActivity({ data, tenantId }) {
   const completeness = data?.dashboardCalculations?.diagnostics?.completeness;
   const provisional = completeness?.provisional ?? true;
   const reasons = completeness?.reasons ?? ['Waiting for the dashboard calculation to report what it is based on.'];
-  // Which build produced these figures. Node does not hot-reload, so an API
-  // left running after a pull reports stale numbers with complete confidence -
-  // that cost a full debugging round trip once. Showing it means the running
-  // build can be read rather than inferred from the numbers themselves.
-  const revision = data?.dashboardCalculations?.diagnostics?.calculationRevision;
   return (
     <Card className="profit-control-card">
       <PanelHeader title="Amazon Account Activity" subtitle={provisional ? 'Provisional — not yet reconciled to Amazon' : 'Matches Amazon statement sections'} />
-      {revision && <div className="activity-revision">calculation build: {revision}</div>}
       {provisional && (
         <div className="activity-provisional">
           <b>These sections are not yet a match for your Amazon statement.</b>
@@ -746,32 +738,6 @@ function ReportsExplorer({ tenantId, data }) {
       <span className={`ledger-code ${codeClass(report.code)}`}>{report.code}</span><div><b>{report.label}</b><p>{detail.explanation}</p></div><small>{job?.completed_at ? `Last synced ${timeAgo(job.completed_at)}` : report.hint}</small>
     </NavLink>;
   })}</div>;
-}
-function reportFieldCount(rows) { return Array.from(new Set(rows.flatMap(row => Object.keys(row ?? {})))).length; }
-function RawApiDataExplorer({ data }) {
-  const [activeType, setActiveType] = useState(REPORTS[0].type);
-  const [page, setPage] = useState(0);
-  const activeReport = REPORTS.find(report => report.type === activeType) ?? REPORTS[0];
-  const rows = getReportRows(data, activeReport.type);
-  const fields = Array.from(new Set(rows.flatMap(row => Object.keys(row ?? {}))));
-  const pageSize = 6;
-  const totalPages = Math.max(1, Math.ceil(rows.length / pageSize));
-  const safePage = Math.min(page, totalPages - 1);
-  const previewRows = rows.slice(safePage * pageSize, safePage * pageSize + pageSize);
-  useEffect(() => { setPage(0); }, [activeType]);
-  return <Card className="raw-data-card">
-    <PanelHeader title="Raw API data explorer" subtitle="rate-limited source review" />
-    <p className="muted">Select one API/report source at a time. The sync ledger above keeps pulls source-by-source instead of fanning out all APIs together, which helps avoid rate-limit pressure.</p>
-    <div className="raw-source-tabs">{REPORTS.map(report => {
-      const reportRows = getReportRows(data, report.type);
-      return <button type="button" key={report.type} className={report.type === activeType ? 'active' : ''} onClick={() => setActiveType(report.type)}><span className={`ledger-code ${codeClass(report.code)}`}>{report.code}</span><b>{report.label}</b><small>{formatNumber(reportRows.length)} rows · {formatNumber(reportFieldCount(reportRows))} fields</small></button>;
-    })}</div>
-    {rows.length ? <>
-      <div className="raw-data-toolbar"><b>{activeReport.label}</b><span>{formatNumber(rows.length)} rows · {formatNumber(fields.length)} fields · showing {formatNumber(previewRows.length)} at a time</span></div>
-      <pre className="raw-json-preview">{JSON.stringify(previewRows, null, 2)}</pre>
-      {rows.length > pageSize && <div className="pager"><Button variant="ghost" disabled={safePage === 0} onClick={() => setPage(p => Math.max(0, p - 1))}>← Previous 6</Button><span>Page {safePage + 1} of {totalPages} · {formatNumber(rows.length)} rows</span><Button variant="ghost" disabled={safePage >= totalPages - 1} onClick={() => setPage(p => Math.min(totalPages - 1, p + 1))}>Next 6 →</Button></div>}
-    </> : <Empty text="No raw rows available for this source yet. Use the source-specific Sync button above first." />}
-  </Card>;
 }
 function ReportDetail({ data, reportType }) {
   const report = REPORTS.find(r => r.type === reportType) ?? REPORTS[0];
@@ -1093,6 +1059,7 @@ function SidebarLink({ to, icon, children, onClick }) {
 
 const SEARCH_KEYWORDS = {
   dashboard: 'overview summary kpi profit',
+  accountActivity: 'statement income expenses tax transfers gst reconciled',
   orderPayments: 'orders transactions money reconciliation customer payments fees',
   sales: 'revenue trend traffic',
   businessPerformance: 'quarterly report metrics',
@@ -1104,8 +1071,7 @@ const SEARCH_KEYWORDS = {
   returns: 'refund customer disposition',
   reimbursements: 'credits lost damaged inventory',
   tax: 'gst b2b b2c invoices cgst sgst igst',
-  reports: 'amazon sync source data',
-  rawData: 'api json technical fields'
+  reports: 'amazon sync source data'
 };
 
 function GlobalSearch({ tenantId }) {
