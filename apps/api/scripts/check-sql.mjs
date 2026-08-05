@@ -5,6 +5,9 @@
 // parameter $4" (a parameter used but never passed) before a user does.
 import fs from 'node:fs';
 import pg from 'pg';
+// Loads the repo's .env wherever this is run from, so the throwaway database
+// can be configured in one place instead of pasted into the file.
+import { envFileLoadedFrom } from '@recon/db/env.js';
 
 const source = fs.readFileSync(new URL('../src/server.js', import.meta.url), 'utf8');
 const calls = [];
@@ -58,7 +61,12 @@ function suppliedCount(tail) {
 // throwaway database carrying packages/db/migrations - never at real data.
 const connectionString = process.env.SQLCHECK_DATABASE_URL;
 if (!connectionString) {
+  // Deliberately NOT falling back to DATABASE_URL: every statement below is
+  // executed, so silently pointing this at the real database would run them
+  // against live seller data.
   console.error('Set SQLCHECK_DATABASE_URL to a throwaway Postgres carrying packages/db/migrations.');
+  console.error(`  Read env from: ${envFileLoadedFrom() ?? 'no .env found'}`);
+  console.error('  It must NOT be your real database - every statement here is executed.');
   process.exit(2);
 }
 const pool = new pg.Pool({ connectionString });

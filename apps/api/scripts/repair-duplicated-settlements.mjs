@@ -30,14 +30,20 @@
 //                                locally, so the next sync re-imports them
 // Without --apply it only reports.
 import pg from 'pg';
+// Loads the repo's .env wherever this is run from. Without it the script saw
+// nothing and the only way to run it was to paste a live credential into a
+// committed file.
+import { requireDatabaseUrl } from '@recon/db/env.js';
 
 const apply = process.argv.includes('--apply');
 const refetchRest = process.argv.includes('--refetch-rest');
 const tenantArg = process.argv.indexOf('--tenant');
 const onlyTenant = tenantArg > -1 ? process.argv[tenantArg + 1] : null;
-const connectionString = process.env.DATABASE_URL;
-if (!connectionString) {
-  console.error('Set DATABASE_URL to the database holding settlement_rows.');
+let connectionString;
+try {
+  connectionString = requireDatabaseUrl('the settlement repair');
+} catch (error) {
+  console.error(error instanceof Error ? error.message : error);
   process.exit(2);
 }
 

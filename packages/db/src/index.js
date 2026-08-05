@@ -1,3 +1,8 @@
+// Must come first: index.js reads process.env.DATABASE_URL at module load, so
+// the .env has to be in place before that line runs. Importing this here means
+// every consumer - the API, migrate.js, and any standalone script - gets the
+// same configuration without having to remember to load it.
+import { databaseUrl as configuredDatabaseUrl } from './env.js';
 import pg from 'pg';
 
 // node-postgres's default DATE (OID 1082) parser builds a JS Date using the
@@ -17,8 +22,11 @@ import pg from 'pg';
 pg.types.setTypeParser(1082, value => value);
 
 const { Pool } = pg;
-const databaseUrl = process.env.DATABASE_URL;
-export const databaseUrlConfigured = Boolean(databaseUrl && databaseUrl !== 'HEHE');
+// configuredDatabaseUrl() returns null for a placeholder as well as for a
+// missing value, so a checkout that still carries the sample value fails the
+// same way as one with nothing set, instead of failing deep inside the driver.
+const databaseUrl = configuredDatabaseUrl();
+export const databaseUrlConfigured = Boolean(databaseUrl);
 export const pool = new Pool({
   connectionString: databaseUrlConfigured ? databaseUrl : undefined,
   ssl: databaseUrlConfigured ? { rejectUnauthorized: false } : false
