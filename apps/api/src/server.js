@@ -1425,7 +1425,16 @@ if (!databaseUrlConfigured) {
     .catch(error => app.log.warn({ err: normalizeDatabaseError(error) }, 'Seller auth schema self-check skipped; run migrations before Amazon authorization'));
   await ensureTenantDataIsolationSchema()
     .catch(error => app.log.warn({ err: normalizeDatabaseError(error) }, 'Tenant data isolation self-check skipped; run migrations before serving tenant dashboards'));
-  await pool.query("insert into users(id,email,password_hash,role,status) values($1,$2,$3,'admin','active') on conflict(email) do nothing", [adminId, defaultAdminEmail, hashPassword(defaultAdminPassword)])
+  // Conflict target is the bootstrap admin's fixed id, not its email. The two
+  // are different unique constraints: once this row exists, any later boot
+  // whose ADMIN_EMAIL differs from what was seeded the first time collides on
+  // the id primary key, which "on conflict(email)" does not arbitrate - so
+  // Postgres raised a real 23505 on users_pkey every restart, misreported by
+  // normalizeDatabaseError as "An account with this email already exists"
+  // (harmless - startup still completed - but confusing, and it meant this
+  // check silently never ran again after the first successful boot). Keying
+  // on id makes "does the seed admin already exist" ask the right question.
+  await pool.query("insert into users(id,email,password_hash,role,status) values($1,$2,$3,'admin','active') on conflict(id) do nothing", [adminId, defaultAdminEmail, hashPassword(defaultAdminPassword)])
     .catch(error => app.log.warn({ err: normalizeDatabaseError(error) }, 'Admin seed skipped; run migrations before first login'));
 }
 
