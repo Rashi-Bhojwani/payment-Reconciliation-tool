@@ -1,6 +1,6 @@
 import React, { createContext, useContext, useEffect, useMemo, useRef, useState } from 'react';
 import { createRoot } from 'react-dom/client';
-import { BrowserRouter, Navigate, NavLink, Route, Routes, useLocation, useNavigate, useSearchParams } from 'react-router-dom';
+import { BrowserRouter, Link, Navigate, Route, Routes, useLocation, useNavigate, useSearchParams } from 'react-router-dom';
 import { Bar, BarChart, CartesianGrid, Cell, Line, LineChart, Pie, PieChart, ResponsiveContainer, Tooltip, XAxis, YAxis } from 'recharts';
 import './style.css';
 
@@ -58,6 +58,10 @@ const NAV_ITEMS = [
   { view: 'reports', label: 'Reports', icon: '◎' },
   { view: 'rawData', label: 'Raw API Data', icon: '{}' }
 ];
+// Settings is deliberately not in NAV_ITEMS (and so not in the sidebar list
+// or GlobalSearch's results, which both iterate NAV_ITEMS) - it's reached
+// from the account menu in the topbar, same as most SaaS dashboards, not
+// from the primary section list.
 
 const VIEW_REPORT_TYPES = {
   orderPayments: ['DIRECT_SP_API_SYNC', 'GET_V2_SETTLEMENT_REPORT_DATA_FLAT_FILE_V2'],
@@ -443,7 +447,7 @@ function AmazonConnectionPanel({ tenantId, seller, onChange, setError }) {
   );
 }
 
-function SellerDashboard() {
+function SellerDashboard({ onDataChange, session, setSession, theme, setTheme }) {
   const [params] = useSearchParams();
   const tenantId = params.get('tenantId') ?? '';
   const view = params.get('view') ?? 'orderPayments';
@@ -471,6 +475,7 @@ function SellerDashboard() {
       const dashboard = await api(`/api/tenants/${tenantId}/dashboard?${rangeQuery(targetRange)}`);
       if (requestId !== rangeSyncRef.current.requestId) return;
       setData(dashboard);
+      onDataChange?.(dashboard);
       const rangeKey = `${targetRange.start}|${targetRange.end}`;
       if (autoPollRef.current.key !== rangeKey) autoPollRef.current = { key: rangeKey, attempts: 0 };
       // The fetch is done, so the fetch spinner stops here - always. It used to
@@ -524,7 +529,7 @@ function SellerDashboard() {
     {amazonError && <p className="alert warning">Amazon connection issue: {amazonError}</p>}
     {error && <p className="alert warning">{error}</p>}
     {(view === 'dashboard' || view === 'orderPayments') && !connected && data && <p className="alert warning">Connect your Amazon account to start pulling real payment data — nothing syncs until then.</p>}
-    {view !== 'dashboard' && !detailView && <SyncLedger tenantId={tenantId} jobs={data?.jobs ?? []} onSynced={load} reportTypes={reportTypes} title={ledgerCopy?.title} subtitle={ledgerCopy?.subtitle} disabled={!connected} />}
+    {view !== 'dashboard' && view !== 'settings' && !detailView && <SyncLedger tenantId={tenantId} jobs={data?.jobs ?? []} onSynced={load} reportTypes={reportTypes} title={ledgerCopy?.title} subtitle={ledgerCopy?.subtitle} disabled={!connected} />}
 
     {view === 'orderPayments' && <OrderReconciliation tenantId={tenantId} />}
     {view === 'dashboard' && <DashboardOverview data={data} channelData={channelData} tenantId={tenantId} />}
@@ -557,11 +562,12 @@ function SellerDashboard() {
     {view === 'rawData' && <RawApiDataExplorer data={data} />}
     {view === 'report-detail' && <ReportDetail data={data} reportType={params.get('reportType')} />}
     {view === 'metric-detail' && <MetricDetail metric={params.get('metric')} tenantId={tenantId} />}
+    {view === 'settings' && <SettingsPage session={session} setSession={setSession} tenantId={tenantId} seller={data?.seller} onChange={load} theme={theme} setTheme={setTheme} />}
   </div>;
 }
 
-function viewTitle(view) { return ({ orderPayments: 'Order Payment Reconciliation', dashboard: 'Dashboard', sales: 'Sales Analytics', businessPerformance: 'Business Performance', productPerformance: 'Product Performance', inventory: 'Inventory', payouts: 'Payout Reconciliation', brand: 'Brand Analytics', feeAudit: 'Fee Leak Audit', returns: 'Returns', reimbursements: 'Reimbursements', tax: 'GST & Tax', reports: 'Reports', rawData: 'Raw API Data', 'report-detail': 'Report Detail', 'metric-detail': 'Calculation Detail' })[view] ?? 'Dashboard'; }
-function viewDescription(view) { return ({ orderPayments: 'See every rupee from customer order value, through Amazon deductions, to the final FBA or FBM seller receivable.', dashboard: 'Amazon-only reconciliation KPIs with explainable drill-downs.', sales: 'Revenue, order value, units and product sales trends from Amazon reports.', businessPerformance: 'Excel-style quarterly business performance report with analysed KPIs and matching graphs.', productPerformance: 'Excel-style product performance analysis with top products and written insights.', inventory: 'FBA inventory snapshots imported from SP-API inventory reports.', payouts: 'Settlement rows and payout reconciliation from Amazon settlement reports.', brand: 'ASIN-level product performance from synced Amazon order items, with Sales & Traffic metrics when available.', returns: 'Customer return reasons, status and disposition.', reimbursements: 'Amazon reimbursement credits for lost, damaged or adjusted inventory.', tax: 'GST B2B and B2C invoice rows in readable form.', reports: 'Open each fetched report and view human-readable data.', rawData: 'Inspect raw fields returned from each imported API/report source before finalizing calculations.', 'report-detail': 'Human-readable rows from the selected SP-API report.' })[view] ?? 'Live seller KPIs populated from synced SP-API orders and reports.'; }
+function viewTitle(view) { return ({ orderPayments: 'Order Payment Reconciliation', dashboard: 'Dashboard', sales: 'Sales Analytics', businessPerformance: 'Business Performance', productPerformance: 'Product Performance', inventory: 'Inventory', payouts: 'Payout Reconciliation', brand: 'Brand Analytics', feeAudit: 'Fee Leak Audit', returns: 'Returns', reimbursements: 'Reimbursements', tax: 'GST & Tax', reports: 'Reports', rawData: 'Raw API Data', 'report-detail': 'Report Detail', 'metric-detail': 'Calculation Detail', settings: 'Settings' })[view] ?? 'Dashboard'; }
+function viewDescription(view) { return ({ orderPayments: 'See every rupee from customer order value, through Amazon deductions, to the final FBA or FBM seller receivable.', dashboard: 'Amazon-only reconciliation KPIs with explainable drill-downs.', sales: 'Revenue, order value, units and product sales trends from Amazon reports.', businessPerformance: 'Excel-style quarterly business performance report with analysed KPIs and matching graphs.', productPerformance: 'Excel-style product performance analysis with top products and written insights.', inventory: 'FBA inventory snapshots imported from SP-API inventory reports.', payouts: 'Settlement rows and payout reconciliation from Amazon settlement reports.', brand: 'ASIN-level product performance from synced Amazon order items, with Sales & Traffic metrics when available.', returns: 'Customer return reasons, status and disposition.', reimbursements: 'Amazon reimbursement credits for lost, damaged or adjusted inventory.', tax: 'GST B2B and B2C invoice rows in readable form.', reports: 'Open each fetched report and view human-readable data.', rawData: 'Inspect raw fields returned from each imported API/report source before finalizing calculations.', 'report-detail': 'Human-readable rows from the selected SP-API report.', settings: 'Appearance, account and Amazon connection settings.' })[view] ?? 'Live seller KPIs populated from synced SP-API orders and reports.'; }
 
 function OrderPayments({ data }) {
   const rows = data?.orderPayments ?? [];
@@ -652,42 +658,228 @@ function FeeLeakAudit({tenantId}) {
   async function audit(){setBusy(true);setError('');try{await api(`/api/tenants/${tenantId}/fee-audit`,{method:'POST',body:JSON.stringify({range:{start:formatDateParam(range.start),end:endOfRangeParam(range.end)},varianceThreshold:5})});await load();}catch(e){setError(e.message)}finally{setBusy(false)}}
   return <><Card className="fee-audit-hero"><div><span className="live-source">AMAZON FEES ESTIMATE API</span><h2>{formatCurrency(result.totalOvercharged)} potential overcharge</h2><p>Expected Amazon fees compared with itemized fees actually deducted. Slab fallback is clearly identified when used.</p></div><Button onClick={audit} disabled={busy}>{busy?'Auditing…':'Run fee audit'}</Button></Card>{error&&<p className="alert error">{error}</p>}<TableCard title="Flagged fee discrepancies" rows={result.flags} columns={['order_id','sku','source','expected_fee','actual_fee','variance','flagged_at','resolved']} pageSize={15}/></>;
 }
+
+// Every settlement document already in the ledger, most recent first. There
+// is no real "processing" state to show here - a row only exists in
+// data.payments because Amazon already settled it, so "Settled" is what
+// every row honestly is. Nothing here is inferred.
+function SettlementTimeline({ payments, tenantId }) {
+  const rows = [...(payments ?? [])].sort((a, b) => new Date(b.posted_date) - new Date(a.posted_date)).slice(0, 6);
+  return <Card className="panel">
+    <PanelHeader title="Settlement Timeline" subtitle="Most recent first" />
+    {rows.length ? <>
+      <div className="settlement-timeline">{rows.map((row, i) => <div className="timeline-row" key={row.settlement_id ?? i}>
+        <span className="timeline-dot" />
+        <div><b>{row.settlement_id ?? 'Settlement'}</b><small>{String(row.posted_date ?? '').slice(0, 10)} · {formatNumber(row.lines ?? 0)} lines</small></div>
+        <span className="timeline-amount">{formatCurrency(row.net_amount)}</span>
+        <span className="pill status-completed">Settled</span>
+      </div>)}</div>
+      <div className="timeline-footer"><Link className="panel-link" to={`/seller?tenantId=${tenantId}&view=payouts`}>View all settlements →</Link></div>
+    </> : <Empty text="No settlements imported for this period yet." />}
+  </Card>;
+}
+
+// Expense Breakdown, straight from the same expense-line groups the Expenses
+// statement section is built from (dashboard-calculations.js's group() over
+// expenseRows) - Amazon's own fee labels, not invented category names. Top 5
+// by size, the rest folded into one honest "Other fees" slice.
+const EXPENSE_SLICE_COLORS = ['#7c3aed', '#1668e8', '#22a65a', '#ea7b24', '#d94380', '#94a3b8'];
+function ExpenseBreakdown({ components, tenantId }) {
+  const ranked = [...(components ?? [])].map(c => ({ ...c, amount: Math.abs(Number(c.amount ?? 0)) })).filter(c => c.amount > 0).sort((a, b) => b.amount - a.amount);
+  const top = ranked.slice(0, 5);
+  const otherTotal = ranked.slice(5).reduce((sum, c) => sum + c.amount, 0);
+  const slices = otherTotal > 0 ? [...top, { label: 'Other fees', amount: otherTotal }] : top;
+  const total = slices.reduce((sum, s) => sum + s.amount, 0);
+  const chartData = slices.map(s => ({ name: s.label, value: s.amount }));
+  return <Card className="panel">
+    <PanelHeader title="Expense Breakdown" subtitle="By Amazon fee label" />
+    {slices.length ? <div className="expense-breakdown">
+      <ResponsiveContainer width="100%" height={190}>
+        <PieChart><Pie data={chartData} innerRadius={56} outerRadius={80} dataKey="value" paddingAngle={2}>{chartData.map((_, i) => <Cell key={i} fill={EXPENSE_SLICE_COLORS[i % EXPENSE_SLICE_COLORS.length]} />)}</Pie><Tooltip formatter={value => formatCurrency(value)} /></PieChart>
+      </ResponsiveContainer>
+      <div className="expense-breakdown-total"><span>Total</span><strong>{formatCurrency(total)}</strong></div>
+      <div className="expense-legend">{slices.map((s, i) => <div className="expense-legend-row" key={s.label}><span className="dot" style={{ background: EXPENSE_SLICE_COLORS[i % EXPENSE_SLICE_COLORS.length] }} /><b>{s.label}</b><span>{formatCurrency(s.amount)} ({total ? Math.round(s.amount / total * 100) : 0}%)</span></div>)}</div>
+      <div className="timeline-footer"><Link className="panel-link" to={`/seller?tenantId=${tenantId}&view=metric-detail&metric=deductions`}>Open full calculation →</Link></div>
+    </div> : <Empty text="No classified expense lines for this period yet." />}
+  </Card>;
+}
+
+// Built from the same sync_jobs history the Sync Ledger uses on every other
+// page - one row per report type, its most recent run. Real timestamps, real
+// statuses, nothing synthesized.
+function RecentActivity({ jobs }) {
+  const rows = [...(jobs ?? [])]
+    .filter(job => job.completed_at || job.started_at)
+    .sort((a, b) => new Date(b.completed_at ?? b.started_at) - new Date(a.completed_at ?? a.started_at))
+    .slice(0, 6);
+  const report = type => REPORTS.find(r => r.type === type);
+  const iconFor = status => status === 'completed' ? { icon: '✓', tone: 'emerald' } : status === 'failed' ? { icon: '✕', tone: 'danger' } : { icon: '⟳', tone: 'marigold' };
+  return <Card className="panel">
+    <PanelHeader title="Recent Activity" subtitle="Sync history" />
+    {rows.length ? <div className="activity-feed">{rows.map((job, i) => {
+      const { icon, tone } = iconFor(job.status);
+      const label = report(job.report_type)?.label ?? job.report_type;
+      return <div className="activity-row" key={i}>
+        <span className={`activity-icon tone-${tone}`} aria-hidden="true">{icon}</span>
+        <div><b>{label} {job.status === 'completed' ? 'imported' : job.status === 'failed' ? 'sync failed' : 'syncing'}</b><small>{job.error_message ?? label}</small></div>
+        <span className="activity-row-right">{timeAgo(job.completed_at ?? job.started_at)}</span>
+      </div>;
+    })}</div> : <Empty text="No syncs recorded yet." />}
+  </Card>;
+}
+
+// Real reconciliation completeness - whether THIS tool's own data for the
+// selected range is fully synced and provably matches Amazon's ledger. This
+// is deliberately not Amazon's Seller Performance / Account Health metrics
+// (Late Shipment Rate, Order Defect Rate, Cancellation Rate) - this tool has
+// never synced that API, and showing numbers for it would mean inventing
+// them. What's shown here is real: the same completeness.provisional flag
+// and reasons the Account Activity panel is built on.
+function DataHealth({ diagnostics, jobs }) {
+  const completeness = diagnostics?.completeness;
+  const clean = completeness && !completeness.provisional;
+  const failedJobs = (jobs ?? []).filter(j => j.status === 'failed').length;
+  const included = diagnostics?.includedRows ?? 0;
+  const excluded = diagnostics?.excludedRows ?? 0;
+  const duplicates = diagnostics?.duplicateRows ?? 0;
+  return <Card className="panel">
+    <PanelHeader title="Data Health" subtitle="This range, this dataset" />
+    <div className={`data-health-status ${clean ? 'is-clean' : 'is-provisional'}`}>
+      <span className="dot" />
+      <div><strong>{clean ? 'Reconciled' : 'Provisional'}</strong><p>{clean ? 'Matches Amazon statement sections for this range.' : `${completeness?.reasons?.length ?? 0} open item(s) - see Alerts.`}</p></div>
+    </div>
+    <div className="data-health-grid">
+      <div><span>Rows used</span><strong>{formatNumber(included)}</strong></div>
+      <div><span>Rows excluded</span><strong>{formatNumber(excluded)}</strong></div>
+      <div><span>Duplicates removed</span><strong>{formatNumber(duplicates)}</strong></div>
+      <div><span>Failed syncs</span><strong>{formatNumber(failedJobs)}</strong></div>
+    </div>
+  </Card>;
+}
+
+// The single source of truth for "what needs attention" - shared by the
+// topbar notification bell and the dashboard's Alerts panel. Every entry
+// here is either one of the dashboard calculation's own stated completeness
+// reasons (dashboard-calculations.js explains, in full sentences, exactly
+// what is incomplete and why - see loadDashboardCalculations) or a sync job
+// Amazon itself reported as failed. Nothing is invented to fill space; an
+// account with clean, complete data produces an empty list.
+function buildAlerts(data) {
+  const alerts = [];
+  const completeness = data?.dashboardCalculations?.diagnostics?.completeness;
+  for (const reason of completeness?.reasons ?? []) alerts.push({ severity: 'medium', text: reason });
+  for (const job of data?.jobs ?? []) {
+    if (job.status !== 'failed') continue;
+    const label = REPORTS.find(r => r.type === job.report_type)?.label ?? job.report_type;
+    alerts.push({ severity: 'high', text: `${label} sync failed: ${job.error_message ?? 'no error detail returned'}`, at: job.completed_at ?? job.started_at });
+  }
+  return alerts;
+}
+function AlertsPanel({ alerts }) {
+  return <Card className="panel">
+    <PanelHeader title="Recent Alerts" subtitle={`${alerts.length} open`} />
+    {alerts.length ? <div className="activity-feed">{alerts.map((alert, i) => <div className={`alert-row severity-${alert.severity}`} key={i}><span className="alert-dot" /><div><p>{alert.text}</p>{alert.at && <small>{timeAgo(alert.at)}</small>}</div></div>)}</div>
+      : <Empty text="Nothing needs attention - this range is clean." />}
+  </Card>;
+}
+
+// Fetches the immediately preceding period of the same length, purely to
+// compute the "vs prior period" deltas on the KPI strip - reuses the exact
+// same /dashboard endpoint and calculation engine the main view already
+// calls, just with a shifted range, so a delta can never disagree with how
+// either figure was itself computed.
+function usePriorPeriod(tenantId, range) {
+  const [prevData, setPrevData] = useState(null);
+  useEffect(() => {
+    if (!tenantId) return;
+    let active = true;
+    const days = Math.max(1, Math.round((startOfDay(range.end) - startOfDay(range.start)) / 864e5) + 1);
+    const prevEnd = addDays(range.start, -1);
+    const prevStart = addDays(prevEnd, -(days - 1));
+    api(`/api/tenants/${tenantId}/dashboard?${rangeQuery({ start: prevStart, end: prevEnd })}`)
+      .then(d => { if (active) setPrevData(d); })
+      .catch(() => { if (active) setPrevData(null); });
+    return () => { active = false; };
+  }, [tenantId, range.start, range.end]);
+  return prevData;
+}
+
 function DashboardOverview({ data, channelData, tenantId }) {
   const { range } = useContext(DateRangeContext);
   const summary = useMemo(() => buildDashboardSummary(data, range), [data, range]);
+  const prevData = usePriorPeriod(tenantId, range);
+  const prevSummary = useMemo(() => prevData ? buildDashboardSummary(prevData) : null, [prevData]);
+  const alerts = useMemo(() => buildAlerts(data), [data]);
+  const diagnostics = data?.dashboardCalculations?.diagnostics;
   return <>
     <div className="metrics-strip">
-      <DrillMetric to={`/seller?tenantId=${tenantId}&view=metric-detail&metric=netSales`} title="Net Sales" value={formatCurrency(summary.netSales)} hint="Click to see order-value formula" />
-      <DrillMetric to={`/seller?tenantId=${tenantId}&view=metric-detail&metric=netQty`} title="Net Qty" value={summary.netQty==null?'Unavailable':formatNumber(summary.netQty)} hint="Click to see units source" />
-      <DrillMetric to={`/seller?tenantId=${tenantId}&view=metric-detail&metric=orders`} title="Orders Synced" value={formatNumber(summary.ordersCount)} hint="Distinct eligible Amazon order IDs" />
-      <DrillMetric to={`/seller?tenantId=${tenantId}&view=metric-detail&metric=returns`} title="Returns" value={formatNumber(summary.returnQty)} hint="Total returned quantity" />
+      <DrillMetric to={`/seller?tenantId=${tenantId}&view=metric-detail&metric=netSales`} title="Net Sales" value={formatCurrency(summary.netSales)} icon="₹" tone="violet" delta={prevSummary && pctDelta(summary.netSales, prevSummary.netSales)} />
+      <DrillMetric to={`/seller?tenantId=${tenantId}&view=metric-detail&metric=netQty`} title="Net Qty" value={summary.netQty==null?'Unavailable':formatNumber(summary.netQty)} icon="◧" tone="blue" delta={prevSummary && pctDelta(summary.netQty, prevSummary.netQty)} />
+      <DrillMetric to={`/seller?tenantId=${tenantId}&view=metric-detail&metric=orders`} title="Orders Synced" value={formatNumber(summary.ordersCount)} icon="⇄" tone="emerald" delta={prevSummary && pctDelta(summary.ordersCount, prevSummary.ordersCount)} />
+      <DrillMetric to={`/seller?tenantId=${tenantId}&view=metric-detail&metric=returns`} title="Returns" value={formatNumber(summary.returnQty)} icon="↩" tone="marigold" delta={prevSummary && pctDelta(summary.returnQty, prevSummary.returnQty)} />
     </div>
 
     <Card className="profit-control-card">
       <PanelHeader title="Profit Analysis" subtitle="Clean overview" />
       <div className="profit-kpi-grid">
-        <DrillMetric to={`/seller?tenantId=${tenantId}&view=metric-detail&metric=settled`} title="Settled Amount" value={formatCurrency(summary.settledAmount)} hint="From settlements / finance" />
-        <DrillMetric to={`/seller?tenantId=${tenantId}&view=metric-detail&metric=deductions`} title="Deductions" value={formatCurrency(summary.deductions)} hint="Fees, refunds, charges" />
-        <DrillMetric to={`/seller?tenantId=${tenantId}&view=metric-detail&metric=reimbursements`} title="Reimbursements" value={formatCurrency(summary.reimbursements)} hint="Credits imported" />
-        <DrillMetric to={`/seller?tenantId=${tenantId}&view=metric-detail&metric=drr`} title="DRR" value={formatCurrency(summary.drr)} hint="Daily run rate" />
+        <DrillMetric to={`/seller?tenantId=${tenantId}&view=metric-detail&metric=settled`} title="Settled Amount" value={formatCurrency(summary.settledAmount)} icon="🧾" tone="violet" hint="From settlements / finance" />
+        <DrillMetric to={`/seller?tenantId=${tenantId}&view=metric-detail&metric=deductions`} title="Deductions" value={formatCurrency(summary.deductions)} icon="✂" tone="danger" hint="Fees, refunds, charges" />
+        <DrillMetric to={`/seller?tenantId=${tenantId}&view=metric-detail&metric=reimbursements`} title="Reimbursements" value={formatCurrency(summary.reimbursements)} icon="↺" tone="emerald" hint="Credits imported" />
+        <DrillMetric to={`/seller?tenantId=${tenantId}&view=metric-detail&metric=drr`} title="DRR" value={formatCurrency(summary.drr)} icon="⏱" tone="marigold" hint="Daily run rate" />
       </div>
     </Card>
 
+    <div className="dashboard-grid three">
+      <SettlementTimeline payments={data?.payments} tenantId={tenantId} />
+      <ExpenseBreakdown components={data?.dashboardCalculations?.statement?.expenses?.components} tenantId={tenantId} />
+    </div>
+
+    {/* Amazon's own five statement sections - Income, Expenses, Tax, GST,
+        Transfers. This is the core reconciliation claim of the tool and stays
+        exactly as it was, regardless of anything else on this page. */}
+    <AccountActivity data={data} tenantId={tenantId} />
+
     <ExplanationGrid summary={summary} tenantId={tenantId} />
 
-    <AccountActivity data={data} tenantId={tenantId} />
+    <div className="dashboard-grid three">
+      <DataHealth diagnostics={diagnostics} jobs={data?.jobs} />
+      <AlertsPanel alerts={alerts} />
+      <RecentActivity jobs={data?.jobs} />
+    </div>
 
     <SalesAnalytics data={data} channelData={channelData} />
 
-    <div className="dashboard-grid two">
-      <TableCard title="Reconciliation Snapshot" rows={summary.reconcileRows} columns={['area', 'count', 'amount', 'status']} />
-      <TableCard title="Recent Sync Jobs" rows={data?.jobs ?? []} columns={['report_type', 'status', 'completed_at', 'error_message']} />
-    </div>
+    <TableCard title="Reconciliation Snapshot" rows={summary.reconcileRows} columns={['area', 'count', 'amount', 'status']} />
   </>;
 }
 
 
-function DrillMetric({ to, title, value, hint }) { return <NavLink to={to} className="mini-metric drill-metric"><span>{title}</span><strong>{value}</strong>{trendHint(hint)}<em>View calculation →</em></NavLink>; }
+// icon/tone/delta are all optional so every existing caller (which only
+// passes to/title/value/hint) renders exactly as before; the dashboard's own
+// KPI strip is the only caller that supplies them.
+function DrillMetric({ to, title, value, hint, icon, tone, delta }) {
+  return <Link to={to} className="mini-metric drill-metric">
+    {icon && <span className={`kpi-icon tone-${tone ?? 'violet'}`} aria-hidden="true">{icon}</span>}
+    <span>{title}</span><strong>{value}</strong>
+    {delta !== undefined ? <KpiDelta value={delta} /> : trendHint(hint)}
+    <em>View calculation →</em>
+  </Link>;
+}
+// Percentage change vs a prior period. null means "not expressible" (no prior
+// value, or the prior value was itself zero and the current one isn't - a
+// true percentage there is undefined, not 0% or some arbitrarily large
+// number), and the caller shows nothing rather than a misleading figure.
+function pctDelta(curr, prev) {
+  if (curr == null || prev == null) return null;
+  if (prev === 0) return curr === 0 ? 0 : null;
+  return ((curr - prev) / Math.abs(prev)) * 100;
+}
+function KpiDelta({ value }) {
+  if (value == null) return null;
+  const dir = value > 0.05 ? 'up' : value < -0.05 ? 'down' : 'flat';
+  const arrow = dir === 'up' ? '↑' : dir === 'down' ? '↓' : '→';
+  return <span className={`kpi-delta ${dir}`}>{arrow} {Math.abs(value).toLocaleString('en-IN', { maximumFractionDigits: 1 })}%<span className="kpi-delta-note">vs prior period</span></span>;
+}
 
 // "Matches Amazon statement sections" is a claim about the data, not a label,
 // so it is only shown when the API can prove the data behind it is whole.
@@ -726,7 +918,7 @@ function ExplanationGrid({ summary, tenantId }) {
     ['Refund value rate', summary.refundValueRate==null?'Unavailable':`${Number(summary.refundValueRate).toLocaleString('en-IN',{maximumFractionDigits:2})}%`, 'Product refund value divided by gross product sales; separate from unit return rate.', 'refundValueRate'],
     ['GST invoice value', summary.gstValue==null?'Unavailable':formatCurrency(summary.gstValue), 'Sales-invoice taxable value minus credit-note/refund taxable value.', 'gstValue']
   ];
-  return <div className="explain-grid">{cards.map(([title, value, copy, target]) => <NavLink key={title} to={`/seller?tenantId=${tenantId}&view=metric-detail&metric=${target}`} className="explain-card"><b>{title}</b><strong>{value}</strong><p>{copy}</p><span>Open calculation →</span></NavLink>)}</div>;
+  return <div className="explain-grid">{cards.map(([title, value, copy, target]) => <Link key={title} to={`/seller?tenantId=${tenantId}&view=metric-detail&metric=${target}`} className="explain-card"><b>{title}</b><strong>{value}</strong><p>{copy}</p><span>Open calculation →</span></Link>)}</div>;
 }
 function InsightCards({ title, cards }) { return <Card><PanelHeader title={title} /><div className="explain-grid compact">{cards.map(([label, value]) => <div className="explain-card" key={label}><b>{label}</b><strong>{value}</strong></div>)}</div></Card>; }
 
@@ -742,9 +934,9 @@ function ReportsExplorer({ tenantId, data }) {
   return <div className="reports-grid">{REPORTS.map(report => {
     const detail = REPORT_DETAIL_MAP[report.type];
     const job = data?.jobs?.find(j => j.report_type === report.type);
-    return <NavLink className={`report-tile ${codeClass(report.code)}`} key={report.type} to={`/seller?tenantId=${tenantId}&view=report-detail&reportType=${report.type}`}>
+    return <Link className={`report-tile ${codeClass(report.code)}`} key={report.type} to={`/seller?tenantId=${tenantId}&view=report-detail&reportType=${report.type}`}>
       <span className={`ledger-code ${codeClass(report.code)}`}>{report.code}</span><div><b>{report.label}</b><p>{detail.explanation}</p></div><small>{job?.completed_at ? `Last synced ${timeAgo(job.completed_at)}` : report.hint}</small>
-    </NavLink>;
+    </Link>;
   })}</div>;
 }
 function reportFieldCount(rows) { return Array.from(new Set(rows.flatMap(row => Object.keys(row ?? {})))).length; }
@@ -1042,6 +1234,57 @@ function TableCard({ title, rows = [], columns, pageSize = 6, downloadFilename }
   </Card>;
 }
 
+// Everything here is either real session data already held by the app
+// (email, role, tenant id) or an existing, already-working control
+// (AmazonConnectionPanel, logout) - nothing new is invented just to fill out
+// a settings page.
+const SETTINGS_TABS = [
+  { key: 'appearance', label: 'Appearance' },
+  { key: 'profile', label: 'Profile' },
+  { key: 'amazon', label: 'Amazon Connection' },
+  { key: 'account', label: 'Account' }
+];
+function SettingsPage({ session, setSession, tenantId, seller, onChange, theme, setTheme }) {
+  const [tab, setTab] = useState('appearance');
+  const [error, setError] = useState('');
+  function logout() { localStorage.removeItem('token'); setSession(null); }
+  return <Card className="panel">
+    <div className="settings-grid">
+      <nav className="settings-nav">{SETTINGS_TABS.map(t => <button type="button" key={t.key} className={tab === t.key ? 'active' : ''} onClick={() => setTab(t.key)}>{t.label}</button>)}</nav>
+      <div className="settings-section">
+        {error && <p className="alert warning">{error}</p>}
+        {tab === 'appearance' && <>
+          <div className="settings-row">
+            <div className="settings-row-copy"><b>Theme</b><p>Applies immediately and is remembered on this device.</p></div>
+            <div className="theme-switch">
+              <button type="button" className={theme === 'light' ? 'active' : ''} onClick={() => setTheme('light')}>☀ Light</button>
+              <button type="button" className={theme === 'dark' ? 'active' : ''} onClick={() => setTheme('dark')}>☾ Dark</button>
+            </div>
+          </div>
+        </>}
+        {tab === 'profile' && <div className="settings-row">
+          <div className="settings-row-copy" style={{ maxWidth: 'none', width: '100%' }}>
+            <b>Signed in as</b>
+            <div className="settings-profile-grid">
+              <div><span>Email</span><b>{session?.email ?? '—'}</b></div>
+              <div><span>Role</span><b style={{ textTransform: 'capitalize' }}>{session?.role ?? '—'}</b></div>
+              <div><span>Tenant ID</span><b>{tenantId || '—'}</b></div>
+            </div>
+          </div>
+        </div>}
+        {tab === 'amazon' && <div className="settings-row">
+          <div className="settings-row-copy"><b>Amazon Seller Central</b><p>Connect or disconnect the Amazon account this tenant syncs from.</p></div>
+          <AmazonConnectionPanel tenantId={tenantId} seller={seller} onChange={onChange} setError={setError} />
+        </div>}
+        {tab === 'account' && <div className="settings-row">
+          <div className="settings-row-copy"><b>Log out</b><p>Ends this session on this device. You'll need to sign in again to return.</p></div>
+          <Button variant="dark" onClick={logout}>⏻ Logout</Button>
+        </div>}
+      </div>
+    </div>
+  </Card>;
+}
+
 // Admin-only screen. Admins never see the seller sidebar/navigation — this is
 // the whole of their UI: tenant table + the one place accounts get created.
 function AdminDashboard() {
@@ -1083,12 +1326,89 @@ function AdminDashboard() {
   </div>;
 }
 
+// A minimal, click-outside-closes dropdown shell shared by the notifications
+// bell and the account menu, so both open/close the same way and only one is
+// ever open at a time.
+function useDropdown() {
+  const [open, setOpen] = useState(false);
+  const rootRef = useRef(null);
+  useEffect(() => {
+    if (!open) return;
+    function onClickOutside(e) { if (rootRef.current && !rootRef.current.contains(e.target)) setOpen(false); }
+    document.addEventListener('mousedown', onClickOutside);
+    return () => document.removeEventListener('mousedown', onClickOutside);
+  }, [open]);
+  return [open, setOpen, rootRef];
+}
+
+function NotificationsBell({ alerts }) {
+  const [open, setOpen, rootRef] = useDropdown();
+  return <div className="topbar-menu-root" ref={rootRef}>
+    <button type="button" className="icon-btn" aria-label="Notifications" title="Notifications" onClick={() => setOpen(o => !o)}>
+      🔔{alerts.length > 0 && <span className="badge-count">{alerts.length > 9 ? '9+' : alerts.length}</span>}
+    </button>
+    {open && <div className="topbar-menu">
+      <div className="topbar-menu-heading">{alerts.length ? `${alerts.length} open item${alerts.length === 1 ? '' : 's'}` : 'Notifications'}</div>
+      {alerts.length ? alerts.map((alert, i) => <div className={`alert-row severity-${alert.severity}`} key={i}><span className="alert-dot" /><div><p>{alert.text}</p>{alert.at && <small>{timeAgo(alert.at)}</small>}</div></div>)
+        : <div className="topbar-menu-empty">Nothing needs attention right now.</div>}
+    </div>}
+  </div>;
+}
+
+function AccountMenu({ session, onLogout, tenantId }) {
+  const [open, setOpen, rootRef] = useDropdown();
+  const label = session?.email?.split('@')[0] ?? session?.email ?? 'Account';
+  return <div className="topbar-menu-root" ref={rootRef}>
+    <button type="button" className="avatar-btn" onClick={() => setOpen(o => !o)}>
+      <span className="avatar">{session?.email?.[0]?.toUpperCase()}</span>
+      <span className="avatar-btn-copy"><b>{label}</b><small>{session?.role}</small></span>
+    </button>
+    {open && <div className="topbar-menu account-menu">
+      <div className="account-menu-header"><span className="avatar">{session?.email?.[0]?.toUpperCase()}</span><div><b>{session?.email}</b><small>{session?.role}</small></div></div>
+      <Link className="account-menu-item" to={`/seller?tenantId=${tenantId ?? ''}&view=settings`} onClick={() => setOpen(false)}>⚙ Settings</Link>
+      <button type="button" className="account-menu-item danger" onClick={onLogout}>⏻ Logout</button>
+    </div>}
+  </div>;
+}
+
+// One CSV, meaningful on every page because dashboardCalculations is fetched
+// on every view regardless of which report you're looking at - the KPIs and
+// Amazon's five statement sections for whatever range is currently selected.
+function exportDashboardSnapshot(data, range) {
+  const m = data?.dashboardCalculations?.metrics ?? {};
+  const s = data?.dashboardCalculations?.statement ?? {};
+  const rows = [
+    { metric: 'Net Sales', value: m.netSales?.value },
+    { metric: 'Net Qty', value: m.netQty?.value },
+    { metric: 'Orders Synced', value: m.orders?.value },
+    { metric: 'Returns', value: m.returns?.value },
+    { metric: 'Settled Amount', value: m.settled?.value },
+    { metric: 'Deductions', value: m.deductions?.value },
+    { metric: 'Reimbursements', value: m.reimbursements?.value },
+    { metric: 'DRR', value: m.drr?.value },
+    { metric: 'Income', value: s.income?.value },
+    { metric: 'Expenses', value: s.expenses?.value },
+    { metric: 'Tax', value: s.tax?.value },
+    { metric: 'Goods and Services Tax', value: s.gst?.value },
+    { metric: 'Transfers', value: s.transfers?.value }
+  ];
+  downloadCsv(`wellsure-snapshot-${toDateInputValue(range.start)}-to-${toDateInputValue(range.end)}.csv`, rows, ['metric', 'value']);
+}
+
 function SidebarLink({ to, icon, children, onClick }) {
   const location = useLocation();
   const target = new URL(to, 'http://local');
   const current = new URL(`${location.pathname}${location.search}`, 'http://local');
+  // Plain Link, deliberately not react-router's NavLink: NavLink computes its
+  // own "active" class from the pathname alone, ignoring the ?view= query
+  // string every sidebar entry actually differs by - since all fourteen
+  // share the pathname /seller, NavLink marked all fourteen active
+  // simultaneously. Confirmed live: every link in the DOM carried class
+  // "active" regardless of which one this component's own (correct) match
+  // computed. A plain Link never adds a class on its own, so this component's
+  // own computed `active` is the only thing that can set it.
   const active = current.pathname === target.pathname && current.searchParams.get('view') === target.searchParams.get('view');
-  return <NavLink className={active ? 'active' : ''} to={to} onClick={onClick}><span className="nav-icon" aria-hidden="true">{icon}</span><span>{children}</span></NavLink>;
+  return <Link className={active ? 'active' : ''} to={to} onClick={onClick}><span className="nav-icon" aria-hidden="true">{icon}</span><span>{children}</span></Link>;
 }
 
 const SEARCH_KEYWORDS = {
@@ -1183,10 +1503,35 @@ function useSidebarOpen() {
   return [open, setOpen];
 }
 
+// Real light/dark toggle, not a cosmetic one - it drives data-theme on <html>,
+// which every existing card/table/input already reads its colors through
+// (see the dark-theme block in style.css), and persists across visits.
+const THEME_KEY = 'wellsure_theme';
+function useTheme() {
+  const [theme, setTheme] = useState(() => {
+    const stored = localStorage.getItem(THEME_KEY);
+    if (stored === 'light' || stored === 'dark') return stored;
+    return typeof window !== 'undefined' && window.matchMedia?.('(prefers-color-scheme: dark)').matches ? 'dark' : 'light';
+  });
+  useEffect(() => {
+    document.documentElement.dataset.theme = theme;
+    localStorage.setItem(THEME_KEY, theme);
+  }, [theme]);
+  return [theme, setTheme];
+}
+
 function SellerShell({ session, setSession }) {
   function logout() { localStorage.removeItem('token'); setSession(null); }
   const [range, setRange] = useState(defaultDateRange);
   const [navOpen, setNavOpen] = useSidebarOpen();
+  const [theme, setTheme] = useTheme();
+  // The dashboard fetch happens inside <SellerDashboard> (it needs the route's
+  // own tenantId/view), but the notifications bell and Export live in the
+  // topbar above it - lifted here via a plain callback so both read the exact
+  // same payload SellerDashboard just loaded, never a second, possibly
+  // inconsistent fetch of their own.
+  const [dashboardData, setDashboardData] = useState(null);
+  const alerts = useMemo(() => buildAlerts(dashboardData), [dashboardData]);
   // On a phone the sidebar is an overlay drawer, so following a link should
   // close it. On a desktop it sits beside the content and should stay put.
   const closeOnNavigate = () => { if (window.innerWidth <= 980) setNavOpen(false); };
@@ -1200,6 +1545,10 @@ function SellerShell({ session, setSession }) {
       <nav>
         {NAV_ITEMS.map(item => <SidebarLink key={item.view} icon={item.icon} to={`/seller?tenantId=${session?.tenantId ?? ''}&view=${item.view}`} onClick={closeOnNavigate}>{item.label}</SidebarLink>)}
       </nav>
+      <div className="sidebar-help">
+        <b>Need help understanding your numbers?</b>
+        <a className="btn btn-secondary" href="mailto:support@wellsure.app?subject=WELLSURE%20support">Contact support</a>
+      </div>
     </aside>
     <main className="workspace">
       <header className="topbar">
@@ -1214,12 +1563,21 @@ function SellerShell({ session, setSession }) {
         <GlobalSearch tenantId={session?.tenantId} />
         <select><option>Amazon.in</option></select>
         <DateRangePicker value={range} onChange={setRange} />
-        <div className="avatar">{session?.email?.[0]?.toUpperCase()}</div>
-        <Button variant="dark" onClick={logout}>Logout</Button>
+        <div className="topbar-actions">
+          <Button
+            variant="secondary"
+            icon="⇩"
+            disabled={!dashboardData}
+            onClick={() => exportDashboardSnapshot(dashboardData, range)}
+            title="Export the current KPI and statement snapshot as CSV"
+          >Export</Button>
+          <NotificationsBell alerts={alerts} />
+          <AccountMenu session={session} onLogout={logout} tenantId={session?.tenantId} />
+        </div>
       </header>
       <DateRangeContext.Provider value={{ range, setRange }}>
         <Routes>
-          <Route path="/seller" element={<SellerDashboard />} />
+          <Route path="/seller" element={<SellerDashboard onDataChange={setDashboardData} session={session} setSession={setSession} theme={theme} setTheme={setTheme} />} />
           <Route path="*" element={<Navigate to={`/seller?tenantId=${session?.tenantId ?? ''}&view=dashboard`} replace />} />
         </Routes>
       </DateRangeContext.Provider>
