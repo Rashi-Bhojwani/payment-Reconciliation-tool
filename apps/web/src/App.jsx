@@ -535,7 +535,13 @@ function SellerDashboard({ onDataChange, session, setSession, theme, setTheme })
   // while that's non-empty so the dashboard fills in on its own - capped so
   // a permanently-failing source (e.g. a real Amazon permission issue)
   // can't poll forever.
-  const AUTO_POLL_MAX_ATTEMPTS = 5;
+  // 30 x 20s = 10 minutes - deliberately longer than the /dashboard handler's
+  // own 6-minute stale-job sweep (see server.js), so this loop always ends in
+  // a state that is actually true: either a real 'completed'/'failed' row, or
+  // the sweep itself flipping an abandoned 'running' row to 'failed'. It is
+  // not bounding how long a sync is allowed to take - only how long the UI
+  // keeps checking back in on one that's still going.
+  const AUTO_POLL_MAX_ATTEMPTS = 30;
   const AUTO_POLL_DELAY_MS = 20_000;
   const autoPollRef = useRef({ key: '', attempts: 0 });
   async function load(targetRange = range, requestId = rangeSyncRef.current.requestId) {
@@ -554,8 +560,22 @@ function SellerDashboard({ onDataChange, session, setSession, theme, setTheme })
       // page sat there. Waiting on Amazon is a different state from loading the
       // page, and it says so, with its own copy and a visible attempt count.
       setLoading(false);
-      const stillSyncing = Boolean(dashboard.autoSyncing?.length) && autoPollRef.current.attempts < AUTO_POLL_MAX_ATTEMPTS;
-      setAwaitingAmazon(stillSyncing ? { sources: dashboard.autoSyncing, attempt: autoPollRef.current.attempts + 1, of: AUTO_POLL_MAX_ATTEMPTS } : null);
+      // dashboard.autoSyncing only lists what THIS request just kicked off -
+      // once a source is actually running, findMissingReportTypes correctly
+      // stops offering it up as "missing" (it's already in flight, no need
+      // to trigger it again), so it silently drops out of autoSyncing on the
+      // very next poll even though it is nowhere near done. Relying on
+      // autoSyncing alone made the poll loop declare victory the moment a
+      // slower source (Orders & finance runs paginated Orders + Finance +
+      // Inventory + Catalog calls, not a single report file - it can
+      // legitimately take minutes) got past its own trigger, leaving the
+      // sync ledger frozen on a stale "running" row with nothing left to
+      // refresh it. Checking data.jobs directly for any row still actually
+      // 'running' is what keeps the loop honest.
+      const runningReportTypes = (dashboard.jobs ?? []).filter(job => job.status === 'running').map(job => job.report_type);
+      const sources = Array.from(new Set([...(dashboard.autoSyncing ?? []), ...runningReportTypes]));
+      const stillSyncing = Boolean(sources.length) && autoPollRef.current.attempts < AUTO_POLL_MAX_ATTEMPTS;
+      setAwaitingAmazon(stillSyncing ? { sources, attempt: autoPollRef.current.attempts + 1, of: AUTO_POLL_MAX_ATTEMPTS } : null);
       if (stillSyncing) {
         autoPollRef.current.attempts += 1;
         setTimeout(() => { if (requestId === rangeSyncRef.current.requestId) void load(targetRange, requestId); }, AUTO_POLL_DELAY_MS);
