@@ -703,8 +703,17 @@ async function runAmazonCallback(request, reply, rememberTenant) {
   const client = await pool.connect();
   try {
     await client.query('begin');
-    await client.query(`insert into sellers(tenant_id, amazon_seller_id, seller_name, marketplace_id, seller_central_region, refresh_token_encrypted, auth_status, connected_at, last_token_refresh_at)
-      values($1,$2,$3,$4,$5,$6,'authorized',now(),now())
+    // first_authorized_at is deliberately NOT in the ON CONFLICT DO UPDATE SET
+    // list below - Postgres then leaves whatever value is already there
+    // untouched on every future reconnect, so it only ever gets written once,
+    // on the true first authorization. connected_at, right next to it, is the
+    // opposite on purpose (reset to now() on every reconnect, since that's
+    // genuinely "most recently connected" and other queries rely on it to
+    // pick the current active seller row) - conflating the two is exactly
+    // what caused data_floor_date to drift later on every reconnect before
+    // this column existed (see 022_seller_first_authorized_at.sql).
+    await client.query(`insert into sellers(tenant_id, amazon_seller_id, seller_name, marketplace_id, seller_central_region, refresh_token_encrypted, auth_status, connected_at, last_token_refresh_at, first_authorized_at)
+      values($1,$2,$3,$4,$5,$6,'authorized',now(),now(),now())
       on conflict(tenant_id, amazon_seller_id) do update set seller_name=excluded.seller_name, marketplace_id=excluded.marketplace_id, seller_central_region=excluded.seller_central_region,
         refresh_token_encrypted=excluded.refresh_token_encrypted, auth_status='authorized', connected_at=now(), last_token_refresh_at=now(), disconnected_at=null`,
       [state.tenantId, sellerId, sellerName, marketplace, MARKETPLACES[marketplace]?.region ?? 'IN', encryptSecret(body.refresh_token)]);
