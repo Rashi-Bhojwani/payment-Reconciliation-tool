@@ -379,6 +379,21 @@ async function findReusableSync(tenantId, reportType, range, windowMs = SYNC_REU
 // must still respond with whatever data already exists) the moment the
 // dashboard is opened for that range.
 const AUTO_SYNC_FRESHNESS_WINDOW_MS = 60 * 60 * 1000;
+// A range that ends before right now is CLOSED - nothing about a past day's
+// orders, settlements or invoices changes after the fact, so once fully
+// synced once it never needs to be re-asked for again. Confirmed this
+// mattered live: after the initial 90-day backfill, picking a different
+// (also fully past) date range inside that same window still re-triggered a
+// live Amazon call every time the freshness window lapsed, even though the
+// data was already sitting in the database from the backfill - "already
+// downloaded" was true but unused. Only a range that still touches today (or
+// later) can receive genuinely new activity, so that's the only case that
+// still needs the short freshness window below.
+function isClosedRange(range) { return new Date(range.end).getTime() <= Date.now(); }
+// Effectively "forever" without being literal Infinity, which the interval
+// arithmetic in findReusableSync (windowMs * '1 millisecond') should not be
+// asked to hold.
+const CLOSED_RANGE_REUSE_WINDOW_MS = 100 * 365 * 864e5;
 const AUTO_SYNC_REPORT_TYPES = Object.freeze(['DIRECT_SP_API_SYNC', 'GET_V2_SETTLEMENT_REPORT_DATA_FLAT_FILE_V2', 'GET_SALES_AND_TRAFFIC_REPORT', 'GET_GST_MTR_B2B_CUSTOM', 'GET_GST_MTR_B2C_CUSTOM', 'GET_FBA_MYI_UNSUPPRESSED_INVENTORY_DATA', 'GET_FBA_REIMBURSEMENTS_DATA', 'GET_FBA_FULFILLMENT_CUSTOMER_RETURNS_DATA']);
 // Nothing below this line may let the app call Amazon more often than a
 // careful human would. A seller's SP-API quota is shared across their whole
@@ -421,8 +436,9 @@ async function autoSyncBackoffRemainingMs(tenantId, reportType) {
 async function findMissingReportTypes(tenantId, range) {
   if (!range?.start || !range?.end) return [];
   const missing = [];
+  const freshnessWindowMs = isClosedRange(range) ? CLOSED_RANGE_REUSE_WINDOW_MS : AUTO_SYNC_FRESHNESS_WINDOW_MS;
   for (const reportType of AUTO_SYNC_REPORT_TYPES) {
-    const reusable = await findReusableSync(tenantId, reportType, range, AUTO_SYNC_FRESHNESS_WINDOW_MS);
+    const reusable = await findReusableSync(tenantId, reportType, range, freshnessWindowMs);
     if (reusable) continue;
     const running = await pool.query(
       "select 1 from sync_jobs where tenant_id=$1 and report_type=$2 and status='running' and started_at > now() - interval '10 minutes' limit 1",
@@ -1180,7 +1196,7 @@ app.get('/api/tenants/:tenantId/dashboard', async request => {
   const start = range.start ? new Date(range.start) : new Date(Date.now() - 30 * 864e5);
   const end = range.end ? new Date(range.end) : new Date();
   const sellerRow = (await pool.query(`select seller_name, amazon_seller_id, marketplace_id, auth_status, connected_at, last_token_refresh_at,
-      backfill_status, backfill_started_at, backfill_completed_at, backfill_progress from sellers
+      backfill_status, backfill_started_at, backfill_completed_at, backfill_progress, data_floor_date from sellers
     where tenant_id=$1 and auth_status='authorized' order by connected_at desc limit 1`, [tenantId])).rows[0] ?? null;
   const backfillRunning = sellerRow?.backfill_status === 'running';
   const seller = sellerRow
@@ -1189,9 +1205,24 @@ app.get('/api/tenants/:tenantId/dashboard', async request => {
         // The one-time 90-day catch-up (see runInitialSellerBackfill). The
         // frontend blocks date-range selection and shows real per-source
         // progress from backfillProgress while status is 'running'.
-        backfillStatus: sellerRow.backfill_status ?? 'completed', backfillStartedAt: sellerRow.backfill_started_at, backfillCompletedAt: sellerRow.backfill_completed_at, backfillProgress: sellerRow.backfill_progress ?? {}
+        backfillStatus: sellerRow.backfill_status ?? 'completed', backfillStartedAt: sellerRow.backfill_started_at, backfillCompletedAt: sellerRow.backfill_completed_at, backfillProgress: sellerRow.backfill_progress ?? {},
+        // Fixed permanently the first time the backfill ran (see
+        // 020_seller_data_floor.sql) - the earliest date this tenant's data
+        // will ever reach, so the picker can refuse a range Amazon can never
+        // supply rather than let the seller pick one and get nothing back.
+        // Null for a seller connected before this feature existed; the
+        // frontend leaves the picker unrestricted in that case.
+        dataFloorDate: sellerRow.data_floor_date
       }
     : { connected: false };
+  // Defense in depth: the frontend picker already refuses to offer a date
+  // before dataFloorDate, but a stale tab or a direct API call could still
+  // send one. Amazon can never supply data before this tenant's floor (see
+  // 020_seller_data_floor.sql), and nothing was ever stored before it either,
+  // so clamp the actual query start here too rather than let a request
+  // silently pass through and return a misleadingly empty range.
+  const floorDate = sellerRow?.data_floor_date ? new Date(sellerRow.data_floor_date) : null;
+  if (floorDate && start < floorDate) start.setTime(floorDate.getTime());
   const effectiveRange = { start: start.toISOString(), end: end.toISOString() };
   // While the backfill owns this tenant's Amazon rate budget (see
   // assertNoBackfillRunning), the demand-driven auto-sync must not also

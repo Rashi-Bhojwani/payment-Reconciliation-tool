@@ -260,7 +260,18 @@ function fromDateInputValue(value) {
   const [year, month, day] = value.split('-').map(Number);
   return new Date(Date.UTC(year, month - 1, day) - IST_OFFSET_MS);
 }
-function DateRangePicker({ value, onChange, disabled }) {
+// minDate (a "YYYY-MM-DD" string, or null/undefined) is seller.dataFloorDate
+// from the dashboard payload - the earliest date the FIRST 90-day backfill
+// ever reached, fixed permanently at that moment (see
+// 020_seller_data_floor.sql). It only ever moves forward as an account ages
+// (today's ceiling moves every day; the floor never does), so it is honest
+// to enforce it in the picker itself: a date before it is not "not synced
+// yet", it is "will never exist", because Amazon's 90-day report retention
+// is measured from now and can't be asked to reach further into the past
+// than it could the day this seller first connected. Null (a seller
+// connected before this feature existed, so no real floor was ever
+// recorded) leaves the picker exactly as unrestricted as before.
+function DateRangePicker({ value, onChange, disabled, minDate }) {
   const [open, setOpen] = useState(false);
   const [draft, setDraft] = useState(() => ({ start: toDateInputValue(value.start), end: toDateInputValue(value.end) }));
   const rootRef = useRef(null);
@@ -277,7 +288,11 @@ function DateRangePicker({ value, onChange, disabled }) {
   }, [open]);
 
   function applyRange() {
-    const start = fromDateInputValue(draft.start);
+    // The <input min> attribute stops normal use, but is only ever a browser
+    // UI hint - it does not stop a value already sitting in the field (e.g.
+    // pasted, or left over from before minDate applied) from being submitted.
+    const clampedStart = minDate && draft.start < minDate ? minDate : draft.start;
+    const start = fromDateInputValue(clampedStart);
     const end = fromDateInputValue(draft.end);
     const ordered = start <= end ? { start, end } : { start: end, end: start };
     onChange({ label: formatRangeLabel(ordered.start, ordered.end), ...ordered });
@@ -299,12 +314,13 @@ function DateRangePicker({ value, onChange, disabled }) {
         <div className="date-range-panel date-range-panel-simple">
           <div className="date-field-group">
             <label>Start date</label>
-            <input className="input" type="date" value={draft.start} max={draft.end || toDateInputValue(new Date())} onChange={e => setDraft(d => ({ ...d, start: e.target.value }))} />
+            <input className="input" type="date" value={draft.start} min={minDate || undefined} max={draft.end || toDateInputValue(new Date())} onChange={e => setDraft(d => ({ ...d, start: e.target.value }))} />
           </div>
           <div className="date-field-group">
             <label>End date</label>
             <input className="input" type="date" value={draft.end} min={draft.start} max={toDateInputValue(new Date())} onChange={e => setDraft(d => ({ ...d, end: e.target.value }))} />
           </div>
+          {minDate && <p className="muted small">Data is available from {minDate} onward - Amazon's report history only reaches back 90 days from when you first connected.</p>}
           <div className="calendar-footer range-apply-row">
             <span className="muted small">Applied only after clicking Apply</span>
             <Button type="button" onClick={applyRange}>Apply</Button>
@@ -1658,7 +1674,7 @@ function SellerShell({ session, setSession }) {
         >☰</button>
         <GlobalSearch tenantId={session?.tenantId} />
         <select><option>Amazon.in</option></select>
-        <DateRangePicker value={range} onChange={setRange} disabled={backfillRunning} />
+        <DateRangePicker value={range} onChange={setRange} disabled={backfillRunning} minDate={dashboardData?.seller?.dataFloorDate} />
         <div className="topbar-actions">
           <Button
             variant="secondary"

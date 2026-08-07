@@ -985,7 +985,15 @@ export async function runInitialSellerBackfill(tenantId) {
   const active = await pool.query("select id from sellers where tenant_id=$1 and auth_status='authorized' order by connected_at desc limit 1", [parsedTenantId]);
   if (!active.rowCount) { console.warn(`${label} skipped - no authorized seller found`); return; }
   const sellerId = active.rows[0].id;
-  await pool.query("update sellers set backfill_status='running', backfill_started_at=now(), backfill_progress='{}'::jsonb where id=$1", [sellerId]);
+  // COALESCE, not a plain overwrite: a later re-backfill (e.g. after
+  // reconnecting to pick up a newly granted SP-API role) computes a range
+  // that starts LATER than the original one, because Amazon's 90-day
+  // retention is measured from "now" - so only the first-ever backfill may
+  // set this floor. See 020_seller_data_floor.sql.
+  await pool.query(
+    "update sellers set backfill_status='running', backfill_started_at=now(), backfill_progress='{}'::jsonb, data_floor_date=coalesce(data_floor_date, $2::date) where id=$1",
+    [sellerId, range.start]
+  );
   console.log(`${label} starting - ${INITIAL_BACKFILL_REPORT_TYPES.length} source(s), ${INITIAL_BACKFILL_DAYS} day window`);
   const progress = {};
   async function setProgress(reportType, state) {
