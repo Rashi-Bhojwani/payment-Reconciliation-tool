@@ -260,7 +260,7 @@ function fromDateInputValue(value) {
   const [year, month, day] = value.split('-').map(Number);
   return new Date(Date.UTC(year, month - 1, day) - IST_OFFSET_MS);
 }
-function DateRangePicker({ value, onChange }) {
+function DateRangePicker({ value, onChange, disabled }) {
   const [open, setOpen] = useState(false);
   const [draft, setDraft] = useState(() => ({ start: toDateInputValue(value.start), end: toDateInputValue(value.end) }));
   const rootRef = useRef(null);
@@ -286,10 +286,16 @@ function DateRangePicker({ value, onChange }) {
 
   return (
     <div className="date-range-picker" ref={rootRef}>
-      <button type="button" className="date-range-trigger" onClick={() => setOpen(o => !o)}>
+      <button
+        type="button"
+        className="date-range-trigger"
+        disabled={disabled}
+        title={disabled ? 'Unavailable while your first 90 days of data are syncing' : undefined}
+        onClick={() => !disabled && setOpen(o => !o)}
+      >
         <span className="date-range-icon">📅</span>{value.label}
       </button>
-      {open && (
+      {!disabled && open && (
         <div className="date-range-panel date-range-panel-simple">
           <div className="date-field-group">
             <label>Start date</label>
@@ -447,6 +453,54 @@ function AmazonConnectionPanel({ tenantId, seller, onChange, setError }) {
   );
 }
 
+// Shown for every page except Settings while runInitialSellerBackfill (the
+// API job that runs once, right after authorization) is still working
+// through this seller's last 90 days - the only window that data is ever
+// reachable in, so it has to complete before any range-based figure on this
+// dashboard can be trusted. REPORTS already lists all eight sources in the
+// exact order the backend backfills them in, so it doubles as this
+// checklist; seller.backfillProgress is the real, live per-source status
+// the backend records as it goes, not a simulated progress bar.
+const BACKFILL_STATE_META = {
+  completed: { icon: '✓', tone: 'emerald', label: 'Synced' },
+  running: { icon: '⟳', tone: 'marigold', label: 'Syncing…' },
+  failed: { icon: '✕', tone: 'danger', label: 'Amazon declined this source' },
+  pending: { icon: '·', tone: '', label: 'Queued' }
+};
+function InitialBackfillGate({ seller }) {
+  const progress = seller.backfillProgress ?? {};
+  const completedCount = REPORTS.filter(r => progress[r.type] === 'completed' || progress[r.type] === 'failed').length;
+  const startedAt = seller.backfillStartedAt ? new Date(seller.backfillStartedAt) : null;
+  const stalled = startedAt && Date.now() - startedAt.getTime() > 30 * 60_000;
+  return (
+    <Card className="panel backfill-gate">
+      <div className="backfill-gate-hero">
+        <span className="spinner-dot" />
+        <div>
+          <h2>Syncing your last 90 days</h2>
+          <p>This runs once, automatically, right after connecting Amazon - it's the one chance to pull this much history, since Amazon only keeps report documents for 90 days. Nothing else is available to look at until it finishes; this page updates on its own.</p>
+        </div>
+      </div>
+      <div className="backfill-gate-progress">
+        <div className="backfill-gate-progress-bar"><div style={{ width: `${Math.round(completedCount / REPORTS.length * 100)}%` }} /></div>
+        <span>{completedCount} of {REPORTS.length} sources</span>
+      </div>
+      <div className="backfill-gate-list">
+        {REPORTS.map(report => {
+          const state = progress[report.type] ?? 'pending';
+          const meta = BACKFILL_STATE_META[state] ?? BACKFILL_STATE_META.pending;
+          return <div className="backfill-gate-row" key={report.type}>
+            <span className={`activity-icon tone-${meta.tone || 'violet'}`} aria-hidden="true">{meta.icon}</span>
+            <div><b>{report.label}</b><small>{report.hint}</small></div>
+            <span className={`pill status-${state === 'completed' ? 'completed' : state === 'failed' ? 'failed' : state === 'running' ? 'running' : 'idle'}`}>{meta.label}</span>
+          </div>;
+        })}
+      </div>
+      {stalled && <p className="alert warning">This is taking longer than usual - if it doesn't move for a while, refresh the page. Nothing is lost either way; it will pick back up.</p>}
+    </Card>
+  );
+}
+
 function SellerDashboard({ onDataChange, session, setSession, theme, setTheme }) {
   const [params] = useSearchParams();
   const tenantId = params.get('tenantId') ?? '';
@@ -500,6 +554,31 @@ function SellerDashboard({ onDataChange, session, setSession, theme, setTheme })
     void load(range, rangeSyncRef.current.requestId);
   }, [tenantId, range.start, range.end]);
 
+  // Self-terminating: re-checks every 5s for as long as the LAST response
+  // said the backfill was still running, and simply stops scheduling once one
+  // says otherwise - no attempt cap needed for the normal case, because
+  // runInitialSellerBackfill (the API job) always reaches a terminal
+  // 'completed' state itself, source by source, even when some of the eight
+  // fail outright. BACKFILL_POLL_MAX_MINUTES only guards the one scenario
+  // that job can't self-recover from - the API process restarting mid-run -
+  // by giving up and telling the seller to refresh rather than polling
+  // forever against a status that will now never change.
+  const BACKFILL_POLL_MS = 5_000;
+  const BACKFILL_POLL_MAX_MINUTES = 30;
+  const backfillPollRef = useRef({ key: '', attempts: 0 });
+  useEffect(() => {
+    if (data?.seller?.backfillStatus !== 'running') return;
+    const rangeKey = `${range.start}|${range.end}`;
+    if (backfillPollRef.current.key !== rangeKey) backfillPollRef.current = { key: rangeKey, attempts: 0 };
+    if (backfillPollRef.current.attempts * BACKFILL_POLL_MS >= BACKFILL_POLL_MAX_MINUTES * 60_000) return;
+    const requestId = rangeSyncRef.current.requestId;
+    const timer = setTimeout(() => {
+      backfillPollRef.current.attempts += 1;
+      if (requestId === rangeSyncRef.current.requestId) void load(range, requestId);
+    }, BACKFILL_POLL_MS);
+    return () => clearTimeout(timer);
+  }, [data, range.start, range.end]);
+
   // Pulled from the same calculateDashboardMetrics engine that powers every
   // other KPI on this dashboard, so this chart can never disagree with the
   // Net Sales / Deductions / Settled figures shown elsewhere on the page.
@@ -515,6 +594,14 @@ function SellerDashboard({ onDataChange, session, setSession, theme, setTheme })
   const ledgerCopy = VIEW_LEDGER_COPY[view];
   const detailView = view === 'report-detail' || view === 'metric-detail';
   const connected = !!data?.seller?.connected;
+  // The one-time 90-day catch-up (see runInitialSellerBackfill on the API).
+  // Every other page is replaced with InitialBackfillGate while this runs -
+  // not just the date picker disabled - because any figure shown from a
+  // partially-backfilled range could be read as final when it isn't yet.
+  // Settings stays reachable (theme, logout, checking the Amazon connection
+  // itself), since none of that depends on the range being complete.
+  const backfillRunning = connected && data.seller.backfillStatus === 'running';
+  const blockedByBackfill = backfillRunning && view !== 'settings';
 
   return <div className="page-stack">
     <div className="section-title">
@@ -525,10 +612,12 @@ function SellerDashboard({ onDataChange, session, setSession, theme, setTheme })
         <AmazonConnectionPanel tenantId={tenantId} seller={data?.seller} onChange={load} setError={setError} />
       </div>
     </div>
-    {freshAmazonAuth && connected && <p className="alert success">Amazon account connected. Select a date range or use Sync on this page to pull limited data.</p>}
+    {freshAmazonAuth && connected && !backfillRunning && <p className="alert success">Amazon account connected. Select a date range or use Sync on this page to pull limited data.</p>}
     {amazonError && <p className="alert warning">Amazon connection issue: {amazonError}</p>}
     {error && <p className="alert warning">{error}</p>}
     {(view === 'dashboard' || view === 'orderPayments') && !connected && data && <p className="alert warning">Connect your Amazon account to start pulling real payment data — nothing syncs until then.</p>}
+    {blockedByBackfill && <InitialBackfillGate seller={data.seller} />}
+    {!blockedByBackfill && <>
     {view !== 'dashboard' && view !== 'settings' && !detailView && <SyncLedger tenantId={tenantId} jobs={data?.jobs ?? []} onSynced={load} reportTypes={reportTypes} title={ledgerCopy?.title} subtitle={ledgerCopy?.subtitle} disabled={!connected} />}
 
     {view === 'orderPayments' && <OrderReconciliation tenantId={tenantId} />}
@@ -563,6 +652,7 @@ function SellerDashboard({ onDataChange, session, setSession, theme, setTheme })
     {view === 'report-detail' && <ReportDetail data={data} reportType={params.get('reportType')} />}
     {view === 'metric-detail' && <MetricDetail metric={params.get('metric')} tenantId={tenantId} />}
     {view === 'settings' && <SettingsPage session={session} setSession={setSession} tenantId={tenantId} seller={data?.seller} onChange={load} theme={theme} setTheme={setTheme} />}
+    </>}
   </div>;
 }
 
@@ -1532,6 +1622,12 @@ function SellerShell({ session, setSession }) {
   // inconsistent fetch of their own.
   const [dashboardData, setDashboardData] = useState(null);
   const alerts = useMemo(() => buildAlerts(dashboardData), [dashboardData]);
+  // The one-time 90-day catch-up after authorization (see
+  // runInitialSellerBackfill on the API). Selecting a different date range
+  // mid-backfill could show a range that isn't fully synced yet as if it
+  // were final, so the picker is locked for the whole app shell - not just
+  // the Dashboard page - until the backend reports it done.
+  const backfillRunning = dashboardData?.seller?.connected && dashboardData.seller.backfillStatus === 'running';
   // On a phone the sidebar is an overlay drawer, so following a link should
   // close it. On a desktop it sits beside the content and should stay put.
   const closeOnNavigate = () => { if (window.innerWidth <= 980) setNavOpen(false); };
@@ -1562,7 +1658,7 @@ function SellerShell({ session, setSession }) {
         >☰</button>
         <GlobalSearch tenantId={session?.tenantId} />
         <select><option>Amazon.in</option></select>
-        <DateRangePicker value={range} onChange={setRange} />
+        <DateRangePicker value={range} onChange={setRange} disabled={backfillRunning} />
         <div className="topbar-actions">
           <Button
             variant="secondary"

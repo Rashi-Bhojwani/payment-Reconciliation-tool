@@ -1243,6 +1243,22 @@ tbody tr:hover td { background: var(--brand-soft); }
 @media (max-width: 1180px) { .dashboard-grid.three { grid-template-columns: 1fr 1fr; } }
 @media (max-width: 720px) { .dashboard-grid.three { grid-template-columns: 1fr; } }
 
+/* ---------- Initial 90-day backfill gate ---------- */
+.backfill-gate { max-width: 720px; margin: 0 auto; padding: 32px; }
+.backfill-gate-hero { display: flex; gap: 16px; align-items: flex-start; margin-bottom: 24px; }
+.backfill-gate-hero .spinner-dot { width: 14px; height: 14px; margin-top: 6px; color: var(--violet); flex: 0 0 auto; }
+.backfill-gate-hero h2 { margin-bottom: 6px; }
+.backfill-gate-hero p { color: var(--muted); line-height: 1.6; margin: 0; }
+.backfill-gate-progress { display: flex; align-items: center; gap: 12px; margin-bottom: 18px; }
+.backfill-gate-progress-bar { flex: 1; height: 8px; border-radius: 999px; background: var(--paper); border: 1px solid var(--border); overflow: hidden; }
+.backfill-gate-progress-bar > div { height: 100%; background: linear-gradient(90deg, var(--violet), var(--violet-deep)); transition: width 0.4s ease; }
+.backfill-gate-progress span { font-size: 12.5px; color: var(--muted); font-weight: 700; white-space: nowrap; }
+.backfill-gate-list { display: flex; flex-direction: column; gap: 2px; }
+.backfill-gate-row { display: grid; grid-template-columns: 30px 1fr auto; align-items: center; gap: 12px; padding: 11px 4px; border-bottom: 1px solid var(--border); }
+.backfill-gate-row:last-child { border-bottom: none; }
+.backfill-gate-row b { font-size: 13.5px; color: var(--ink); display: block; }
+.backfill-gate-row small { color: var(--muted); font-size: 11.5px; }
+
 .sidebar nav a.active {
   background: linear-gradient(135deg, var(--violet), var(--violet-deep));
   color: #fff;

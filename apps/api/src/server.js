@@ -8,7 +8,7 @@ import { assertActiveTenant, databaseUrlConfigured, pool, withTenant } from '@re
 import { getSpApiEndpoint, MARKETPLACES, REPORT_TYPES, SpApiClient } from '@recon/sp-api-client';
 import { secrets } from './config/secrets.js';
 import { decryptSecret, encryptSecret } from './config/crypto.js';
-import { buildGstInvoicesFromOrderItems, startScheduler, syncRecentApiDataForTenant, syncReportForTenant } from './jobs/sync.js';
+import { buildGstInvoicesFromOrderItems, runInitialSellerBackfill, startScheduler, syncRecentApiDataForTenant, syncReportForTenant } from './jobs/sync.js';
 import { buildRestoreStatements, createSyncQueue } from './jobs/sync-queue.js';
 import { calendarDays } from './jobs/reporting-calendar.js';
 import { categorizeFinanceLabel } from './jobs/finance-components.js';
@@ -310,11 +310,34 @@ function buildOrderPaymentRows(orders, settlementRows, financeRows) {
 }
 
 function queueInitialSellerSync(tenantId) {
-  // Keep the authorization callback fast and safe: mark the seller connected
-  // first, then do only a small direct-API warmup in the background. Report
-  // pulls remain page/date scoped from the UI so a newly connected account is
-  // not hit with multiple report-generation requests immediately.
-  syncRecentApiDataForTenant(tenantId, { days: 7 }).catch(error => app.log.warn({ err: error, tenantId }, 'Initial Amazon direct API sync failed'));
+  // Keeps the authorization callback itself fast: the seller is already
+  // marked connected before this runs, and the backfill continues in the
+  // background rather than making the seller's browser wait on it. It is
+  // the ONLY chance to ever capture this seller's last 90 days - see
+  // runInitialSellerBackfill and 019_seller_initial_backfill.sql. The
+  // dashboard shows a real, per-source progress screen and blocks date-range
+  // selection until this finishes, so an in-progress backfill is never
+  // mistaken for a complete (and possibly wrong) figure.
+  runInitialSellerBackfill(tenantId).catch(error => app.log.warn({ err: error, tenantId }, 'Initial 90-day backfill failed'));
+}
+
+// runInitialSellerBackfill calls syncRecentApiDataForTenant/syncReportForTenant
+// directly, one report type at a time, deliberately NOT through
+// runExclusiveSync (sync-queue.js) - that queue is keyed per tenant+report
+// type and lives only in this module, so a call routed through it here would
+// not actually be visible to a backfill running the same tenant+report type
+// from a different await chain. Blocking every OTHER path that can start a
+// sync for this tenant while a backfill is under way is simpler and
+// airtight: nothing else can ever compete with it for the same Amazon rate
+// bucket. This is checked - not just left to the frontend's own gating - so
+// a stale tab, a direct API call, or a race during the few seconds after
+// authorization can't trigger a second, concurrent sync against the same
+// account.
+async function assertNoBackfillRunning(tenantId, action = 'This action') {
+  const row = (await pool.query("select backfill_status from sellers where tenant_id=$1 and auth_status='authorized' order by connected_at desc limit 1", [tenantId])).rows[0];
+  if (row?.backfill_status === 'running') {
+    throw Object.assign(new Error(`${action} is unavailable while your first 90 days of data are still syncing. This finishes automatically - please wait.`), { statusCode: 409 });
+  }
 }
 
 
@@ -727,6 +750,7 @@ app.post('/api/tenants/:tenantId/sync/:reportType', async request => {
   const body = z.object({ range: DateRangeSchema.optional() }).parse(request.body ?? {});
   await requireTenantUser(request, params.tenantId);
   await assertActiveTenant(params.tenantId);
+  await assertNoBackfillRunning(params.tenantId, 'Manual sync');
   return syncReportForSellerRequest(params, body.range);
 });
 
@@ -734,6 +758,7 @@ app.post('/api/tenants/:tenantId/sync', async request => {
   const { tenantId } = TenantParamsSchema.parse(request.params);
   await requireTenantUser(request, tenantId);
   await assertActiveTenant(tenantId);
+  await assertNoBackfillRunning(tenantId, 'Manual sync');
   const body = SellerSyncSchema.parse(request.body ?? {});
   const results = [];
   // This route called Amazon unconditionally: no reuse check, no in-flight
@@ -848,6 +873,7 @@ app.post('/api/tenants/:tenantId/settlement-data/reset', async request => {
   const body = z.object({ range: DateRangeSchema, confirm: z.literal(true, { errorMap: () => ({ message: 'This deletes stored settlement rows for the given range before re-fetching them from Amazon - pass confirm: true to proceed.' }) }) }).parse(request.body ?? {});
   await requireTenantUser(request, tenantId);
   await assertActiveTenant(tenantId);
+  await assertNoBackfillRunning(tenantId, 'Settlement reset');
   app.log.warn({ tenantId, range: body.range }, 'Settlement data reset requested: deleting stored settlement rows for this range and re-syncing from Amazon');
   return resetSettlementData(tenantId, body.range);
 });
@@ -1153,13 +1179,26 @@ app.get('/api/tenants/:tenantId/dashboard', async request => {
   const range = DashboardQuerySchema.parse(request.query);
   const start = range.start ? new Date(range.start) : new Date(Date.now() - 30 * 864e5);
   const end = range.end ? new Date(range.end) : new Date();
-  const sellerRow = (await pool.query(`select seller_name, amazon_seller_id, marketplace_id, auth_status, connected_at, last_token_refresh_at from sellers
+  const sellerRow = (await pool.query(`select seller_name, amazon_seller_id, marketplace_id, auth_status, connected_at, last_token_refresh_at,
+      backfill_status, backfill_started_at, backfill_completed_at, backfill_progress from sellers
     where tenant_id=$1 and auth_status='authorized' order by connected_at desc limit 1`, [tenantId])).rows[0] ?? null;
+  const backfillRunning = sellerRow?.backfill_status === 'running';
   const seller = sellerRow
-    ? { connected: true, sellerName: sellerRow.seller_name, sellerId: sellerRow.amazon_seller_id, marketplaceId: sellerRow.marketplace_id, authStatus: sellerRow.auth_status, connectedAt: sellerRow.connected_at, lastTokenRefreshAt: sellerRow.last_token_refresh_at }
+    ? {
+        connected: true, sellerName: sellerRow.seller_name, sellerId: sellerRow.amazon_seller_id, marketplaceId: sellerRow.marketplace_id, authStatus: sellerRow.auth_status, connectedAt: sellerRow.connected_at, lastTokenRefreshAt: sellerRow.last_token_refresh_at,
+        // The one-time 90-day catch-up (see runInitialSellerBackfill). The
+        // frontend blocks date-range selection and shows real per-source
+        // progress from backfillProgress while status is 'running'.
+        backfillStatus: sellerRow.backfill_status ?? 'completed', backfillStartedAt: sellerRow.backfill_started_at, backfillCompletedAt: sellerRow.backfill_completed_at, backfillProgress: sellerRow.backfill_progress ?? {}
+      }
     : { connected: false };
   const effectiveRange = { start: start.toISOString(), end: end.toISOString() };
-  const autoSyncReportTypes = sellerRow ? await findMissingReportTypes(tenantId, effectiveRange) : [];
+  // While the backfill owns this tenant's Amazon rate budget (see
+  // assertNoBackfillRunning), the demand-driven auto-sync must not also
+  // start work against the same tenant+report type - and there is nothing
+  // useful to show for an arbitrary range yet anyway, since the dashboard is
+  // showing the backfill's own progress screen instead of figures.
+  const autoSyncReportTypes = sellerRow && !backfillRunning ? await findMissingReportTypes(tenantId, effectiveRange) : [];
   for (const reportType of autoSyncReportTypes) triggerBackgroundSync(tenantId, reportType, effectiveRange);
   return withTenant(tenantId, async client => {
     // Requests interrupted by a process restart or disconnected client can

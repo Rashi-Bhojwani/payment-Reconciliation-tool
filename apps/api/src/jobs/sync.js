@@ -941,18 +941,103 @@ export async function buildGstInvoicesFromOrderItems(tenantId, invoiceType) {
   });
 }
 
+// The one-time 90-day catch-up run right after a seller authorizes. Amazon
+// retains report documents for a maximum of 90 days (confirmed against the
+// official SP-API getReports reference - "Reports are retained for a
+// maximum of 90 days" - and against a real settlement 400 hit trying to ask
+// for more), so the moment of authorization is the only chance this history
+// is ever reachable; the nightly scheduler (startScheduler, below) keeps
+// everything current from here on, so this function only has one job to do,
+// once, per seller.
+//
+// Every source is synced ONE AT A TIME, never in parallel - this keeps the
+// traffic pattern against Amazon identical to a seller manually clicking
+// Sync eight times over a few minutes, which the app already does safely
+// today; nothing here asks Amazon for more than that, just in one
+// automatic pass instead of eight manual ones. A source that comes back
+// truncated (a 90-day settlement history can span more documents than one
+// call fetches) is re-run in place until Amazon has nothing left for this
+// window, using the exact same convergence signal (outstandingDocuments)
+// the demand-driven per-page sync already relies on - only here an
+// unattended loop drives it instead of repeated dashboard loads. A source
+// Amazon refuses outright (a missing SP-API role, exactly like the Brand
+// Analytics 403 hit on GET_SALES_AND_TRAFFIC_REPORT) is recorded failed and
+// skipped rather than aborting the other seven.
+const INITIAL_BACKFILL_DAYS = 90;
+const INITIAL_BACKFILL_MAX_ATTEMPTS_PER_SOURCE = 20;
+const INITIAL_BACKFILL_REPORT_TYPES = [
+  'DIRECT_SP_API_SYNC',
+  'GET_V2_SETTLEMENT_REPORT_DATA_FLAT_FILE_V2',
+  'GET_SALES_AND_TRAFFIC_REPORT',
+  'GET_GST_MTR_B2B_CUSTOM',
+  'GET_GST_MTR_B2C_CUSTOM',
+  'GET_FBA_MYI_UNSUPPRESSED_INVENTORY_DATA',
+  'GET_FBA_REIMBURSEMENTS_DATA',
+  'GET_FBA_FULFILLMENT_CUSTOMER_RETURNS_DATA'
+];
+export async function runInitialSellerBackfill(tenantId) {
+  const parsedTenantId = z.string().uuid().parse(tenantId);
+  const range = { start: new Date(Date.now() - INITIAL_BACKFILL_DAYS * 864e5).toISOString(), end: new Date().toISOString() };
+  const label = `[backfill ${parsedTenantId.slice(0, 8)}]`;
+  // Scoped to the CURRENT authorized seller row, not the tenant generally -
+  // if the tenant reconnects a different Amazon account before this finishes,
+  // progress must not be attributed to a seller row it no longer describes.
+  const active = await pool.query("select id from sellers where tenant_id=$1 and auth_status='authorized' order by connected_at desc limit 1", [parsedTenantId]);
+  if (!active.rowCount) { console.warn(`${label} skipped - no authorized seller found`); return; }
+  const sellerId = active.rows[0].id;
+  await pool.query("update sellers set backfill_status='running', backfill_started_at=now(), backfill_progress='{}'::jsonb where id=$1", [sellerId]);
+  console.log(`${label} starting - ${INITIAL_BACKFILL_REPORT_TYPES.length} source(s), ${INITIAL_BACKFILL_DAYS} day window`);
+  const progress = {};
+  async function setProgress(reportType, state) {
+    progress[reportType] = state;
+    await pool.query('update sellers set backfill_progress=$2 where id=$1', [sellerId, JSON.stringify(progress)]);
+  }
+  for (const reportType of INITIAL_BACKFILL_REPORT_TYPES) {
+    const startedAt = Date.now();
+    await setProgress(reportType, 'running');
+    try {
+      if (reportType === 'DIRECT_SP_API_SYNC') {
+        await syncRecentApiDataForTenant(parsedTenantId, { range });
+      } else {
+        for (let attempt = 0; attempt < INITIAL_BACKFILL_MAX_ATTEMPTS_PER_SOURCE; attempt += 1) {
+          const result = await syncReportForTenant({ tenantId: parsedTenantId, reportType, range });
+          if (!result?.outstandingDocuments) break;
+        }
+      }
+      await setProgress(reportType, 'completed');
+      console.log(`${label} ${reportType} completed in ${Date.now() - startedAt}ms`);
+    } catch (error) {
+      await setProgress(reportType, 'failed');
+      console.error(`${label} ${reportType} failed after ${Date.now() - startedAt}ms:`, error instanceof Error ? error.message : error);
+    }
+  }
+  await pool.query("update sellers set backfill_status='completed', backfill_completed_at=now() where id=$1", [sellerId]);
+  console.log(`${label} finished`);
+}
+
 /** @param {string} reportType */
+// DIRECT_SP_API_SYNC (Orders + Finances + Inventory) is not an Amazon report
+// type - it is not in REPORT_TYPES/NIGHTLY_REPORTS at all - so it was never
+// part of the nightly run, only synced once at connection and again
+// whenever a seller happened to view a range that needed it. Every other
+// figure on this dashboard is built from it, so "every day gets saved" was
+// only true for the seven report-based sources; Orders/Finance activity on a
+// day nobody happened to open the dashboard was not captured until someone
+// eventually did. It is included here as its own branch (syncActiveTenants
+// is called once per source, and this source uses a different sync
+// function, not syncReportForTenant).
 async function syncActiveTenants(reportType) {
-  const parsedReportType = z.enum(REPORT_TYPES).parse(reportType);
+  const isDirect = reportType === 'DIRECT_SP_API_SYNC';
+  const parsedReportType = isDirect ? reportType : z.enum(REPORT_TYPES).parse(reportType);
   const tenants = await pool.query("select id from tenants where status = 'active'");
   const limit = pLimit(3);
   // One tenant's report failure (e.g. Amazon has no settlement report ready
   // yet for this period) must never stop every other tenant's nightly sync,
   // and must never surface as an unhandled rejection that could take the
-  // whole scheduler down. syncReportForTenant already records the failure on
+  // whole scheduler down. Both sync functions already record the failure on
   // the tenant's own sync_jobs row, so it is safe to swallow here.
   await Promise.all(tenants.rows.map(row => limit(() =>
-    syncReportForTenant({ tenantId: row.id, reportType: parsedReportType })
+    (isDirect ? syncRecentApiDataForTenant(row.id, { days: 2 }) : syncReportForTenant({ tenantId: row.id, reportType: parsedReportType }))
       .catch(error => { console.error(`Nightly sync failed for tenant ${row.id} (${parsedReportType}):`, error instanceof Error ? error.message : error); })
   )));
 }
@@ -962,7 +1047,7 @@ async function syncActiveTenants(reportType) {
 // and wrong for anything that boots the server and then wants to finish.
 export function startScheduler() {
   return cron.schedule('0 2 * * *', () => {
-    Promise.all(NIGHTLY_REPORTS.map(reportType => syncActiveTenants(reportType)))
+    Promise.all([...NIGHTLY_REPORTS, 'DIRECT_SP_API_SYNC'].map(reportType => syncActiveTenants(reportType)))
       .catch(error => console.error('Nightly sync scheduler run failed:', error instanceof Error ? error.message : error));
   });
 }
