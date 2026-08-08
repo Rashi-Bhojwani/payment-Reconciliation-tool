@@ -975,52 +975,70 @@ const INITIAL_BACKFILL_REPORT_TYPES = [
   'GET_FBA_REIMBURSEMENTS_DATA',
   'GET_FBA_FULFILLMENT_CUSTOMER_RETURNS_DATA'
 ];
+// Guards against two backfills running at once for the same tenant.
+// queueInitialSellerSync fires on every OAuth callback with no await and no
+// idea whether a previous run is still going - a double callback (a
+// re-authorize whose redirect gets hit twice, a double-click, a browser
+// retry) used to launch two full backfill loops in parallel, each
+// independently calling createReport for the same report types around the
+// same time. Amazon's own answer to that is to CANCEL the superseded
+// request, not error it - which showed up as "Report ... CANCELLED" on
+// Inventory/Reimbursements/Returns for a seller who had just re-authorized,
+// with nothing about permissions wrong at all. This makes a second call for
+// a tenant that's already running a no-op instead of a race.
+const backfillInFlight = new Set();
 export async function runInitialSellerBackfill(tenantId) {
   const parsedTenantId = z.string().uuid().parse(tenantId);
-  const range = { start: new Date(Date.now() - INITIAL_BACKFILL_DAYS * 864e5).toISOString(), end: new Date().toISOString() };
   const label = `[backfill ${parsedTenantId.slice(0, 8)}]`;
-  // Scoped to the CURRENT authorized seller row, not the tenant generally -
-  // if the tenant reconnects a different Amazon account before this finishes,
-  // progress must not be attributed to a seller row it no longer describes.
-  const active = await pool.query("select id from sellers where tenant_id=$1 and auth_status='authorized' order by connected_at desc limit 1", [parsedTenantId]);
-  if (!active.rowCount) { console.warn(`${label} skipped - no authorized seller found`); return; }
-  const sellerId = active.rows[0].id;
-  // COALESCE, not a plain overwrite: a later re-backfill (e.g. after
-  // reconnecting to pick up a newly granted SP-API role) computes a range
-  // that starts LATER than the original one, because Amazon's 90-day
-  // retention is measured from "now" - so only the first-ever backfill may
-  // set this floor. See 020_seller_data_floor.sql.
-  await pool.query(
-    "update sellers set backfill_status='running', backfill_started_at=now(), backfill_progress='{}'::jsonb, data_floor_date=coalesce(data_floor_date, $2::date) where id=$1",
-    [sellerId, range.start]
-  );
-  console.log(`${label} starting - ${INITIAL_BACKFILL_REPORT_TYPES.length} source(s), ${INITIAL_BACKFILL_DAYS} day window`);
-  const progress = {};
-  async function setProgress(reportType, state) {
-    progress[reportType] = state;
-    await pool.query('update sellers set backfill_progress=$2 where id=$1', [sellerId, JSON.stringify(progress)]);
-  }
-  for (const reportType of INITIAL_BACKFILL_REPORT_TYPES) {
-    const startedAt = Date.now();
-    await setProgress(reportType, 'running');
-    try {
-      if (reportType === 'DIRECT_SP_API_SYNC') {
-        await syncRecentApiDataForTenant(parsedTenantId, { range });
-      } else {
-        for (let attempt = 0; attempt < INITIAL_BACKFILL_MAX_ATTEMPTS_PER_SOURCE; attempt += 1) {
-          const result = await syncReportForTenant({ tenantId: parsedTenantId, reportType, range });
-          if (!result?.outstandingDocuments) break;
-        }
-      }
-      await setProgress(reportType, 'completed');
-      console.log(`${label} ${reportType} completed in ${Date.now() - startedAt}ms`);
-    } catch (error) {
-      await setProgress(reportType, 'failed');
-      console.error(`${label} ${reportType} failed after ${Date.now() - startedAt}ms:`, error instanceof Error ? error.message : error);
+  if (backfillInFlight.has(parsedTenantId)) { console.log(`${label} skipped - already running for this tenant`); return; }
+  backfillInFlight.add(parsedTenantId);
+  try {
+    const range = { start: new Date(Date.now() - INITIAL_BACKFILL_DAYS * 864e5).toISOString(), end: new Date().toISOString() };
+    // Scoped to the CURRENT authorized seller row, not the tenant generally -
+    // if the tenant reconnects a different Amazon account before this finishes,
+    // progress must not be attributed to a seller row it no longer describes.
+    const active = await pool.query("select id from sellers where tenant_id=$1 and auth_status='authorized' order by connected_at desc limit 1", [parsedTenantId]);
+    if (!active.rowCount) { console.warn(`${label} skipped - no authorized seller found`); return; }
+    const sellerId = active.rows[0].id;
+    // COALESCE, not a plain overwrite: a later re-backfill (e.g. after
+    // reconnecting to pick up a newly granted SP-API role) computes a range
+    // that starts LATER than the original one, because Amazon's 90-day
+    // retention is measured from "now" - so only the first-ever backfill may
+    // set this floor. See 020_seller_data_floor.sql.
+    await pool.query(
+      "update sellers set backfill_status='running', backfill_started_at=now(), backfill_progress='{}'::jsonb, data_floor_date=coalesce(data_floor_date, $2::date) where id=$1",
+      [sellerId, range.start]
+    );
+    console.log(`${label} starting - ${INITIAL_BACKFILL_REPORT_TYPES.length} source(s), ${INITIAL_BACKFILL_DAYS} day window`);
+    const progress = {};
+    async function setProgress(reportType, state) {
+      progress[reportType] = state;
+      await pool.query('update sellers set backfill_progress=$2 where id=$1', [sellerId, JSON.stringify(progress)]);
     }
+    for (const reportType of INITIAL_BACKFILL_REPORT_TYPES) {
+      const startedAt = Date.now();
+      await setProgress(reportType, 'running');
+      try {
+        if (reportType === 'DIRECT_SP_API_SYNC') {
+          await syncRecentApiDataForTenant(parsedTenantId, { range });
+        } else {
+          for (let attempt = 0; attempt < INITIAL_BACKFILL_MAX_ATTEMPTS_PER_SOURCE; attempt += 1) {
+            const result = await syncReportForTenant({ tenantId: parsedTenantId, reportType, range });
+            if (!result?.outstandingDocuments) break;
+          }
+        }
+        await setProgress(reportType, 'completed');
+        console.log(`${label} ${reportType} completed in ${Date.now() - startedAt}ms`);
+      } catch (error) {
+        await setProgress(reportType, 'failed');
+        console.error(`${label} ${reportType} failed after ${Date.now() - startedAt}ms:`, error instanceof Error ? error.message : error);
+      }
+    }
+    await pool.query("update sellers set backfill_status='completed', backfill_completed_at=now() where id=$1", [sellerId]);
+    console.log(`${label} finished`);
+  } finally {
+    backfillInFlight.delete(parsedTenantId);
   }
-  await pool.query("update sellers set backfill_status='completed', backfill_completed_at=now() where id=$1", [sellerId]);
-  console.log(`${label} finished`);
 }
 
 /** @param {string} reportType */
