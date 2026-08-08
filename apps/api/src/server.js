@@ -362,7 +362,7 @@ async function findReusableSync(tenantId, reportType, range, windowMs = SYNC_REU
   const recent = await pool.query(
     `select id, completed_at, range_start, range_end from sync_jobs
      where tenant_id=$1 and report_type=$2 and status='completed'
-       and completed_at is not null and completed_at > now() - ($5::int * interval '1 millisecond')
+       and completed_at is not null and completed_at > now() - ($5::bigint * interval '1 millisecond')
        and range_start is not null and range_end is not null
        and range_start <= $3 and range_end >= $4
      order by completed_at desc limit 1`,
