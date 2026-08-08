@@ -456,6 +456,14 @@ function AmazonConnectionPanel({ tenantId, seller, onChange, setError }) {
       <div className="amazon-chip is-connected">
         <span className="dot" />
         <div className="chip-copy"><b>{seller.sellerId}</b><small>{seller.marketplaceId}</small></div>
+        {/* Re-authorizing doesn't require disconnecting first - it's the
+            same Amazon consent redirect either way, and re-authorizing is
+            exactly what's needed after enabling a new SP-API role (e.g.
+            Brand Analytics) in Developer Central, since a refresh token only
+            ever carries the roles that were granted at the moment it was
+            issued. The callback's upsert (see /oauth/callback) already
+            handles landing on an existing connected seller safely. */}
+        <Button variant="secondary" disabled={busy} onClick={connect} title="Re-run Amazon's authorization - use this after enabling a new role (e.g. Brand Analytics) in Developer Central so the account picks it up">{busy ? 'Redirecting…' : 'Re-authorize'}</Button>
         <Button variant="ghost" disabled={busy} onClick={disconnect}>{busy ? 'Disconnecting…' : 'Disconnect'}</Button>
       </div>
     );

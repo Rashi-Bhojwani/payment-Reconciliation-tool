@@ -755,6 +755,27 @@ app.get('/api/tenants/:tenantId/amazon/access-token', async request => {
   return { accessToken: token.accessToken, expiresAt: token.expiresAt, expiresIn: token.expiresIn, sellerId: seller.amazon_seller_id, marketplaceId: seller.marketplace_id };
 });
 
+// The frontend's Settings > Amazon panel has called this since it was
+// built, but the route itself was never added - Disconnect has been a dead
+// 404 the whole time. auth_status flips to 'revoked' (not deleted - the
+// refresh token is left in place so a straight re-authorize below can
+// overwrite it, and disconnected_at is cleared automatically by the OAuth
+// callback's upsert on reconnect) so every "where auth_status='authorized'"
+// query elsewhere in the app - dashboard, sync, access-token - stops
+// treating this seller as connected without touching any already-synced
+// data.
+app.post('/api/tenants/:tenantId/amazon/disconnect', async request => {
+  const { tenantId } = TenantParamsSchema.parse(request.params);
+  await requireTenantUser(request, tenantId);
+  await assertActiveTenant(tenantId);
+  const result = await pool.query(
+    "update sellers set auth_status='revoked', disconnected_at=now() where tenant_id=$1 and auth_status='authorized' returning id",
+    [tenantId]
+  );
+  if (!result.rowCount) throw Object.assign(new Error('Amazon seller is not connected'), { statusCode: 404 });
+  return { disconnected: true };
+});
+
 app.get('/api/admin/tenants', async request => {
   await requireAdmin(request);
   const result = await pool.query(`select t.id, t.company_name, t.owner_email, t.login_email, t.status, t.plan, t.created_at, t.approved_at,
