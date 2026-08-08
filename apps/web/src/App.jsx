@@ -938,6 +938,38 @@ function usePriorPeriod(tenantId, range) {
   return prevData;
 }
 
+// Amazon's own Sales Dashboard totals for the range, computed the same way
+// Amazon computes them: sum businessReportRows (already deduplicated
+// per-day - server.js prefers each day's asin='ALL' rollup row and only
+// falls back to summing per-ASIN rows when Amazon didn't send one, so this
+// never double-counts). Deliberately separate from Net Qty / Orders Synced
+// above: those are reconciliation-adjusted (net of actual returns, cancelled
+// and pending/unshipped orders excluded, missing item quantities backfilled
+// from settlement data) - genuinely different, both-correct numbers for
+// different questions, not two attempts at the same one. Comparing this card
+// against Seller Central's Sales Dashboard is the direct apples-to-apples
+// check; Net Qty/Orders Synced are not meant to equal it.
+function sumBusinessReportTotals(rows) {
+  return (rows ?? []).reduce((acc, row) => ({
+    totalOrderItems: acc.totalOrderItems + Number(row.total_order_items ?? 0),
+    unitsOrdered: acc.unitsOrdered + Number(row.units_ordered ?? 0),
+    orderedProductSales: acc.orderedProductSales + Number(row.ordered_product_sales ?? 0)
+  }), { totalOrderItems: 0, unitsOrdered: 0, orderedProductSales: 0 });
+}
+function AmazonBusinessReportCard({ rows }) {
+  const hasRows = Boolean(rows?.length);
+  const totals = useMemo(() => sumBusinessReportTotals(rows), [rows]);
+  return <Card className="profit-control-card">
+    <PanelHeader title="Amazon Business Report" subtitle="Matches Seller Central's Sales Dashboard for this range" />
+    {hasRows
+      ? <div className="profit-kpi-grid">
+          <div className="mini-metric"><span>Total Order Items</span><strong>{formatNumber(totals.totalOrderItems)}</strong></div>
+          <div className="mini-metric"><span>Units Ordered</span><strong>{formatNumber(totals.unitsOrdered)}</strong></div>
+          <div className="mini-metric"><span>Ordered Product Sales</span><strong>{formatCurrency(totals.orderedProductSales)}</strong></div>
+        </div>
+      : <Empty text="Amazon's Sales and Traffic report hasn't synced for this range yet - once it does, these three numbers will match Seller Central's Sales Dashboard exactly." />}
+  </Card>;
+}
 function DashboardOverview({ data, channelData, tenantId }) {
   const { range } = useContext(DateRangeContext);
   const summary = useMemo(() => buildDashboardSummary(data, range), [data, range]);
@@ -952,6 +984,8 @@ function DashboardOverview({ data, channelData, tenantId }) {
       <DrillMetric to={`/seller?tenantId=${tenantId}&view=metric-detail&metric=orders`} title="Orders Synced" value={formatNumber(summary.ordersCount)} icon="⇄" tone="emerald" delta={prevSummary && pctDelta(summary.ordersCount, prevSummary.ordersCount)} />
       <DrillMetric to={`/seller?tenantId=${tenantId}&view=metric-detail&metric=returns`} title="Returns" value={formatNumber(summary.returnQty)} icon="↩" tone="marigold" delta={prevSummary && pctDelta(summary.returnQty, prevSummary.returnQty)} />
     </div>
+
+    <AmazonBusinessReportCard rows={data?.businessReportRows} />
 
     <Card className="profit-control-card">
       <PanelHeader title="Profit Analysis" subtitle="Clean overview" />
