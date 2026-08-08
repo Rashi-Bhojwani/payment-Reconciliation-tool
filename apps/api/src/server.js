@@ -765,9 +765,29 @@ app.get('/api/admin/tenants', async request => {
   return { tenants: result.rows };
 });
 
+// Also doubles as "Activate" for a suspended tenant - granting and
+// reactivating are the same state transition (-> active, approved_at=now()),
+// so a suspended seller revoked by mistake is one click from working again.
 app.post('/api/admin/tenants/:tenantId/grant-access', async request => { await requireAdmin(request); const { tenantId } = TenantParamsSchema.parse(request.params); return (await pool.query("update tenants set status='active', approved_at=now(), approved_by_admin_id=$2 where id=$1 returning id,status,approved_at", [tenantId, adminId])).rows[0]; });
 app.post('/api/admin/tenants/:tenantId/reject', async request => { await requireAdmin(request); const { tenantId } = TenantParamsSchema.parse(request.params); return (await pool.query("update tenants set status='suspended' where id=$1 returning id,status", [tenantId])).rows[0]; });
 app.post('/api/admin/tenants/:tenantId/revoke-access', async request => { await requireAdmin(request); const { tenantId } = TenantParamsSchema.parse(request.params); return (await pool.query("update tenants set status='suspended' where id=$1 returning id,status", [tenantId])).rows[0]; });
+// Permanently removes the tenant and, via ON DELETE CASCADE (see
+// 001_init.sql), every row that hangs off it - users, sellers, sync_jobs,
+// orders, settlement_rows, and every other fact table. Irreversible, so it's
+// deliberately refused for an 'active' tenant even if a stale UI or a direct
+// API call tries it: the seller must be revoked (suspended) first. That
+// mirrors the two-step flow in the admin UI (Revoke, then Delete or
+// Activate) and means a live, in-use account can never be deleted in one
+// accidental click.
+app.delete('/api/admin/tenants/:tenantId', async request => {
+  await requireAdmin(request);
+  const { tenantId } = TenantParamsSchema.parse(request.params);
+  const tenant = (await pool.query('select status from tenants where id=$1', [tenantId])).rows[0];
+  if (!tenant) throw Object.assign(new Error('Tenant not found'), { statusCode: 404 });
+  if (tenant.status === 'active') throw Object.assign(new Error('Revoke this seller before deleting - active accounts cannot be deleted directly'), { statusCode: 409 });
+  await pool.query('delete from tenants where id=$1', [tenantId]);
+  return { deleted: true, id: tenantId };
+});
 app.post('/api/admin/tenants/:tenantId/sync/:reportType', async request => { await requireAdmin(request); return syncReportForTenant(SyncParamsSchema.parse(request.params)); });
 
 app.post('/api/tenants/:tenantId/sync/:reportType', async request => {

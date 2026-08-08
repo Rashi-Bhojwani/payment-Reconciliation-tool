@@ -1419,7 +1419,11 @@ function AdminDashboard() {
   const [creating, setCreating] = useState(false);
   const [createMsg, setCreateMsg] = useState('');
   async function load() { try { setTenants((await api('/api/admin/tenants')).tenants); } catch (e) { setError(e.message); } }
-  async function action(path) { await api(path, { method: 'POST' }); await load(); }
+  async function action(path) { try { await api(path, { method: 'POST' }); await load(); } catch (e) { setError(e.message); } }
+  async function deleteTenant(t) {
+    if (!window.confirm(`Delete ${t.company_name}? This permanently removes their login and every synced record - orders, settlements, GST invoices, everything. This cannot be undone.`)) return;
+    try { await api(`/api/admin/tenants/${t.id}`, { method: 'DELETE' }); await load(); } catch (e) { setError(e.message); }
+  }
   useEffect(() => { void load(); }, []);
   const stats = useMemo(() => ({ total: tenants.length, pending: tenants.filter(t => !t.amazon_connected).length, active: tenants.filter(t => t.status === 'active').length }), [tenants]);
 
@@ -1441,14 +1445,14 @@ function AdminDashboard() {
     <Card className="create-seller-card">
       <PanelHeader title="Create seller account" subtitle="Admin only" />
       <form onSubmit={createSeller} className="form-row">
-        <Input placeholder="Company name" value={newSeller.companyName} onChange={e => setNewSeller({ ...newSeller, companyName: e.target.value })} required />
+        <Input placeholder="Seller name" value={newSeller.companyName} onChange={e => setNewSeller({ ...newSeller, companyName: e.target.value })} required />
         <Input placeholder="Owner email" type="email" value={newSeller.ownerEmail} onChange={e => setNewSeller({ ...newSeller, ownerEmail: e.target.value })} required />
         <Input placeholder="Temporary password" type="password" value={newSeller.password} onChange={e => setNewSeller({ ...newSeller, password: e.target.value })} required minLength={8} />
         <Button disabled={creating}>{creating ? 'Creating…' : 'Create seller'}</Button>
       </form>
       {createMsg && <p className="alert success">{createMsg}</p>}
     </Card>
-    <Card className="table-card"><PanelHeader title="Seller Authorization Control" /><div className="table-wrap"><table><thead><tr><th>Seller</th><th>Status</th><th>Login</th><th>Amazon auth</th><th>Connected</th><th>Last sync</th><th>Actions</th></tr></thead><tbody>{tenants.map(t => <tr key={t.id}><td><b>{t.company_name}</b><small>{t.id}</small></td><td><span className={`pill status-${t.status}`}>{t.status}</span></td><td>{t.login_email ?? t.owner_email ?? '—'}</td><td>{t.amazon_connected ? `${t.seller_name ?? t.company_name} · ${t.amazon_seller_id} · ${t.auth_status}` : 'Not connected'}</td><td>{t.amazon_connected_at ? new Date(t.amazon_connected_at).toLocaleString() : '—'}</td><td>{t.last_successful_sync ?? '—'}</td><td><div className="row-actions">{t.status === 'pending' && <><Button onClick={() => action(`/api/admin/tenants/${t.id}/grant-access`)}>Grant</Button><Button variant="secondary" onClick={() => action(`/api/admin/tenants/${t.id}/reject`)}>Reject</Button></>}{t.status === 'active' && <>{REPORTS.map(r => <Button variant="secondary" key={r.type} onClick={() => action(`/api/admin/tenants/${t.id}/sync/${r.type}`)}>{r.code}</Button>)}<Button variant="danger" onClick={() => action(`/api/admin/tenants/${t.id}/revoke-access`)}>Revoke</Button></>}</div></td></tr>)}</tbody></table></div></Card>
+    <Card className="table-card"><PanelHeader title="Seller Authorization Control" /><div className="table-wrap"><table><thead><tr><th>Seller</th><th>Status</th><th>Login</th><th>Amazon auth</th><th>Connected</th><th>Last sync</th><th>Actions</th></tr></thead><tbody>{tenants.map(t => <tr key={t.id}><td><b>{t.company_name}</b><small>{t.id}</small></td><td><span className={`pill status-${t.status}`}>{t.status}</span></td><td>{t.login_email ?? t.owner_email ?? '—'}</td><td>{t.amazon_connected ? `${t.seller_name ?? t.company_name} · ${t.amazon_seller_id} · ${t.auth_status}` : 'Not connected'}</td><td>{t.amazon_connected_at ? new Date(t.amazon_connected_at).toLocaleString() : '—'}</td><td>{t.last_successful_sync ?? '—'}</td><td><div className="row-actions">{t.status === 'pending' && <><Button onClick={() => action(`/api/admin/tenants/${t.id}/grant-access`)}>Grant</Button><Button variant="secondary" onClick={() => action(`/api/admin/tenants/${t.id}/reject`)}>Reject</Button></>}{t.status === 'active' && <Button variant="danger" onClick={() => action(`/api/admin/tenants/${t.id}/revoke-access`)}>Revoke</Button>}{t.status === 'suspended' && <><Button onClick={() => action(`/api/admin/tenants/${t.id}/grant-access`)}>Activate</Button><Button variant="danger" onClick={() => deleteTenant(t)}>Delete</Button></>}</div></td></tr>)}</tbody></table></div></Card>
   </div>;
 }
 
