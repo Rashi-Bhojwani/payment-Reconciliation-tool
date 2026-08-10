@@ -700,6 +700,17 @@ async function runAmazonCallback(request, reply, rememberTenant) {
   const marketplace = tenant.default_marketplace_id ?? 'A21TJRUUN4KGV';
   const sellerId = query.selling_partner_id ?? `SELLER-${state.tenantId}`;
   const sellerName = tenant.company_name;
+  // Diagnostic only, never the raw secret: a one-way fingerprint of whichever
+  // refresh token was already stored for this seller, if any, so the log can
+  // say for certain whether THIS authorization actually replaced it with a
+  // different one from Amazon - rather than leaving that as a guess when a
+  // newly-granted role still doesn't seem to take effect after re-authorizing.
+  const priorTokenRow = (await pool.query('select refresh_token_encrypted from sellers where tenant_id=$1 and amazon_seller_id=$2', [state.tenantId, sellerId])).rows[0];
+  const fingerprint = value => crypto.createHash('sha256').update(value).digest('hex').slice(0, 12);
+  const priorFingerprint = priorTokenRow ? fingerprint(decryptSecret(priorTokenRow.refresh_token_encrypted)) : null;
+  const newFingerprint = fingerprint(body.refresh_token);
+  app.log.info({ tenantId: state.tenantId, sellerId, priorFingerprint, newFingerprint, tokenChanged: priorFingerprint === null ? 'first-authorization' : priorFingerprint !== newFingerprint }, 'Amazon OAuth callback - refresh token fingerprint');
+
   const client = await pool.connect();
   try {
     await client.query('begin');
