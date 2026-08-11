@@ -956,18 +956,33 @@ function sumBusinessReportTotals(rows) {
     orderedProductSales: acc.orderedProductSales + Number(row.ordered_product_sales ?? 0)
   }), { totalOrderItems: 0, unitsOrdered: 0, orderedProductSales: 0 });
 }
+// Amazon's own "Avg. units/order item" and "Avg. sales/order item" are
+// ratios over the RANGE TOTAL, not an average of each day's own average -
+// confirmed against a live Seller Central screenshot: 623 units ordered /
+// 590 total order items = 1.0559 -> displayed as 1.06, and
+// ₹83,42,382.00 / 590 = ₹14,139.63 exactly. Averaging the per-day
+// average_sales_per_order_item / average_units_per_order_item fields
+// instead (which businessReportRows also carries) would give a different,
+// non-matching number on any range where daily volume varies - so these two
+// are deliberately derived from the same totals as the other three, not
+// pulled from those columns.
+function formatRatio(value) { return Number(value ?? 0).toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 }); }
 function AmazonBusinessReportCard({ rows }) {
   const hasRows = Boolean(rows?.length);
   const totals = useMemo(() => sumBusinessReportTotals(rows), [rows]);
+  const avgUnitsPerOrderItem = totals.totalOrderItems ? totals.unitsOrdered / totals.totalOrderItems : null;
+  const avgSalesPerOrderItem = totals.totalOrderItems ? totals.orderedProductSales / totals.totalOrderItems : null;
   return <Card className="profit-control-card">
     <PanelHeader title="Amazon Business Report" subtitle="Matches Seller Central's Sales Dashboard for this range" />
     {hasRows
-      ? <div className="profit-kpi-grid">
+      ? <div className="profit-kpi-grid amazon-business-report-grid">
           <div className="mini-metric"><span>Total Order Items</span><strong>{formatNumber(totals.totalOrderItems)}</strong></div>
           <div className="mini-metric"><span>Units Ordered</span><strong>{formatNumber(totals.unitsOrdered)}</strong></div>
           <div className="mini-metric"><span>Ordered Product Sales</span><strong>{formatCurrency(totals.orderedProductSales)}</strong></div>
+          <div className="mini-metric"><span>Avg. Units/Order Item</span><strong>{avgUnitsPerOrderItem==null?'—':formatRatio(avgUnitsPerOrderItem)}</strong></div>
+          <div className="mini-metric"><span>Avg. Sales/Order Item</span><strong>{avgSalesPerOrderItem==null?'—':formatCurrency(avgSalesPerOrderItem)}</strong></div>
         </div>
-      : <Empty text="Amazon's Sales and Traffic report hasn't synced for this range yet - once it does, these three numbers will match Seller Central's Sales Dashboard exactly." />}
+      : <Empty text="Amazon's Sales and Traffic report hasn't synced for this range yet - once it does, these five numbers will match Seller Central's Sales Dashboard exactly." />}
   </Card>;
 }
 function DashboardOverview({ data, channelData, tenantId }) {

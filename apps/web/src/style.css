@@ -710,6 +710,8 @@ tbody tr:hover td { background: rgba(115, 87, 232, 0.045); }
 }
 .account-activity-grid { grid-template-columns: repeat(5, minmax(0, 1fr)); }
 .account-activity-grid .mini-metric { min-width: 0; }
+.amazon-business-report-grid { grid-template-columns: repeat(5, minmax(0, 1fr)); }
+.amazon-business-report-grid .mini-metric { min-width: 0; }
 .activity-provisional {
   margin: 0 0 14px;
   padding: 12px 14px;
