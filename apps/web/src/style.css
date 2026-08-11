@@ -548,6 +548,20 @@ select, input { font-family: inherit; }
   border-radius: var(--radius-sm);
   margin-bottom: 4px;
 }
+.ledger-upload-panel {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-end;
+  gap: 14px;
+  padding: 14px 16px;
+  margin: 0 0 4px;
+  background: var(--paper);
+  border-radius: var(--radius-sm);
+  border: 1px dashed var(--border);
+}
+.ledger-upload-panel p { flex-basis: 100%; margin: 0 0 2px; }
+.ledger-upload-panel input[type="file"] { max-width: 260px; }
+.ledger-upload-panel .calendar-footer { flex-basis: 100%; }
 
 /* ---------- Metrics & stats ---------- */
 .metrics-strip, .stat-grid {

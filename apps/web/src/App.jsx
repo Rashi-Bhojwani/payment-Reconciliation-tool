@@ -1,4 +1,4 @@
-import React, { createContext, useContext, useEffect, useMemo, useRef, useState } from 'react';
+import React, { createContext, Fragment, useContext, useEffect, useMemo, useRef, useState } from 'react';
 import { createRoot } from 'react-dom/client';
 import { BrowserRouter, Link, Navigate, Route, Routes, useLocation, useNavigate, useSearchParams } from 'react-router-dom';
 import { Bar, BarChart, CartesianGrid, Cell, Line, LineChart, Pie, PieChart, ResponsiveContainer, Tooltip, XAxis, YAxis } from 'recharts';
@@ -124,6 +124,15 @@ async function syncAmazonSource(tenantId, reportType, range) {
 async function resetSettlementData(tenantId, range) {
   const payload = { method: 'POST', body: JSON.stringify({ range: { start: formatDateParam(range.start), end: endOfRangeParam(range.end) }, confirm: true }) };
   return api(`/api/tenants/${tenantId}/settlement-data/reset`, payload);
+}
+// Report types Seller Central lets a person download much further back than
+// SP-API's 90-day report retention allows an app to fetch automatically -
+// see the matching UPLOADABLE_REPORT_TYPES comment in server.js for exactly
+// why these five and not the other three.
+const UPLOADABLE_REPORT_TYPES = new Set(['GET_V2_SETTLEMENT_REPORT_DATA_FLAT_FILE_V2', 'GET_GST_MTR_B2B_CUSTOM', 'GET_GST_MTR_B2C_CUSTOM', 'GET_FBA_FULFILLMENT_CUSTOMER_RETURNS_DATA', 'GET_FBA_REIMBURSEMENTS_DATA']);
+async function uploadReportFile(tenantId, reportType, content, range) {
+  const payload = { method: 'POST', body: JSON.stringify({ content, range: { start: formatDateParam(range.start), end: endOfRangeParam(range.end) } }) };
+  return api(`/api/tenants/${tenantId}/reports/${reportType}/upload`, payload);
 }
 
 function Button({ className = '', variant = 'primary', icon, children, ...props }) { return <button {...props} className={`btn btn-${variant} ${className}`}>{icon && <span className="btn-icon" aria-hidden="true">{icon}</span>}{children}</button>; }
@@ -341,7 +350,35 @@ function StatCard({ title, value, hint }) { return <Card className="stat-card"><
 function SyncLedger({ tenantId, jobs = [], onSynced, reportTypes, title, subtitle, disabled }) {
   const { range } = useContext(DateRangeContext);
   const [rowState, setRowState] = useState({});
+  const [uploadOpen, setUploadOpen] = useState(null);
+  const [uploadDraft, setUploadDraft] = useState({ start: '', end: '', file: null });
   const reports = reportTypes ? REPORTS.filter(r => reportTypes.includes(r.type)) : REPORTS;
+
+  function openUpload(reportType) {
+    setUploadOpen(reportType);
+    setUploadDraft({ start: toDateInputValue(range.start), end: toDateInputValue(range.end), file: null });
+  }
+
+  // Reads the file in the browser and sends it as JSON, same as every other
+  // write in this app - no multipart dependency needed for what is, in the
+  // end, just text. The seller states which period the file covers rather
+  // than the server guessing it from row contents: unambiguous, and it's
+  // exactly what they'd already know from the statement/report they just
+  // downloaded (e.g. "Q1 2026 settlement").
+  async function uploadOne(reportType) {
+    if (disabled || !uploadDraft.file) return;
+    setRowState(s => ({ ...s, [reportType]: { loading: true } }));
+    try {
+      const content = await uploadDraft.file.text();
+      const uploadRange = { start: fromDateInputValue(uploadDraft.start), end: fromDateInputValue(uploadDraft.end) };
+      const result = await uploadReportFile(tenantId, reportType, content, uploadRange);
+      setRowState(s => ({ ...s, [reportType]: { loading: false, justSynced: true, summary: `${formatNumber(result.rowsImported)} report rows imported from uploaded file` } }));
+      setUploadOpen(null);
+      await onSynced?.();
+    } catch (e) {
+      setRowState(s => ({ ...s, [reportType]: { loading: false, error: e.message } }));
+    }
+  }
 
   async function syncOne(reportType) {
     if (disabled) return;
@@ -407,21 +444,45 @@ function SyncLedger({ tenantId, jobs = [], onSynced, reportTypes, title, subtitl
           const busy = local?.loading;
           const failed = local?.error || job?.status === 'failed';
           const statusLabel = disabled ? 'locked' : busy ? 'syncing' : failed ? 'failed' : job?.status ?? 'idle';
+          const uploadable = UPLOADABLE_REPORT_TYPES.has(report.type);
           return (
-            <div className={`ledger-row ${codeClass(report.code)}`} key={report.type}>
-              <span className="ledger-index">{String(i + 1).padStart(2, '0')}</span>
-              <span className={`ledger-code ${codeClass(report.code)}`}>{report.code}</span>
-              <div className="ledger-meta">
-                <b>{report.label}</b>
-                <small>{local?.error ?? local?.summary ?? (job?.completed_at ? `Last synced ${timeAgo(job.completed_at)}` : report.hint)}</small>
-                {!local && job?.error_message && <small className={job.status === 'failed' ? 'ledger-note-error' : 'ledger-note-warning'}>{job.error_message}</small>}
+            <Fragment key={report.type}>
+              <div className={`ledger-row ${codeClass(report.code)}`}>
+                <span className="ledger-index">{String(i + 1).padStart(2, '0')}</span>
+                <span className={`ledger-code ${codeClass(report.code)}`}>{report.code}</span>
+                <div className="ledger-meta">
+                  <b>{report.label}</b>
+                  <small>{local?.error ?? local?.summary ?? (job?.completed_at ? `Last synced ${timeAgo(job.completed_at)}${job.source === 'manual_upload' ? ' - uploaded file' : ''}` : report.hint)}</small>
+                  {!local && job?.error_message && <small className={job.status === 'failed' ? 'ledger-note-error' : 'ledger-note-warning'}>{job.error_message}</small>}
+                </div>
+                <span className={`pill status-${statusLabel}`}>{statusLabel}</span>
+                {report.type === 'GET_V2_SETTLEMENT_REPORT_DATA_FLAT_FILE_V2' && (
+                  <Button variant="secondary" disabled={disabled || busy} title="Deletes stored settlement rows for this range and re-downloads them from Amazon - use only if figures look wrong" onClick={() => resetSettlements()}>{busy ? '…' : 'Reset & Resync'}</Button>
+                )}
+                {uploadable && (
+                  <Button variant="secondary" disabled={disabled || busy} title="Import a report file you downloaded directly from Seller Central - the only way to get data older than Amazon's 90-day API limit" onClick={() => uploadOpen === report.type ? setUploadOpen(null) : openUpload(report.type)}>Upload</Button>
+                )}
+                <Button variant="secondary" disabled={disabled || busy} onClick={() => syncOne(report.type)}>{busy ? 'Syncing…' : 'Sync'}</Button>
               </div>
-              <span className={`pill status-${statusLabel}`}>{statusLabel}</span>
-              {report.type === 'GET_V2_SETTLEMENT_REPORT_DATA_FLAT_FILE_V2' && (
-                <Button variant="secondary" disabled={disabled || busy} title="Deletes stored settlement rows for this range and re-downloads them from Amazon - use only if figures look wrong" onClick={() => resetSettlements()}>{busy ? '…' : 'Reset & Resync'}</Button>
+              {uploadOpen === report.type && (
+                <div className="ledger-upload-panel">
+                  <p className="muted small">Upload a {report.label} file downloaded directly from Seller Central - this reaches further back than Amazon's API allows this app to fetch automatically. State the period this file actually covers below; it must be correct for the data to land in the right place.</p>
+                  <div className="date-field-group">
+                    <label>Period start</label>
+                    <input className="input" type="date" value={uploadDraft.start} max={uploadDraft.end || undefined} onChange={e => setUploadDraft(d => ({ ...d, start: e.target.value }))} />
+                  </div>
+                  <div className="date-field-group">
+                    <label>Period end</label>
+                    <input className="input" type="date" value={uploadDraft.end} min={uploadDraft.start} max={toDateInputValue(new Date())} onChange={e => setUploadDraft(d => ({ ...d, end: e.target.value }))} />
+                  </div>
+                  <input className="input" type="file" accept=".txt,.csv,.tsv" onChange={e => setUploadDraft(d => ({ ...d, file: e.target.files?.[0] ?? null }))} />
+                  <div className="calendar-footer range-apply-row">
+                    <Button variant="ghost" type="button" onClick={() => setUploadOpen(null)}>Cancel</Button>
+                    <Button type="button" disabled={busy || !uploadDraft.file || !uploadDraft.start || !uploadDraft.end} onClick={() => uploadOne(report.type)}>{busy ? 'Uploading…' : 'Upload'}</Button>
+                  </div>
+                </div>
               )}
-              <Button variant="secondary" disabled={disabled || busy} onClick={() => syncOne(report.type)}>{busy ? 'Syncing…' : 'Sync'}</Button>
-            </div>
+            </Fragment>
           );
         })}
       </div>

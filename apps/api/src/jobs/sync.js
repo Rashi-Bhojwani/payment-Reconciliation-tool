@@ -530,7 +530,7 @@ async function saveSalesTrafficDaily(tenantId, content, range) {
 }
 
 /** @param {string} tenantId @param {string} reportType @param {string} content */
-async function saveStructuredRows(tenantId, reportType, content, range) {
+export async function saveStructuredRows(tenantId, reportType, content, range) {
   switch (reportType) {
     case 'GET_V2_SETTLEMENT_REPORT_DATA_FLAT_FILE_V2': return saveSettlementRows(tenantId, content).then(result => result.parsed);
     case 'GET_GST_MTR_B2B_CUSTOM': return saveGstInvoices(tenantId, content, 'b2b');

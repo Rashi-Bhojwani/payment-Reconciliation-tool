@@ -8,14 +8,21 @@ import { assertActiveTenant, databaseUrlConfigured, pool, withTenant } from '@re
 import { getSpApiEndpoint, MARKETPLACES, REPORT_TYPES, SpApiClient } from '@recon/sp-api-client';
 import { secrets } from './config/secrets.js';
 import { decryptSecret, encryptSecret } from './config/crypto.js';
-import { buildGstInvoicesFromOrderItems, runInitialSellerBackfill, startScheduler, syncRecentApiDataForTenant, syncReportForTenant } from './jobs/sync.js';
+import { buildGstInvoicesFromOrderItems, runInitialSellerBackfill, saveStructuredRows, startScheduler, syncRecentApiDataForTenant, syncReportForTenant } from './jobs/sync.js';
 import { buildRestoreStatements, createSyncQueue } from './jobs/sync-queue.js';
-import { calendarDays } from './jobs/reporting-calendar.js';
+import { calendarDay, calendarDays } from './jobs/reporting-calendar.js';
 import { categorizeFinanceLabel } from './jobs/finance-components.js';
 import { calculateDashboardMetrics } from './jobs/dashboard-calculations.js';
 import { runFeeAuditForTenant } from './jobs/fee-audit.js';
 
-const app = Fastify({ logger: { redact: ['req.headers.authorization', 'refresh_token', 'access_token', 'password', 'passwordHash'] }, trustProxy: true });
+// Default 1 MiB body limit is fine for every other route, but a manually
+// uploaded settlement or GST MTR flat file (see /reports/:reportType/upload)
+// - sent as a JSON string, not multipart, to avoid a new dependency for
+// something this codebase already handles as raw text everywhere else - can
+// legitimately run tens of thousands of rows for a full quarter. 25 MiB is
+// generous enough for that while staying nowhere near "someone could DoS the
+// process with this."
+const app = Fastify({ logger: { redact: ['req.headers.authorization', 'refresh_token', 'access_token', 'password', 'passwordHash'] }, trustProxy: true, bodyLimit: 25 * 1024 * 1024 });
 
 await app.register(cors, { origin: secrets.frontendOrigin, credentials: true });
 await app.register(rateLimit, { max: 180, timeWindow: '1 minute' });
@@ -856,6 +863,75 @@ app.post('/api/tenants/:tenantId/sync', async request => {
   return { results };
 });
 
+// Report types where a human downloading directly from Seller Central
+// produces the exact same flat-file format Amazon's own API returns, so the
+// same parser/save path (saveStructuredRows) can be trusted on it without a
+// separate parser being written and unverified against real files:
+//  - Settlement, GST B2B/B2C, FBA Returns, FBA Reimbursements are all TSV
+//    documents Amazon generates identically regardless of whether a human
+//    or the API requested them.
+// Deliberately excludes two report types that WOULD be wrong here:
+//  - GET_SALES_AND_TRAFFIC_REPORT: Seller Central's manual "Business
+//    Reports" export is a different CSV shape than the API's JSON payload -
+//    assuming they match without ever having verified a real exported file
+//    risks silently storing wrong numbers, which is worse than not
+//    supporting upload for it at all.
+//  - GET_FBA_MYI_UNSUPPRESSED_INVENTORY_DATA: inventory is a point-in-time
+//    snapshot, not a time series - saveInventorySnapshots always dates a
+//    snapshot "today" (see snapshotDate in sync.js), so uploading an old
+//    inventory file would silently mislabel stale stock levels as current.
+//    There is nothing correct this upload could backfill.
+const UPLOADABLE_REPORT_TYPES = new Set([
+  'GET_V2_SETTLEMENT_REPORT_DATA_FLAT_FILE_V2',
+  'GET_GST_MTR_B2B_CUSTOM',
+  'GET_GST_MTR_B2C_CUSTOM',
+  'GET_FBA_FULFILLMENT_CUSTOMER_RETURNS_DATA',
+  'GET_FBA_REIMBURSEMENTS_DATA'
+]);
+const ReportUploadSchema = z.object({ content: z.string().min(1), range: DateRangeSchema });
+// The only route in the app that ingests report data without ever calling
+// Amazon - for the handful of report types Seller Central lets a person
+// download much further back than SP-API's 90-day retention allows an app
+// to fetch automatically (see UPLOADABLE_REPORT_TYPES above). Reuses
+// saveStructuredRows, the exact function every API-driven sync already
+// calls to turn report content into rows - so an uploaded settlement file
+// gets the same balance-to-the-paisa check (assertSettlementsBalance) as
+// one Amazon's API handed over directly, and every other correctness rule
+// already built into this pipeline applies unchanged. The caller supplies
+// the range being uploaded (what period this file covers) rather than the
+// server trying to infer it from row contents, which is unambiguous and
+// matches exactly how every other sync_jobs row already records its range.
+app.post('/api/tenants/:tenantId/reports/:reportType/upload', async request => {
+  const { tenantId, reportType } = SellerSyncParamsSchema.parse(request.params);
+  await requireTenantUser(request, tenantId);
+  await assertActiveTenant(tenantId);
+  if (!UPLOADABLE_REPORT_TYPES.has(reportType)) {
+    throw Object.assign(new Error(`${reportType} does not support manual upload - either its Seller Central export format is unverified against this app's parser, or the report type has no meaningful historical range to upload.`), { statusCode: 400 });
+  }
+  const body = ReportUploadSchema.parse(request.body);
+  const rowsImported = await saveStructuredRows(tenantId, reportType, body.content, null);
+  await pool.query(
+    `insert into sync_jobs(tenant_id, report_type, status, started_at, completed_at, range_start, range_end, source)
+     values($1,$2,'completed',now(),now(),$3,$4,'manual_upload')`,
+    [tenantId, reportType, body.range.start, body.range.end]
+  );
+  // Real data reaching further back than the recorded floor means the floor
+  // was wrong, not that this upload should be clamped to it - same LEAST
+  // reasoning as 022_seller_first_authorized_at.sql, just applied live
+  // instead of as a one-time migration. Never moves the floor later, only
+  // ever earlier or from null to a real date. calendarDay converts the
+  // instant to its IST calendar day first, the same correction
+  // reporting-calendar.js already applies everywhere else a DATE column is
+  // compared - casting the raw UTC ISO string straight to ::date instead
+  // silently shifts a day near midnight IST, confirmed elsewhere in this
+  // codebase (see that file's own comment for the verified repro).
+  await pool.query(
+    "update sellers set data_floor_date = least(coalesce(data_floor_date, $2::date), $2::date) where tenant_id=$1 and auth_status='authorized'",
+    [tenantId, calendarDay(body.range.start)]
+  );
+  return { reportType, status: 'completed', source: 'manual_upload', rowsImported };
+});
+
 // A tenant that was actively re-synced during this session's earlier bugs
 // (before document-level dedup and a stable source_key formula both landed)
 // can be left with genuine duplicate-content settlement_rows: two rows that
@@ -1394,10 +1470,10 @@ app.get('/api/tenants/:tenantId/dashboard', async request => {
       select settlement_id, posted_date, net_amount, lines from merged order by posted_date desc nulls last limit 100`, [tenantId, start, end])).rows;
     const jobs = (await client.query(`
       with normalized_jobs as (
-        select report_type, status, started_at, completed_at, error_message, s3_key
+        select report_type, status, started_at, completed_at, error_message, s3_key, source
         from sync_jobs where tenant_id=$1
       )
-      select distinct on (report_type) report_type, status, started_at, completed_at, error_message, s3_key
+      select distinct on (report_type) report_type, status, started_at, completed_at, error_message, s3_key, source
       from normalized_jobs
       order by report_type, started_at desc nulls last
     `, [tenantId])).rows;
@@ -1536,7 +1612,7 @@ app.get('/api/tenants/:tenantId/summary', async request => {
     grossSales: (await client.query("select coalesce(sum(amount),0) total from settlement_rows where tenant_id=$1 and (amount_type ilike '%principal%' or amount_description ilike '%principal%')", [tenantId])).rows[0].total,
     fees: (await client.query("select coalesce(sum(amount),0) total from settlement_rows where tenant_id=$1 and amount < 0 and (amount_type ilike '%fee%' or amount_description ilike '%fee%')", [tenantId])).rows[0].total,
     feeLeaks: (await client.query('select count(*) count from fee_leak_flags where tenant_id=$1', [tenantId])).rows[0].count,
-    recentJobs: (await client.query('select report_type,status,started_at,completed_at,error_message,s3_key from sync_jobs where tenant_id=$1 order by started_at desc nulls last limit 10', [tenantId])).rows
+    recentJobs: (await client.query('select report_type,status,started_at,completed_at,error_message,s3_key,source from sync_jobs where tenant_id=$1 order by started_at desc nulls last limit 10', [tenantId])).rows
   }));
 });
 
