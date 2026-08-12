@@ -1032,8 +1032,19 @@ export async function buildGstInvoicesFromOrderItems(tenantId, invoiceType) {
   const parsedInvoiceType = z.enum(['b2b', 'b2c']).parse(invoiceType);
   await assertActiveTenant(parsedTenantId);
   return withTenant(parsedTenantId, async db => {
+    // source_key here mirrors this query's own GROUP BY exactly (order_id +
+    // invoice_type + date) rather than the per-shipment-item identity
+    // saveGstInvoices now uses - this fallback already aggregates every
+    // item on an order into one row per order+day, so that coarser grain is
+    // its real, correct identity, not a bug to fix. It just needs to be
+    // deterministic (same order+type+day always hashes the same way) so a
+    // re-run updates the existing estimate instead of duplicating it. Must
+    // target (tenant_id, source_key) now, not the old composite key - that
+    // unique constraint no longer exists on this table (see
+    // 024_gst_invoices_source_key.sql), so the previous ON CONFLICT target
+    // here would fail outright on every call once that migration runs.
     const result = await db.query(
-      `insert into gst_invoices(tenant_id, invoice_type, order_id, taxable_value, cgst, sgst, igst, invoice_date)
+      `insert into gst_invoices(tenant_id, invoice_type, order_id, taxable_value, cgst, sgst, igst, invoice_date, source_key)
        select oi.tenant_id,
          $2,
          oi.amazon_order_id,
@@ -1041,12 +1052,13 @@ export async function buildGstInvoicesFromOrderItems(tenantId, invoiceType) {
          sum(coalesce(oi.item_tax,0) / 2) cgst,
          sum(coalesce(oi.item_tax,0) / 2) sgst,
          0 igst,
-         date(coalesce(o.order_date, now())) invoice_date
+         date(coalesce(o.order_date, now())) invoice_date,
+         encode(digest(oi.amazon_order_id || '|' || $2 || '|' || date(coalesce(o.order_date, now()))::text, 'sha256'), 'hex') source_key
        from order_items oi
        left join orders o on o.tenant_id=oi.tenant_id and o.amazon_order_id=oi.amazon_order_id
        where oi.tenant_id=$1
        group by oi.tenant_id, oi.amazon_order_id, date(coalesce(o.order_date, now()))
-       on conflict (tenant_id, invoice_type, order_id, invoice_date) do update set
+       on conflict (tenant_id, source_key) do update set
          taxable_value=excluded.taxable_value,
          cgst=excluded.cgst,
          sgst=excluded.sgst,
