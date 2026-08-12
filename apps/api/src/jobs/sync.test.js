@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { batchUpsert, dropRepeatedSettlements, ordinalsWithinGroup, parseDelimited, settlementBalanceErrors, withTenantSyncMutex } from './sync.js';
+import { assertGstInvoiceTypeMatchesContent, batchUpsert, dropRepeatedSettlements, ordinalsWithinGroup, parseDelimited, settlementBalanceErrors, withTenantSyncMutex } from './sync.js';
 
 function fakeClient() {
   const calls = [];
@@ -258,4 +258,35 @@ test('parseDelimited skips a trailing blank line without producing a phantom emp
 test('parseDelimited returns nothing for empty content', () => {
   assert.deepEqual(parseDelimited(''), []);
   assert.deepEqual(parseDelimited('   '), []);
+});
+
+// A B2B invoice legally requires the buyer's GSTIN; a B2C (consumer) one
+// never has one - confirmed against a real Seller Central B2B download,
+// where every row carried a populated Customer Bill To Gstid. This is the
+// only thing standing between an admin clicking the wrong Upload button and
+// silently mislabeling a whole file's invoice_type.
+test('assertGstInvoiceTypeMatchesContent rejects a B2C-shaped file (no buyer GSTIN) uploaded as B2B', () => {
+  const rows = [{ 'Customer Bill To Gstid': '', 'Order Id': '1' }, { 'Customer Bill To Gstid': '', 'Order Id': '2' }];
+  assert.throws(() => assertGstInvoiceTypeMatchesContent(rows, 'b2b'), /looks like a B2C file/);
+});
+
+test('assertGstInvoiceTypeMatchesContent rejects a B2B-shaped file (every row has a buyer GSTIN) uploaded as B2C', () => {
+  const rows = [{ 'Customer Bill To Gstid': '29BRMPR5033G2ZE', 'Order Id': '1' }, { 'Customer Bill To Gstid': '19ADAPA7979H1ZA', 'Order Id': '2' }];
+  assert.throws(() => assertGstInvoiceTypeMatchesContent(rows, 'b2c'), /looks like a B2B file/);
+});
+
+test('assertGstInvoiceTypeMatchesContent passes a correctly matched B2B file', () => {
+  const rows = [{ 'Customer Bill To Gstid': '29BRMPR5033G2ZE', 'Order Id': '1' }];
+  assert.doesNotThrow(() => assertGstInvoiceTypeMatchesContent(rows, 'b2b'));
+});
+
+test('assertGstInvoiceTypeMatchesContent passes a correctly matched B2C file', () => {
+  const rows = [{ 'Customer Bill To Gstid': '', 'Order Id': '1' }];
+  assert.doesNotThrow(() => assertGstInvoiceTypeMatchesContent(rows, 'b2c'));
+});
+
+test('assertGstInvoiceTypeMatchesContent never fires when the file has no GSTID column at all - an unfamiliar shape is not evidence of anything', () => {
+  const rows = [{ 'Order Id': '1', Sku: 'ABC' }];
+  assert.doesNotThrow(() => assertGstInvoiceTypeMatchesContent(rows, 'b2b'));
+  assert.doesNotThrow(() => assertGstInvoiceTypeMatchesContent(rows, 'b2c'));
 });

@@ -144,6 +144,17 @@ function pick(row, names) {
   }
   return undefined;
 }
+// pick() alone can't tell "this column doesn't exist in this file's schema"
+// apart from "it exists but is blank on this row" - both return undefined.
+// That distinction is exactly what a B2B/B2C mismatch check needs: a real
+// B2C row genuinely has an empty Customer Bill To Gstid (consumers don't
+// have GST registration - confirmed against a real B2B file, where every
+// row has one), but a report format this app has never seen the column
+// name for at all must not be treated as evidence of anything.
+function hasColumn(row, names) {
+  const keys = new Set(Object.keys(row).map(key => key.toLowerCase().replace(/[^a-z0-9]/g, '')));
+  return names.some(name => keys.has(name.toLowerCase().replace(/[^a-z0-9]/g, '')));
+}
 
 const BATCH_UPSERT_CHUNK_SIZE = 500;
 // Tables where a dropped row is missing money, not just a missing detail.
@@ -476,8 +487,29 @@ async function saveSettlementRows(tenantId, content) {
 // database row now too (see 024_gst_invoices_source_key.sql), so this must
 // generate one for every row and use it as the real upsert identity, the
 // same fix already proven for those other tables.
+const GSTID_FIELD_NAMES = ['customer-bill-to-gstid', 'customer bill to gstid', 'customerbilltogstid', 'customer-ship-to-gstid', 'customer ship to gstid', 'customershiptogstid'];
+// Catches uploading a B2C file to the B2B button or vice versa - a real
+// mistake to worry about, since the upload endpoint has no other way to
+// know which type a file actually is; it trusts whichever button was
+// clicked entirely. A B2B invoice legally requires the buyer's GSTIN, a B2C
+// one never has one (confirmed against a real file: every B2B row carries a
+// populated Customer Bill To Gstid). Only fires when the column is present
+// in the file's own schema at all (see hasColumn) - a report shape this
+// check has never seen a sample of is left unvalidated rather than blocked
+// on a guess.
+export function assertGstInvoiceTypeMatchesContent(rows, invoiceType) {
+  if (!rows.length || !rows.some(row => hasColumn(row, GSTID_FIELD_NAMES))) return;
+  const withGstid = rows.filter(row => pick(row, GSTID_FIELD_NAMES) != null).length;
+  if (invoiceType === 'b2b' && withGstid === 0) {
+    throw new Error(`This looks like a B2C file, not B2B - none of the ${rows.length} row(s) have a buyer GSTIN, which every B2B invoice requires. Check you picked the right file/button.`);
+  }
+  if (invoiceType === 'b2c' && withGstid === rows.length) {
+    throw new Error(`This looks like a B2B file, not B2C - every one of the ${rows.length} row(s) has a buyer GSTIN, which a B2C (consumer) invoice never has. Check you picked the right file/button.`);
+  }
+}
 async function saveGstInvoices(tenantId, content, invoiceType) {
   const rows = z.array(ReportRowSchema).parse(parseReportRows(invoiceType === 'b2b' ? 'GET_GST_MTR_B2B_CUSTOM' : 'GET_GST_MTR_B2C_CUSTOM', content));
+  assertGstInvoiceTypeMatchesContent(rows, invoiceType);
   const ordinals = ordinalsWithinGroup(rows, row => text(pick(row, ['order-id', 'order id', 'amazon-order-id', 'amazonOrderId'])));
   await withTenantTransaction(tenantId, async client => {
     // 'tax exclusive gross' is the column a real Seller Central Merchant Tax
