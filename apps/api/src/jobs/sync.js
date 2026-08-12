@@ -464,8 +464,21 @@ async function saveSettlementRows(tenantId, content) {
 }
 
 /** @param {string} tenantId @param {string} content @param {'b2b'|'b2c'} invoiceType */
+// A real Merchant Tax Report has one row per SHIPMENT ITEM, not one per
+// order - a two-SKU order invoiced on the same date produces two distinct
+// rows. The old conflict target here was (tenant_id, invoice_type, order_id,
+// invoice_date) - no line-item discriminator at all - so those two genuinely
+// separate GST lines silently collapsed into one upsert, confirmed live: "69
+// row(s) in gst_invoices shared a conflict key within one batch and were
+// merged" on a single real file. gst_invoices also never received the
+// source_key treatment settlement_rows/returns/order_items/reimbursements
+// got in migrations 011/012/014 - source_key is what actually keys the
+// database row now too (see 024_gst_invoices_source_key.sql), so this must
+// generate one for every row and use it as the real upsert identity, the
+// same fix already proven for those other tables.
 async function saveGstInvoices(tenantId, content, invoiceType) {
   const rows = z.array(ReportRowSchema).parse(parseReportRows(invoiceType === 'b2b' ? 'GET_GST_MTR_B2B_CUSTOM' : 'GET_GST_MTR_B2C_CUSTOM', content));
+  const ordinals = ordinalsWithinGroup(rows, row => text(pick(row, ['order-id', 'order id', 'amazon-order-id', 'amazonOrderId'])));
   await withTenantTransaction(tenantId, async client => {
     // 'tax exclusive gross' is the column a real Seller Central Merchant Tax
     // Report download uses for this - there is no column literally called
@@ -476,14 +489,33 @@ async function saveGstInvoices(tenantId, content, invoiceType) {
     // rather than replacing them, in case the API's own report (never yet
     // seen live for this tenant - Tax Invoicing role still pending) uses
     // different naming.
-    const batch = rows.map(row => [tenantId, invoiceType, text(pick(row, ['order-id', 'order id', 'amazon-order-id', 'amazonOrderId'])), number(pick(row, ['cgst', 'cgst tax', 'cgst amount'])), number(pick(row, ['sgst', 'sgst tax', 'sgst amount'])), number(pick(row, ['igst', 'igst tax', 'igst amount'])), number(pick(row, ['taxable-value', 'taxable value', 'taxableValue', 'taxable amount', 'tax exclusive gross'])), text(pick(row, ['invoice-date', 'invoice date', 'invoiceDate', 'transaction-date', 'transaction date'])) ?? null, row]);
+    const batch = rows.map((row, rowIndex) => {
+      const orderId = text(pick(row, ['order-id', 'order id', 'amazon-order-id', 'amazonOrderId']));
+      const invoiceDate = text(pick(row, ['invoice-date', 'invoice date', 'invoiceDate', 'transaction-date', 'transaction date'])) ?? null;
+      const taxableValue = number(pick(row, ['taxable-value', 'taxable value', 'taxableValue', 'taxable amount', 'tax exclusive gross']));
+      return [tenantId, invoiceType, orderId, number(pick(row, ['cgst', 'cgst tax', 'cgst amount'])), number(pick(row, ['sgst', 'sgst tax', 'sgst amount'])), number(pick(row, ['igst', 'igst tax', 'igst amount'])), taxableValue, invoiceDate, row, sourceKey(row, [
+        orderId, invoiceDate, taxableValue,
+        pick(row, ['invoice-number', 'invoice number', 'invoiceNumber']),
+        pick(row, ['shipment-item-id', 'shipment item id', 'shipmentItemId']),
+        pick(row, ['sku', 'seller-sku', 'sellerSku']),
+        pick(row, ['asin']),
+        `#${ordinals[rowIndex]}`
+      ])];
+    });
     await batchUpsert(client, {
       table: 'gst_invoices',
-      columns: ['tenant_id', 'invoice_type', 'order_id', 'cgst', 'sgst', 'igst', 'taxable_value', 'invoice_date', 'raw'],
-      conflictColumns: ['tenant_id', 'invoice_type', 'order_id', 'invoice_date'],
-      updateColumns: ['cgst', 'sgst', 'igst', 'taxable_value', 'raw'],
+      columns: ['tenant_id', 'invoice_type', 'order_id', 'cgst', 'sgst', 'igst', 'taxable_value', 'invoice_date', 'raw', 'source_key'],
+      conflictColumns: ['tenant_id', 'source_key'],
+      updateColumns: ['invoice_type', 'order_id', 'cgst', 'sgst', 'igst', 'taxable_value', 'invoice_date', 'raw'],
       rows: batch
     });
+    // Same guarantee settlement_rows already makes: distinct keys must equal
+    // parsed rows, or two genuinely separate GST lines just silently became
+    // one and real tax data is gone.
+    const distinctKeys = new Set(batch.map(row => row[row.length - 1])).size;
+    if (distinctKeys !== rows.length) {
+      throw new Error(`GST invoice import would lose rows: ${rows.length} parsed but only ${distinctKeys} distinct source_key values`);
+    }
   });
   return rows.length;
 }
