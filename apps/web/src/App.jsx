@@ -455,14 +455,16 @@ function SyncLedger({ tenantId, jobs = [], onSynced, reportTypes, title, subtitl
                   <small>{local?.error ?? local?.summary ?? (job?.completed_at ? `Last synced ${timeAgo(job.completed_at)}${job.source === 'manual_upload' ? ' - uploaded file' : ''}` : report.hint)}</small>
                   {!local && job?.error_message && <small className={job.status === 'failed' ? 'ledger-note-error' : 'ledger-note-warning'}>{job.error_message}</small>}
                 </div>
-                <span className={`pill status-${statusLabel}`}>{statusLabel}</span>
-                {report.type === 'GET_V2_SETTLEMENT_REPORT_DATA_FLAT_FILE_V2' && (
-                  <Button variant="secondary" disabled={disabled || busy} title="Deletes stored settlement rows for this range and re-downloads them from Amazon - use only if figures look wrong" onClick={() => resetSettlements()}>{busy ? '…' : 'Reset & Resync'}</Button>
-                )}
-                {uploadable && (
-                  <Button variant="secondary" disabled={disabled || busy} title="Import a report file you downloaded directly from Seller Central - the only way to get data older than Amazon's 90-day API limit" onClick={() => uploadOpen === report.type ? setUploadOpen(null) : openUpload(report.type)}>Upload</Button>
-                )}
-                <Button variant="secondary" disabled={disabled || busy} onClick={() => syncOne(report.type)}>{busy ? 'Syncing…' : 'Sync'}</Button>
+                <div className="ledger-row-actions">
+                  <span className={`pill status-${statusLabel}`}>{statusLabel}</span>
+                  {report.type === 'GET_V2_SETTLEMENT_REPORT_DATA_FLAT_FILE_V2' && (
+                    <Button variant="secondary" disabled={disabled || busy} title="Deletes stored settlement rows for this range and re-downloads them from Amazon - use only if figures look wrong" onClick={() => resetSettlements()}>{busy ? '…' : 'Reset & Resync'}</Button>
+                  )}
+                  {uploadable && (
+                    <Button variant="secondary" disabled={disabled || busy} title="Import a report file you downloaded directly from Seller Central - the only way to get data older than Amazon's 90-day API limit" onClick={() => uploadOpen === report.type ? setUploadOpen(null) : openUpload(report.type)}>Upload</Button>
+                  )}
+                  <Button variant="secondary" disabled={disabled || busy} onClick={() => syncOne(report.type)}>{busy ? 'Syncing…' : 'Sync'}</Button>
+                </div>
               </div>
               {uploadOpen === report.type && (
                 <div className="ledger-upload-panel">

@@ -478,7 +478,7 @@ select, input { font-family: inherit; }
 .ledger { display: flex; flex-direction: column; }
 .ledger-row {
   display: grid;
-  grid-template-columns: 28px 48px 1fr auto auto;
+  grid-template-columns: 28px 48px 1fr auto;
   align-items: center;
   gap: 16px;
   padding: 14px 10px 14px 12px;
@@ -487,6 +487,12 @@ select, input { font-family: inherit; }
   border-radius: 0 8px 8px 0;
   transition: background 0.12s ease, border-color 0.12s ease;
 }
+/* One flexible trailing column, not a fixed count of grid columns - a row
+   can show anywhere from just the status pill (idle) up to pill + Reset &
+   Resync + Upload + Sync all at once, and a hardcoded column count breaks
+   (extra buttons silently wrap onto their own line, misaligned) the moment
+   a row needs more slots than there are columns for. */
+.ledger-row-actions { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; justify-content: flex-end; }
 .ledger-row:first-child { border-top: none; }
 .ledger-row:hover { background: color-mix(in srgb, var(--accent, var(--violet)) 6%, white); border-left-color: var(--accent, var(--border-cool)); }
 .ledger-index { font-family: 'IBM Plex Mono', monospace; color: var(--muted); font-size: 12px; }
@@ -681,7 +687,8 @@ tbody tr:hover td { background: rgba(115, 87, 232, 0.045); }
   }
 
   .dashboard-grid, .dashboard-grid.two, .metrics-strip, .stat-grid { grid-template-columns: 1fr; }
-  .ledger-row { grid-template-columns: 24px 40px 1fr; grid-template-areas: "idx code meta" ". . pill" ". . btn"; }
+  .ledger-row { grid-template-columns: 24px 40px 1fr; }
+  .ledger-row-actions { grid-column: 1 / -1; justify-content: flex-start; margin-top: 8px; }
 }
 
 @media (prefers-reduced-motion: reduce) {
