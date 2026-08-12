@@ -583,11 +583,20 @@ async function saveReimbursements(tenantId, content) {
   const rows = z.array(ReportRowSchema).parse(parseReportRows('GET_FBA_REIMBURSEMENTS_DATA', content));
   const ordinals = ordinalsWithinGroup(rows, row => text(pick(row, ['reimbursement-id', 'reimbursement id', 'approval-date', 'reimbursement-date'])));
   await withTenantTransaction(tenantId, async client => {
+    // 'amount total', 'merchant sku' are the columns a real Seller Central
+    // "Fulfillment by Amazon Reports > Reimbursements" download uses for
+    // these - reversed word order from the API's 'total-amount', and a
+    // different name entirely from 'seller-sku'. Caught from the report's
+    // own column headers before any upload, same pattern as the GST 'Tax
+    // Exclusive Gross' fix. 'date' is deliberately last/lowest-priority in
+    // each list - it's the only date column this report has, but "date" is
+    // generic enough that a more specific candidate should always win first
+    // if one exists.
     const batch = rows.map((row, rowIndex) => {
-      const amount = number(pick(row, ['amount', 'total-amount', 'total amount', 'reimbursement amount']));
+      const amount = number(pick(row, ['amount', 'total-amount', 'total amount', 'reimbursement amount', 'amount total']));
       const reason = text(pick(row, ['reason', 'reason-code', 'reason code', 'approval-reason']));
-      const sku = text(pick(row, ['sku', 'seller-sku', 'seller sku']));
-      const reimbursementDate = text(pick(row, ['reimbursement-date', 'reimbursement date', 'approval-date', 'approval date'])) ?? null;
+      const sku = text(pick(row, ['sku', 'seller-sku', 'seller sku', 'merchant sku', 'merchant-sku']));
+      const reimbursementDate = text(pick(row, ['reimbursement-date', 'reimbursement date', 'approval-date', 'approval date', 'date'])) ?? null;
       return [tenantId, amount, reason, sku, reimbursementDate, sourceKey(row, [sku, reimbursementDate, amount, reason,
         pick(row, ['reimbursement-id', 'reimbursement id', 'reimbursementId']),
         pick(row, ['case-id', 'case id', 'caseId']),
