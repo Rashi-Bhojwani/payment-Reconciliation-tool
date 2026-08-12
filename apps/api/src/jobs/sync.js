@@ -215,12 +215,55 @@ export async function batchUpsert(client, { table, columns, conflictColumns, upd
 }
 
 /** @param {string} textContent @returns {Array<Record<string, unknown>>} */
-function parseTsv(textContent) {
+// Amazon's own SP-API flat-file reports (settlement, GST MTR, FBA reports)
+// are genuinely tab-separated with no quoting - a naive split('\t') has
+// always been correct for those, confirmed against real synced report
+// files in storage/raw-reports. But a report a human downloads directly
+// from Seller Central's UI is not guaranteed to be the same file: a real
+// Merchant Tax Report pulled from Seller Central > Manage Taxes > GST
+// Monthly Reports came back as RFC4180 CSV - comma-delimited, double-quote
+// wrapped fields, no tabs anywhere in the document. Fed through the old
+// tab-only splitter, the entire header line collapsed into one bogus
+// column and every real field (order id, invoice date, every tax amount)
+// silently came back as undefined/0 - not an error, just wrong data
+// stored as if it were right. Confirmed directly against that real file
+// before this fix, not assumed.
+//
+// Delimiter is detected from the header line (tab wins if present, since
+// every verified API report uses it and a value could theoretically
+// contain a comma); quote handling is real RFC4180 - a field wrapped in
+// "..." can contain the delimiter or a literal newline, and "" inside a
+// quoted field is an escaped literal quote. Parsed as one character stream
+// rather than pre-splitting on newlines specifically so an embedded
+// newline inside a quoted field (e.g. a multi-line item description)
+// cannot be mistaken for a row boundary.
+export function parseDelimited(textContent) {
   const trimmed = z.string().parse(textContent).trim();
   if (!trimmed) return [];
-  const [headerLine, ...lines] = trimmed.split(/\r?\n/);
-  const headers = headerLine.split('\t').map(header => header.trim());
-  return lines.filter(Boolean).map(line => Object.fromEntries(line.split('\t').map((value, index) => [headers[index], value])));
+  const delimiter = trimmed.slice(0, trimmed.indexOf('\n') === -1 ? trimmed.length : trimmed.indexOf('\n')).includes('\t') ? '\t' : ',';
+  const rows = [];
+  let row = [];
+  let field = '';
+  let inQuotes = false;
+  for (let i = 0; i < trimmed.length; i += 1) {
+    const char = trimmed[i];
+    if (inQuotes) {
+      if (char === '"') {
+        if (trimmed[i + 1] === '"') { field += '"'; i += 1; }
+        else inQuotes = false;
+      } else field += char;
+      continue;
+    }
+    if (char === '"' && field === '') { inQuotes = true; continue; }
+    if (char === delimiter) { row.push(field); field = ''; continue; }
+    if (char === '\r') continue;
+    if (char === '\n') { row.push(field); rows.push(row); row = []; field = ''; continue; }
+    field += char;
+  }
+  if (field !== '' || row.length) { row.push(field); rows.push(row); }
+  const [headerRow, ...dataRows] = rows;
+  const headers = headerRow.map(header => header.trim());
+  return dataRows.filter(r => r.some(value => value !== '')).map(r => Object.fromEntries(headers.map((header, index) => [header, r[index]])));
 }
 
 /** @param {Record<string, unknown>} object @returns {Record<string, unknown>} */
@@ -261,7 +304,7 @@ function parseReportRows(reportType, content) {
     }
     return collectObjectRows(json);
   }
-  return parseTsv(trimmed);
+  return parseDelimited(trimmed);
 }
 
 /** @param {string} tenantId @param {string} content */
@@ -424,7 +467,16 @@ async function saveSettlementRows(tenantId, content) {
 async function saveGstInvoices(tenantId, content, invoiceType) {
   const rows = z.array(ReportRowSchema).parse(parseReportRows(invoiceType === 'b2b' ? 'GET_GST_MTR_B2B_CUSTOM' : 'GET_GST_MTR_B2C_CUSTOM', content));
   await withTenantTransaction(tenantId, async client => {
-    const batch = rows.map(row => [tenantId, invoiceType, text(pick(row, ['order-id', 'order id', 'amazon-order-id', 'amazonOrderId'])), number(pick(row, ['cgst', 'cgst tax', 'cgst amount'])), number(pick(row, ['sgst', 'sgst tax', 'sgst amount'])), number(pick(row, ['igst', 'igst tax', 'igst amount'])), number(pick(row, ['taxable-value', 'taxable value', 'taxableValue', 'taxable amount'])), text(pick(row, ['invoice-date', 'invoice date', 'invoiceDate', 'transaction-date', 'transaction date'])) ?? null, row]);
+    // 'tax exclusive gross' is the column a real Seller Central Merchant Tax
+    // Report download uses for this - there is no column literally called
+    // "taxable value" in that file at all. Confirmed arithmetically against
+    // three real rows before adding this, not assumed: Tax Exclusive Gross +
+    // Total Tax Amount = Invoice Amount, exactly, to the paisa, on every row -
+    // that is the taxable value. Kept alongside the original candidates
+    // rather than replacing them, in case the API's own report (never yet
+    // seen live for this tenant - Tax Invoicing role still pending) uses
+    // different naming.
+    const batch = rows.map(row => [tenantId, invoiceType, text(pick(row, ['order-id', 'order id', 'amazon-order-id', 'amazonOrderId'])), number(pick(row, ['cgst', 'cgst tax', 'cgst amount'])), number(pick(row, ['sgst', 'sgst tax', 'sgst amount'])), number(pick(row, ['igst', 'igst tax', 'igst amount'])), number(pick(row, ['taxable-value', 'taxable value', 'taxableValue', 'taxable amount', 'tax exclusive gross'])), text(pick(row, ['invoice-date', 'invoice date', 'invoiceDate', 'transaction-date', 'transaction date'])) ?? null, row]);
     await batchUpsert(client, {
       table: 'gst_invoices',
       columns: ['tenant_id', 'invoice_type', 'order_id', 'cgst', 'sgst', 'igst', 'taxable_value', 'invoice_date', 'raw'],

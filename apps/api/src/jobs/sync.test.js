@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { batchUpsert, dropRepeatedSettlements, ordinalsWithinGroup, settlementBalanceErrors, withTenantSyncMutex } from './sync.js';
+import { batchUpsert, dropRepeatedSettlements, ordinalsWithinGroup, parseDelimited, settlementBalanceErrors, withTenantSyncMutex } from './sync.js';
 
 function fakeClient() {
   const calls = [];
@@ -220,4 +220,42 @@ test('settlements that were never repeated are left exactly as they came', () =>
   const doc = [...settlementDoc('S1', '10.00', [['Principal', '10.00']]),
                ...settlementDoc('S2', '20.00', [['Principal', '20.00']])];
   assert.deepEqual(dropRepeatedSettlements(doc), doc);
+});
+
+// A real Merchant Tax Report downloaded directly from Seller Central (Manage
+// Taxes > GST Monthly Reports) came back as RFC4180 CSV, not the tab-only
+// format every API-fetched report has always used - comma-delimited,
+// double-quote-wrapped fields, embedded commas inside a quoted field. The
+// old naive split('\t') found zero tabs in the whole document, so the header
+// line collapsed into one bogus column and every real field (order id,
+// invoice date, every tax amount) silently came back undefined/0 instead of
+// erroring. These lock in the fix against exactly that shape.
+test('parseDelimited reads a real Seller Central GST CSV export with quoted, comma-containing fields', () => {
+  const csv = '"Order Id","Item Description","Igst Tax"\n' +
+    '"171-9245913-1713967","Golden Bird, Resin Statue, 3-pack","216.61"\n';
+  const rows = parseDelimited(csv);
+  assert.deepEqual(rows, [{ 'Order Id': '171-9245913-1713967', 'Item Description': 'Golden Bird, Resin Statue, 3-pack', 'Igst Tax': '216.61' }]);
+});
+
+test('parseDelimited handles an escaped literal quote ("" inside a quoted field) as one literal quote character', () => {
+  const csv = '"Sku","Item Description"\n"SKU1","12"" Wall Clock"\n';
+  const rows = parseDelimited(csv);
+  assert.equal(rows[0]['Item Description'], '12" Wall Clock');
+});
+
+test('parseDelimited still reads a real tab-delimited API settlement report unchanged', () => {
+  const tsv = 'settlement-id\ttotal-amount\tamount\nS1\t100.00\t100.00\n';
+  const rows = parseDelimited(tsv);
+  assert.deepEqual(rows, [{ 'settlement-id': 'S1', 'total-amount': '100.00', amount: '100.00' }]);
+});
+
+test('parseDelimited skips a trailing blank line without producing a phantom empty row', () => {
+  const csv = '"a","b"\n"1","2"\n\n';
+  const rows = parseDelimited(csv);
+  assert.equal(rows.length, 1);
+});
+
+test('parseDelimited returns nothing for empty content', () => {
+  assert.deepEqual(parseDelimited(''), []);
+  assert.deepEqual(parseDelimited('   '), []);
 });
