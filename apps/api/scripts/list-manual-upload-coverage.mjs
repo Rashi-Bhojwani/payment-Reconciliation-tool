@@ -16,6 +16,7 @@ const tenantId = arg('tenant');
 if (!tenantId) { console.error('Usage: --tenant <uuid> [--from YYYY-MM] [--to YYYY-MM] [--report-type TYPE]'); process.exit(2); }
 
 const UPLOADABLE_REPORT_TYPES = ['GET_V2_SETTLEMENT_REPORT_DATA_FLAT_FILE_V2', 'GET_GST_MTR_B2B_CUSTOM', 'GET_GST_MTR_B2C_CUSTOM', 'GET_FBA_FULFILLMENT_CUSTOMER_RETURNS_DATA', 'GET_FBA_REIMBURSEMENTS_DATA'];
+const IST_OFFSET_MS = 5.5 * 60 * 60 * 1000;
 const reportTypes = arg('report-type') ? [arg('report-type')] : UPLOADABLE_REPORT_TYPES;
 
 const now = new Date();
@@ -54,8 +55,16 @@ try {
     console.log(`\n${reportType} - ${rows.length} manual upload(s) on record`);
     let missing = 0;
     for (const month of months) {
-      const monthStart = month;
-      const monthEnd = new Date(Date.UTC(month.getUTCFullYear(), month.getUTCMonth() + 1, 1));
+      // Bug fixed here, not upstream: the app stores range_start/range_end as
+      // IST midnight converted to UTC (see formatDateParam/endOfRangeParam in
+      // App.jsx), which sits ~5.5 hours EARLIER than plain UTC midnight of
+      // the same calendar day. The first version of this script compared
+      // against plain UTC month boundaries, so every real upload's range_end
+      // fell just short of "the start of next month" as this script defined
+      // it - flagging every single already-uploaded month as missing. Fixed
+      // by computing the same IST-shifted boundary the app itself writes.
+      const monthStart = new Date(Date.UTC(month.getUTCFullYear(), month.getUTCMonth(), 1) - IST_OFFSET_MS);
+      const monthEnd = new Date(Date.UTC(month.getUTCFullYear(), month.getUTCMonth() + 1, 1) - IST_OFFSET_MS);
       const covered = rows.some(row => new Date(row.range_start) <= monthStart && new Date(row.range_end) >= monthEnd);
       if (!covered) { console.log(`  MISSING  ${monthLabel(month)} (${monthKey(month)})`); missing += 1; }
     }
