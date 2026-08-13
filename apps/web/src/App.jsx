@@ -181,18 +181,11 @@ function timeAgo(iso) {
   return `${Math.round(hrs / 24)}d ago`;
 }
 
-// The WELLSURE mark, recreated as an SVG rather than shipped as an image
-// file - the source PNG was pasted into chat but never landed as a file this
-// session could read/embed, so this is a faithful redraw (gold ring, black
-// zigzag "W") from the same reference, not the original artwork. Swap in the
-// real file later by replacing this component's body with an <img>.
+// Points at the real logo file, dropped into apps/web/public/ so Vite serves
+// it at this exact root path - nothing here needs to change once that file
+// exists, just add public/logo.png (or .svg) with this name.
 function LogoMark({ size = 40 }) {
-  return (
-    <svg width={size} height={size} viewBox="0 0 40 40" role="img" aria-label="WELLSURE">
-      <circle cx="20" cy="20" r="18.5" fill="none" stroke="var(--marigold)" strokeWidth="3" />
-      <path d="M9.5 13.5 L14.5 27 L20 16.5 L25.5 27 L30.5 13.5" fill="none" stroke="#0a0a0a" strokeWidth="3.4" strokeLinecap="round" strokeLinejoin="round" />
-    </svg>
-  );
+  return <img src="/logo.png" alt="WELLSURE" width={size} height={size} style={{ objectFit: 'contain' }} />;
 }
 
 // Login only — account creation is admin-only now (see AdminDashboard's
