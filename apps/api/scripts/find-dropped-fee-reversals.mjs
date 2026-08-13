@@ -35,6 +35,17 @@ if (!tenantId || !from || !to) {
 }
 
 const FINANCE_LOOKBACK_DAYS = 60; // must match server.js - this is what makes the dedup trustworthy
+// The dashboard sends a picked IST calendar day as ITS MIDNIGHT IN UTC, which
+// is 5.5 hours *before* that same UTC date's midnight (see reporting-calendar.js:
+// "21 Jul" travels as 2026-07-20T18:30:00.000Z). Parsing --from/--to as plain
+// UTC midnight - what this script did originally - put the whole window 5.5
+// hours late on both ends, which is exactly a boundary bug: it clips real
+// transactions off the front of the range and pulls in ones that don't belong
+// at the back. Confirmed live: it was the entire reason this script's computed
+// Expenses (-216233.34) disagreed with the live dashboard's own figure
+// (-217996.65) by 1763.31, though both were fed the same 10-day range - a gap
+// far larger than the ~81 the real gap being hunted was ever going to be.
+const IST_OFFSET_MS = 5.5 * 60 * 60 * 1000;
 
 let connectionString;
 try { connectionString = requireDatabaseUrl('the Expenses gap trace'); }
@@ -46,7 +57,7 @@ const round2 = v => Math.round((Number(v) + Number.EPSILON) * 100) / 100;
 const amount = row => Number(row?.amount ?? 0) || 0;
 
 try {
-  const range = { start: new Date(`${from}T00:00:00Z`).toISOString(), end: new Date(`${to}T00:00:00Z`).toISOString() };
+  const range = { start: new Date(Date.parse(`${from}T00:00:00Z`) - IST_OFFSET_MS).toISOString(), end: new Date(Date.parse(`${to}T00:00:00Z`) - IST_OFFSET_MS).toISOString() };
 
   // Same shape as loadDashboardCalculations' financeItems query in server.js.
   const { rows } = await pool.query(`
