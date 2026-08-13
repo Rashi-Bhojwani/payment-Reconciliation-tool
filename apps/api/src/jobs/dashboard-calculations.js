@@ -47,7 +47,7 @@ const isRefund=row=>/refund/.test(text(row));
 // - the tax was being added to the sale. Net Sales, Fee Impact, Refund Value
 // Rate and DRR all read off this. Only the line's own description (or the
 // normalized Finance API category) may decide that a row is a product sale.
-const isPrincipal=row=>/principal|item price/.test(norm(`${row.amount_description??''} ${row.category??''}`));
+export const isPrincipal=row=>/principal|item price/.test(norm(`${row.amount_description??''} ${row.category??''}`));
 // A tax discount reduces the GST collected; it is not a promotional rebate.
 // The exclusion used to be a literal list of settlement's spellings ("product
 // tax discount", "shipping tax discount", "gift wrap tax discount"), which the
@@ -76,7 +76,7 @@ const isPromotion=row=>/promotion|promo rebate/.test(text(row))&&!isProductGst(r
 // Tax bucket - which Amazon does not use: on both reconciled accounts every
 // line of its Tax section is 0, while TDS appears under Expenses as "TDS -
 // Section 194-O Net".
-const isWithholding=row=>/\b(tcs|tds)\b|withholding|tax withheld/.test(text(row))&&!/reimburse/.test(text(row));
+export const isWithholding=row=>/\b(tcs|tds)\b|withholding|tax withheld/.test(text(row))&&!/reimburse/.test(text(row));
 const isReimbursement=row=>/reimburse|safe t|lost|damaged|clawback/.test(text(row));
 // Shipping and gift wrap CREDITS are Income - they are money the buyer paid.
 // The matching charges ("shipping chargeback", "gift wrap fee", a purchased
@@ -123,7 +123,7 @@ const isShippingOrGiftWrapCredit=row=>/shipping|gift wrap/.test(text(row))
 // away from anything that is genuinely a sale, a promotion or a transfer.
 const isGenericFeeComponent=row=>/^(base|tax|amount|fee|total|promo)$/.test(norm(row.amount_description??''))
   &&!isPrincipal(row)&&!isPromotion(row)&&!isReimbursement(row)&&!isTransfer(row);
-const isFee=row=>/itemfees|itemtcs|itemtds|other transaction|fee|commission|closing|storage|shipping label|service|advertis|adjustment|easy ship charges|postagepurchase|cancellation|holdback|shipping hb|tcs|tds/.test(text(row))&&!isReimbursement(row)&&!isPrincipal(row)&&!isPromotion(row)||isGenericFeeComponent(row);
+export const isFee=row=>/itemfees|itemtcs|itemtds|other transaction|fee|commission|closing|storage|shipping label|service|advertis|adjustment|easy ship charges|postagepurchase|cancellation|holdback|shipping hb|tcs|tds/.test(text(row))&&!isReimbursement(row)&&!isPrincipal(row)&&!isPromotion(row)||isGenericFeeComponent(row);
 // Amazon is not consistent about spacing, and norm() cannot repair it: it
 // splits camelCase, so "GiftwrapTax" becomes "giftwrap tax" - one word - while
 // settlement writes "Gift wrap tax". A pattern demanding the space missed the
@@ -137,7 +137,7 @@ const isFee=row=>/itemfees|itemtcs|itemtds|other transaction|fee|commission|clos
 // alias it does not contain the literal phrase "product tax" and falls
 // through to isGenericTax instead of GST, producing a phantom non-zero Tax
 // figure on Deferred orders even after the camelCase-splitting fix.
-const isProductGst=row=>/product tax|our price tax|shipping tax|gift ?wrap tax|tax discount|\bgst collected|\bgst refund/.test(text(row))&&!/fee|commission|service|itemtcs|itemtds|tcs|tds/.test(text(row));
+export const isProductGst=row=>/product tax|our price tax|shipping tax|gift ?wrap tax|tax discount|\bgst collected|\bgst refund/.test(text(row))&&!/fee|commission|service|itemtcs|itemtds|tcs|tds/.test(text(row));
 // finance_transaction_items.category is not a raw Amazon label like
 // settlement's amount_type/amount_description - it is a normalized bucket
 // name from categorizeFinanceLabel() (finance-components.js), which
@@ -151,8 +151,8 @@ const isProductGst=row=>/product tax|our price tax|shipping tax|gift ?wrap tax|t
 // yet merging in Finance API rows made it show non-zero). Only the row's
 // own amount_type/amount_description - the actual label text, not the
 // bucket it got sorted into - may trigger this specific classifier.
-const isGenericTax=row=>/\btax\b/.test(norm(`${row.amount_type??''} ${row.amount_description??''}`))&&!isProductGst(row)&&!isWithholding(row)&&!isFee(row);
-const isTransfer=row=>/transfer|deposit|bank account|withdrawal/.test(text(row));
+export const isGenericTax=row=>/\btax\b/.test(norm(`${row.amount_type??''} ${row.amount_description??''}`))&&!isProductGst(row)&&!isWithholding(row)&&!isFee(row);
+export const isTransfer=row=>/transfer|deposit|bank account|withdrawal/.test(text(row));
 const round2=value=>Math.round((Number(value)+Number.EPSILON)*100)/100;
 const signedSum=rows=>round2(rows.reduce((sum,row)=>sum+amount(row),0));
 const component=(category,label,value,rows,operation='+')=>({category,label,amount:value,count:rows.length,operation});

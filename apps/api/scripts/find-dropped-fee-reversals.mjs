@@ -1,63 +1,54 @@
-// Lists the specific Finance API rows dedupeRepostedTransactions dropped as
-// "already counted" re-issued copies, for one tenant and one display range -
-// so "why does Expenses read 81 more negative than Amazon's statement" has an
-// actual transaction id behind it instead of a guess.
+// Computes Expenses for one tenant+range using the REAL production pipeline
+// (same finance query, same dedupeRepostedTransactions, same isFee/isWithholding
+// classifiers dashboard-calculations.js itself uses - all imported, none
+// reimplemented) and then explains any gap against Amazon's own statement by
+// finding the specific transaction groups where deduplication's tie-break
+// (keep the earliest-posted copy) disagrees with which side of the range
+// boundary the money should land on.
 //
-// Why this needed its own script rather than a manual CSV reconstruction:
-// the dashboard fetches finance_transaction_items with 60 DAYS OF LOOKBACK
-// before range.start (FINANCE_LOOKBACK_DAYS in server.js) so a deferred
-// transaction's later release can be matched to its origin even when the
-// origin posted before the window the user is looking at. The "Raw API data
-// explorer" CSV download does not carry that lookback - it queries
-// posted_date within the range only - so reconstructing the dedup from that
-// export alone silently keeps rows the live calculation would have dropped,
-// and comes out wrong by far more than the real gap. This script issues the
-// same lookback-widened query loadDashboardCalculations does, then calls the
-// real dedupeRepostedTransactions - not a re-implementation of it - so
-// whatever this prints is exactly what the dashboard is doing.
-//
-// A dropped row with a POSITIVE amount under a fee-shaped category
-// (closing_fee, referral_commission, fulfillment_fee_*, storage_fee,
-// shipping_fee, ...) is the shape of a fee reversal: Amazon's own statement
-// counts it as an expense credit, but it exists only on the re-issued copy
-// this has to drop to avoid double-counting the fee itself - see the
-// "Expenses can read more negative..." note in dashboard-calculations.js.
+// Why this exists instead of eyeballing a CSV: a first attempt at this filtered
+// dropped rows by a hand-written "looks fee-shaped" keyword regex and it
+// missed TCS/TDS entirely (real classification treats those as isWithholding,
+// not isFee, and the keyword list never said tcs/tds) - it dumped ~600 mostly
+// irrelevant rows instead of pointing at a cause. Reusing the actual
+// classifiers there is no more room for that kind of miss: whatever this
+// script calls Expenses IS what the dashboard calls Expenses, because it is
+// the same four lines of code.
 //
 // Read-only. Nothing is deleted or changed.
 //
 // Usage:
-//   DATABASE_URL=... node apps/api/scripts/find-dropped-fee-reversals.mjs --tenant <uuid> --from 2026-05-10 --to 2026-08-11
+//   DATABASE_URL=... node apps/api/scripts/find-dropped-fee-reversals.mjs \
+//     --tenant <uuid> --from 2026-05-10 --to 2026-08-11 [--amazon-expenses -217915.65]
 import pg from 'pg';
 import { requireDatabaseUrl } from '@recon/db/env.js';
-import { dedupeRepostedTransactions } from '../src/jobs/dashboard-calculations.js';
+import { dedupeRepostedTransactions, isFee, isWithholding, isPrincipal, isProductGst } from '../src/jobs/dashboard-calculations.js';
 
 const arg = name => { const i = process.argv.indexOf(`--${name}`); return i > -1 ? process.argv[i + 1] : null; };
 const tenantId = arg('tenant');
 const from = arg('from');
 const to = arg('to');
+const amazonExpenses = arg('amazon-expenses');
 if (!tenantId || !from || !to) {
-  console.error('Usage: --tenant <uuid> --from YYYY-MM-DD --to YYYY-MM-DD (to is exclusive - pass the day AFTER the last day you want included)');
+  console.error('Usage: --tenant <uuid> --from YYYY-MM-DD --to YYYY-MM-DD (to is exclusive - pass the day AFTER the last day you want included) [--amazon-expenses -217915.65]');
   process.exit(2);
 }
 
 const FINANCE_LOOKBACK_DAYS = 60; // must match server.js - this is what makes the dedup trustworthy
 
 let connectionString;
-try { connectionString = requireDatabaseUrl('the dropped fee reversal trace'); }
+try { connectionString = requireDatabaseUrl('the Expenses gap trace'); }
 catch (error) { console.error(error instanceof Error ? error.message : error); process.exit(2); }
 
 const isLocal = /host=\/|@localhost|@127\.0\.0\.1/.test(connectionString);
 const pool = new pg.Pool({ connectionString, ssl: isLocal ? false : { rejectUnauthorized: false } });
-
-const FEE_SHAPED = /fee|commission|closing|storage|shipping|advertis|service|adjustment|other/i;
+const round2 = v => Math.round((Number(v) + Number.EPSILON) * 100) / 100;
+const amount = row => Number(row?.amount ?? 0) || 0;
 
 try {
   const range = { start: new Date(`${from}T00:00:00Z`).toISOString(), end: new Date(`${to}T00:00:00Z`).toISOString() };
 
-  // Same shape as loadDashboardCalculations' financeItems query in server.js -
-  // deliberately kept in lockstep with it rather than simplified, since the
-  // whole point is to feed dedupeRepostedTransactions exactly what the
-  // dashboard feeds it.
+  // Same shape as loadDashboardCalculations' financeItems query in server.js.
   const { rows } = await pool.query(`
     select fi.id source_row_id, fi.transaction_id, coalesce(ft.related_order_id, fi.order_id) order_id,
            fi.sku, fi.category, fi.amount_description, fi.amount, fi.posted_date,
@@ -73,43 +64,62 @@ try {
 
   const nonSummary = rows.filter(row => !String(row.category ?? '').startsWith('summary_'));
   const { kept, dropped } = dedupeRepostedTransactions(nonSummary);
-  console.log(`${kept.length} kept, ${dropped} dropped as re-issued copies of already-counted money\n`);
-  // dedupeRepostedTransactions returns only counts, not which rows it dropped
-  // - kept holds the exact same row objects (references, not copies) it was
-  // given, so the complement is exactly what it discarded. Deriving this here
-  // instead of changing that function's return shape keeps the production
-  // dedup untouched by a diagnostic script.
-  const keptSet = new Set(kept);
-  const droppedRows = nonSummary.filter(row => !keptSet.has(row));
+  console.log(`${kept.length} kept, ${dropped} dropped as re-issued copies of already-counted money`);
 
   const inRange = row => {
     const t = new Date(row.posted_date).getTime();
     return t >= new Date(range.start).getTime() && t < new Date(range.end).getTime();
   };
-  const droppedInRange = (droppedRows ?? []).filter(inRange);
-  console.log(`${droppedInRange.length} of those dropped row(s) posted inside ${from} - ${to} (the range actually being viewed):\n`);
-
-  const candidates = droppedInRange
-    .filter(row => Number(row.amount) > 0 && FEE_SHAPED.test(`${row.category} ${row.amount_description}`))
-    .sort((a, b) => Number(b.amount) - Number(a.amount));
-
-  if (candidates.length) {
-    console.log('Positive-amount, fee-shaped dropped rows - the ones most likely to be a fee reversal Amazon still counts:');
-    let total = 0;
-    for (const row of candidates) {
-      total += Number(row.amount);
-      console.log(`  ${row.posted_date.toISOString?.() ?? row.posted_date}  ${row.transaction_status ?? '?'}  ${row.category}/${row.amount_description}  ${Number(row.amount).toFixed(2)}  order ${row.order_id ?? '(none)'}  txn ${row.transaction_id}`);
-    }
-    console.log(`\n  Sum of the above: ${total.toFixed(2)}`);
-  } else {
-    console.log('No positive-amount, fee-shaped dropped rows found in this range - the gap is not this mechanism, or the reversal is shaped differently than expected.');
+  const financeStatementRows = kept.filter(inRange);
+  const expenseRows = financeStatementRows.filter(row => (isFee(row) || isWithholding(row)) && !isProductGst(row) && !isPrincipal(row));
+  const expenses = round2(expenseRows.reduce((sum, row) => sum + amount(row), 0));
+  console.log(`\nComputed Expenses for ${from} - ${to}: ${expenses.toFixed(2)} (${expenseRows.length} rows)`);
+  if (amazonExpenses != null) {
+    const diff = round2(expenses - Number(amazonExpenses));
+    console.log(`Amazon's statement: ${Number(amazonExpenses).toFixed(2)}  |  diff: ${diff >= 0 ? '+' : ''}${diff.toFixed(2)}`);
   }
 
-  if (droppedInRange.length) {
-    console.log(`\nAll ${droppedInRange.length} dropped row(s) in range, for reference:`);
-    for (const row of droppedInRange.sort((a, b) => Math.abs(Number(b.amount)) - Math.abs(Number(a.amount)))) {
-      console.log(`  ${row.posted_date.toISOString?.() ?? row.posted_date}  ${row.transaction_status ?? '?'}  ${row.category}/${row.amount_description}  ${Number(row.amount).toFixed(2)}  order ${row.order_id ?? '(none)'}  txn ${row.transaction_id}`);
+  // The actual mechanism worth checking: dedupeRepostedTransactions keeps the
+  // EARLIEST-posted copy of a repeated line and drops the rest, then this
+  // range filter is applied AFTER that choice is made. If a line's earliest
+  // copy posted before `from` (inside the 60-day lookback, so it exists in
+  // `rows` but gets filtered out here) while a later re-issued copy of the
+  // SAME line posted inside the range, neither copy ends up counted for this
+  // range - the kept one is too early, the in-range one was dropped as a
+  // duplicate. If Amazon's own statement dates this line by the later
+  // (release) date instead of the origin date, that is exactly a section gap
+  // with no fabrication involved on either side - just two different, both
+  // reasonable, dating conventions disagreeing on one line.
+  const groups = new Map();
+  for (const row of nonSummary) {
+    if (!row.order_id) continue;
+    const key = `${row.order_id}|${row.category ?? ''}|${row.amount_description ?? ''}|${amount(row)}`;
+    (groups.get(key) ?? groups.set(key, []).get(key)).push(row);
+  }
+  const keptSet = new Set(kept);
+  const boundaryCases = [];
+  for (const [key, members] of groups) {
+    if (members.length < 2) continue;
+    const keptMembers = members.filter(r => keptSet.has(r));
+    const droppedMembers = members.filter(r => !keptSet.has(r));
+    if (!keptMembers.length || !droppedMembers.length) continue;
+    const keptInRange = keptMembers.some(inRange);
+    const droppedInRangeAny = droppedMembers.some(inRange);
+    if (keptInRange !== droppedInRangeAny) {
+      boundaryCases.push({ key, keptMembers, droppedMembers, keptInRange, droppedInRangeAny });
     }
+  }
+
+  if (boundaryCases.length) {
+    console.log(`\n${boundaryCases.length} line(s) where the kept copy and a dropped copy of the SAME line fall on different sides of the range boundary - these are the specific candidates for a dating-convention gap:`);
+    for (const c of boundaryCases) {
+      const isExpenseLine = (isFee(c.keptMembers[0]) || isWithholding(c.keptMembers[0])) && !isProductGst(c.keptMembers[0]) && !isPrincipal(c.keptMembers[0]);
+      console.log(`\n  ${c.key}  ${isExpenseLine ? '(EXPENSE line)' : '(not an Expense line)'}`);
+      for (const r of c.keptMembers) console.log(`    KEPT     ${r.posted_date.toISOString?.() ?? r.posted_date}  ${r.transaction_status}  ${inRange(r) ? 'IN RANGE' : 'outside range (lookback)'}  txn ${r.transaction_id}`);
+      for (const r of c.droppedMembers) console.log(`    DROPPED  ${r.posted_date.toISOString?.() ?? r.posted_date}  ${r.transaction_status}  ${inRange(r) ? 'IN RANGE' : 'outside range'}  txn ${r.transaction_id}`);
+    }
+  } else {
+    console.log('\nNo line has its kept and dropped copies split across the range boundary - the gap (if any) is not this mechanism.');
   }
 } catch (error) {
   console.error('Failed:', error instanceof Error ? error.message : error);
