@@ -1025,6 +1025,34 @@ function AmazonBusinessReportCard({ rows }) {
       : <Empty text="Coming soon - requires Amazon's Sales & Traffic report, paused until Amazon approves the Brand Analytics role. Once enabled, these five numbers will match Seller Central's Sales Dashboard exactly." />}
   </Card>;
 }
+// Amazon's own five statement sections - Income, Expenses, Tax, GST,
+// Transfers. This is the core reconciliation claim of the tool, so it stays
+// on the dashboard regardless of anything else there. These five are
+// settlement/finance-derived (not blocked on the paused GST B2B/B2C or
+// Sales & Traffic reports), unlike the GST invoice value tile elsewhere,
+// which is why they're not gated behind a "Coming soon" notice. This used
+// to also show a "Provisional - not yet reconciled" debug banner and a
+// calculation-build revision line for whoever was building the tool - that
+// diagnostic language was dropped for a hosted end user; the five cards
+// themselves (each a link to its own source rows and formula) were not.
+function AmazonStatementSummary({ data, tenantId }) {
+  return (
+    <Card className="profit-control-card">
+      <PanelHeader title="Amazon Statement Summary" subtitle="Income, Expenses, Tax, GST & Transfers" />
+      <div className="profit-kpi-grid account-activity-grid">
+        {['income', 'expenses', 'tax', 'transfers', 'gst'].map(metric => (
+          <DrillMetric
+            key={metric}
+            to={`/seller?tenantId=${tenantId}&view=metric-detail&metric=${metric}`}
+            title={metric === 'gst' ? 'Goods and Services Tax' : metric[0].toUpperCase() + metric.slice(1)}
+            value={formatCurrency(data?.dashboardCalculations?.statement?.[metric]?.value)}
+            hint="Open Amazon source rows and formula"
+          />
+        ))}
+      </div>
+    </Card>
+  );
+}
 function DashboardOverview({ data, channelData, tenantId }) {
   const { range } = useContext(DateRangeContext);
   const summary = useMemo(() => buildDashboardSummary(data, range), [data, range]);
@@ -1054,6 +1082,8 @@ function DashboardOverview({ data, channelData, tenantId }) {
       <SettlementTimeline payments={data?.payments} tenantId={tenantId} />
       <ExpenseBreakdown components={data?.dashboardCalculations?.statement?.expenses?.components} tenantId={tenantId} />
     </div>
+
+    <AmazonStatementSummary data={data} tenantId={tenantId} />
 
     <ExplanationGrid summary={summary} tenantId={tenantId} />
 
