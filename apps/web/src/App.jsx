@@ -1598,7 +1598,7 @@ function SidebarLink({ to, icon, children, onClick }) {
   // computed. A plain Link never adds a class on its own, so this component's
   // own computed `active` is the only thing that can set it.
   const active = current.pathname === target.pathname && current.searchParams.get('view') === target.searchParams.get('view');
-  return <Link className={active ? 'active' : ''} to={to} onClick={onClick}><span className="nav-icon" aria-hidden="true">{icon}</span><span>{children}</span></Link>;
+  return <Link className={active ? 'active' : ''} to={to} onClick={onClick}><span className="nav-icon" aria-hidden="true">{icon}</span><span className="nav-label">{children}</span></Link>;
 }
 
 const SEARCH_KEYWORDS = {
@@ -1743,8 +1743,12 @@ function SellerShell({ session, setSession }) {
     {navOpen && <div className="sidebar-overlay" onClick={() => setNavOpen(false)} />}
     <aside className={`sidebar${navOpen ? ' open' : ''}`} aria-hidden={!navOpen}>
       <div className="sidebar-head">
-        <div className="logo"><LogoMark height={46} /><small>Seller Intelligence</small></div>
-        <button type="button" className="sidebar-close" aria-label="Close menu" title="Close menu" onClick={() => setNavOpen(false)}>✕</button>
+        <div className="logo"><LogoMark height={56} /></div>
+        {/* "Collapse", not "close" - see the .app-shell.nav-closed rewrite in
+            style.css: this now narrows the sidebar to an icon rail (logo and
+            nav icons still visible/clickable), it never fully disappears on
+            desktop. */}
+        <button type="button" className="sidebar-close" aria-label="Collapse menu" title="Collapse menu" onClick={() => setNavOpen(false)}>✕</button>
       </div>
       <nav>
         {NAV_ITEMS.map(item => <SidebarLink key={item.view} icon={item.icon} to={`/seller?tenantId=${session?.tenantId ?? ''}&view=${item.view}`} onClick={closeOnNavigate}>{item.label}</SidebarLink>)}
@@ -1759,9 +1763,9 @@ function SellerShell({ session, setSession }) {
         <button
           type="button"
           className="hamburger-btn"
-          aria-label={navOpen ? 'Close menu' : 'Open menu'}
+          aria-label={navOpen ? 'Collapse menu' : 'Expand menu'}
           aria-expanded={navOpen}
-          title={navOpen ? 'Hide menu' : 'Show menu'}
+          title={navOpen ? 'Collapse menu' : 'Expand menu'}
           onClick={() => setNavOpen(o => !o)}
         >☰</button>
         <GlobalSearch tenantId={session?.tenantId} />
@@ -1795,7 +1799,7 @@ function AdminShell({ session, setSession }) {
   function logout() { localStorage.removeItem('token'); setSession(null); }
   return <div className="admin-shell">
     <header className="admin-topbar">
-      <div className="logo"><LogoMark height={46} /><small>Admin Console</small></div>
+      <div className="logo"><LogoMark height={56} /></div>
       <div className="admin-topbar-right">
         <div className="avatar">{session?.email?.[0]?.toUpperCase()}</div>
         <Button variant="dark" onClick={logout}>Logout {session?.email}</Button>

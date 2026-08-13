@@ -1151,16 +1151,39 @@ td { padding: 13px 14px; color:#344054; }
 .app-shell {
   transition: grid-template-columns 0.24s cubic-bezier(0.4, 0, 0.2, 1);
 }
-.app-shell.nav-closed { grid-template-columns: 0 minmax(0, 1fr); }
+/* "Collapsed" used to mean gone - grid column to 0, sidebar opacity/
+   visibility hidden entirely. Now it means a narrow icon rail instead: the
+   logo and every nav icon stay visible and clickable, just without the
+   250px of labels and the help card. Only the label text, the collapse
+   button and the help card disappear - see the rules below. */
+.app-shell.nav-closed { grid-template-columns: 76px minmax(0, 1fr); }
 .app-shell.nav-closed > .sidebar {
-  padding-left: 0;
-  padding-right: 0;
-  opacity: 0;
-  pointer-events: none;
-  visibility: hidden;
-  transition: opacity 0.16s ease, visibility 0s linear 0.24s;
+  padding-left: 10px;
+  padding-right: 10px;
+  opacity: 1;
+  pointer-events: auto;
+  visibility: visible;
 }
 .sidebar { transition: opacity 0.2s ease; }
+.app-shell.nav-closed .sidebar-head { justify-content: center; overflow: hidden; }
+.app-shell.nav-closed .sidebar-close,
+.app-shell.nav-closed .nav-label,
+.app-shell.nav-closed .sidebar-help { display: none; }
+.app-shell.nav-closed .sidebar nav a { justify-content: center; padding: 13px 8px; gap: 0; }
+/* Overrides LogoMark's own inline height (it can't know it's sitting in a
+   76px rail). A real wordmark lockup is usually much wider than it is tall,
+   so bounding height alone let it overflow the rail sideways and get
+   clipped invisible - bounding max-width too (76px rail minus the sidebar's
+   own side padding) makes width the binding constraint for a wide mark and
+   height the binding constraint for a squarer one, so it always shrinks to
+   fit fully on-screen instead of spilling past either edge. */
+.app-shell.nav-closed .logo-mark {
+  height: auto !important;
+  max-height: 30px;
+  max-width: 56px;
+  width: auto;
+  object-fit: contain;
+}
 
 .sidebar-head { display: flex; align-items: center; justify-content: space-between; gap: 10px; padding-right: 2px; }
 .sidebar-close {
