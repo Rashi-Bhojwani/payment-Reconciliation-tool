@@ -58,8 +58,8 @@ body {
   font-family: 'Inter', -apple-system, sans-serif;
   -webkit-font-smoothing: antialiased;
   background-image:
-    radial-gradient(circle at 100% 0%, rgba(37, 99, 235, .055), transparent 34%),
-    linear-gradient(135deg, #fbfcff, #f7faff 52%, #fff);
+    radial-gradient(circle at 100% 0%, rgba(245, 197, 24, .07), transparent 34%),
+    linear-gradient(135deg, #fffdf6, #fffaf0 52%, #fff);
   background-attachment: fixed;
 }
 h1, h2, h3 { font-family: 'Space Grotesk', 'Inter', sans-serif; margin: 0; color: var(--ink); letter-spacing: -0.01em; }
@@ -83,7 +83,7 @@ select, input { font-family: inherit; }
 }
 .btn:active { transform: translateY(1px); }
 .btn:disabled { opacity: 0.5; cursor: not-allowed; transform: none; }
-.btn-primary { background: linear-gradient(135deg, #1769e8, #0758db); color: #fff; box-shadow: 0 6px 16px rgba(22, 104, 232, .24); }
+.btn-primary { background: linear-gradient(135deg, #232323, #000); color: #fff; box-shadow: 0 6px 16px rgba(0, 0, 0, .24); }
 .btn-primary:hover:not(:disabled) { filter: brightness(1.05); box-shadow: 0 8px 20px rgba(232, 93, 42, 0.36); }
 .btn-secondary { background: var(--surface); color: var(--ink); border: 1px solid var(--border-cool); }
 .btn-secondary:hover:not(:disabled) { border-color: var(--violet); color: var(--violet-deep); }
@@ -134,7 +134,7 @@ select, input { font-family: inherit; }
   min-height: 100vh;
   display: grid;
   grid-template-columns: 1.1fr 0.9fr;
-  background: #f8faff;
+  background: #fdfbf3;
 }
 .login-hero {
   padding: 72px 64px;
@@ -146,9 +146,9 @@ select, input { font-family: inherit; }
   position: relative;
   overflow: hidden;
   background:
-    radial-gradient(circle at 10% 10%, rgba(37, 99, 235, .16), transparent 38%),
-    radial-gradient(circle at 88% 88%, rgba(124, 58, 237, .15), transparent 42%),
-    linear-gradient(145deg, #f8fbff 0%, #eef4ff 58%, #f7f3ff 100%);
+    radial-gradient(circle at 10% 10%, rgba(245, 197, 24, .20), transparent 38%),
+    radial-gradient(circle at 88% 88%, rgba(23, 23, 23, .10), transparent 42%),
+    linear-gradient(145deg, #fffdf5 0%, #fdf6df 58%, #f7f3ea 100%);
 }
 .login-hero::before {
   content: '';
@@ -162,16 +162,10 @@ select, input { font-family: inherit; }
   pointer-events: none;
 }
 .login-hero > * { position: relative; }
-.brand-mark {
-  width: 44px; height: 44px;
-  background: linear-gradient(135deg, var(--marigold), var(--marigold-deep));
-  color: #fff;
-  border-radius: 10px;
-  display: flex; align-items: center; justify-content: center;
-  font-family: 'Space Grotesk', sans-serif;
-  font-weight: 700; font-size: 20px;
-  box-shadow: 0 8px 20px rgba(232, 162, 61, 0.35);
-}
+/* Sized by its LogoMark child's own size prop now (the SVG mark, not a
+   lettered badge) - a fixed box here would just clip or float a
+   differently-sized mark, so this is layout only. */
+.brand-mark { display: flex; align-items: center; justify-content: center; }
 .eyebrow {
   font-family: 'IBM Plex Mono', monospace;
   font-size: 12px;
@@ -543,6 +537,13 @@ select, input { font-family: inherit; }
 .pill.status-suspended { background: var(--danger-bg); color: var(--danger); }
 .pill.status-idle { background: var(--paper); color: var(--muted); }
 .pill.status-locked { background: var(--paper); color: var(--muted); opacity: 0.7; }
+.pill.status-coming-soon { background: var(--brand-soft); color: var(--marigold-deep); }
+/* PAUSED_REPORT_TYPES rows (GST B2B/B2C, Sales & Traffic) - dimmed rather
+   than hidden, so a seller can still see the report exists and why it isn't
+   running, without it competing visually with reports that actually work. */
+.ledger-row.is-paused { opacity: 0.6; }
+.ledger-row.is-paused:hover { background: none; border-left-color: transparent; }
+.alert.coming-soon { background: var(--brand-soft); color: var(--marigold-deep); font-weight: 600; }
 .range-loading-pill { display: inline-flex; align-items: center; gap: 6px; }
 .spinner-dot { width: 8px; height: 8px; border-radius: 50%; background: currentColor; animation: spinner-dot-pulse 1s ease-in-out infinite; }
 @keyframes spinner-dot-pulse { 0%, 100% { opacity: 0.25; transform: scale(0.8); } 50% { opacity: 1; transform: scale(1.1); } }
@@ -926,18 +927,23 @@ tbody tr:hover td { background: rgba(115, 87, 232, 0.045); }
   --shadow: 0 1px 2px rgba(15, 23, 42, 0.04), 0 18px 45px rgba(15, 23, 42, 0.07);
   --shadow-lift: 0 14px 35px rgba(116, 95, 151, 0.12), 0 24px 55px rgba(82, 68, 112, 0.08);
 }
-body { background: radial-gradient(circle at 82% -10%, rgba(37,99,235,.07), transparent 34%), var(--paper); }
+body { background: radial-gradient(circle at 82% -10%, rgba(245,197,24,.08), transparent 34%), var(--paper); }
 .app-shell { grid-template-columns: 292px 1fr; }
 .sidebar { background: rgba(255,255,255,.97); color: var(--text); border-right: 1px solid var(--border); box-shadow: 8px 0 28px rgba(15,23,42,.035); backdrop-filter: blur(18px); padding: 30px 20px; gap: 36px; }
-.sidebar .logo span, .admin-topbar .logo span, .brand-mark { background: linear-gradient(135deg, #1769e8, #7c3aed); color: #fff; box-shadow: 0 10px 24px rgba(37,99,235,.22); }
+/* .logo span no longer exists in the markup (the "W" letter badge was
+   replaced by the real WELLSURE mark, an inline SVG that draws its own gold
+   ring - see LogoMark in App.jsx), so it needs no background of its own
+   here. .brand-mark still wraps that SVG on the login/boot screens and only
+   needs sizing, not a colored circle behind it. */
+.sidebar .logo span, .admin-topbar .logo span, .brand-mark { background: none; box-shadow: none; }
 .sidebar .logo b { color: var(--ink); font-size: 17px; }
 .sidebar .logo small { color: var(--muted); }
 .sidebar nav { gap: 8px; }
 .sidebar nav a { color: #625b74; font-size: 15px; padding: 13px 16px; border-radius: 13px; border-left: 0; display:flex; align-items:center; gap:14px; }
 .nav-icon { width: 28px; height: 28px; border-radius: 9px; display:inline-flex; align-items:center; justify-content:center; color:#736b86; border:1px solid transparent; font-weight:700; }
-.sidebar nav a:hover { background: #f2f6ff; color: #0758c8; }
-.sidebar nav a.active { background: linear-gradient(90deg, #edf3ff, #f3f5ff); color: #0758c8; box-shadow: inset 4px 0 0 #7c3aed; }
-.sidebar nav a.active .nav-icon { background:#e7efff; color:#1769e8; border-color:#c8d8fb; }
+.sidebar nav a:hover { background: #fbf1d6; color: #171717; }
+.sidebar nav a.active { background: linear-gradient(90deg, #fbf1d6, #fdf6e3); color: #171717; box-shadow: inset 4px 0 0 var(--marigold); }
+.sidebar nav a.active .nav-icon { background:#fbf1d6; color:#8a6a00; border-color:#ecd68a; }
 .workspace { background: transparent; }
 .topbar { margin: 22px 32px 0; border: 1px solid var(--border); border-radius: 20px; background: rgba(255,255,255,.78); box-shadow: var(--shadow); backdrop-filter: blur(18px); }
 .global-search input { background: #f8faff; border-color: var(--border); }
@@ -946,7 +952,7 @@ body { background: radial-gradient(circle at 82% -10%, rgba(37,99,235,.07), tran
 .section-title p { font-size: 16px; line-height: 1.55; }
 .btn { border-radius: 12px; padding: 11px 17px; font-size: 14px; }
 .btn-icon { font-size: 15px; }
-.btn-primary { background: linear-gradient(135deg, #1769e8, #0758db); color: #fff; box-shadow: 0 10px 24px rgba(22,104,232,.24); }
+.btn-primary { background: linear-gradient(135deg, #232323, #000); color: #fff; box-shadow: 0 10px 24px rgba(0,0,0,.28); }
 .btn-secondary, .btn-ghost, .date-range-trigger, .amazon-chip { background: rgba(255,255,255,.92); }
 .btn-accent { background: linear-gradient(135deg, #29ba68, #15964d); color: #fff; }
 .card { background: var(--surface); border-color: var(--border); box-shadow: var(--shadow); backdrop-filter: blur(18px); }
@@ -1209,7 +1215,7 @@ td { padding: 13px 14px; color:#344054; }
   --ring: rgba(101, 84, 217, 0.28);
 }
 
-::selection { background: rgba(124, 58, 237, 0.18); }
+::selection { background: rgba(245, 197, 24, 0.30); }
 
 .input:focus, .btn:focus-visible, button:focus-visible, a:focus-visible,
 select:focus-visible, summary:focus-visible {
@@ -1218,27 +1224,26 @@ select:focus-visible, summary:focus-visible {
 }
 .input:focus { border-color: var(--violet); box-shadow: 0 0 0 3px var(--ring); }
 
-/* Was an orange glow under a blue button - a leftover, not a choice. */
-.btn-primary:hover:not(:disabled) { filter: brightness(1.04); box-shadow: 0 12px 26px rgba(22, 104, 232, 0.34); }
+.btn-primary:hover:not(:disabled) { filter: brightness(1.04); box-shadow: 0 12px 26px rgba(0, 0, 0, 0.34); }
 
 /* .btn-dark darkened its background on hover but kept its dark text, so the
    Logout label disappeared under the cursor. */
-.btn-dark { background: var(--violet-soft); color: var(--ink-deep); border: 1px solid #e0d8f6; }
+.btn-dark { background: var(--violet-soft); color: var(--ink-deep); border: 1px solid #e5d9a8; }
 .btn-dark:hover:not(:disabled) { background: var(--ink-deep); color: #fff; border-color: var(--ink-deep); }
 
 /* ---------- Surface polish ---------- */
 body {
   background:
-    radial-gradient(circle at 88% -12%, rgba(124, 58, 237, 0.07), transparent 38%),
-    radial-gradient(circle at -6% 8%, rgba(23, 105, 232, 0.06), transparent 34%),
+    radial-gradient(circle at 88% -12%, rgba(245, 197, 24, 0.08), transparent 38%),
+    radial-gradient(circle at -6% 8%, rgba(23, 23, 23, 0.05), transparent 34%),
     var(--paper);
 }
 .topbar { gap: 12px; padding: 14px 20px; }
 .topbar select { border-radius: 11px; padding: 9px 12px; background: #fbfcff; }
-.topbar .avatar { background: linear-gradient(135deg, var(--brand), var(--violet)); color: #fff; }
+.topbar .avatar { background: linear-gradient(135deg, var(--violet), var(--marigold-deep)); color: #fff; }
 
 .card { border-radius: var(--radius); transition: box-shadow 0.16s ease, border-color 0.16s ease; }
-.panel-header span { background: var(--brand-soft); border-color: #dbe6ff; color: #3552a4; }
+.panel-header span { background: var(--brand-soft); border-color: #ecd68a; color: #8a6a00; }
 
 .table-wrap table { border-collapse: separate; border-spacing: 0; }
 th:first-child { border-top-left-radius: var(--radius-sm); }
@@ -1285,7 +1290,7 @@ tbody tr:hover td { background: var(--brand-soft); }
 .sidebar nav a.active {
   background: linear-gradient(135deg, var(--violet), var(--violet-deep));
   color: #fff;
-  box-shadow: 0 8px 18px rgba(124, 58, 237, .28);
+  box-shadow: 0 8px 18px rgba(0, 0, 0, .28);
 }
 .sidebar nav a.active .nav-icon { background: rgba(255,255,255,.22); color: #fff; border-color: transparent; }
 
@@ -1471,6 +1476,29 @@ tbody tr:hover td { background: var(--brand-soft); }
 .settings-profile-grid span { display: block; color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: .04em; margin-bottom: 4px; }
 .settings-profile-grid b { font-size: 13.5px; color: var(--ink); word-break: break-all; }
 @media (max-width: 900px) { .settings-grid { grid-template-columns: 1fr; } }
+
+/* ==========================================================================
+   WELLSURE brand palette (light theme)
+   The app's own "palette consolidation" pass above settled every interactive
+   color onto a blue/violet ramp via --brand/--violet/--marigold. Re-pointing
+   those same tokens here - rather than hunting down every rule that reads
+   them - re-skins the whole app to WELLSURE's actual mark (a gold ring, a
+   black zigzag "W") without redoing that consolidation work. Gold is the
+   accent (focus rings, the active nav rail, badges, the logo ring itself);
+   near-black is the "ink" role primary buttons and hovers use - together
+   they're the mark's own two colors, nothing invented. This block only
+   affects light mode: :root[data-theme="dark"] below still wins there. */
+:root {
+  --marigold: #f5c518;
+  --marigold-deep: #8a6a00;
+  --violet: #171717;
+  --violet-deep: #000000;
+  --violet-soft: #f3efe3;
+  --brand: #171717;
+  --brand-deep: #000000;
+  --brand-soft: #fbf1d6;
+  --ring: rgba(197, 149, 5, 0.28);
+}
 
 /* ==========================================================================
    Dark theme

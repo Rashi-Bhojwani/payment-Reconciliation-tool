@@ -130,6 +130,13 @@ async function resetSettlementData(tenantId, range) {
 // see the matching UPLOADABLE_REPORT_TYPES comment in server.js for exactly
 // why these five and not the other three.
 const UPLOADABLE_REPORT_TYPES = new Set(['GET_V2_SETTLEMENT_REPORT_DATA_FLAT_FILE_V2', 'GET_GST_MTR_B2B_CUSTOM', 'GET_GST_MTR_B2C_CUSTOM', 'GET_FBA_FULFILLMENT_CUSTOMER_RETURNS_DATA', 'GET_FBA_REIMBURSEMENTS_DATA']);
+// GST B2B/B2C need the "Tax Invoicing" role and Sales & Traffic needs
+// "Brand Analytics" - neither is visible in Developer Central for this app
+// yet, so every live pull of these three fails with the same 403. Rather
+// than let a hosted end user hit that error, the ledger shows them as a
+// paused feature instead of a broken one. Remove a type here the moment
+// Amazon grants the role - nothing else about the sync path changes.
+const PAUSED_REPORT_TYPES = new Set(['GET_SALES_AND_TRAFFIC_REPORT', 'GET_GST_MTR_B2B_CUSTOM', 'GET_GST_MTR_B2C_CUSTOM']);
 async function uploadReportFile(tenantId, reportType, content, range) {
   const payload = { method: 'POST', body: JSON.stringify({ content, range: { start: formatDateParam(range.start), end: endOfRangeParam(range.end) } }) };
   return api(`/api/tenants/${tenantId}/reports/${reportType}/upload`, payload);
@@ -139,6 +146,10 @@ function Button({ className = '', variant = 'primary', icon, children, ...props 
 function Input(props) { return <input {...props} className="input" />; }
 function Card({ children, className = '' }) { return <section className={`card ${className}`}>{children}</section>; }
 function Empty({ text }) { return <div className="empty-state">{text}</div>; }
+// Shown on pages/cards fed entirely or partly by a PAUSED_REPORT_TYPES
+// report, so a seller sees an honest reason instead of an empty or
+// suspiciously-wrong number with no explanation.
+function ComingSoonNotice({ text }) { return <p className="alert coming-soon">🕒 {text}</p>; }
 function formatCurrency(value) { return `₹${Number(value ?? 0).toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`; }
 function formatNumber(value) { return Number(value ?? 0).toLocaleString('en-IN'); }
 function csvEscape(value) {
@@ -170,6 +181,20 @@ function timeAgo(iso) {
   return `${Math.round(hrs / 24)}d ago`;
 }
 
+// The WELLSURE mark, recreated as an SVG rather than shipped as an image
+// file - the source PNG was pasted into chat but never landed as a file this
+// session could read/embed, so this is a faithful redraw (gold ring, black
+// zigzag "W") from the same reference, not the original artwork. Swap in the
+// real file later by replacing this component's body with an <img>.
+function LogoMark({ size = 40 }) {
+  return (
+    <svg width={size} height={size} viewBox="0 0 40 40" role="img" aria-label="WELLSURE">
+      <circle cx="20" cy="20" r="18.5" fill="none" stroke="var(--marigold)" strokeWidth="3" />
+      <path d="M9.5 13.5 L14.5 27 L20 16.5 L25.5 27 L30.5 13.5" fill="none" stroke="#0a0a0a" strokeWidth="3.4" strokeLinecap="round" strokeLinejoin="round" />
+    </svg>
+  );
+}
+
 // Login only — account creation is admin-only now (see AdminDashboard's
 // "Create seller account" card), so there is no self-serve signup here.
 function Login({ setSession }) {
@@ -186,7 +211,7 @@ function Login({ setSession }) {
   }
   return <main className="login-shell">
     <section className="login-hero">
-      <div className="brand-mark">W</div>
+      <div className="brand-mark"><LogoMark size={64} /></div>
       <p className="eyebrow">Ledger 01 — Seller Reconciliation</p>
       <h1>Every rupee Amazon touches, reconciled in one command center.</h1>
       <p>Connect Seller Central, pull SP-API orders and reports on your own schedule, and track payouts, sales, inventory and account health from a single secure cockpit.</p>
@@ -443,27 +468,28 @@ function SyncLedger({ tenantId, jobs = [], onSynced, reportTypes, title, subtitl
           // leave this control disabled after the page is refreshed.
           const busy = local?.loading;
           const failed = local?.error || job?.status === 'failed';
-          const statusLabel = disabled ? 'locked' : busy ? 'syncing' : failed ? 'failed' : job?.status ?? 'idle';
-          const uploadable = UPLOADABLE_REPORT_TYPES.has(report.type);
+          const paused = PAUSED_REPORT_TYPES.has(report.type);
+          const statusLabel = paused ? 'coming-soon' : disabled ? 'locked' : busy ? 'syncing' : failed ? 'failed' : job?.status ?? 'idle';
+          const uploadable = !paused && UPLOADABLE_REPORT_TYPES.has(report.type);
           return (
             <Fragment key={report.type}>
-              <div className={`ledger-row ${codeClass(report.code)}`}>
+              <div className={`ledger-row ${codeClass(report.code)}${paused ? ' is-paused' : ''}`}>
                 <span className="ledger-index">{String(i + 1).padStart(2, '0')}</span>
                 <span className={`ledger-code ${codeClass(report.code)}`}>{report.code}</span>
                 <div className="ledger-meta">
                   <b>{report.label}</b>
-                  <small>{local?.error ?? local?.summary ?? (job?.completed_at ? `Last synced ${timeAgo(job.completed_at)}${job.source === 'manual_upload' ? ' - uploaded file' : ''}` : report.hint)}</small>
-                  {!local && job?.error_message && <small className={job.status === 'failed' ? 'ledger-note-error' : 'ledger-note-warning'}>{job.error_message}</small>}
+                  <small>{paused ? 'Paused until Amazon approves the SP-API role this report needs.' : (local?.error ?? local?.summary ?? (job?.completed_at ? `Last synced ${timeAgo(job.completed_at)}${job.source === 'manual_upload' ? ' - uploaded file' : ''}` : report.hint))}</small>
+                  {!paused && !local && job?.error_message && <small className={job.status === 'failed' ? 'ledger-note-error' : 'ledger-note-warning'}>{job.error_message}</small>}
                 </div>
                 <div className="ledger-row-actions">
-                  <span className={`pill status-${statusLabel}`}>{statusLabel}</span>
-                  {report.type === 'GET_V2_SETTLEMENT_REPORT_DATA_FLAT_FILE_V2' && (
+                  <span className={`pill status-${statusLabel}`}>{paused ? 'Coming soon' : statusLabel}</span>
+                  {!paused && report.type === 'GET_V2_SETTLEMENT_REPORT_DATA_FLAT_FILE_V2' && (
                     <Button variant="secondary" disabled={disabled || busy} title="Deletes stored settlement rows for this range and re-downloads them from Amazon - use only if figures look wrong" onClick={() => resetSettlements()}>{busy ? '…' : 'Reset & Resync'}</Button>
                   )}
                   {uploadable && (
                     <Button variant="secondary" disabled={disabled || busy} title="Import a report file you downloaded directly from Seller Central - the only way to get data older than Amazon's 90-day API limit" onClick={() => uploadOpen === report.type ? setUploadOpen(null) : openUpload(report.type)}>Upload</Button>
                   )}
-                  <Button variant="secondary" disabled={disabled || busy} onClick={() => syncOne(report.type)}>{busy ? 'Syncing…' : 'Sync'}</Button>
+                  {!paused && <Button variant="secondary" disabled={disabled || busy} onClick={() => syncOne(report.type)}>{busy ? 'Syncing…' : 'Sync'}</Button>}
                 </div>
               </div>
               {uploadOpen === report.type && (
@@ -716,22 +742,26 @@ function SellerDashboard({ onDataChange, session, setSession, theme, setTheme })
       <div className="actions">
         {loading && <span className="pill status-running range-loading-pill"><span className="spinner-dot" />Refreshing…</span>}
         {!loading && awaitingAmazon && <span className="pill status-idle range-loading-pill"><span className="spinner-dot" />Amazon is preparing {awaitingAmazon.sources.length} report{awaitingAmazon.sources.length === 1 ? '' : 's'} · check {awaitingAmazon.attempt}/{awaitingAmazon.of}</span>}
-        <AmazonConnectionPanel tenantId={tenantId} seller={data?.seller} onChange={load} setError={setError} />
+        {/* Connecting/re-authorizing/disconnecting Amazon lives in
+            Settings → Amazon Connection now, not exposed on every page - a
+            hosted end user doesn't need "Disconnect" one click away from
+            their dashboard. The banner below still tells an unconnected
+            seller what to do; it just doesn't put the button in their face. */}
       </div>
     </div>
     {freshAmazonAuth && connected && !backfillRunning && <p className="alert success">Amazon account connected. Select a date range or use Sync on this page to pull limited data.</p>}
     {amazonError && <p className="alert warning">Amazon connection issue: {amazonError}</p>}
     {error && <p className="alert warning">{error}</p>}
-    {(view === 'dashboard' || view === 'orderPayments') && !connected && data && <p className="alert warning">Connect your Amazon account to start pulling real payment data — nothing syncs until then.</p>}
+    {(view === 'dashboard' || view === 'orderPayments') && !connected && data && <p className="alert warning">Connect your Amazon account in Settings → Amazon Connection to start pulling real payment data — nothing syncs until then.</p>}
     {blockedByBackfill && <InitialBackfillGate seller={data.seller} />}
     {!blockedByBackfill && <>
     {view !== 'dashboard' && view !== 'settings' && !detailView && <SyncLedger tenantId={tenantId} jobs={data?.jobs ?? []} onSynced={load} reportTypes={reportTypes} title={ledgerCopy?.title} subtitle={ledgerCopy?.subtitle} disabled={!connected} />}
 
     {view === 'orderPayments' && <OrderReconciliation tenantId={tenantId} />}
     {view === 'dashboard' && <DashboardOverview data={data} channelData={channelData} tenantId={tenantId} />}
-    {view === 'sales' && <SalesAnalytics data={data} channelData={channelData} />}
-    {view === 'businessPerformance' && <BusinessPerformanceReport data={data} />}
-    {view === 'productPerformance' && <ProductPerformanceReport data={data} />}
+    {view === 'sales' && <><ComingSoonNotice text="Sales & Traffic report is paused until Amazon approves the Brand Analytics role - the figures below may be incomplete until then." /><SalesAnalytics data={data} channelData={channelData} /></>}
+    {view === 'businessPerformance' && <><ComingSoonNotice text="Some of this report's figures come from Sales & Traffic, which is paused until Amazon approves the Brand Analytics role - Orders-based figures are unaffected." /><BusinessPerformanceReport data={data} /></>}
+    {view === 'productPerformance' && <><ComingSoonNotice text="Product Performance requires Amazon's Sales & Traffic report, paused until Amazon approves the Brand Analytics role." /><ProductPerformanceReport data={data} /></>}
     {view === 'inventory' && <TableCard title="Inventory" rows={data?.inventory ?? []} columns={['sku', 'fulfillable_quantity', 'snapshot_date']} downloadFilename="inventory.csv" />}
     {view === 'payouts' && <>
       <TableCard title="Payout Activity" rows={data?.payments ?? []} columns={['posted_date', 'settlement_id', 'net_amount', 'lines']} downloadFilename="payout-activity.csv" />
@@ -746,7 +776,7 @@ function SellerDashboard({ onDataChange, session, setSession, theme, setTheme })
     {view === 'feeAudit' && <FeeLeakAudit tenantId={tenantId} />}
     {view === 'returns' && <TableCard title="Return Details" rows={data?.returns ?? []} columns={['order_id', 'return_reason', 'disposition', 'status', 'return_date']} downloadFilename="returns.csv" />}
     {view === 'reimbursements' && <TableCard title="Reimbursement Details" rows={data?.reimbursements ?? []} columns={['sku', 'amount', 'reason', 'reimbursement_date']} downloadFilename="reimbursements.csv" />}
-    {view === 'tax' && <TableCard title="GST Invoice Details" rows={data?.invoices ?? []} columns={['invoice_type', 'order_id', 'taxable_value', 'cgst', 'sgst', 'igst', 'invoice_date']} downloadFilename="gst-invoices.csv" />}
+    {view === 'tax' && <><ComingSoonNotice text="GST B2B and B2C invoice reports are paused until Amazon approves the Tax Invoicing role - new invoices won't sync until then." /><TableCard title="GST Invoice Details" rows={data?.invoices ?? []} columns={['invoice_type', 'order_id', 'taxable_value', 'cgst', 'sgst', 'igst', 'invoice_date']} downloadFilename="gst-invoices.csv" /></>}
     {view === 'reports' && <>
       <ReportsExplorer tenantId={tenantId} data={data} />
       {/* Also on Payouts, but this is the page people look for raw exports on.
@@ -901,83 +931,22 @@ function ExpenseBreakdown({ components, tenantId }) {
   </Card>;
 }
 
-// Built from the same sync_jobs history the Sync Ledger uses on every other
-// page - one row per report type, its most recent run. Real timestamps, real
-// statuses, nothing synthesized.
-function RecentActivity({ jobs }) {
-  const rows = [...(jobs ?? [])]
-    .filter(job => job.completed_at || job.started_at)
-    .sort((a, b) => new Date(b.completed_at ?? b.started_at) - new Date(a.completed_at ?? a.started_at))
-    .slice(0, 6);
-  const report = type => REPORTS.find(r => r.type === type);
-  const iconFor = status => status === 'completed' ? { icon: '✓', tone: 'emerald' } : status === 'failed' ? { icon: '✕', tone: 'danger' } : { icon: '⟳', tone: 'marigold' };
-  return <Card className="panel">
-    <PanelHeader title="Recent Activity" subtitle="Sync history" />
-    {rows.length ? <div className="activity-feed">{rows.map((job, i) => {
-      const { icon, tone } = iconFor(job.status);
-      const label = report(job.report_type)?.label ?? job.report_type;
-      return <div className="activity-row" key={i}>
-        <span className={`activity-icon tone-${tone}`} aria-hidden="true">{icon}</span>
-        <div><b>{label} {job.status === 'completed' ? 'imported' : job.status === 'failed' ? 'sync failed' : 'syncing'}</b><small>{job.error_message ?? label}</small></div>
-        <span className="activity-row-right">{timeAgo(job.completed_at ?? job.started_at)}</span>
-      </div>;
-    })}</div> : <Empty text="No syncs recorded yet." />}
-  </Card>;
-}
-
-// Real reconciliation completeness - whether THIS tool's own data for the
-// selected range is fully synced and provably matches Amazon's ledger. This
-// is deliberately not Amazon's Seller Performance / Account Health metrics
-// (Late Shipment Rate, Order Defect Rate, Cancellation Rate) - this tool has
-// never synced that API, and showing numbers for it would mean inventing
-// them. What's shown here is real: the same completeness.provisional flag
-// and reasons the Account Activity panel is built on.
-function DataHealth({ diagnostics, jobs }) {
-  const completeness = diagnostics?.completeness;
-  const clean = completeness && !completeness.provisional;
-  const failedJobs = (jobs ?? []).filter(j => j.status === 'failed').length;
-  const included = diagnostics?.includedRows ?? 0;
-  const excluded = diagnostics?.excludedRows ?? 0;
-  const duplicates = diagnostics?.duplicateRows ?? 0;
-  return <Card className="panel">
-    <PanelHeader title="Data Health" subtitle="This range, this dataset" />
-    <div className={`data-health-status ${clean ? 'is-clean' : 'is-provisional'}`}>
-      <span className="dot" />
-      <div><strong>{clean ? 'Reconciled' : 'Provisional'}</strong><p>{clean ? 'Matches Amazon statement sections for this range.' : `${completeness?.reasons?.length ?? 0} open item(s) - see Alerts.`}</p></div>
-    </div>
-    <div className="data-health-grid">
-      <div><span>Rows used</span><strong>{formatNumber(included)}</strong></div>
-      <div><span>Rows excluded</span><strong>{formatNumber(excluded)}</strong></div>
-      <div><span>Duplicates removed</span><strong>{formatNumber(duplicates)}</strong></div>
-      <div><span>Failed syncs</span><strong>{formatNumber(failedJobs)}</strong></div>
-    </div>
-  </Card>;
-}
-
-// The single source of truth for "what needs attention" - shared by the
-// topbar notification bell and the dashboard's Alerts panel. Every entry
-// here is either one of the dashboard calculation's own stated completeness
-// reasons (dashboard-calculations.js explains, in full sentences, exactly
-// what is incomplete and why - see loadDashboardCalculations) or a sync job
-// Amazon itself reported as failed. Nothing is invented to fill space; an
-// account with clean, complete data produces an empty list.
+// The single source of truth for "what needs attention", shown in the
+// topbar notification bell. Deliberately narrow: only a sync job Amazon
+// itself reported as failed, in plain language ("X sync failed: reason").
+// The dashboard-calculation's own internal completeness/coverage reasoning
+// (which rows were excluded and why, dedup counts, etc.) used to feed this
+// too, but that is diagnostic detail for whoever built the reconciliation,
+// not something an end user hosting this tool needs surfaced as an "alert" -
+// it lives in the calculation detail pages for whoever wants it.
 function buildAlerts(data) {
   const alerts = [];
-  const completeness = data?.dashboardCalculations?.diagnostics?.completeness;
-  for (const reason of completeness?.reasons ?? []) alerts.push({ severity: 'medium', text: reason });
   for (const job of data?.jobs ?? []) {
     if (job.status !== 'failed') continue;
     const label = REPORTS.find(r => r.type === job.report_type)?.label ?? job.report_type;
     alerts.push({ severity: 'high', text: `${label} sync failed: ${job.error_message ?? 'no error detail returned'}`, at: job.completed_at ?? job.started_at });
   }
   return alerts;
-}
-function AlertsPanel({ alerts }) {
-  return <Card className="panel">
-    <PanelHeader title="Recent Alerts" subtitle={`${alerts.length} open`} />
-    {alerts.length ? <div className="activity-feed">{alerts.map((alert, i) => <div className={`alert-row severity-${alert.severity}`} key={i}><span className="alert-dot" /><div><p>{alert.text}</p>{alert.at && <small>{timeAgo(alert.at)}</small>}</div></div>)}</div>
-      : <Empty text="Nothing needs attention - this range is clean." />}
-  </Card>;
 }
 
 // Fetches the immediately preceding period of the same length, purely to
@@ -1045,7 +1014,7 @@ function AmazonBusinessReportCard({ rows }) {
           <div className="mini-metric"><span>Avg. Units/Order Item</span><strong>{avgUnitsPerOrderItem==null?'—':formatRatio(avgUnitsPerOrderItem)}</strong></div>
           <div className="mini-metric"><span>Avg. Sales/Order Item</span><strong>{avgSalesPerOrderItem==null?'—':formatCurrency(avgSalesPerOrderItem)}</strong></div>
         </div>
-      : <Empty text="Amazon's Sales and Traffic report hasn't synced for this range yet - once it does, these five numbers will match Seller Central's Sales Dashboard exactly." />}
+      : <Empty text="Coming soon - requires Amazon's Sales & Traffic report, paused until Amazon approves the Brand Analytics role. Once enabled, these five numbers will match Seller Central's Sales Dashboard exactly." />}
   </Card>;
 }
 function DashboardOverview({ data, channelData, tenantId }) {
@@ -1053,8 +1022,6 @@ function DashboardOverview({ data, channelData, tenantId }) {
   const summary = useMemo(() => buildDashboardSummary(data, range), [data, range]);
   const prevData = usePriorPeriod(tenantId, range);
   const prevSummary = useMemo(() => prevData ? buildDashboardSummary(prevData) : null, [prevData]);
-  const alerts = useMemo(() => buildAlerts(data), [data]);
-  const diagnostics = data?.dashboardCalculations?.diagnostics;
   return <>
     <div className="metrics-strip">
       <DrillMetric to={`/seller?tenantId=${tenantId}&view=metric-detail&metric=netSales`} title="Net Sales" value={formatCurrency(summary.netSales)} icon="₹" tone="violet" delta={prevSummary && pctDelta(summary.netSales, prevSummary.netSales)} />
@@ -1080,18 +1047,7 @@ function DashboardOverview({ data, channelData, tenantId }) {
       <ExpenseBreakdown components={data?.dashboardCalculations?.statement?.expenses?.components} tenantId={tenantId} />
     </div>
 
-    {/* Amazon's own five statement sections - Income, Expenses, Tax, GST,
-        Transfers. This is the core reconciliation claim of the tool and stays
-        exactly as it was, regardless of anything else on this page. */}
-    <AccountActivity data={data} tenantId={tenantId} />
-
     <ExplanationGrid summary={summary} tenantId={tenantId} />
-
-    <div className="dashboard-grid three">
-      <DataHealth diagnostics={diagnostics} jobs={data?.jobs} />
-      <AlertsPanel alerts={alerts} />
-      <RecentActivity jobs={data?.jobs} />
-    </div>
 
     <SalesAnalytics data={data} channelData={channelData} />
 
@@ -1127,42 +1083,18 @@ function KpiDelta({ value }) {
   return <span className={`kpi-delta ${dir}`}>{arrow} {Math.abs(value).toLocaleString('en-IN', { maximumFractionDigits: 1 })}%<span className="kpi-delta-note">vs prior period</span></span>;
 }
 
-// "Matches Amazon statement sections" is a claim about the data, not a label,
-// so it is only shown when the API can prove the data behind it is whole.
-// While anything is outstanding the panel says so and lists what, because a
-// seller cannot otherwise tell a matched figure from a provisional one
-// without opening Seller Central and checking by hand.
-function AccountActivity({ data, tenantId }) {
-  const completeness = data?.dashboardCalculations?.diagnostics?.completeness;
-  const provisional = completeness?.provisional ?? true;
-  const reasons = completeness?.reasons ?? ['Waiting for the dashboard calculation to report what it is based on.'];
-  // Which build produced these figures. Node does not hot-reload, so an API
-  // left running after a pull reports stale numbers with complete confidence -
-  // that cost a full debugging round trip once. Showing it means the running
-  // build can be read rather than inferred from the numbers themselves.
-  const revision = data?.dashboardCalculations?.diagnostics?.calculationRevision;
-  return (
-    <Card className="profit-control-card">
-      <PanelHeader title="Amazon Account Activity" subtitle={provisional ? 'Provisional — not yet reconciled to Amazon' : 'Matches Amazon statement sections'} />
-      {revision && <div className="activity-revision">calculation build: {revision}</div>}
-      {provisional && (
-        <div className="activity-provisional">
-          <b>These sections are not yet a match for your Amazon statement.</b>
-          <ul>{reasons.map(reason => <li key={reason}>{reason}</li>)}</ul>
-        </div>
-      )}
-      <div className="profit-kpi-grid account-activity-grid">
-        {['income','expenses','tax','transfers','gst'].map(metric=><DrillMetric key={metric} to={`/seller?tenantId=${tenantId}&view=metric-detail&metric=${metric}`} title={metric==='gst'?'Goods and Services Tax':metric[0].toUpperCase()+metric.slice(1)} value={formatCurrency(data?.dashboardCalculations?.statement?.[metric]?.value)} hint="Open Amazon source rows and formula" />)}
-      </div>
-    </Card>
-  );
-}
+// GST invoice value has its own dependency note rather than the generic
+// "Unavailable" the other three cards use: it is not a transient sync gap,
+// it is paused pending Amazon's approval of the Tax Invoicing role - see
+// PAUSED_REPORT_TYPES. Telling a seller "coming soon" is honest; telling
+// them "Unavailable" alongside three genuinely-transient gaps is not.
 function ExplanationGrid({ summary, tenantId }) {
+  const gstPaused = summary.gstValue == null;
   const cards = [
     ['Fee impact', summary.feeImpact==null?'Unavailable':`${Number(summary.feeImpact).toLocaleString('en-IN',{maximumFractionDigits:2})}%`, 'Net Amazon fees excluding TCS/TDS as a percentage of gross product sales.', 'feeImpact'],
     ['Return rate', summary.returnRate==null?'Unavailable / source mismatch':`${Number(summary.returnRate).toLocaleString('en-IN',{maximumFractionDigits:2})}%`, 'Physically returned units divided by shipped units.', 'returnRate'],
     ['Refund value rate', summary.refundValueRate==null?'Unavailable':`${Number(summary.refundValueRate).toLocaleString('en-IN',{maximumFractionDigits:2})}%`, 'Product refund value divided by gross product sales; separate from unit return rate.', 'refundValueRate'],
-    ['GST invoice value', summary.gstValue==null?'Unavailable':formatCurrency(summary.gstValue), 'Sales-invoice taxable value minus credit-note/refund taxable value.', 'gstValue']
+    ['GST invoice value', gstPaused?'Coming soon':formatCurrency(summary.gstValue), gstPaused?'Requires GST B2B/B2C invoice data - paused until Amazon approves the Tax Invoicing role.':'Sales-invoice taxable value minus credit-note/refund taxable value.', 'gstValue']
   ];
   return <div className="explain-grid">{cards.map(([title, value, copy, target]) => <Link key={title} to={`/seller?tenantId=${tenantId}&view=metric-detail&metric=${target}`} className="explain-card"><b>{title}</b><strong>{value}</strong><p>{copy}</p><span>Open calculation →</span></Link>)}</div>;
 }
@@ -1795,7 +1727,7 @@ function SellerShell({ session, setSession }) {
     {navOpen && <div className="sidebar-overlay" onClick={() => setNavOpen(false)} />}
     <aside className={`sidebar${navOpen ? ' open' : ''}`} aria-hidden={!navOpen}>
       <div className="sidebar-head">
-        <div className="logo"><span>W</span><div><b>WELLSURE</b><small>Seller Intelligence</small></div></div>
+        <div className="logo"><LogoMark size={38} /><div><b>WELLSURE</b><small>Seller Intelligence</small></div></div>
         <button type="button" className="sidebar-close" aria-label="Close menu" title="Close menu" onClick={() => setNavOpen(false)}>✕</button>
       </div>
       <nav>
@@ -1847,7 +1779,7 @@ function AdminShell({ session, setSession }) {
   function logout() { localStorage.removeItem('token'); setSession(null); }
   return <div className="admin-shell">
     <header className="admin-topbar">
-      <div className="logo"><span>W</span><div><b>WELLSURE</b><small>Admin Console</small></div></div>
+      <div className="logo"><LogoMark size={38} /><div><b>WELLSURE</b><small>Admin Console</small></div></div>
       <div className="admin-topbar-right">
         <div className="avatar">{session?.email?.[0]?.toUpperCase()}</div>
         <Button variant="dark" onClick={logout}>Logout {session?.email}</Button>
@@ -1893,7 +1825,7 @@ function App() {
       .catch(() => localStorage.removeItem('token'))
       .finally(() => setBooted(true));
   }, []);
-  if (!booted) return <div className="boot-screen"><div className="brand-mark">W</div><p>Signing you in…</p></div>;
+  if (!booted) return <div className="boot-screen"><div className="brand-mark"><LogoMark size={56} /></div><p>Signing you in…</p></div>;
   if (!session) return <BrowserRouter><Login setSession={setSession} /></BrowserRouter>;
   return <BrowserRouter>{session.role === 'admin' ? <AdminShell session={session} setSession={setSession} /> : <SellerShell session={session} setSession={setSession} />}</BrowserRouter>;
 }
