@@ -1165,7 +1165,15 @@ td { padding: 13px 14px; color:#344054; }
   visibility: visible;
 }
 .sidebar { transition: opacity 0.2s ease; }
-.app-shell.nav-closed .sidebar-head { justify-content: center; overflow: hidden; }
+/* flex-shrink: 0 (not overflow: hidden) is the safety net here on purpose:
+   .sidebar-head is a flex item inside the sidebar's column flex, and
+   `overflow: hidden` on a flex item resets its automatic minimum size to 0
+   (a well-known flexbox quirk - min-height:auto only takes its content's
+   size into account for overflow:visible). That let the flex layout shrink
+   this row to a literal 0px height whenever the column was even slightly
+   tight, clipping the logo away completely though its own box measured
+   fine - it simply had no visible parent box left to paint into. */
+.app-shell.nav-closed .sidebar-head { justify-content: center; flex-shrink: 0; }
 .app-shell.nav-closed .sidebar-close,
 .app-shell.nav-closed .nav-label,
 .app-shell.nav-closed .sidebar-help { display: none; }
@@ -1173,15 +1181,17 @@ td { padding: 13px 14px; color:#344054; }
 /* Overrides LogoMark's own inline height (it can't know it's sitting in a
    76px rail). A real wordmark lockup is usually much wider than it is tall,
    so bounding height alone let it overflow the rail sideways and get
-   clipped invisible - bounding max-width too (76px rail minus the sidebar's
-   own side padding) makes width the binding constraint for a wide mark and
-   height the binding constraint for a squarer one, so it always shrinks to
-   fit fully on-screen instead of spilling past either edge. */
+   clipped off past the edge. A first fix bounded max-width too with
+   height/width left auto - but auto+max-* has no box to fall back on
+   while the file at /logo-light.png / /logo-dark.png isn't live yet (or
+   fails to load for any other reason), so the mark rendered as nothing at
+   all instead of a broken-image placeholder. A fixed width+height always
+   reserves a real, visible slot in the rail - object-fit: contain then
+   letterboxes whatever image actually loads inside it, so a wide lockup
+   shrinks to fit instead of spilling past the rail's edge. */
 .app-shell.nav-closed .logo-mark {
-  height: auto !important;
-  max-height: 30px;
-  max-width: 56px;
-  width: auto;
+  height: 28px !important;
+  width: 44px !important;
   object-fit: contain;
 }
 
