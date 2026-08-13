@@ -181,11 +181,26 @@ function timeAgo(iso) {
   return `${Math.round(hrs / 24)}d ago`;
 }
 
-// Points at the real logo file, dropped into apps/web/public/ so Vite serves
-// it at this exact root path - nothing here needs to change once that file
-// exists, just add public/logo.png (or .svg) with this name.
-function LogoMark({ size = 40 }) {
-  return <img src="/logo.png" alt="WELLSURE" width={size} height={size} style={{ objectFit: 'contain' }} />;
+// Two fake links, not one - the real files get dropped into apps/web/public/
+// at exactly these two names, one for each theme (a light-sidebar logo and a
+// dark-sidebar logo, however those actually differ - background, outline,
+// whatever the seller's own brand assets need). Which one is visible is
+// decided in CSS off data-theme (see .logo-mark-light/.logo-mark-dark in
+// style.css), not a theme prop threaded through every caller, so this
+// renders correctly even on the login/boot screens where no component
+// carries theme state at all.
+//
+// Sized by HEIGHT ONLY. The logo is a full lockup - ring mark, WELLSURE
+// wordmark, tagline - not a square icon, so forcing width equal to height
+// (an earlier version of this component did exactly that) squashed it into
+// an illegible box. Width is left to the file's own aspect ratio.
+function LogoMark({ height = 40 }) {
+  return (
+    <>
+      <img className="logo-mark logo-mark-light" src="/logo-light.png" alt="WELLSURE" style={{ height, width: 'auto' }} />
+      <img className="logo-mark logo-mark-dark" src="/logo-dark.png" alt="WELLSURE" style={{ height, width: 'auto' }} />
+    </>
+  );
 }
 
 // Login only — account creation is admin-only now (see AdminDashboard's
@@ -204,7 +219,7 @@ function Login({ setSession }) {
   }
   return <main className="login-shell">
     <section className="login-hero">
-      <div className="brand-mark"><LogoMark size={64} /></div>
+      <div className="brand-mark"><LogoMark height={76} /></div>
       <p className="eyebrow">Ledger 01 — Seller Reconciliation</p>
       <h1>Every rupee Amazon touches, reconciled in one command center.</h1>
       <p>Connect Seller Central, pull SP-API orders and reports on your own schedule, and track payouts, sales, inventory and account health from a single secure cockpit.</p>
@@ -1682,12 +1697,20 @@ function useSidebarOpen() {
 // which every existing card/table/input already reads its colors through
 // (see the dark-theme block in style.css), and persists across visits.
 const THEME_KEY = 'wellsure_theme';
+function resolveStoredTheme() {
+  const stored = localStorage.getItem(THEME_KEY);
+  if (stored === 'light' || stored === 'dark') return stored;
+  return typeof window !== 'undefined' && window.matchMedia?.('(prefers-color-scheme: dark)').matches ? 'dark' : 'light';
+}
+// useTheme() only mounts inside SellerShell, i.e. after login - so without
+// this, data-theme was never set on <html> for the login/boot screens, and
+// anything keyed off it there (the light/dark logo swap - see LogoMark)
+// would always render as if light mode, even for a seller whose device or
+// saved preference is dark. Runs once at module load, before the first
+// render, so there is no flash of the wrong logo either.
+if (typeof document !== 'undefined') document.documentElement.dataset.theme = resolveStoredTheme();
 function useTheme() {
-  const [theme, setTheme] = useState(() => {
-    const stored = localStorage.getItem(THEME_KEY);
-    if (stored === 'light' || stored === 'dark') return stored;
-    return typeof window !== 'undefined' && window.matchMedia?.('(prefers-color-scheme: dark)').matches ? 'dark' : 'light';
-  });
+  const [theme, setTheme] = useState(resolveStoredTheme);
   useEffect(() => {
     document.documentElement.dataset.theme = theme;
     localStorage.setItem(THEME_KEY, theme);
@@ -1720,7 +1743,7 @@ function SellerShell({ session, setSession }) {
     {navOpen && <div className="sidebar-overlay" onClick={() => setNavOpen(false)} />}
     <aside className={`sidebar${navOpen ? ' open' : ''}`} aria-hidden={!navOpen}>
       <div className="sidebar-head">
-        <div className="logo"><LogoMark size={38} /><div><b>WELLSURE</b><small>Seller Intelligence</small></div></div>
+        <div className="logo"><LogoMark height={46} /><small>Seller Intelligence</small></div>
         <button type="button" className="sidebar-close" aria-label="Close menu" title="Close menu" onClick={() => setNavOpen(false)}>✕</button>
       </div>
       <nav>
@@ -1772,7 +1795,7 @@ function AdminShell({ session, setSession }) {
   function logout() { localStorage.removeItem('token'); setSession(null); }
   return <div className="admin-shell">
     <header className="admin-topbar">
-      <div className="logo"><LogoMark size={38} /><div><b>WELLSURE</b><small>Admin Console</small></div></div>
+      <div className="logo"><LogoMark height={46} /><small>Admin Console</small></div>
       <div className="admin-topbar-right">
         <div className="avatar">{session?.email?.[0]?.toUpperCase()}</div>
         <Button variant="dark" onClick={logout}>Logout {session?.email}</Button>
@@ -1818,7 +1841,7 @@ function App() {
       .catch(() => localStorage.removeItem('token'))
       .finally(() => setBooted(true));
   }, []);
-  if (!booted) return <div className="boot-screen"><div className="brand-mark"><LogoMark size={56} /></div><p>Signing you in…</p></div>;
+  if (!booted) return <div className="boot-screen"><div className="brand-mark"><LogoMark height={64} /></div><p>Signing you in…</p></div>;
   if (!session) return <BrowserRouter><Login setSession={setSession} /></BrowserRouter>;
   return <BrowserRouter>{session.role === 'admin' ? <AdminShell session={session} setSession={setSession} /> : <SellerShell session={session} setSession={setSession} />}</BrowserRouter>;
 }

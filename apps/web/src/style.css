@@ -931,13 +931,22 @@ body { background: radial-gradient(circle at 82% -10%, rgba(245,197,24,.08), tra
 .app-shell { grid-template-columns: 292px 1fr; }
 .sidebar { background: rgba(255,255,255,.97); color: var(--text); border-right: 1px solid var(--border); box-shadow: 8px 0 28px rgba(15,23,42,.035); backdrop-filter: blur(18px); padding: 30px 20px; gap: 36px; }
 /* .logo span no longer exists in the markup (the "W" letter badge was
-   replaced by the real WELLSURE mark, an inline SVG that draws its own gold
-   ring - see LogoMark in App.jsx), so it needs no background of its own
-   here. .brand-mark still wraps that SVG on the login/boot screens and only
-   needs sizing, not a colored circle behind it. */
+   replaced by the real WELLSURE logo file - see LogoMark in App.jsx), so it
+   needs no background of its own here. .brand-mark still wraps that image
+   on the login/boot screens and only needs sizing, not a colored circle
+   behind it. .logo no longer carries a separate "WELLSURE" heading either -
+   the logo file already spells that out - just the small context caption
+   ("Seller Intelligence" / "Admin Console") beside it. */
 .sidebar .logo span, .admin-topbar .logo span, .brand-mark { background: none; box-shadow: none; }
-.sidebar .logo b { color: var(--ink); font-size: 17px; }
-.sidebar .logo small { color: var(--muted); }
+.sidebar .logo small, .admin-topbar .logo small { color: var(--muted); }
+/* LogoMark renders both theme variants and lets CSS pick one, so the login
+   and boot screens (which mount before any component has theme state) show
+   the right logo immediately - see the module-level data-theme assignment
+   next to resolveStoredTheme in App.jsx. */
+.logo-mark { display: block; }
+.logo-mark-dark { display: none; }
+:root[data-theme="dark"] .logo-mark-light { display: none; }
+:root[data-theme="dark"] .logo-mark-dark { display: block; }
 .sidebar nav { gap: 8px; }
 .sidebar nav a { color: #625b74; font-size: 15px; padding: 13px 16px; border-radius: 13px; border-left: 0; display:flex; align-items:center; gap:14px; }
 .nav-icon { width: 28px; height: 28px; border-radius: 9px; display:inline-flex; align-items:center; justify-content:center; color:#736b86; border:1px solid transparent; font-weight:700; }
