@@ -12,7 +12,7 @@ import { buildGstInvoicesFromOrderItems, runInitialSellerBackfill, saveStructure
 import { buildRestoreStatements, createSyncQueue } from './jobs/sync-queue.js';
 import { calendarDay, calendarDays } from './jobs/reporting-calendar.js';
 import { categorizeFinanceLabel } from './jobs/finance-components.js';
-import { calculateDashboardMetrics } from './jobs/dashboard-calculations.js';
+import { CALCULATION_REVISION, calculateDashboardMetrics } from './jobs/dashboard-calculations.js';
 import { runFeeAuditForTenant } from './jobs/fee-audit.js';
 
 // Default 1 MiB body limit is fine for every other route, but a manually
@@ -586,7 +586,14 @@ app.setErrorHandler((error, _request, reply) => {
   reply.code(statusCode).send({ error: statusCode === 500 ? 'Internal server error' : normalized.message });
 });
 
-app.get('/health', async () => ({ ok: true }));
+// calculationRevision here, not just in a tenant's own diagnostics, exists
+// specifically so "is the running process actually the build I just pulled"
+// is a single unauthenticated request away - no login, no tenant id, no
+// dashboard drill-down needed. Chasing a figure the dashboard showed but no
+// committed build reproduced cost a full round trip once (see
+// CALCULATION_REVISION's own comment); this makes that check the first
+// thing anyone reaches for instead of the last.
+app.get('/health', async () => ({ ok: true, calculationRevision: CALCULATION_REVISION }));
 
 // Admin-only: creates a seller tenant + its first login user. There is no
 // public/self-serve signup route any more — account creation is entirely in

@@ -254,7 +254,7 @@ const gstKey=row=>`${rawField(row.raw,['invoice-number','invoice number','docume
 // stale numbers with total confidence. Bump this whenever the statement maths
 // changes, and the running build can be read off the dashboard instead of
 // inferred from the numbers it produces.
-export const CALCULATION_REVISION = 'label-spacing-2026-08-04';
+export const CALCULATION_REVISION = 'generic-fee-echo-dedup-2026-08-14';
 export const MINIMUM_DEDUPE_LOOKBACK_DAYS = 30;
 // The instant a row was posted, for ordering. Never compare posted_date as a
 // string: it arrives as a Date from Postgres and as an ISO string from an
