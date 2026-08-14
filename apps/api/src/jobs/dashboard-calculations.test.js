@@ -251,6 +251,32 @@ test('Net Sales counts product sales only, never the tax stamped with the same a
   assert.equal(r.statement.transfers.value,-246.63);
 });
 
+test('Net Sales excludes ShippingPrincipal - "principal" alone is not product-specific',()=>{
+  // Real seller (TGS INDIA, Jun 1-Jul 31 2026). The Finance API names a
+  // shipping charge "ShippingPrincipal" - it contains the literal word
+  // "principal", same as a genuine product sale's "OurPricePrincipal", so the
+  // bare /principal/ test counted it as a product sale. Amazon's own
+  // statement lists this seller's four ShippingPrincipal rows (40+40+40+80)
+  // as a single separate "Shipping credits: 200.00" Income line, not part of
+  // "Seller fulfilled product sales" - so Net Sales read 200.00 too high
+  // (97,294.25 against Amazon's 96,974.25 for this same window, before this
+  // fix and before accounting for the unrelated promotion-row boundary gap).
+  const range={start:'2026-06-01T00:00:00Z',end:'2026-08-01T00:00:00Z'};
+  const financeLine=(id,category,description,value,extra={})=>({source_row_id:id,transaction_id:id,order_id:`order-${id}`,category,amount_description:description,amount:value,posted_date:'2026-06-19T23:33:26.000Z',transaction_status:'DEFERRED_RELEASED',...extra});
+  const r=calculateDashboardMetrics({
+    orders:[],orderItems:[],returns:[],reimbursements:[],gstInvoices:[],settlementRows:[],settlementHeaders:[],settledOrderIdsAllTime:[],
+    financeItems:[
+      financeLine('sale','item_price','OurPricePrincipal',349.00),
+      financeLine('ship1','shipping_charge','ShippingPrincipal',40.00),
+      financeLine('ship2','shipping_charge','ShippingPrincipal',40.00),
+      financeLine('ship3','shipping_charge','ShippingPrincipal',40.00),
+      financeLine('ship4','shipping_charge','ShippingPrincipal',80.00)
+    ]
+  },range);
+  assert.equal(r.metrics.netSales.value,349.00,'the four ShippingPrincipal rows (200.00) must not be counted as product sales');
+  assert.equal(r.metrics.netSales.components.find(x=>x.category==='gross_sales').amount,349.00);
+});
+
 test('flags a settlement whose lines do not add up to Amazon\'s own stated total',()=>{
   // Every settlement document states its own total, so its lines must foot to
   // it exactly. This is a complete self-check for ingestion loss - no

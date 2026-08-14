@@ -47,7 +47,19 @@ const isRefund=row=>/refund/.test(text(row));
 // - the tax was being added to the sale. Net Sales, Fee Impact, Refund Value
 // Rate and DRR all read off this. Only the line's own description (or the
 // normalized Finance API category) may decide that a row is a product sale.
-export const isPrincipal=row=>/principal|item price/.test(norm(`${row.amount_description??''} ${row.category??''}`));
+// "principal" alone is not specific enough: Amazon's Finance API names a
+// shipping charge "ShippingPrincipal" and a gift-wrap charge
+// "GiftWrapPrincipal" - both contain the literal word "principal", so the
+// bare regex counted them as a product sale. Confirmed on a real seller's
+// account: four ShippingPrincipal rows worth exactly 200.00 (which Amazon's
+// own statement lists as a separate "Shipping credits" Income line, not
+// product sales) were inflating Gross product sales, and so Net Sales,
+// Fee Impact and Refund Value Rate, by that same 200.00. Shipping/gift-wrap
+// credits already have their own classifier (isShippingOrGiftWrapCredit,
+// below) which still correctly counts them as Income - this exclusion only
+// keeps them out of PRODUCT sales specifically, same principle as the
+// ItemPrice/amount_type fix above.
+export const isPrincipal=row=>{const t=norm(`${row.amount_description??''} ${row.category??''}`);return /principal|item price/.test(t)&&!/shipping|gift wrap/.test(t);};
 // A tax discount reduces the GST collected; it is not a promotional rebate.
 // The exclusion used to be a literal list of settlement's spellings ("product
 // tax discount", "shipping tax discount", "gift wrap tax discount"), which the
