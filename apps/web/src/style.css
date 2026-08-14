@@ -1328,6 +1328,9 @@ tbody tr:hover td { background: var(--brand-soft); }
 .backfill-gate-row:last-child { border-bottom: none; }
 .backfill-gate-row b { font-size: 13.5px; color: var(--ink); display: block; }
 .backfill-gate-row small { color: var(--muted); font-size: 11.5px; }
+.backfill-gate-reasons { display: flex; flex-direction: column; gap: 8px; margin: 0 0 18px; padding: 14px 16px; border-radius: 12px; background: var(--paper); border: 1px solid var(--border); list-style: none; }
+.backfill-gate-reasons li { font-size: 12.5px; line-height: 1.6; color: var(--muted); padding-left: 16px; position: relative; }
+.backfill-gate-reasons li::before { content: '•'; position: absolute; left: 0; color: var(--violet); }
 
 .sidebar nav a.active {
   background: linear-gradient(135deg, var(--violet), var(--violet-deep));

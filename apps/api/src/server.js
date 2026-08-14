@@ -964,6 +964,25 @@ app.post('/api/tenants/:tenantId/reports/:reportType/upload', async request => {
 // back with `on conflict do nothing`, so any row the re-fetch *did* bring
 // down stays the authoritative copy and only genuine gaps are refilled.
 const SETTLEMENT_REPORT_TYPE = 'GET_V2_SETTLEMENT_REPORT_DATA_FLAT_FILE_V2';
+// A fixed cooldown, not the exponential failure-count backoff used for
+// missing-report auto-sync (autoSyncBackoffRemainingMs): that helper counts
+// CONSECUTIVE FAILED jobs, but a corrupt settlement is recorded as a
+// successful sync - it downloaded fine, the numbers are just wrong - so a
+// failure-based check would see zero failures and retrigger on every single
+// dashboard request. This checks the most recent attempt regardless of
+// its outcome, so a Reset & Resync that raced Amazon's rate limit gets a
+// real gap before the next automatic attempt instead of being restarted
+// every few seconds while a seller's tab sits open.
+const SETTLEMENT_AUTOHEAL_COOLDOWN_MS = 15 * 60 * 1000;
+async function settlementAutoHealOnCooldown(tenantId) {
+  const { rows } = await pool.query(
+    `select coalesce(completed_at, started_at) as at_time from sync_jobs
+     where tenant_id=$1 and report_type=$2 order by coalesce(completed_at, started_at) desc limit 1`,
+    [tenantId, SETTLEMENT_REPORT_TYPE]
+  );
+  const at = rows[0]?.at_time;
+  return Boolean(at) && Date.now() - new Date(at).getTime() < SETTLEMENT_AUTOHEAL_COOLDOWN_MS;
+}
 async function restoreSettlementRows(tenantId, rows) {
   const statements = buildRestoreStatements(rows);
   if (!statements.length) return 0;
@@ -1592,6 +1611,37 @@ app.get('/api/tenants/:tenantId/dashboard', async request => {
       console.log(`[dashboard ${tenantId.slice(0, 8)}] SETTLEMENT INTEGRITY FAILURE - ${integrity.length} settlement(s) do not add up to the total Amazon stamped on them. Figures derived from them are wrong; re-run Reset & Resync for settlements.`);
       for (const row of integrity) console.log(`[dashboard ${tenantId.slice(0, 8)}]   settlement=${row.settlement_id} rows=${row.row_count} sum=${row.rows_total.toFixed(2)} amazon_total=${row.header_total.toFixed(2)} difference=${row.difference.toFixed(2)}`);
     }
+    // A seller was never going to notice a console log and click Reset &
+    // Resync themselves - confirmed live, this exact failure sat unfixed
+    // for hours until it was found by reading server logs by hand. Corrupt
+    // or incomplete settlement data is the one failure that makes every
+    // money figure wrong, so it repairs itself instead of waiting on a
+    // human. A plain background sync (triggerBackgroundSync above) cannot
+    // do this: it skips any report type with a recent COMPLETED sync, and a
+    // corrupt settlement document is recorded as completed - just wrong -
+    // so only a real Reset & Resync (delete stored rows, re-download from
+    // Amazon) replaces it.
+    //
+    // settlementDataBroken is also returned to the frontend, which blocks
+    // the whole dashboard on it - the numbers computed from broken data are
+    // never rendered, only "still verifying" - so the two behaviours are
+    // dual: the seller never sees a wrong figure, and the server keeps
+    // trying to make it right without being asked.
+    const settlementDataBroken = Boolean(outstanding) || Boolean(integrity?.length);
+    if (settlementDataBroken && !backfillRunning) {
+      if (syncQueue.isBusy(`${tenantId}:${SETTLEMENT_REPORT_TYPE}`)) {
+        if (!autoSyncReportTypes.includes(SETTLEMENT_REPORT_TYPE)) autoSyncReportTypes.push(SETTLEMENT_REPORT_TYPE);
+      } else if (!(await settlementAutoHealOnCooldown(tenantId))) {
+        console.log(`[dashboard ${tenantId.slice(0, 8)}] auto-healing broken settlement data - triggering Reset & Resync automatically`);
+        resetSettlementData(tenantId, effectiveRange).catch(error => app.log.warn({ err: error, tenantId }, 'Automatic settlement auto-heal failed'));
+        if (!autoSyncReportTypes.includes(SETTLEMENT_REPORT_TYPE)) autoSyncReportTypes.push(SETTLEMENT_REPORT_TYPE);
+      }
+      // On cooldown: say nothing new here. The most recent attempt already
+      // logged its own outcome (success, or "run again once the rate limit
+      // clears"), and the seller-facing pill/gate stays up regardless via
+      // settlementDataBroken - there is nothing further to trigger until
+      // the cooldown lapses.
+    }
     const pendingDetail=dashboardCalculations.diagnostics?.pendingFinanceRowsDetail;
     const mergeSummary=dashboardCalculations.diagnostics?.pendingMergeSummary;
     if (pendingDetail?.length) {
@@ -1606,7 +1656,7 @@ app.get('/api/tenants/:tenantId/dashboard', async request => {
       for (const row of pendingDetail) console.log(`${label}   [excluded] order=${row.order_id} status=${row.transaction_status} category=${row.category} amount_desc=${row.amount_description ?? ''} amount=${row.amount} -> would be ${row.bucket}`);
     }
     const hasImportedData = Number(orders.orders ?? 0) > 0 || Number(kpis.net_settled ?? 0) !== 0 || products.length > 0 || payments.length > 0 || inventory.length > 0;
-    return { seller, amazonAuth, hasImportedData, kpis, orders, orderRows, orderPayments, paymentComponents, paymentSummary, dashboardCalculations, businessReportRows, products, trend, payments, settlementLines, financeLines, financialComponents, financialSummary, jobs, inventory, returns, reimbursements, invoices, orderItems, financeTransactions, autoSyncing: autoSyncReportTypes };
+    return { seller, amazonAuth, hasImportedData, kpis, orders, orderRows, orderPayments, paymentComponents, paymentSummary, dashboardCalculations, businessReportRows, products, trend, payments, settlementLines, financeLines, financialComponents, financialSummary, jobs, inventory, returns, reimbursements, invoices, orderItems, financeTransactions, autoSyncing: autoSyncReportTypes, settlementDataBroken };
   });
 });
 
