@@ -32,27 +32,30 @@ test('matches the MINDCIRCUS Amazon Account Activity fixture without constants',
   assert.equal(r.diagnostics.sourcePolicy.financial.startsWith('Amazon Settlement report'),true);
 });
 test('uses current status only and preserves identical-SKU lines with stable item IDs',()=>{const r=calculateDashboardMetrics(mindcircusFixture(),range);assert.equal(r.metrics.netQty.value,3);assert.equal(r.metrics.orders.value,1);assert.equal(r.metrics.returnRate.value,40);});
-test('a standard-id Shipped order flagged IsReplacementOrder is excluded, not just one literally statused "Replacement"',()=>{
-  const input=mindcircusFixture();
-  input.orders.push({amazon_order_id:'407-5555555-5555555',status:'Shipped',raw:{IsReplacementOrder:true}});
-  input.orderItems.push({source_row_id:'db3',amazon_order_id:'407-5555555-5555555',sku:'other',asin:'b',quantity_ordered:5,item_price:0,raw:{orderItemId:'item-3'}});
-  const r=calculateDashboardMetrics(input,range);
-  assert.equal(r.metrics.netQty.value,3);
-  assert.equal(r.metrics.orders.value,1);
-});
-test('a Shipped order with a non-standard order id is excluded even with no IsReplacementOrder flag - the real S02-... case',()=>{
+test('a Shipped order with a non-standard order id is excluded from Net Qty and Orders - the real S02-... case',()=>{
   // Live case: order id "S02-1001563-0287843" (not the usual
   // NNN-NNNNNNN-NNNNNNN shape), 0.00 item price, quantity 5 - exactly the
   // gap between shipped units (361) and Amazon's own Units Ordered (356).
-  // The exported CSV that caught this has no order-level raw JSON, so
-  // whether Amazon populated IsReplacementOrder for this account is
-  // unconfirmed; the id shape alone must be enough.
   const input=mindcircusFixture();
   input.orders.push({amazon_order_id:'S02-1001563-0287843',status:'Shipped',raw:{}});
   input.orderItems.push({source_row_id:'db4',amazon_order_id:'S02-1001563-0287843',sku:'other',asin:'b',quantity_ordered:5,item_price:0,raw:{orderItemId:'item-4'}});
   const r=calculateDashboardMetrics(input,range);
   assert.equal(r.metrics.netQty.value,3);
   assert.equal(r.metrics.orders.value,1);
+});
+test('a standard-id order flagged IsReplacementOrder is still counted - Amazon\'s own Units Ordered counts it too',()=>{
+  // The flag alone used to be enough to exclude an order. Proven wrong live:
+  // excluding every IsReplacementOrder=true order (not just the
+  // non-standard-id one) dropped the account's Net Qty to 352, but Amazon's
+  // own Units Ordered report stayed at 356 - Amazon counts a standard-id
+  // replacement as a real ordered unit, and only excludes the kind that gets
+  // its own non-standard order id.
+  const input=mindcircusFixture();
+  input.orders.push({amazon_order_id:'407-5555555-5555555',status:'Shipped',raw:{IsReplacementOrder:true}});
+  input.orderItems.push({source_row_id:'db3',amazon_order_id:'407-5555555-5555555',sku:'other',asin:'b',quantity_ordered:5,item_price:0,raw:{orderItemId:'item-3'}});
+  const r=calculateDashboardMetrics(input,range);
+  assert.equal(r.metrics.netQty.value,8);
+  assert.equal(r.metrics.orders.value,2);
 });
 test('negative Principal is a refund through parent transaction metadata',()=>{const input=mindcircusFixture();const refund=input.settlementRows.find(x=>x.source_row_id==='sf-refund');delete refund.transaction_type;assert.equal(calculateDashboardMetrics(input,range).metrics.netSales.value,154522.8);});
 test('missing return quantity makes quantity KPIs unavailable instead of guessing one',()=>{const input=mindcircusFixture();input.returns[0].quantity=null;const r=calculateDashboardMetrics(input,range);assert.equal(r.metrics.returns.value,null);assert.equal(r.metrics.netQty.value,null);assert.equal(r.metrics.returnRate.value,null);assert.match(r.metrics.returnRate.status,/^Unavailable\b/);});
