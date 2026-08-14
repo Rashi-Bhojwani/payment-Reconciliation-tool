@@ -72,7 +72,27 @@ export const isPrincipal=row=>{const t=norm(`${row.amount_description??''} ${row
 // Deferring to isProductGst instead of restating its spellings means the two
 // can no longer disagree, whatever Amazon calls the line next. "OurPriceDiscount"
 // and "ShippingDiscount" carry no tax wording, so they remain promotions.
-const isPromotion=row=>/promotion|promo rebate/.test(text(row))&&!isProductGst(row);
+//
+// That claim was aspirational, not real: neither "OurPriceDiscount" nor
+// "ShippingDiscount" contains the word "promotion" or "promo rebate", so the
+// regex above never actually matched either of them by that route -
+// "OurPriceDiscount" only survived because its category is literally
+// "promotion". "ShippingDiscount" has no such category (it is
+// "shipping_charge"), so it fell through to isShippingOrGiftWrapCredit
+// instead - correct for Income's total (both land in Income) but wrong for
+// Net Sales, which subtracts promotions but not shipping credits.
+//
+// Reproduced against a real account's Net Sales export: Income already
+// matched Amazon's statement exactly (97,775.43), but Net Sales read
+// 97,094.25 against an Amazon-implied 96,974.25 - short by 120.00. Amazon's
+// own PDF nets "ShippingDiscount" into "Promotional rebates", not a
+// separate shipping line (its Income debits foot to exactly refunds +
+// promotional rebates, nothing else). The same 120.00 reappears as the gap
+// between (reimbursements + shipping/gift-wrap credits) here and on the
+// statement - proving this is a reclassification, not missing money: Income
+// stays exactly correct either way, only which section the 120.00 sits in
+// was wrong.
+const isPromotion=row=>/promotion|promo rebate|discount/.test(text(row))&&!isProductGst(row);
 // Amazon's own Transaction/Account Activity statement puts TDS Reimbursement
 // and Chargebacks under Income - grouped with A-to-z Guarantee claims,
 // SAFE-T Reimbursements and Clawbacks as claims-related credits/debits,
@@ -276,7 +296,7 @@ const gstKey=row=>`${rawField(row.raw,['invoice-number','invoice number','docume
 // stale numbers with total confidence. Bump this whenever the statement maths
 // changes, and the running build can be read off the dashboard instead of
 // inferred from the numbers it produces.
-export const CALCULATION_REVISION = 'replacement-order-id-shape-only-2026-08-14';
+export const CALCULATION_REVISION = 'shipping-discount-is-a-promotion-2026-08-14';
 export const MINIMUM_DEDUPE_LOOKBACK_DAYS = 30;
 // The instant a row was posted, for ordering. Never compare posted_date as a
 // string: it arrives as a Date from Postgres and as an ISO string from an

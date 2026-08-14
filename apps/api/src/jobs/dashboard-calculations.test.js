@@ -301,6 +301,32 @@ test('Net Sales excludes ShippingPrincipal - "principal" alone is not product-sp
   assert.equal(r.metrics.netSales.value,349.00,'the four ShippingPrincipal rows (200.00) must not be counted as product sales');
   assert.equal(r.metrics.netSales.components.find(x=>x.category==='gross_sales').amount,349.00);
 });
+test('ShippingDiscount is a promotion, not a shipping credit - Income unchanged, Net Sales corrected',()=>{
+  // Real seller (TGS INDIA, Jun 1-Jul 31 2026). "ShippingDiscount" carries
+  // neither "promotion" nor "promo rebate" and its category is
+  // "shipping_charge", not "promotion" - so it fell through isPromotion into
+  // isShippingOrGiftWrapCredit instead. Income was unaffected either way
+  // (both land in Income), but Net Sales subtracts promotions and not
+  // shipping credits, so it read 120.00 too high: 97,094.25 against Amazon's
+  // implied 96,974.25, even after Income matched Amazon's statement exactly
+  // at 97,775.43. Amazon's own PDF has no separate shipping-discount debit
+  // line at all - its Income debits foot to exactly refunds + promotional
+  // rebates - so it nets ShippingDiscount into Promotional rebates too.
+  const range={start:'2026-06-01T00:00:00Z',end:'2026-08-01T00:00:00Z'};
+  const financeLine=(id,category,description,value,extra={})=>({source_row_id:id,transaction_id:id,order_id:`order-${id}`,category,amount_description:description,amount:value,posted_date:'2026-06-19T23:33:26.000Z',transaction_status:'DEFERRED_RELEASED',...extra});
+  const input={
+    orders:[],orderItems:[],returns:[],reimbursements:[],gstInvoices:[],settlementRows:[],settlementHeaders:[],settledOrderIdsAllTime:[],
+    financeItems:[
+      financeLine('sale','item_price','OurPricePrincipal',300.00),
+      financeLine('ship-discount','shipping_charge','ShippingDiscount',-40.00),
+      financeLine('ship-credit','shipping_charge','ShippingCredit',200.00)
+    ]
+  };
+  const r=calculateDashboardMetrics(input,range);
+  assert.equal(r.statement.income.value,460.00,'ShippingDiscount still lands in Income - just under Promotions instead of Shipping credits');
+  assert.equal(r.metrics.netSales.value,260.00,'the -40.00 ShippingDiscount must reduce Net Sales, unlike a real shipping credit');
+  assert.equal(r.metrics.netSales.components.find(x=>x.category==='promotions').amount,-40.00);
+});
 
 test('flags a settlement whose lines do not add up to Amazon\'s own stated total',()=>{
   // Every settlement document states its own total, so its lines must foot to
