@@ -1165,15 +1165,6 @@ const FINANCE_LOOKBACK_DAYS = 60;
   const reimbursements = await db.query('select amount,reason,sku,reimbursement_date from reimbursements where tenant_id=$1 and reimbursement_date >= $2 and reimbursement_date < $3',[tenantId,...calendarDays(range)]);
   const gstInvoices = await db.query('select id source_row_id,invoice_type,order_id,cgst,sgst,igst,taxable_value,invoice_date,raw from gst_invoices where tenant_id=$1 and invoice_date >= $2 and invoice_date < $3',[tenantId,...calendarDays(range)]);
   const result=calculateDashboardMetrics({orders:orders.rows,orderItems:orderItems.rows,returns:returns.rows,settlementRows:settlementRows.rows,settlementHeaders:settlementHeaders.rows,financeItems:financeItems.rows,financeTransactions:financeTransactions.rows,reimbursements:reimbursements.rows,gstInvoices:gstInvoices.rows,settledOrderIdsAllTime:settledOrderIds.rows.map(row=>row.order_id),settlementIntegrity:settlementIntegrity.rows,outstandingSettlementSyncs:Number(outstandingSettlementSyncs.rows[0]?.pending ?? 0)},range);
-  // Temporary, loud, and deliberately not behind a flag: while chasing
-  // whether a running process actually reflects a just-pulled build, the
-  // dashboard's own numbers are not trustworthy evidence (that is the whole
-  // problem being diagnosed) - this prints straight to the terminal running
-  // the API process, so "is the code I just fixed the code that answered
-  // THIS request" is answered directly, not inferred from what the browser
-  // shows. Remove once dedupeRepostedTransactions's generic-echo pass is
-  // confirmed to be reflected in the live dashboard.
-  console.log(`[loadDashboardCalculations] tenant=${tenantId} range=${range.start}..${range.end} calculationRevision=${result.diagnostics.calculationRevision} financeItems.rows=${financeItems.rows.length} expenses=${result.statement.expenses.value} deductions=${result.metrics.deductions.value}`);
   return result;
 }
 
