@@ -1592,6 +1592,23 @@ tbody tr:hover td { background: var(--brand-soft); }
 :root[data-theme="dark"] .date-range-panel,
 :root[data-theme="dark"] .topbar-menu,
 :root[data-theme="dark"] .login-card { background: var(--surface); }
+/* .login-shell/.login-hero's background is a light-only decorative
+   gradient (not a token - see the light-mode rule above), so it never
+   followed data-theme on its own. That let a seller who explicitly picks
+   dark mode land back on the exact same white-on-cream bug a system-dark
+   device used to trigger by default (see resolveStoredTheme in App.jsx):
+   text colors like --ink-deep flip to near-white for dark mode, but the
+   background stayed light, so the headline went nearly invisible. */
+:root[data-theme="dark"] .login-shell { background: #0f0d1e; }
+:root[data-theme="dark"] .login-hero {
+  background:
+    radial-gradient(circle at 10% 10%, rgba(245, 197, 24, .14), transparent 38%),
+    radial-gradient(circle at 88% 88%, rgba(255, 255, 255, .05), transparent 42%),
+    linear-gradient(145deg, #17142c 0%, #14122a 58%, #100e22 100%);
+}
+:root[data-theme="dark"] .login-hero p { color: #b7b1dc; }
+:root[data-theme="dark"] .hero-ledger { border-top-color: rgba(255, 255, 255, .12); }
+:root[data-theme="dark"] .hero-ledger div { color: #c9c5e6; }
 :root[data-theme="dark"] .mini-metric,
 :root[data-theme="dark"] .metrics-strip .mini-metric,
 :root[data-theme="dark"] .explain-card,

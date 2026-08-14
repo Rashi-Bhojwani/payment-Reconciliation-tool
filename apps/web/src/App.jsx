@@ -1727,10 +1727,19 @@ function useSidebarOpen() {
 // which every existing card/table/input already reads its colors through
 // (see the dark-theme block in style.css), and persists across visits.
 const THEME_KEY = 'wellsure_theme';
+// Deliberately does NOT fall back to prefers-color-scheme for a first-time
+// visitor. It used to, and that is exactly what broke the hosted login page:
+// a device set to system dark mode landed a brand-new seller in dark theme
+// before they ever touched the toggle, and .login-shell/.login-hero's
+// background is a hardcoded light gradient (not a token), so text colors
+// flipped to their dark-mode values (near-white) while the background
+// stayed light - unreadable white-on-cream. WELLSURE's light gold/black
+// look is the intended default brand identity, not one of two equally-
+// supported options, so every new visitor starts there; dark mode is still
+// one click away and remembered via THEME_KEY once a seller actually picks it.
 function resolveStoredTheme() {
   const stored = localStorage.getItem(THEME_KEY);
-  if (stored === 'light' || stored === 'dark') return stored;
-  return typeof window !== 'undefined' && window.matchMedia?.('(prefers-color-scheme: dark)').matches ? 'dark' : 'light';
+  return stored === 'dark' ? 'dark' : 'light';
 }
 // useTheme() only mounts inside SellerShell, i.e. after login - so without
 // this, data-theme was never set on <html> for the login/boot screens, and
