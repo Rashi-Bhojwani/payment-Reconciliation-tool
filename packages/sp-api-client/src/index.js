@@ -44,17 +44,26 @@ const SETTLEMENT_PAYOUT_LOOKBACK_MS = 10 * 864e5;
 // Reporting only the status code sent a seller hunting for a permissions problem
 // that did not exist. Never throws: a diagnostic must not replace the error it
 // is describing.
+//
+// A handful of real rejections (an edge/WAF-level 400 before the request ever
+// reaches Amazon's application layer, for one) come back with an EMPTY body -
+// no errors[] to report. That used to collapse to a bare "failed: 400" with
+// nothing else to go on. x-amzn-RequestId is on nearly every SP-API response
+// (error or not) and is exactly what Amazon Selling Partner Support asks for
+// first when a seller opens a ticket about a specific failed call, so it is
+// worth surfacing even when there is no error body to pair it with.
 async function describeAmazonError(response) {
   try {
+    const requestId = response.headers?.get?.('x-amzn-RequestId') ?? response.headers?.get?.('x-amzn-requestid');
     const body = await response.clone().text();
-    if (!body) return '';
+    if (!body) return requestId ? ` (no error detail in response body - amzn-RequestId: ${requestId}, worth pasting into a ticket at Amazon Seller Central > Support if this repeats)` : ' (empty response body - no further detail available from Amazon)';
     let detail = body;
     try {
       const parsed = JSON.parse(body);
       const messages = (parsed?.errors ?? []).map(e => [e.code, e.message, e.details].filter(Boolean).join(' - ')).filter(Boolean);
       if (messages.length) detail = messages.join('; ');
     } catch { /* not JSON - the raw body is still the best available detail */ }
-    return ` - Amazon says: ${String(detail).slice(0, 400)}`;
+    return ` - Amazon says: ${String(detail).slice(0, 400)}${requestId ? ` (amzn-RequestId: ${requestId})` : ''}`;
   } catch {
     return '';
   }
