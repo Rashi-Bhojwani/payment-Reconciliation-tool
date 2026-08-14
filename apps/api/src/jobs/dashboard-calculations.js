@@ -200,6 +200,27 @@ const utcDate=value=>{
 const rangeDates=range=>({start:new Date(range.start),end:new Date(range.end)});
 const inRange=(value,range)=>{const d=utcDate(value);const r=rangeDates(range);return !Number.isNaN(d.getTime())&&d>=r.start&&d<r.end;};
 const statusEligible=status=>!new Set(['cancelled','canceled','pending','unshipped','replacement']).has(norm(status).replaceAll(' ',''));
+// The 'replacement' entry above has never once matched a real order: Amazon's
+// OrderStatus enum has no such value - a free-replacement order still reports
+// OrderStatus=Shipped like any other. Amazon flags it two other ways instead:
+// IsReplacementOrder=true on the order itself, and a non-standard order id
+// (observed live: "S02-1001563-0287843" instead of the usual
+// NNN-NNNNNNN-NNNNNNN shape every ordinary order has). Reproduced against a
+// real account's Net Qty export: of 339 shipped order-item rows for 1
+// Jun-31 Jul, exactly one had a non-standard order id, at 0.00 item price
+// and quantity 5 - and 5 is exactly the gap between our shipped-unit count
+// (361) and Amazon's own Units Ordered business report (356). A warranty
+// replacement is not a sale, so Amazon's own report excludes it; ours must
+// too.
+//
+// Both checks are kept rather than just the flag: IsReplacementOrder is the
+// documented signal, but nothing here confirms Amazon actually populated it
+// for this account's sync (the exported CSV that caught this bug doesn't
+// carry order-level raw JSON to check). The id-shape check is the one piece
+// of direct evidence available on every row regardless of that, so it
+// stands on its own rather than being purely a fallback.
+const STANDARD_ORDER_ID = /^\d{3}-\d{7}-\d{7}$/;
+const isReplacementOrder=row=>{const flag=rawField(row.raw,['IsReplacementOrder','is-replacement-order','isReplacementOrder']);if(flag===true||norm(`${flag??''}`)==='true')return true;return row.amazon_order_id!=null&&!STANDARD_ORDER_ID.test(row.amazon_order_id);};
 const orderItemKey=row=>rawField(row.raw,['order-item-id','orderItemId','order-item-code','amazon-order-item-id'])??row.order_item_id??row.source_row_id??row.id;
 const returnKey=row=>rawField(row.raw,['return-event-id','event-id','rma-id'])??`${row.order_id??''}|${rawField(row.raw,['order-item-id','orderItemId'])??row.order_item_id??''}|${row.sku??''}|${row.return_date??''}|${row.quantity??''}`;
 const financialKey=row=>`${row.transaction_id??row.settlement_id??''}|${row.order_id??''}|${rawField(row.raw,['order-item-id','orderItemId','order-item-code'])??row.order_item_id??row.sku??''}|${row.category??row.amount_type??''}|${row.amount_description??''}|${row.posted_date??''}|${amount(row)}`;
@@ -254,7 +275,7 @@ const gstKey=row=>`${rawField(row.raw,['invoice-number','invoice number','docume
 // stale numbers with total confidence. Bump this whenever the statement maths
 // changes, and the running build can be read off the dashboard instead of
 // inferred from the numbers it produces.
-export const CALCULATION_REVISION = 'generic-fee-echo-dedup-2026-08-14';
+export const CALCULATION_REVISION = 'exclude-replacement-orders-2026-08-14';
 export const MINIMUM_DEDUPE_LOOKBACK_DAYS = 30;
 // The instant a row was posted, for ordering. Never compare posted_date as a
 // string: it arrives as a Date from Postgres and as an ISO string from an
@@ -385,7 +406,7 @@ export function inclusiveDays(start,end){
 }
 
 export function calculateDashboardMetrics(input,range){
-  const orderAudit=dedupe(input.orders??[],row=>row.amazon_order_id);const eligibleOrders=orderAudit.included.filter(row=>statusEligible(row.status));const eligibleIds=new Set(eligibleOrders.map(row=>row.amazon_order_id));
+  const orderAudit=dedupe(input.orders??[],row=>row.amazon_order_id);const eligibleOrders=orderAudit.included.filter(row=>statusEligible(row.status)&&!isReplacementOrder(row));const eligibleIds=new Set(eligibleOrders.map(row=>row.amazon_order_id));
   const itemAudit=dedupe((input.orderItems??[]).filter(row=>eligibleIds.has(row.amazon_order_id)),row=>orderItemKey(row)??keyOf(row));
   const returnAudit=dedupe(input.returns??[],returnKey);
 

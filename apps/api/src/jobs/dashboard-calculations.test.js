@@ -4,9 +4,9 @@ import { calculateDashboardMetrics, dedupeRepostedTransactions, inclusiveDays } 
 const range={start:'2026-06-27T00:00:00Z',end:'2026-07-27T00:00:00Z'};
 const line=(id,description,amount,parent='Order',extra={})=>({settlement_id:'statement',source_row_id:id,amount_description:description,amount,parent_transaction_type:parent,posted_date:'2026-07-10T00:00:00Z',...extra});
 function mindcircusFixture(){return{
-  orders:[{amazon_order_id:'shipped',status:'Shipped',raw:{history:'was Unshipped and Pending'}},{amazon_order_id:'cancelled',status:'Cancelled'},{amazon_order_id:'replacement',status:'Replacement'}],
-  orderItems:[{source_row_id:'db1',amazon_order_id:'shipped',sku:'same',asin:'a',quantity_ordered:2,raw:{orderItemId:'item-1'}},{source_row_id:'db2',amazon_order_id:'shipped',sku:'same',asin:'a',quantity_ordered:3,raw:{orderItemId:'item-2'}}],
-  returns:[{source_row_id:'ret1',order_id:'shipped',sku:'same',return_date:'2026-07-12',quantity:2,raw:{eventId:'event-1'}}],
+  orders:[{amazon_order_id:'407-1111111-1111111',status:'Shipped',raw:{history:'was Unshipped and Pending'}},{amazon_order_id:'cancelled',status:'Cancelled'},{amazon_order_id:'replacement',status:'Replacement'}],
+  orderItems:[{source_row_id:'db1',amazon_order_id:'407-1111111-1111111',sku:'same',asin:'a',quantity_ordered:2,raw:{orderItemId:'item-1'}},{source_row_id:'db2',amazon_order_id:'407-1111111-1111111',sku:'same',asin:'a',quantity_ordered:3,raw:{orderItemId:'item-2'}}],
+  returns:[{source_row_id:'ret1',order_id:'407-1111111-1111111',sku:'same',return_date:'2026-07-12',quantity:2,raw:{eventId:'event-1'}}],
   settlementRows:[
     line('sf-sale','Principal',164084.08,'Order'),line('sf-refund','Principal',-45927.15,'Refund'),line('fba-sale','Principal',49861.08,'Order'),line('fba-refund','Principal',-10996.61,'Refund'),
     line('promo','Promotional rebate',-2955.62),line('promo-refund','Promotional rebate refund',457.02,'Refund'),line('safe','SAFE-T Reimbursement',196.72,'SAFE-T Reimbursement'),line('shipping','Shipping credits',1686.50),
@@ -32,6 +32,28 @@ test('matches the MINDCIRCUS Amazon Account Activity fixture without constants',
   assert.equal(r.diagnostics.sourcePolicy.financial.startsWith('Amazon Settlement report'),true);
 });
 test('uses current status only and preserves identical-SKU lines with stable item IDs',()=>{const r=calculateDashboardMetrics(mindcircusFixture(),range);assert.equal(r.metrics.netQty.value,3);assert.equal(r.metrics.orders.value,1);assert.equal(r.metrics.returnRate.value,40);});
+test('a standard-id Shipped order flagged IsReplacementOrder is excluded, not just one literally statused "Replacement"',()=>{
+  const input=mindcircusFixture();
+  input.orders.push({amazon_order_id:'407-5555555-5555555',status:'Shipped',raw:{IsReplacementOrder:true}});
+  input.orderItems.push({source_row_id:'db3',amazon_order_id:'407-5555555-5555555',sku:'other',asin:'b',quantity_ordered:5,item_price:0,raw:{orderItemId:'item-3'}});
+  const r=calculateDashboardMetrics(input,range);
+  assert.equal(r.metrics.netQty.value,3);
+  assert.equal(r.metrics.orders.value,1);
+});
+test('a Shipped order with a non-standard order id is excluded even with no IsReplacementOrder flag - the real S02-... case',()=>{
+  // Live case: order id "S02-1001563-0287843" (not the usual
+  // NNN-NNNNNNN-NNNNNNN shape), 0.00 item price, quantity 5 - exactly the
+  // gap between shipped units (361) and Amazon's own Units Ordered (356).
+  // The exported CSV that caught this has no order-level raw JSON, so
+  // whether Amazon populated IsReplacementOrder for this account is
+  // unconfirmed; the id shape alone must be enough.
+  const input=mindcircusFixture();
+  input.orders.push({amazon_order_id:'S02-1001563-0287843',status:'Shipped',raw:{}});
+  input.orderItems.push({source_row_id:'db4',amazon_order_id:'S02-1001563-0287843',sku:'other',asin:'b',quantity_ordered:5,item_price:0,raw:{orderItemId:'item-4'}});
+  const r=calculateDashboardMetrics(input,range);
+  assert.equal(r.metrics.netQty.value,3);
+  assert.equal(r.metrics.orders.value,1);
+});
 test('negative Principal is a refund through parent transaction metadata',()=>{const input=mindcircusFixture();const refund=input.settlementRows.find(x=>x.source_row_id==='sf-refund');delete refund.transaction_type;assert.equal(calculateDashboardMetrics(input,range).metrics.netSales.value,154522.8);});
 test('missing return quantity makes quantity KPIs unavailable instead of guessing one',()=>{const input=mindcircusFixture();input.returns[0].quantity=null;const r=calculateDashboardMetrics(input,range);assert.equal(r.metrics.returns.value,null);assert.equal(r.metrics.netQty.value,null);assert.equal(r.metrics.returnRate.value,null);assert.match(r.metrics.returnRate.status,/^Unavailable\b/);});
 test('positive returns with unavailable shipped source never report zero percent',()=>{const input=mindcircusFixture();input.orderItems=[];const r=calculateDashboardMetrics(input,range);assert.equal(r.metrics.returnRate.value,null);assert.match(r.metrics.returnRate.status,/^Unavailable\b/);});
@@ -164,14 +186,14 @@ test('counts shipped units from Amazon settlement quantity when order items lag 
   // Return Rate entirely when any order's items had not arrived, even though
   // Amazon had already stated the quantity on the settlement line.
   const range={start:'2026-07-01T00:00:00Z',end:'2026-07-30T00:00:00Z'};
-  const orders=[{amazon_order_id:'order-a',status:'Shipped',order_date:'2026-07-05T00:00:00Z'},{amazon_order_id:'order-b',status:'Shipped',order_date:'2026-07-06T00:00:00Z'}];
+  const orders=[{amazon_order_id:'407-2222222-2222222',status:'Shipped',order_date:'2026-07-05T00:00:00Z'},{amazon_order_id:'407-3333333-3333333',status:'Shipped',order_date:'2026-07-06T00:00:00Z'}];
   const settlementRows=[
-    line('a','Principal',1000,'Order',{order_id:'order-a',amount_type:'ItemPrice',raw:{'quantity-purchased':'2'}}),
-    line('b','Principal',500,'Order',{order_id:'order-b',amount_type:'ItemPrice',raw:{'quantity-purchased':'3'}})
+    line('a','Principal',1000,'Order',{order_id:'407-2222222-2222222',amount_type:'ItemPrice',raw:{'quantity-purchased':'2'}}),
+    line('b','Principal',500,'Order',{order_id:'407-3333333-3333333',amount_type:'ItemPrice',raw:{'quantity-purchased':'3'}})
   ];
   const base={orders,returns:[],reimbursements:[],gstInvoices:[],settlementHeaders:[],financeItems:[],settledOrderIdsAllTime:[],settlementRows};
   // Only order-a has items synced so far; order-b is counted from settlement.
-  const partial=calculateDashboardMetrics({...base,orderItems:[{source_row_id:'i1',amazon_order_id:'order-a',quantity_ordered:2,raw:{'order-item-id':'i1'}}]},range);
+  const partial=calculateDashboardMetrics({...base,orderItems:[{source_row_id:'i1',amazon_order_id:'407-2222222-2222222',quantity_ordered:2,raw:{'order-item-id':'i1'}}]},range);
   assert.equal(partial.metrics.netQty.value,5);
   assert.match(partial.metrics.netQty.source,/settlement quantity-purchased/);
   assert.equal(partial.metrics.netQty.status,null);
@@ -180,7 +202,7 @@ test('counts shipped units from Amazon settlement quantity when order items lag 
   const settlementOnly=calculateDashboardMetrics({...base,orderItems:[]},range);
   assert.equal(settlementOnly.metrics.netQty.value,5);
   // An order Amazon has given no quantity for anywhere is reported, not hidden.
-  const shortfall=calculateDashboardMetrics({...base,orders:[...orders,{amazon_order_id:'order-c',status:'Shipped',order_date:'2026-07-07T00:00:00Z'}],orderItems:[]},range);
+  const shortfall=calculateDashboardMetrics({...base,orders:[...orders,{amazon_order_id:'407-4444444-4444444',status:'Shipped',order_date:'2026-07-07T00:00:00Z'}],orderItems:[]},range);
   assert.equal(shortfall.metrics.netQty.value,5);
   assert.match(shortfall.metrics.netQty.status,/1 of 3 orders still awaiting quantity/);
 });
@@ -188,10 +210,10 @@ test('counts shipped units from Amazon settlement quantity when order items lag 
 test('an order is never counted twice when both order items and settlement carry a quantity',()=>{
   const range={start:'2026-07-01T00:00:00Z',end:'2026-07-30T00:00:00Z'};
   const r=calculateDashboardMetrics({
-    orders:[{amazon_order_id:'order-a',status:'Shipped',order_date:'2026-07-05T00:00:00Z'}],
-    orderItems:[{source_row_id:'i1',amazon_order_id:'order-a',quantity_ordered:2,raw:{'order-item-id':'i1'}}],
+    orders:[{amazon_order_id:'407-2222222-2222222',status:'Shipped',order_date:'2026-07-05T00:00:00Z'}],
+    orderItems:[{source_row_id:'i1',amazon_order_id:'407-2222222-2222222',quantity_ordered:2,raw:{'order-item-id':'i1'}}],
     returns:[],reimbursements:[],gstInvoices:[],settlementHeaders:[],financeItems:[],settledOrderIdsAllTime:[],
-    settlementRows:[line('a','Principal',1000,'Order',{order_id:'order-a',amount_type:'ItemPrice',raw:{'quantity-purchased':'2'}})]
+    settlementRows:[line('a','Principal',1000,'Order',{order_id:'407-2222222-2222222',amount_type:'ItemPrice',raw:{'quantity-purchased':'2'}})]
   },range);
   assert.equal(r.metrics.netQty.value,2);
   assert.equal(r.metrics.netQty.source,'Orders + Returns');
@@ -206,8 +228,8 @@ test('one return without a quantity no longer blanks Net Qty and Return Rate',()
   const range={start:'2026-07-01T00:00:00Z',end:'2026-07-30T00:00:00Z'};
   const ret=(id,quantity)=>({source_row_id:id,order_id:`o-${id}`,return_date:'2026-07-12',quantity,raw:{eventId:id}});
   const base={
-    orders:[{amazon_order_id:'order-a',status:'Shipped',order_date:'2026-07-05T00:00:00Z'}],
-    orderItems:[{source_row_id:'i1',amazon_order_id:'order-a',quantity_ordered:100,raw:{'order-item-id':'i1'}}],
+    orders:[{amazon_order_id:'407-2222222-2222222',status:'Shipped',order_date:'2026-07-05T00:00:00Z'}],
+    orderItems:[{source_row_id:'i1',amazon_order_id:'407-2222222-2222222',quantity_ordered:100,raw:{'order-item-id':'i1'}}],
     reimbursements:[],gstInvoices:[],settlementHeaders:[],financeItems:[],settledOrderIdsAllTime:[],settlementRows:[]
   };
   const partial=calculateDashboardMetrics({...base,returns:[ret('r1',3),ret('r2',5),ret('r3',null)]},range);
