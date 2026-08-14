@@ -262,6 +262,70 @@ export const MINIMUM_DEDUPE_LOOKBACK_DAYS = 30;
 const postedAt=row=>{const t=utcDate(row?.posted_date).getTime();return Number.isNaN(t)?Infinity:t;};
 const RELEASE_RANK=Object.freeze({released:0,deferred_released:1,deferred:2});
 const releaseRank=row=>RELEASE_RANK[String(row?.transaction_status??'').trim().toLowerCase().replace(/[\s-]+/g,'_')]??9;
+// A transaction whose every line is Amazon's bare, not-yet-classified label
+// ("Base"/"Tax", category "other"/"tax" - no fee-type name attached) is not
+// yet a candidate for the per-line dedup above: that dedup requires an exact
+// (order_id, category, amount_description, amount) match, and by the time
+// Amazon later re-posts the SAME fee under its real name (a NEW transaction
+// id, category e.g. "closing_fee", description "FixedClosingFee Base"), the
+// category+description text differs, so the two are never recognised as the
+// same line and both survive.
+//
+// Found on a real seller (TGS INDIA, 1 Jun-31 Jul 2026): 127 wholly-generic
+// transactions across 68 orders whose every line amount was matched exactly
+// by a specifically-named fee transaction on the same order - 6,304.67 of
+// double-counted Expenses, against an observed gap to Amazon's own statement
+// of 6,305.85 for the same window. Net Sales, Income, Tax, Transfers and GST
+// were all within a few rupees or exact; this single mechanism was the whole
+// remaining Expenses gap.
+//
+// Matched at the TRANSACTION level, not the line level, and every line's
+// amount must be consumable from the specific side: a lone "Base: -75" with
+// no sibling "Tax" line matching just as exactly is not dropped, because a
+// partial match is exactly the "different economic event" case line-level
+// dedup above already protects. isGenericLine's TAX_LABELS check on category
+// mirrors how the rest of this file already tells "other" from "tax" apart.
+const GENERIC_ECHO_DESCRIPTIONS=Object.freeze(new Set(['Base','Tax']));
+const isGenericLine=row=>GENERIC_ECHO_DESCRIPTIONS.has(row.amount_description)&&(row.category==='other'||row.category==='tax');
+function dropGenericFeeEchoes(rows){
+  const byTransaction=new Map();
+  for(const row of rows){
+    if(!row.order_id)continue;
+    const list=byTransaction.get(row.transaction_id);
+    if(list)list.push(row);else byTransaction.set(row.transaction_id,[row]);
+  }
+  const specificAmountsByOrder=new Map();
+  for(const [,lines] of byTransaction){
+    if(lines.every(isGenericLine))continue;
+    const order=lines[0].order_id;
+    let counter=specificAmountsByOrder.get(order);
+    if(!counter){counter=new Map();specificAmountsByOrder.set(order,counter);}
+    for(const row of lines){const key=round2(amount(row));counter.set(key,(counter.get(key)??0)+1);}
+  }
+  const dropSet=new Set();
+  let dropped=0;
+  for(const [,lines] of byTransaction){
+    if(!lines.every(isGenericLine))continue;
+    const counter=specificAmountsByOrder.get(lines[0].order_id);
+    if(!counter)continue;
+    const claimed=[];
+    let fullyMatched=true;
+    for(const row of lines){
+      const key=round2(amount(row));
+      const available=counter.get(key)??0;
+      if(available<=0){fullyMatched=false;break;}
+      counter.set(key,available-1);
+      claimed.push(key);
+    }
+    if(fullyMatched){
+      for(const row of lines)dropSet.add(row);
+      dropped+=lines.length;
+    }else{
+      for(const key of claimed)counter.set(key,(counter.get(key)??0)+1);
+    }
+  }
+  return {kept:rows.filter(row=>!dropSet.has(row)),dropped};
+}
 export function dedupeRepostedTransactions(rows){
   // Identity is the LINE, not the whole transaction.
   //
@@ -310,7 +374,8 @@ export function dedupeRepostedTransactions(rows){
     kept.push(...copies.slice(0,realEvents));
     dropped+=copies.length-realEvents;
   }
-  return {kept,dropped};
+  const echoPass=dropGenericFeeEchoes(kept);
+  return {kept:echoPass.kept,dropped:dropped+echoPass.dropped};
 }
 
 export function inclusiveDays(start,end){

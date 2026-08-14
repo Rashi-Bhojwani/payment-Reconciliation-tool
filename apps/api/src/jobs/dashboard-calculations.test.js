@@ -751,6 +751,74 @@ test('dedupeRepostedTransactions keeps the ORIGINAL posting, not the released co
   assert.equal(dropped,1);
 });
 
+test('drops a fee re-posted under its real name as a duplicate of its own generic echo',()=>{
+  // Real seller (TGS INDIA, Jun-Jul 2026), real order 402-6587848-0749910.
+  // Amazon posted this order's Commission and FixedClosingFee fees TWICE
+  // under two DIFFERENT transaction ids: once early, generically, as bare
+  // category "other"/"tax" with description "Base"/"Tax" (no fee-type name
+  // yet), and again once the transaction matured, under its real name -
+  // category "referral_commission"/"closing_fee", description "Commission
+  // Base"/"FixedClosingFee Base". The per-line dedup above requires an exact
+  // category+description match, so two rows with the same order and amount
+  // but different labels were never recognised as the same line, and both
+  // survived. Measured against this seller's real CSV: 127 such wholly-
+  // generic transactions across 68 orders, 6,304.67 double-counted - against
+  // an observed Expenses gap to Amazon's own statement of 6,305.85 for the
+  // same window. This was the entire remaining gap.
+  // A real transaction is several LINES sharing one transaction_id (a fee's
+  // Base amount and its Tax amount always post together) - the fixture must
+  // share transaction_id across a pair the way Amazon's own data does, or it
+  // is not testing the transaction-level match at all.
+  const line=(sourceId,txn,order,category,description,value,iso)=>({source_row_id:sourceId,transaction_id:txn,order_id:order,category,amount_description:description,amount:value,posted_date:iso,transaction_status:'RELEASED'});
+  const rows=[
+    // the early, generic echo - transaction "vQrpo" in the real data
+    line('r1','vQrpo','402-6587848-0749910','other','Base',-5.98,'2026-07-11T08:46:39.000Z'),
+    line('r2','vQrpo','402-6587848-0749910','tax','Tax',-1.08,'2026-07-11T08:46:39.000Z'),
+    // the later, properly-named re-post - transaction "UYQot" in the real data
+    line('r3','UYQot','402-6587848-0749910','referral_commission','Commission Base',-5.98,'2026-07-20T06:53:48.000Z'),
+    line('r4','UYQot','402-6587848-0749910','referral_commission','Commission Tax',-1.08,'2026-07-20T06:53:48.000Z')
+  ];
+  const {kept,dropped}=dedupeRepostedTransactions(rows);
+  assert.equal(dropped,2,'the two generic-echo rows are dropped, not the two named ones');
+  assert.equal(kept.length,2);
+  assert.ok(kept.every(row=>row.transaction_id==='UYQot'),'the specifically-named transaction is the one kept');
+
+  const range={start:'2026-06-01T00:00:00Z',end:'2026-08-01T00:00:00Z'};
+  const r=calculateDashboardMetrics({
+    orders:[],orderItems:[],returns:[],reimbursements:[],gstInvoices:[],settlementRows:[],settlementHeaders:[],settledOrderIdsAllTime:[],
+    financeItems:rows
+  },range);
+  assert.equal(r.statement.expenses.value,-7.06,'the fee is counted once (-5.98-1.08), not twice (-14.12)');
+});
+test('a generic Base/Tax pair with no matching named fee on the order is not an echo',()=>{
+  // The transaction-level match must require EVERY line's amount to be
+  // claimable from a specifically-named transaction on the same order - a
+  // real, standalone generic fee (no later re-post under a real name exists
+  // yet, or ever will for this account) must survive untouched.
+  const line=(sourceId,txn,order,category,description,value,iso)=>({source_row_id:sourceId,transaction_id:txn,order_id:order,category,amount_description:description,amount:value,posted_date:iso,transaction_status:'RELEASED'});
+  const rows=[
+    line('r1','vQrpo','order-1','other','Base',-40.00,'2026-07-11T08:46:39.000Z'),
+    line('r2','vQrpo','order-1','tax','Tax',-7.20,'2026-07-11T08:46:39.000Z')
+  ];
+  const {kept,dropped}=dedupeRepostedTransactions(rows);
+  assert.equal(dropped,0);
+  assert.equal(kept.length,2);
+});
+test('a partially-matching generic transaction is not dropped - only a full echo is',()=>{
+  // If just one of a generic transaction's lines happens to match a named
+  // fee's amount by coincidence, that is not proof the whole transaction is
+  // an echo - dropping it would delete real, uncounted money. Every line
+  // must be claimable, or none are dropped.
+  const line=(sourceId,txn,order,category,description,value,iso)=>({source_row_id:sourceId,transaction_id:txn,order_id:order,category,amount_description:description,amount:value,posted_date:iso,transaction_status:'RELEASED'});
+  const rows=[
+    line('r1','vQrpo','order-1','other','Base',-40.00,'2026-07-11T08:46:39.000Z'),
+    line('r2','vQrpo','order-1','tax','Tax',-9.99,'2026-07-11T08:46:39.000Z'),
+    line('r3','UYQot','order-1','closing_fee','FixedClosingFee Base',-40.00,'2026-07-20T06:53:48.000Z')
+  ];
+  const {kept,dropped}=dedupeRepostedTransactions(rows);
+  assert.equal(dropped,0,'the -9.99 Tax line has nothing to match, so the generic transaction survives whole');
+  assert.equal(kept.length,3);
+});
 test('dates are ordered as instants, not as strings',()=>{
   // Postgres returns timestamptz as a Date object, and String(date) is
   // "Wed Jul 01 2026 ...", so a lexicographic sort orders by WEEKDAY NAME:
