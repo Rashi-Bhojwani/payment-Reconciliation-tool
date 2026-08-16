@@ -1613,34 +1613,34 @@ app.get('/api/tenants/:tenantId/dashboard', async request => {
     }
     // A seller was never going to notice a console log and click Reset &
     // Resync themselves - confirmed live, this exact failure sat unfixed
-    // for hours until it was found by reading server logs by hand. Corrupt
-    // or incomplete settlement data is the one failure that makes every
-    // money figure wrong, so it repairs itself instead of waiting on a
-    // human. A plain background sync (triggerBackgroundSync above) cannot
-    // do this: it skips any report type with a recent COMPLETED sync, and a
-    // corrupt settlement document is recorded as completed - just wrong -
-    // so only a real Reset & Resync (delete stored rows, re-download from
-    // Amazon) replaces it.
+    // for hours until it was found by reading server logs by hand. So a
+    // settlement whose own rows do not add up to the total Amazon stamped
+    // on it repairs itself instead of waiting on a human. A plain
+    // background sync (triggerBackgroundSync above) cannot do this: it
+    // skips any report type with a recent COMPLETED sync, and a corrupt
+    // settlement IS recorded as completed - it downloaded fine, the rows
+    // are just wrong - so only a real Reset & Resync replaces it.
     //
-    // settlementDataBroken is also returned to the frontend, which blocks
-    // the whole dashboard on it - the numbers computed from broken data are
-    // never rendered, only "still verifying" - so the two behaviours are
-    // dual: the seller never sees a wrong figure, and the server keeps
-    // trying to make it right without being asked.
-    const settlementDataBroken = Boolean(outstanding) || Boolean(integrity?.length);
-    if (settlementDataBroken && !backfillRunning) {
+    // ONLY the integrity failure triggers this, deliberately. The first
+    // version also triggered on outstandingSettlementSyncs, which was
+    // wrong: that counts partial syncs from the last 7 days, and a range
+    // ending today ALWAYS has settlement documents Amazon has not issued
+    // yet, so it could never reach zero and the repair fired forever on a
+    // healthy account. "Amazon has not settled this week yet" is not
+    // corruption - it is how settlement works, and no amount of re-fetching
+    // changes it.
+    const settlementDataCorrupt = Boolean(integrity?.length);
+    if (settlementDataCorrupt && !backfillRunning) {
       if (syncQueue.isBusy(`${tenantId}:${SETTLEMENT_REPORT_TYPE}`)) {
         if (!autoSyncReportTypes.includes(SETTLEMENT_REPORT_TYPE)) autoSyncReportTypes.push(SETTLEMENT_REPORT_TYPE);
       } else if (!(await settlementAutoHealOnCooldown(tenantId))) {
-        console.log(`[dashboard ${tenantId.slice(0, 8)}] auto-healing broken settlement data - triggering Reset & Resync automatically`);
+        console.log(`[dashboard ${tenantId.slice(0, 8)}] auto-healing corrupt settlement data - triggering Reset & Resync automatically`);
         resetSettlementData(tenantId, effectiveRange).catch(error => app.log.warn({ err: error, tenantId }, 'Automatic settlement auto-heal failed'));
         if (!autoSyncReportTypes.includes(SETTLEMENT_REPORT_TYPE)) autoSyncReportTypes.push(SETTLEMENT_REPORT_TYPE);
       }
       // On cooldown: say nothing new here. The most recent attempt already
       // logged its own outcome (success, or "run again once the rate limit
-      // clears"), and the seller-facing pill/gate stays up regardless via
-      // settlementDataBroken - there is nothing further to trigger until
-      // the cooldown lapses.
+      // clears"), and there is nothing further to trigger until it lapses.
     }
     const pendingDetail=dashboardCalculations.diagnostics?.pendingFinanceRowsDetail;
     const mergeSummary=dashboardCalculations.diagnostics?.pendingMergeSummary;
@@ -1656,7 +1656,7 @@ app.get('/api/tenants/:tenantId/dashboard', async request => {
       for (const row of pendingDetail) console.log(`${label}   [excluded] order=${row.order_id} status=${row.transaction_status} category=${row.category} amount_desc=${row.amount_description ?? ''} amount=${row.amount} -> would be ${row.bucket}`);
     }
     const hasImportedData = Number(orders.orders ?? 0) > 0 || Number(kpis.net_settled ?? 0) !== 0 || products.length > 0 || payments.length > 0 || inventory.length > 0;
-    return { seller, amazonAuth, hasImportedData, kpis, orders, orderRows, orderPayments, paymentComponents, paymentSummary, dashboardCalculations, businessReportRows, products, trend, payments, settlementLines, financeLines, financialComponents, financialSummary, jobs, inventory, returns, reimbursements, invoices, orderItems, financeTransactions, autoSyncing: autoSyncReportTypes, settlementDataBroken };
+    return { seller, amazonAuth, hasImportedData, kpis, orders, orderRows, orderPayments, paymentComponents, paymentSummary, dashboardCalculations, businessReportRows, products, trend, payments, settlementLines, financeLines, financialComponents, financialSummary, jobs, inventory, returns, reimbursements, invoices, orderItems, financeTransactions, autoSyncing: autoSyncReportTypes, settlementDataCorrupt };
   });
 });
 

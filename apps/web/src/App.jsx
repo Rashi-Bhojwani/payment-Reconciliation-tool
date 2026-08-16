@@ -622,28 +622,28 @@ function InitialBackfillGate({ seller }) {
   );
 }
 
-// Shown instead of every page's real figures whenever the server has found
-// its own stored data provably wrong for the selected range - a settlement
-// that does not add up to what Amazon stamped on it, or a sync that never
-// finished. The server is already re-fetching automatically in the
-// background (see settlementDataBroken on the API); this page's only job is
-// to make sure nobody is shown a number computed from data known to be
-// broken while that happens. It disappears on its own the next time the
-// dashboard reloads clean - see the settlementDataBroken-aware poll loop in
-// SellerDashboard's load().
-function DataVerifyingGate({ reasons, attempt, of }) {
+// A settlement whose stored rows do not add up to the total Amazon stamped
+// on the document is corrupt, and the server is already re-downloading it
+// automatically (see settlementDataCorrupt on the API). This says so inline
+// and keeps the figures visible.
+//
+// It deliberately does NOT replace the whole page the way
+// InitialBackfillGate does. Blocking everything was tried and was wrong:
+// most "incomplete" reasons a dashboard reports are normal and permanent -
+// a range ending today always runs past the last settlement Amazon has
+// issued, deferred activity is always live - so a full-page block on them
+// never cleared and hid a working dashboard behind a spinner forever. The
+// one-time backfill is a genuinely empty state with nothing to show; this
+// is not.
+function SettlementRepairNotice({ count }) {
   return (
-    <Card className="panel backfill-gate">
-      <div className="backfill-gate-hero">
-        <span className="spinner-dot" />
-        <div>
-          <h2>Verifying your Amazon data</h2>
-          <p>Something in the data behind this range doesn't check out yet, so figures are held back rather than shown wrong - a settlement that doesn't add up to what Amazon stamped on it, or a sync that didn't finish. This is fixing itself automatically{attempt ? ` (check ${attempt}${of ? ` of ${of}` : ''})` : ''}; nothing to click.</p>
-        </div>
-      </div>
-      {reasons.length > 0 && <ul className="backfill-gate-reasons">{reasons.map((reason, i) => <li key={i}>{reason}</li>)}</ul>}
-      <p className="alert warning">This can take a while when Amazon is rate-limiting re-downloads - up to 30 minutes is normal. If it sits here much longer than that, refresh the page; nothing is lost either way.</p>
-    </Card>
+    <p className="alert warning settlement-repair-notice">
+      <span className="spinner-dot" />
+      <span>
+        <b>Re-checking {count} settlement{count === 1 ? '' : 's'} with Amazon.</b>{' '}
+        {count === 1 ? 'It does' : 'They do'} not add up to the total Amazon stamped on {count === 1 ? 'it' : 'them'}, so some figures below may shift once the corrected copy arrives. This is being fixed automatically - nothing to click.
+      </span>
+    </p>
   );
 }
 
@@ -704,15 +704,14 @@ function SellerDashboard({ onDataChange, session, setSession, theme, setTheme })
       // 'running' is what keeps the loop honest.
       const runningReportTypes = (dashboard.jobs ?? []).filter(job => job.status === 'running').map(job => job.report_type);
       const sources = Array.from(new Set([...(dashboard.autoSyncing ?? []), ...runningReportTypes]));
-      // settlementDataBroken can be true with an EMPTY sources list: the
-      // server only adds Settlements to autoSyncing while it is actively
-      // (re)triggering or a resync is in flight - between attempts it sits
-      // on a cooldown (see settlementAutoHealOnCooldown) and reports neither.
-      // Without this, the poll loop would stop refreshing during that gap
-      // and the blocking gate below would sit frozen until a manual reload,
-      // exactly the "seller has to do something themselves" outcome this
-      // exists to remove.
-      const stillSyncing = (Boolean(sources.length) || dashboard.settlementDataBroken) && autoPollRef.current.attempts < AUTO_POLL_MAX_ATTEMPTS;
+      // Deliberately keyed on work actually in flight, NOT on "the data is
+      // not perfect yet". A settlement repair that is running shows up in
+      // sources like any other sync and polls normally; one waiting out its
+      // cooldown does not, and must not, or a dashboard left open would
+      // re-poll every 20s indefinitely against conditions that are often
+      // permanent and normal (a range ending today always outruns Amazon's
+      // last settlement). The repair notice stays visible either way.
+      const stillSyncing = Boolean(sources.length) && autoPollRef.current.attempts < AUTO_POLL_MAX_ATTEMPTS;
       setAwaitingAmazon(stillSyncing ? { sources, attempt: autoPollRef.current.attempts + 1, of: AUTO_POLL_MAX_ATTEMPTS } : null);
       if (stillSyncing) {
         autoPollRef.current.attempts += 1;
@@ -776,16 +775,13 @@ function SellerDashboard({ onDataChange, session, setSession, theme, setTheme })
   // itself), since none of that depends on the range being complete.
   const backfillRunning = connected && data.seller.backfillStatus === 'running';
   const blockedByBackfill = backfillRunning && view !== 'settings';
-  // Same principle as the backfill gate, for a failure that shows up after
-  // the backfill is long done: a settlement that is corrupt or a sync that
-  // never finished makes every money figure on this range provably wrong,
-  // not just stale. The server is already auto-repairing it in the
-  // background (see settlementDataBroken/settlementAutoHealOnCooldown on
-  // the API) - this only controls whether the seller is shown numbers
-  // computed from that broken data while it does. Settings stays reachable
-  // for the same reason it does during a backfill.
-  const settlementDataBroken = connected && !backfillRunning && Boolean(data.settlementDataBroken);
-  const blockedByBrokenSettlements = settlementDataBroken && view !== 'settings';
+  // Corrupt settlements are repaired in the background and reported inline
+  // (SettlementRepairNotice), never by hiding the dashboard. Only the
+  // one-time backfill blocks the page - see the comment on
+  // SettlementRepairNotice for why the two are not the same case.
+  const settlementRepairCount = connected && !backfillRunning
+    ? (data?.dashboardCalculations?.diagnostics?.settlementIntegrity?.length ?? 0)
+    : 0;
 
   return <div className="page-stack">
     <div className="section-title">
@@ -805,8 +801,8 @@ function SellerDashboard({ onDataChange, session, setSession, theme, setTheme })
     {error && <p className="alert warning">{error}</p>}
     {(view === 'dashboard' || view === 'orderPayments') && !connected && data && <p className="alert warning">Connect your Amazon account in Settings → Amazon Connection to start pulling real payment data — nothing syncs until then.</p>}
     {blockedByBackfill && <InitialBackfillGate seller={data.seller} />}
-    {!blockedByBackfill && blockedByBrokenSettlements && <DataVerifyingGate reasons={data?.dashboardCalculations?.diagnostics?.completeness?.reasons ?? []} attempt={awaitingAmazon?.attempt} of={awaitingAmazon?.of} />}
-    {!blockedByBackfill && !blockedByBrokenSettlements && <>
+    {!blockedByBackfill && <>
+    {settlementRepairCount > 0 && view !== 'settings' && <SettlementRepairNotice count={settlementRepairCount} />}
     {view !== 'dashboard' && view !== 'settings' && !detailView && <SyncLedger tenantId={tenantId} jobs={data?.jobs ?? []} onSynced={load} reportTypes={reportTypes} title={ledgerCopy?.title} subtitle={ledgerCopy?.subtitle} disabled={!connected} />}
 
     {view === 'orderPayments' && <OrderReconciliation tenantId={tenantId} />}
