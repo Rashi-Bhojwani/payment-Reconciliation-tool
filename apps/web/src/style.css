@@ -1330,6 +1330,14 @@ tbody tr:hover td { background: var(--brand-soft); }
 .backfill-gate-row small { color: var(--muted); font-size: 11.5px; }
 .settlement-repair-notice { display: flex; align-items: flex-start; gap: 10px; line-height: 1.6; }
 .settlement-repair-notice .spinner-dot { width: 12px; height: 12px; margin-top: 5px; flex: 0 0 auto; }
+/* Sticks to the bottom of the scroll container so the total stays readable
+   on a wide money table the seller has to scroll sideways through. */
+.table-totals td { position: sticky; bottom: 0; background: var(--paper); border-top: 2px solid var(--border); font-weight: 700; color: var(--ink); white-space: nowrap; }
+.payout-summary { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 12px; margin: 16px 0; }
+.payout-summary > div { padding: 14px 16px; border: 1px solid var(--border); border-radius: 12px; background: var(--paper); }
+.payout-summary span { display: block; font-size: 11.5px; text-transform: uppercase; letter-spacing: 0.04em; color: var(--muted); font-weight: 700; }
+.payout-summary strong { display: block; font-size: 22px; margin: 4px 0 2px; color: var(--ink); }
+.payout-summary small { color: var(--muted); font-size: 11.5px; }
 
 .sidebar nav a.active {
   background: linear-gradient(135deg, var(--violet), var(--violet-deep));
