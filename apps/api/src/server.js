@@ -13,6 +13,7 @@ import { buildRestoreStatements, createSyncQueue } from './jobs/sync-queue.js';
 import { calendarDay, calendarDays } from './jobs/reporting-calendar.js';
 import { categorizeFinanceLabel } from './jobs/finance-components.js';
 import { CALCULATION_REVISION, calculateDashboardMetrics } from './jobs/dashboard-calculations.js';
+import { matchesAmazonTotal, round2, statementBucket, statementPeriod, summariseStatementRows } from './jobs/settlement-statements.js';
 import { runFeeAuditForTenant } from './jobs/fee-audit.js';
 
 // Default 1 MiB body limit is fine for every other route, but a manually
@@ -1055,6 +1056,94 @@ app.post('/api/tenants/:tenantId/settlement-data/reset', async request => {
   await assertNoBackfillRunning(tenantId, 'Settlement reset');
   app.log.warn({ tenantId, range: body.range }, 'Settlement data reset requested: deleting stored settlement rows for this range and re-syncing from Amazon');
   return resetSettlementData(tenantId, body.range);
+});
+
+// One settlement = one of Amazon's own statement periods, the same rows its
+// "All Statements" page shows. The columns mirror that page exactly (Sales,
+// Refunds, Expenses, Others, Payout) because a seller comparing the two
+// should be comparing like with like, not translating between two different
+// vocabularies for the same money. The bucketing itself lives in
+// jobs/settlement-statements.js so it can be tested without standing up a
+// server - see that module for why amount_type is read before the text
+// classifiers.
+const StatementRowsSchema = `select id source_row_id, settlement_id, order_id, sku, amount_type, amount_description, amount, posted_date, raw,
+      coalesce(raw->>'transaction-type',raw->>'transaction type',raw->>'transactionType') parent_transaction_type
+      from settlement_rows where tenant_id=$1 and settlement_id is not null and settlement_id <> ''`;
+
+// Amazon's "All Statements" page, rebuilt from the settlement rows this tool
+// already holds - so a seller can answer "this payout was 4,825.94, where did
+// that come from" without downloading a flat file and adding columns by hand.
+app.get('/api/tenants/:tenantId/statements', async request => {
+  const { tenantId } = TenantParamsSchema.parse(request.params);
+  await requireTenantUser(request, tenantId); await assertActiveTenant(tenantId);
+  return withTenant(tenantId, async db => {
+    const { rows } = await db.query(StatementRowsSchema, [tenantId]);
+    const bySettlement = new Map();
+    for (const row of rows) {
+      const list = bySettlement.get(row.settlement_id);
+      if (list) list.push(row); else bySettlement.set(row.settlement_id, [row]);
+    }
+    const statements = [...bySettlement].map(([settlementId, settlementRows]) => {
+      const period = statementPeriod(settlementRows);
+      const totals = summariseStatementRows(settlementRows);
+      return {
+        settlement_id: settlementId, ...period, ...totals, lines: settlementRows.length,
+        // Amazon stamps its own total on the document. Reporting ours beside
+        // it, and whether they agree, is the difference between "here is a
+        // number" and "here is a number Amazon confirms" - and it is how a
+        // half-downloaded settlement announces itself instead of quietly
+        // producing a wrong payout.
+        matches_amazon: matchesAmazonTotal(totals.payout, period.amazon_total)
+      };
+    });
+    statements.sort((a, b) => String(b.period_end ?? b.deposit_date ?? '').localeCompare(String(a.period_end ?? a.deposit_date ?? '')));
+    return { statements };
+  });
+});
+
+// The drill-down: every line behind one payout, grouped the way a seller
+// would ask about it - first by section, then by Amazon's own label, and
+// separately rolled up per order so "which orders made up this payout" is
+// answerable without reading hundreds of raw rows.
+app.get('/api/tenants/:tenantId/statements/:settlementId', async request => {
+  const { tenantId, settlementId } = z.object({ tenantId: z.string().uuid(), settlementId: z.string().min(1) }).parse(request.params);
+  await requireTenantUser(request, tenantId); await assertActiveTenant(tenantId);
+  return withTenant(tenantId, async db => {
+    const { rows } = await db.query(`${StatementRowsSchema} and settlement_id=$2 order by posted_date, id`, [tenantId, settlementId]);
+    if (!rows.length) throw Object.assign(new Error('No settlement rows stored for that statement.'), { statusCode: 404 });
+    const period = statementPeriod(rows);
+    const totals = summariseStatementRows(rows);
+    const groups = new Map();
+    for (const row of rows) {
+      const bucket = statementBucket(row);
+      const label = `${row.amount_type ?? ''} ${row.amount_description ?? ''}`.trim() || '(no label)';
+      const key = `${bucket}|${label}`;
+      const current = groups.get(key) ?? { bucket, label, amount: 0, lines: 0 };
+      current.amount += Number(row.amount ?? 0); current.lines += 1;
+      groups.set(key, current);
+    }
+    const byOrder = new Map();
+    for (const row of rows) {
+      if (!row.order_id) continue;
+      const current = byOrder.get(row.order_id) ?? { order_id: row.order_id, sales: 0, refunds: 0, expenses: 0, others: 0, net: 0, lines: 0 };
+      const bucket = statementBucket(row);
+      if (bucket !== 'transfer') { current[bucket] += Number(row.amount ?? 0); current.net += Number(row.amount ?? 0); }
+      current.lines += 1;
+      byOrder.set(row.order_id, current);
+    }
+    const orders = [...byOrder.values()].map(order => ({ ...order, sales: round2(order.sales), refunds: round2(order.refunds), expenses: round2(order.expenses), others: round2(order.others), net: round2(order.net) }))
+      .sort((a, b) => Math.abs(b.net) - Math.abs(a.net));
+    return {
+      settlement_id: settlementId, ...period, ...totals, lines: rows.length,
+      matches_amazon: matchesAmazonTotal(totals.payout, period.amazon_total),
+      groups: [...groups.values()].map(group => ({ ...group, amount: round2(group.amount) })).sort((a, b) => Math.abs(b.amount) - Math.abs(a.amount)),
+      orders,
+      // Rows with no order id - subscription, storage, advertising, transfers.
+      // These are exactly the money a seller cannot find by looking at orders,
+      // and the usual reason a payout is smaller than the order total.
+      nonOrderLines: rows.filter(row => !row.order_id).length
+    };
+  });
 });
 
 const DASHBOARD_METRICS = ['netSales','netQty','orders','returns','settled','deductions','reimbursements','drr','feeImpact','returnRate','refundValueRate','gstValue','income','expenses','tax','transfers','gst'];

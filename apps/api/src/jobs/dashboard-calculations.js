@@ -37,7 +37,7 @@ const text = row => norm(`${row.parent_transaction_type??''} ${row.transaction_t
 const keyOf = row => row.source_row_id ?? row.id ?? `${row.transaction_id??row.settlement_id??''}|${row.order_id??''}|${row.order_item_id??row.sku??''}|${row.category??row.amount_type??''}|${row.amount_description??''}|${row.posted_date??''}|${amount(row)}`;
 function dedupe(rows,key=keyOf){const seen=new Set(),included=[],duplicates=[];for(const row of rows){const keyValue=key(row);(seen.has(keyValue)?duplicates:included).push(row);seen.add(keyValue);}return{included,duplicates};}
 const isSummary=row=>String(row.category??'').startsWith('summary_');
-const isRefund=row=>/refund/.test(text(row));
+export const isRefund=row=>/refund/.test(text(row));
 // amount_type is the settlement report's GROUP for a line, not the line
 // itself: Amazon stamps "ItemPrice" on Principal, Product Tax, Shipping and
 // Shipping tax alike. Including it here made every one of those count as a
@@ -92,7 +92,7 @@ export const isPrincipal=row=>{const t=norm(`${row.amount_description??''} ${row
 // statement - proving this is a reclassification, not missing money: Income
 // stays exactly correct either way, only which section the 120.00 sits in
 // was wrong.
-const isPromotion=row=>/promotion|promo rebate|discount/.test(text(row))&&!isProductGst(row);
+export const isPromotion=row=>/promotion|promo rebate|discount/.test(text(row))&&!isProductGst(row);
 // Amazon's own Transaction/Account Activity statement puts TDS Reimbursement
 // and Chargebacks under Income - grouped with A-to-z Guarantee claims,
 // SAFE-T Reimbursements and Clawbacks as claims-related credits/debits,
@@ -109,7 +109,7 @@ const isPromotion=row=>/promotion|promo rebate|discount/.test(text(row))&&!isPro
 // line of its Tax section is 0, while TDS appears under Expenses as "TDS -
 // Section 194-O Net".
 export const isWithholding=row=>/\b(tcs|tds)\b|withholding|tax withheld/.test(text(row))&&!/reimburse/.test(text(row));
-const isReimbursement=row=>/reimburse|safe t|lost|damaged|clawback/.test(text(row));
+export const isReimbursement=row=>/reimburse|safe t|lost|damaged|clawback/.test(text(row));
 // Shipping and gift wrap CREDITS are Income - they are money the buyer paid.
 // The matching charges ("shipping chargeback", "gift wrap fee", a purchased
 // shipping label) are Expenses, and isFee already claims those, so this must
@@ -117,7 +117,7 @@ const isReimbursement=row=>/reimburse|safe t|lost|damaged|clawback/.test(text(ro
 // lines: "Shipping credits" / "Gift wrap credits" under Income against
 // "Shipping label purchases" and the transaction fees under Expenses.
 // Tax on either belongs to GST, never here.
-const isShippingOrGiftWrapCredit=row=>/shipping|gift wrap/.test(text(row))
+export const isShippingOrGiftWrapCredit=row=>/shipping|gift wrap/.test(text(row))
   &&!isFee(row)&&!isProductGst(row)&&!isWithholding(row)&&!isPromotion(row)&&!isTransfer(row);
 // "holdback"/"shipping hb" earn theirs too. Amazon defines Other transaction
 // fees as "shipping chargebacks, shipping HOLDBACKS, and sales tax collection

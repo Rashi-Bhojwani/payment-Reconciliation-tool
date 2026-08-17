@@ -815,6 +815,7 @@ function SellerDashboard({ onDataChange, session, setSession, theme, setTheme })
     {view === 'productPerformance' && <><ComingSoonNotice text="Product Performance requires Amazon's Sales & Traffic report, paused until Amazon approves the Brand Analytics role." /><ProductPerformanceReport data={data} /></>}
     {view === 'inventory' && <TableCard title="Inventory" rows={data?.inventory ?? []} columns={['sku', 'fulfillable_quantity', 'snapshot_date']} downloadFilename="inventory.csv" />}
     {view === 'payouts' && <>
+      <StatementsView tenantId={tenantId} />
       <TableCard title="Payout Activity" rows={data?.payments ?? []} columns={['posted_date', 'settlement_id', 'net_amount', 'lines']} downloadFilename="payout-activity.csv" totals={{ net_amount: formatCurrency(sumColumn(data?.payments, 'net_amount')) }} />
       <TableCard title="Settlement Lines (itemized)" rows={data?.settlementLines ?? []} columns={['source_row_id', 'posted_date', 'posted_date_time', 'settlement_id', 'order_id', 'transaction_type', 'order_item_code', 'merchant_order_item_id', 'adjustment_id', 'sku', 'quantity_purchased', 'amount_type', 'amount_description', 'amount', 'source_key']} pageSize={10} downloadFilename="settlement-lines.csv" totals={{ amount: formatCurrency(sumColumn(data?.settlementLines, 'amount')) }} />
       {/* The other half of the ledger. Settlement documents carry only Released
@@ -984,6 +985,91 @@ function OrderReconciliation({ tenantId }) {
   // filters, so narrowing to one account type or status re-totals to match.
   const ledgerTotals={product_charges:formatCurrency(sumBy(filteredTransactions,'product_charges')),promotional_rebates:formatCurrency(sumBy(filteredTransactions,'promotional_rebates')),amazon_fees:formatCurrency(sumBy(filteredTransactions,'amazon_fees')),other:formatCurrency(sumBy(filteredTransactions,'other')),total:formatCurrency(sumBy(filteredTransactions,'total'))};
   return <>{reconciliationTable}<Card className="transaction-ledger-intro"><div><span className="live-source">MATCHES SELLER CENTRAL TRANSACTION VIEW</span><h2>All Amazon transactions</h2><p>This includes Order Payments, refunds, Easy Ship charges, service fees, tax withheld, and standalone transactions—not only orders that have a payout.</p></div><div className="transaction-ledger-actions"><strong>{formatNumber(filteredTransactions.length)} of {formatNumber(transactions.length)} transactions</strong><Button variant="secondary" disabled={!ledgerRows.length} onClick={()=>downloadCsv('amazon-transactions.csv',ledgerRows,ledgerColumns)}>Download filtered CSV</Button></div></Card><Card className="transaction-filters"><div><label>Account type<select className="input" value={ledgerFilters.account} onChange={event=>setLedgerFilters(value=>({...value,account:event.target.value}))}><option value="">All account types</option>{uniqueValues('account_type').map(value=><option key={value}>{value}</option>)}</select></label><label>Transaction type<select className="input" value={ledgerFilters.type} onChange={event=>setLedgerFilters(value=>({...value,type:event.target.value}))}><option value="">All transaction types</option>{uniqueValues('transaction_type').map(value=><option key={value}>{value}</option>)}</select></label><label>Transaction status<select className="input" value={ledgerFilters.status} onChange={event=>setLedgerFilters(value=>({...value,status:event.target.value}))}><option value="">All statuses</option>{uniqueValues('transaction_status').map(value=><option key={value}>{value}</option>)}</select></label><label>Order ID<Input value={ledgerFilters.orderId} onChange={event=>setLedgerFilters(value=>({...value,orderId:event.target.value}))} placeholder="Enter order ID…"/></label></div><Button variant="ghost" onClick={()=>setLedgerFilters({account:'',type:'',status:'',orderId:''})}>Clear filters</Button></Card><TableCard title="Complete Amazon transaction ledger" rows={ledgerRows} columns={ledgerColumns} pageSize={10} totals={ledgerTotals} totalsLabel="Totals (all filtered rows)"/></>;
+}
+
+// Amazon's own "All Statements" page, rebuilt from the settlement rows this
+// tool holds - same columns, same periods, same payout figures - so a seller
+// can compare the two side by side without translating between them. Expand a
+// row and it answers the question the Amazon page cannot: not just what the
+// payout was, but every line that made it that number.
+//
+// Deliberately NOT date-range filtered. A settlement is Amazon's own period,
+// and cutting one in half at the edge of whatever range the picker happens to
+// hold would produce a payout that matches nothing - the whole point here is
+// that each row foots to the total Amazon stamped on that document.
+const STATEMENT_BUCKETS = [
+  { key: 'sales', label: 'Sales', hint: 'Money the buyer paid: product price, GST on it, shipping, gift wrap, and promotional rebates' },
+  { key: 'refunds', label: 'Refunds', hint: 'Money returned to buyers, including the fees Amazon gave back with them' },
+  { key: 'expenses', label: 'Expenses', hint: "Amazon's charges: commission, fulfilment, closing, storage, advertising, TCS/TDS withheld" },
+  { key: 'others', label: 'Others', hint: 'Anything Amazon labelled in a way no rule here recognised - normally zero' }
+];
+function StatementDetail({ tenantId, settlementId }) {
+  const [detail, setDetail] = useState(null);
+  const [error, setError] = useState('');
+  useEffect(() => {
+    let active = true; setDetail(null); setError('');
+    api(`/api/tenants/${tenantId}/statements/${encodeURIComponent(settlementId)}`)
+      .then(result => { if (active) setDetail(result); })
+      .catch(e => { if (active) setError(e.message); });
+    return () => { active = false; };
+  }, [tenantId, settlementId]);
+  if (error) return <p className="alert error">{error}</p>;
+  if (!detail) return <Empty text="Loading every line behind this payout…" />;
+  return <div className="statement-detail">
+    <div className="statement-detail-formula">
+      {STATEMENT_BUCKETS.map(bucket => <div key={bucket.key} title={bucket.hint}><span>{bucket.label}</span><strong>{formatCurrency(detail[bucket.key])}</strong></div>)}
+      <div className="statement-detail-payout"><span>Payout</span><strong>{formatCurrency(detail.payout)}</strong></div>
+    </div>
+    {detail.matches_amazon === false && <p className="alert warning">These lines add up to {formatCurrency(detail.payout)}, but Amazon stamped {formatCurrency(detail.amazon_total)} on this document — a difference of {formatCurrency(detail.payout - detail.amazon_total)}. The stored rows for this statement are incomplete or duplicated, so treat this breakdown as unreliable until it re-syncs.</p>}
+    <h4>Where the money went, by Amazon's own label</h4>
+    <div className="table-wrap"><table><thead><tr><th>Section</th><th>Amazon's label</th><th>Lines</th><th>Amount</th></tr></thead><tbody>
+      {detail.groups.map(group => <tr key={`${group.bucket}|${group.label}`}><td><span className={`pill statement-pill-${group.bucket}`}>{STATEMENT_BUCKETS.find(b => b.key === group.bucket)?.label ?? group.bucket}</span></td><td>{group.label}</td><td>{formatNumber(group.lines)}</td><td>{formatCurrency(group.amount)}</td></tr>)}
+    </tbody><tfoot><tr className="table-totals"><td colSpan="3">Total · {formatNumber(detail.lines)} line{detail.lines === 1 ? '' : 's'}</td><td>{formatCurrency(detail.payout)}</td></tr></tfoot></table></div>
+    <h4>Order by order</h4>
+    <p className="muted small">{detail.nonOrderLines > 0 ? `${formatNumber(detail.nonOrderLines)} line${detail.nonOrderLines === 1 ? '' : 's'} in this statement belong to no order — subscription, storage, advertising and similar account-level charges. That is usually why a payout is smaller than the orders alone suggest.` : 'Every line in this statement belongs to an order.'}</p>
+    {detail.orders.length ? <div className="table-wrap"><table><thead><tr><th>Order</th><th>Sales</th><th>Refunds</th><th>Expenses</th><th>Others</th><th>Net for this order</th></tr></thead><tbody>
+      {detail.orders.map(order => <tr key={order.order_id}><td>{order.order_id}</td><td>{formatCurrency(order.sales)}</td><td>{formatCurrency(order.refunds)}</td><td>{formatCurrency(order.expenses)}</td><td>{formatCurrency(order.others)}</td><td><b>{formatCurrency(order.net)}</b></td></tr>)}
+    </tbody></table></div> : <Empty text="No order-level lines in this statement." />}
+  </div>;
+}
+function StatementsView({ tenantId }) {
+  const [statements, setStatements] = useState(null);
+  const [error, setError] = useState('');
+  const [openId, setOpenId] = useState('');
+  useEffect(() => {
+    let active = true; setError('');
+    api(`/api/tenants/${tenantId}/statements`)
+      .then(result => { if (active) setStatements(result.statements); })
+      .catch(e => { if (active) setError(e.message); });
+    return () => { active = false; };
+  }, [tenantId]);
+  if (error) return <Card className="table-card"><PanelHeader title="All Statements" /><p className="alert error">{error}</p></Card>;
+  if (!statements) return <Card className="table-card"><PanelHeader title="All Statements" /><Empty text="Loading your settlement statements…" /></Card>;
+  const period = statement => {
+    const start = statement.period_start ? String(statement.period_start).slice(0, 10) : null;
+    const end = statement.period_end ? String(statement.period_end).slice(0, 10) : null;
+    return start && end ? `${start} → ${end}` : start ?? end ?? statement.settlement_id;
+  };
+  return <Card className="table-card">
+    <PanelHeader title="All Statements" subtitle="every settlement Amazon has issued, and exactly what made up each payout" />
+    <p className="reconciliation-note">These are Amazon's own statement periods, rebuilt from the settlement documents already synced — the same figures its “All Statements” page shows. Open any row to see every line behind that payout: what was earned, what Amazon deducted, and which orders it came from. Sales + Refunds + Expenses + Others always equals Payout exactly, because every line lands in one of those four.</p>
+    {statements.length ? <div className="table-wrap"><table><thead><tr><th>Statement period</th><th>Deposited</th><th>Sales</th><th>Refunds</th><th>Expenses</th><th>Others</th><th>Payout</th><th>Amazon agrees?</th><th></th></tr></thead><tbody>
+      {statements.map(statement => <React.Fragment key={statement.settlement_id}>
+        <tr>
+          <td><b>{period(statement)}</b><br /><small className="muted">{statement.settlement_id} · {formatNumber(statement.lines)} lines</small></td>
+          <td>{statement.deposit_date ? String(statement.deposit_date).slice(0, 10) : <span className="pill status-idle">Not yet paid out</span>}</td>
+          <td>{formatCurrency(statement.sales)}</td>
+          <td>{formatCurrency(statement.refunds)}</td>
+          <td>{formatCurrency(statement.expenses)}</td>
+          <td>{formatCurrency(statement.others)}</td>
+          <td><b>{formatCurrency(statement.payout)}</b></td>
+          <td>{statement.matches_amazon === true ? <span className="pill status-completed">Matches</span> : statement.matches_amazon === false ? <span className="pill status-failed">Off by {formatCurrency(Math.abs(statement.payout - statement.amazon_total))}</span> : <span className="pill status-idle">No total stated</span>}</td>
+          <td><Button variant="ghost" onClick={() => setOpenId(openId === statement.settlement_id ? '' : statement.settlement_id)}>{openId === statement.settlement_id ? 'Hide' : 'Breakdown'}</Button></td>
+        </tr>
+        {openId === statement.settlement_id && <tr className="order-detail-row"><td colSpan="9"><StatementDetail tenantId={tenantId} settlementId={statement.settlement_id} /></td></tr>}
+      </React.Fragment>)}
+    </tbody></table></div> : <Empty text="No settlement statements synced yet. Run the Settlements sync on the Reports page." />}
+  </Card>;
 }
 
 function FeeLeakAudit({tenantId}) {

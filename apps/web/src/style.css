@@ -1339,6 +1339,18 @@ tbody tr:hover td { background: var(--brand-soft); }
 .payout-summary strong { display: block; font-size: 22px; margin: 4px 0 2px; color: var(--ink); }
 .payout-summary small { color: var(--muted); font-size: 11.5px; line-height: 1.5; display: block; }
 .payout-summary-note { color: var(--muted); font-size: 12px; line-height: 1.6; margin: -4px 0 16px; }
+.statement-detail { padding: 18px 4px 8px; }
+.statement-detail h4 { margin: 22px 0 8px; font-size: 13.5px; }
+.statement-detail-formula { display: flex; flex-wrap: wrap; align-items: stretch; gap: 10px; margin-bottom: 16px; }
+.statement-detail-formula > div { flex: 1 1 140px; padding: 12px 14px; border: 1px solid var(--border); border-radius: 12px; background: var(--paper); }
+.statement-detail-formula span { display: block; font-size: 11px; text-transform: uppercase; letter-spacing: 0.04em; color: var(--muted); font-weight: 700; }
+.statement-detail-formula strong { display: block; font-size: 16px; margin-top: 4px; color: var(--ink); }
+.statement-detail-payout { border-color: var(--violet) !important; }
+.statement-detail-payout strong { color: var(--violet-deep); }
+.statement-pill-sales { background: rgba(34, 160, 96, 0.12); color: #1c7a49; }
+.statement-pill-refunds { background: rgba(214, 122, 32, 0.14); color: #96551a; }
+.statement-pill-expenses { background: rgba(206, 62, 62, 0.12); color: #9c2f2f; }
+.statement-pill-others { background: rgba(120, 120, 130, 0.14); color: var(--muted); }
 
 .sidebar nav a.active {
   background: linear-gradient(135deg, var(--violet), var(--violet-deep));
