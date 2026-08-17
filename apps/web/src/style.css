@@ -1337,7 +1337,8 @@ tbody tr:hover td { background: var(--brand-soft); }
 .payout-summary > div { padding: 14px 16px; border: 1px solid var(--border); border-radius: 12px; background: var(--paper); }
 .payout-summary span { display: block; font-size: 11.5px; text-transform: uppercase; letter-spacing: 0.04em; color: var(--muted); font-weight: 700; }
 .payout-summary strong { display: block; font-size: 22px; margin: 4px 0 2px; color: var(--ink); }
-.payout-summary small { color: var(--muted); font-size: 11.5px; }
+.payout-summary small { color: var(--muted); font-size: 11.5px; line-height: 1.5; display: block; }
+.payout-summary-note { color: var(--muted); font-size: 12px; line-height: 1.6; margin: -4px 0 16px; }
 
 .sidebar nav a.active {
   background: linear-gradient(135deg, var(--violet), var(--violet-deep));
