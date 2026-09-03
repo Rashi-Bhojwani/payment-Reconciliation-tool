@@ -169,6 +169,36 @@ try {
   check(badPackage.status === 400 && /greater than 0/i.test(badPackage.body.error ?? ''),
     'an invalid package is rejected with the real reason', badPackage.body.error ?? '');
 
+  // An account whose whole history predates this tool is ALL shipped orders,
+  // so this is not an edge case - it is the first screen such a seller sees.
+  // Measurements against one of them mean nothing.
+  const { rows: [marketplace] } = await admin.query("select id from scheduling.marketplaces where code='AMAZON'");
+  const { rows: [shippedOrder] } = await admin.query(
+    `insert into scheduling.orders
+       (seller_id, marketplace_id, marketplace_account_id, external_order_id,
+        order_date, last_updated_date, marketplace_status, internal_status)
+     select $1, $2, id, '402-2036854-8535523', now(), now(), 'SHIPPED', 'SHIPPED'
+       from scheduling.marketplace_accounts where seller_id = $1 limit 1
+     returning id`,
+    [tenantId, marketplace.id]
+  );
+  const settledPackage = await call(`/api/tenants/${tenantId}/scheduling/orders/${shippedOrder.id}/package`, {
+    method: 'PUT', body: JSON.stringify({ weightGrams: 500, lengthCm: 20, widthCm: 15, heightCm: 10, packageType: 'BOX' })
+  });
+  check(settledPackage.status === 409 && /already shipped/i.test(settledPackage.body.error ?? ''),
+    'measurements cannot be saved against an order Amazon already shipped',
+    `status=${settledPackage.status} ${settledPackage.body.error ?? ''}`);
+
+  const settledSchedule = await call(`/api/tenants/${tenantId}/scheduling/orders/${shippedOrder.id}/schedule`, { method: 'POST' });
+  check(settledSchedule.status === 200 && settledSchedule.body.ok === false && /already shipped/i.test(settledSchedule.body.reason ?? ''),
+    'scheduling an already-shipped order is refused with Amazon\'s own reason',
+    settledSchedule.body.reason ?? `status=${settledSchedule.status}`);
+
+  const detail = await call(`/api/tenants/${tenantId}/scheduling/orders/${shippedOrder.id}`);
+  check(detail.body.order?.internal_status === 'SHIPPED' && detail.body.isComplete === false,
+    'the detail payload reports the settled status the UI keys its read-only view off',
+    `status=${detail.body.order?.internal_status} isComplete=${detail.body.isComplete}`);
+
   // --- cross-tenant access -------------------------------------------------
   const otherReg = await registerSeller('E2E Other Co', `e2e-other-${crypto.randomUUID()}@example.test`);
   const otherTenantId = otherReg.body.tenant?.id;
@@ -191,6 +221,7 @@ try {
   server.scheduler?.stop?.();
   server.schedulingScheduler?.stop?.();
   await server.app.close();
+  await admin.query('delete from scheduling.orders where external_order_id = $1', ['402-2036854-8535523']);
   await admin.query('delete from tenants where company_name like $1', ['E2E %']);
   await admin.end();
   const { closeSchedulingPool } = await import('@recon/order-scheduler');

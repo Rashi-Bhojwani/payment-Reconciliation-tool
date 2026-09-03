@@ -1122,6 +1122,17 @@ const SCHEDULING_STATUS = {
   CANCELLED: { label: 'Cancelled', pill: 'status-idle' }
 };
 const SCHEDULING_STATUS_ORDER = ['READY_FOR_REVIEW', 'READY_TO_SCHEDULE', 'SCHEDULING', 'FAILED', 'SCHEDULED', 'SHIPPED', 'CANCELLED', 'NEW', 'SYNCED'];
+// Statuses where this tool has nothing left to do with the order, and what to
+// say instead of a form. SHIPPED is the one that matters in practice: Amazon
+// reports it for anything fulfilled directly in Seller Central, which is every
+// order an account placed before it started using this tool.
+const SETTLED_SCHEDULING_STATUS = {
+  SHIPPED: 'Amazon reports this order as already shipped — fulfilled directly in Seller Central, outside this tool. There is nothing left to schedule, so there is nothing to measure.',
+  CANCELLED: 'This order was cancelled, so there is nothing to ship.',
+  SCHEDULED: 'The pickup is already booked with Amazon — the shipment is listed on the left. These are the measurements it was booked with.'
+};
+const packageHasMeasurements = pkg =>
+  Boolean(pkg) && [pkg.weight_grams, pkg.length_cm, pkg.width_cm, pkg.height_cm].some(v => v != null && v !== '');
 // Views driven by the Orders API rather than by a synced report, so the
 // report-oriented chrome (SyncLedger, the date range) does not apply to them.
 const SCHEDULING_VIEWS = new Set(['scheduling', 'shipments']);
@@ -1386,7 +1397,13 @@ function SchedulingOrderDetail({ tenantId, orderId, onChanged }) {
   if (error && !detail) return <p className="alert error">{error}</p>;
   if (!detail) return <Empty text="Loading order…" />;
 
-  const terminal = { SCHEDULED: 'Already scheduled', CANCELLED: 'Order cancelled', SHIPPED: 'Already shipped' }[detail.order.internal_status];
+  // An order in one of these is finished as far as this tool is concerned, and
+  // the package form has no job to do on it. Getting this wrong is worse than
+  // it sounds: an account whose whole history predates this tool is ALL
+  // shipped orders, so the very first screen a seller sees would be a hundred
+  // rows each demanding four measurements for a parcel that left weeks ago.
+  const settled = SETTLED_SCHEDULING_STATUS[detail.order.internal_status];
+  const savedPackage = detail.package && packageHasMeasurements(detail.package);
   const set = (key, value) => setForm(previous => ({ ...previous, [key]: value }));
 
   return <div className="order-detail-grid">
@@ -1419,30 +1436,45 @@ function SchedulingOrderDetail({ tenantId, orderId, onChanged }) {
 
     <div>
       <h4>Package</h4>
-      <p className="muted">Amazon quotes a pickup slot from the real weight and box size, so these have to be measured, not estimated. They are saved against this order and reused if you reschedule.</p>
-      {notice && <p className="alert success">{notice}</p>}
-      {error && <p className="alert error">{error}</p>}
-      <form className="scheduling-package-form" onSubmit={savePackage}>
-        <label>Weight (grams)<Input type="number" step="1" min="1" value={form.weightGrams} onChange={e => set('weightGrams', e.target.value)} /></label>
-        <label>Length (cm)<Input type="number" step="0.1" min="0.1" value={form.lengthCm} onChange={e => set('lengthCm', e.target.value)} /></label>
-        <label>Width (cm)<Input type="number" step="0.1" min="0.1" value={form.widthCm} onChange={e => set('widthCm', e.target.value)} /></label>
-        <label>Height (cm)<Input type="number" step="0.1" min="0.1" value={form.heightCm} onChange={e => set('heightCm', e.target.value)} /></label>
-        <label>Package type
-          <select className="input" value={form.packageType} onChange={e => set('packageType', e.target.value)}>
-            <option value="">Select…</option>
-            {PACKAGE_TYPES.map(type => <option key={type} value={type}>{type.replace('_', ' ')}</option>)}
-          </select>
-        </label>
-        <Button type="submit" variant="secondary" disabled={busy === 'save'}>{busy === 'save' ? 'Saving…' : 'Save package'}</Button>
-      </form>
+      {/* The settled check comes FIRST, before the package-completeness one.
+          The other order round-trips through "you still have to fill this in"
+          for an order that shipped a month ago, because an unmeasured parcel
+          and a parcel that needs measuring look identical from the data. */}
+      {settled ? <>
+        <p className="muted">{settled}</p>
+        {savedPackage
+          ? <dl className="scheduling-package-readout">
+            <div><dt>Weight</dt><dd>{formatGrams(detail.package.weight_grams)}</dd></div>
+            <div><dt>Size</dt><dd>{formatDimensions(detail.package.length_cm, detail.package.width_cm, detail.package.height_cm)}</dd></div>
+            <div><dt>Type</dt><dd>{(detail.package.package_type ?? '—').replace('_', ' ')}</dd></div>
+          </dl>
+          : null}
+      </> : <>
+        <p className="muted">Amazon quotes a pickup slot from the real weight and box size, so these have to be measured, not estimated. They are saved against this order and reused if you reschedule.</p>
+        {notice && <p className="alert success">{notice}</p>}
+        {error && <p className="alert error">{error}</p>}
+        <form className="scheduling-package-form" onSubmit={savePackage}>
+          <label>Weight (grams)<Input type="number" step="1" min="1" value={form.weightGrams} onChange={e => set('weightGrams', e.target.value)} /></label>
+          <label>Length (cm)<Input type="number" step="0.1" min="0.1" value={form.lengthCm} onChange={e => set('lengthCm', e.target.value)} /></label>
+          <label>Width (cm)<Input type="number" step="0.1" min="0.1" value={form.widthCm} onChange={e => set('widthCm', e.target.value)} /></label>
+          <label>Height (cm)<Input type="number" step="0.1" min="0.1" value={form.heightCm} onChange={e => set('heightCm', e.target.value)} /></label>
+          <label>Package type
+            <select className="input" value={form.packageType} onChange={e => set('packageType', e.target.value)}>
+              <option value="">Select…</option>
+              {PACKAGE_TYPES.map(type => <option key={type} value={type}>{type.replace('_', ' ')}</option>)}
+            </select>
+          </label>
+          <Button type="submit" variant="secondary" disabled={busy === 'save'}>{busy === 'save' ? 'Saving…' : 'Save package'}</Button>
+        </form>
 
-      {detail.isComplete
-        ? <Button disabled={Boolean(terminal) || busy === 'schedule'} onClick={schedule}>{terminal ?? (busy === 'schedule' ? 'Asking Amazon…' : 'Schedule pickup')}</Button>
-        // Disabled here purely to avoid a dead-end click; the API refuses the
-        // same thing independently (schedulingService's preflight), so this is
-        // a courtesy, not the guard.
-        : <><p className="muted"><b>Fill in every field above before scheduling.</b> Still missing: {detail.missingFields.join(', ')}.</p>
-          <Button disabled title="Fill in every field above first">Schedule pickup</Button></>}
+        {detail.isComplete
+          // Disabled here purely to avoid a dead-end click; the API refuses the
+          // same thing independently (schedulingService's preflight), so this is
+          // a courtesy, not the guard.
+          ? <Button disabled={busy === 'schedule'} onClick={schedule}>{busy === 'schedule' ? 'Asking Amazon…' : 'Schedule pickup'}</Button>
+          : <><p className="muted"><b>Fill in every field above before scheduling.</b> Still missing: {detail.missingFields.join(', ')}.</p>
+            <Button disabled title="Fill in every field above first">Schedule pickup</Button></>}
+      </>}
     </div>
   </div>;
 }

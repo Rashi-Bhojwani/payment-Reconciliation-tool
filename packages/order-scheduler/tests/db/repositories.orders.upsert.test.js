@@ -51,6 +51,78 @@ test('re-upserting an existing order actually applies its new internal_status an
   });
 });
 
+test('a search-only re-sync never erases what the getOrder detail call established', async () => {
+  // The exact sequence that produced a live account of 100 orders all reading
+  // "Amazon status: —", "Ship by —", "Deliver by —": once an order is settled,
+  // orderSyncService skips the per-order getOrder call, so the next sync
+  // carries ONLY search data - which does not include status, dates, channel,
+  // service level or the order total at all. A plain assignment wrote NULL
+  // over every one of them while internal_status survived, leaving an order
+  // the app was certain about with nothing left to explain why.
+  const tenant = await createTenant('upsert-null-clobber');
+  const account = await createMarketplaceAccount(tenant.id, { externalAccountId: 'EXT-UPSERT-NULLS' });
+
+  await asTenant(tenant.id, async () => {
+    const detailed = await ordersRepo.upsertFromMarketplace(tenant.id, baseOrder(account.marketplace_id, account.id, {
+      externalOrderId: 'DETAIL-THEN-SEARCH',
+      internalStatus: 'SHIPPED',
+      marketplaceStatus: 'SHIPPED',
+      fulfillmentChannel: 'MFN',
+      shipServiceLevel: 'Std IN Dom',
+      shipByDate: new Date('2026-08-05T00:00:00.000Z'),
+      deliveryByDate: new Date('2026-08-09T00:00:00.000Z'),
+      orderTotalAmount: 1299.5,
+      orderTotalCurrency: 'INR',
+    }));
+    assert.equal(detailed.marketplace_status, 'SHIPPED');
+
+    // Now exactly what a later sweep sends for a settled order: search shape,
+    // every detail-only field null.
+    const afterSearchOnly = await ordersRepo.upsertFromMarketplace(tenant.id, baseOrder(account.marketplace_id, account.id, {
+      externalOrderId: 'DETAIL-THEN-SEARCH',
+      internalStatus: 'SHIPPED',
+      marketplaceStatus: null,
+      fulfillmentChannel: null,
+      shipServiceLevel: null,
+      shipByDate: null,
+      deliveryByDate: null,
+      orderTotalAmount: null,
+      orderTotalCurrency: null,
+    }));
+
+    assert.equal(afterSearchOnly.marketplace_status, 'SHIPPED', 'Amazon\'s confirmed status must survive a search-only re-sync');
+    assert.equal(afterSearchOnly.fulfillment_channel, 'MFN');
+    assert.equal(afterSearchOnly.ship_service_level, 'Std IN Dom');
+    assert.ok(afterSearchOnly.ship_by_date, 'the ship-by deadline must not be erased');
+    assert.ok(afterSearchOnly.delivery_by_date, 'the deliver-by date must not be erased');
+    assert.equal(Number(afterSearchOnly.order_total_amount), 1299.5);
+    assert.equal(afterSearchOnly.order_total_currency, 'INR');
+  });
+});
+
+test('a later detail sync still updates those fields — COALESCE must not freeze them', async () => {
+  // The other half of the rule: never overwrite a known value with NULL is not
+  // the same as never overwrite. A real new value has to land, or an order
+  // whose ship-by date Amazon moved would keep showing the old deadline.
+  const tenant = await createTenant('upsert-still-updates');
+  const account = await createMarketplaceAccount(tenant.id, { externalAccountId: 'EXT-UPSERT-UPDATES' });
+
+  await asTenant(tenant.id, async () => {
+    await ordersRepo.upsertFromMarketplace(tenant.id, baseOrder(account.marketplace_id, account.id, {
+      externalOrderId: 'DETAIL-THEN-DETAIL',
+      marketplaceStatus: 'Unshipped',
+      shipByDate: new Date('2026-08-05T00:00:00.000Z'),
+    }));
+    const updated = await ordersRepo.upsertFromMarketplace(tenant.id, baseOrder(account.marketplace_id, account.id, {
+      externalOrderId: 'DETAIL-THEN-DETAIL',
+      marketplaceStatus: 'SHIPPED',
+      shipByDate: new Date('2026-08-07T00:00:00.000Z'),
+    }));
+    assert.equal(updated.marketplace_status, 'SHIPPED');
+    assert.equal(new Date(updated.ship_by_date).toISOString(), '2026-08-07T00:00:00.000Z');
+  });
+});
+
 test('an upsert with no tenant bound is refused rather than silently writing nothing', async () => {
   // Not a repository behaviour but a merge one, and it belongs next to the
   // write it protects: under FORCE row-level security this insert would be

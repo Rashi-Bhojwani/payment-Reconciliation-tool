@@ -61,6 +61,18 @@ const PackageSchema = z.object({
   packageType: z.string().trim().min(1, 'Package type is required'),
 });
 
+// Statuses where the order is finished as far as this tool is concerned.
+// Saving package measurements against one of these is meaningless - the parcel
+// has shipped, or was cancelled, or is already booked at the dimensions it was
+// booked with - so the write is refused rather than quietly accepted.
+// schedulingService's own preflight already refuses to SCHEDULE these; this
+// covers the save that would precede it.
+const SETTLED_STATUSES = {
+  SHIPPED: 'Amazon reports this order as already shipped, so there is nothing left to schedule.',
+  CANCELLED: 'This order was cancelled, so there is nothing to ship.',
+  SCHEDULED: 'This order\'s pickup is already booked. Cancel the booking with Amazon before changing its measurements.'
+};
+
 const BulkScheduleSchema = z.object({
   orderIds: z.array(z.string().uuid()).min(1, 'Select at least one order to schedule.').max(200),
 });
@@ -128,17 +140,21 @@ export default async function schedulingRoutes(app, { requireTenantUser }) {
 
     const link = await ensureAmazonSchedulingAccount(tenantId);
 
+    // Sequential, not Promise.all. A tenant scope is ONE pooled connection, and
+    // node-postgres deprecated issuing a query on a client already running one
+    // (removed in pg 9) - it queues them anyway, so the parallel spelling buys
+    // nothing here but a warning and a future breakage. These are indexed reads
+    // on one connection either way.
     return inTenantScope(tenantId, async () => {
-      const [accounts, counts] = await Promise.all([
-        marketplaceAccountsRepo.listBySeller(tenantId),
-        ordersRepo.countsByInternalStatus(tenantId),
-      ]);
-      const syncStates = await Promise.all(
-        accounts.map(async account => ({
+      const accounts = await marketplaceAccountsRepo.listBySeller(tenantId);
+      const counts = await ordersRepo.countsByInternalStatus(tenantId);
+      const syncStates = [];
+      for (const account of accounts) {
+        syncStates.push({
           marketplaceAccountId: account.id,
           ...(await marketplaceAccountSyncStateRepo.get(account.id)),
-        })),
-      );
+        });
+      }
       return {
         connected: link.linked,
         connectionReason: link.reason,
@@ -196,11 +212,11 @@ export default async function schedulingRoutes(app, { requireTenantUser }) {
       // cannot be used to probe which order ids exist on other tenants.
       if (!order) return reply.code(404).send({ error: 'Order not found' });
 
-      const [items, packages, shipments] = await Promise.all([
-        orderItemsRepo.listByOrder(tenantId, orderId),
-        packagesRepo.listByOrder(tenantId, orderId),
-        shipmentsRepo.listByOrder(tenantId, orderId),
-      ]);
+      // Sequential for the same reason as the overview above: one scope is one
+      // connection, and pg deprecated overlapping queries on a single client.
+      const items = await orderItemsRepo.listByOrder(tenantId, orderId);
+      const packages = await packagesRepo.listByOrder(tenantId, orderId);
+      const shipments = await shipmentsRepo.listByOrder(tenantId, orderId);
       const pkg = packages[0] ?? (await packagesRepo.getOrCreatePrimary(tenantId, orderId));
       return {
         order,
@@ -230,6 +246,8 @@ export default async function schedulingRoutes(app, { requireTenantUser }) {
     return inTenantScope(tenantId, async () => {
       const order = await ordersRepo.findById(tenantId, orderId);
       if (!order) return reply.code(404).send({ error: 'Order not found' });
+      const settled = SETTLED_STATUSES[order.internal_status];
+      if (settled) return reply.code(409).send({ error: settled });
 
       const pkg = await packagesRepo.getOrCreatePrimary(tenantId, orderId);
       const saved = await packagesRepo.save(tenantId, pkg.id, parsed.data, user.sub ?? null);

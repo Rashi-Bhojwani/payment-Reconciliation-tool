@@ -199,7 +199,27 @@ export async function upsertFromMarketplace(sellerId, order, piiColumns, client)
      ON CONFLICT (marketplace_account_id, external_order_id) DO UPDATE SET
         order_date           = EXCLUDED.order_date,
         last_updated_date    = EXCLUDED.last_updated_date,
-        marketplace_status   = EXCLUDED.marketplace_status,
+        -- COALESCE, not a plain assignment, for every field below that only
+        -- the per-order getOrder call carries. searchOrders does not return
+        -- status, ship-by/deliver-by dates, fulfillment channel, service
+        -- level or order total at all (see AmazonAdapter.normalizeSearchOrder,
+        -- where they are explicitly null rather than guessed) - and
+        -- orderSyncService deliberately SKIPS getOrder for an order already
+        -- in a settled status, since its outcome is known and the call costs
+        -- rate limit for nothing.
+        --
+        -- Put together, those two correct behaviours had a bad interaction: a
+        -- re-sync of a shipped order wrote search-only data, and a plain
+        -- assignment overwrote Amazon's confirmed "SHIPPED", its real ship-by
+        -- date and its order total with NULL. internal_status survived
+        -- (nextStatus protects it), so the order still read as shipped while
+        -- every fact explaining WHY had been erased - a detail panel of em
+        -- dashes for an order the app was certain about. Observed on a live
+        -- account where all 100 orders showed "Amazon status: —".
+        --
+        -- Never overwriting a known value with NULL is the same rule the PII
+        -- columns below have always followed, for the same reason.
+        marketplace_status   = COALESCE(EXCLUDED.marketplace_status, orders.marketplace_status),
         -- internal_status was missing from this list entirely — a real bug
         -- that silently discarded orderSyncService.nextStatus()'s computed
         -- value on every re-sync of an order that already existed (i.e.
@@ -213,15 +233,18 @@ export async function upsertFromMarketplace(sellerId, order, piiColumns, client)
         -- upstream whether to keep a terminal/in-flight status or move on,
         -- so its result is always the correct final answer, not a guess.
         internal_status      = EXCLUDED.internal_status,
-        fulfillment_channel  = EXCLUDED.fulfillment_channel,
-        ship_service_level   = EXCLUDED.ship_service_level,
+        fulfillment_channel  = COALESCE(EXCLUDED.fulfillment_channel, orders.fulfillment_channel),
+        ship_service_level   = COALESCE(EXCLUDED.ship_service_level, orders.ship_service_level),
+        -- is_prime is hardcoded false by both normalizers and is_business_order
+        -- is a real boolean search DOES carry, so neither is a null-clobber
+        -- risk and both are written straight through.
         is_prime             = EXCLUDED.is_prime,
         is_business_order    = EXCLUDED.is_business_order,
-        earliest_ship_date   = EXCLUDED.earliest_ship_date,
-        ship_by_date         = EXCLUDED.ship_by_date,
-        delivery_by_date     = EXCLUDED.delivery_by_date,
-        order_total_amount   = EXCLUDED.order_total_amount,
-        order_total_currency = EXCLUDED.order_total_currency,
+        earliest_ship_date   = COALESCE(EXCLUDED.earliest_ship_date, orders.earliest_ship_date),
+        ship_by_date         = COALESCE(EXCLUDED.ship_by_date, orders.ship_by_date),
+        delivery_by_date     = COALESCE(EXCLUDED.delivery_by_date, orders.delivery_by_date),
+        order_total_amount   = COALESCE(EXCLUDED.order_total_amount, orders.order_total_amount),
+        order_total_currency = COALESCE(EXCLUDED.order_total_currency, orders.order_total_currency),
         -- Never overwrite stored PII with NULL, and never resurrect purged PII.
         buyer_name_enc       = CASE WHEN orders.pii_purged_at IS NULL
                                     THEN COALESCE(EXCLUDED.buyer_name_enc, orders.buyer_name_enc)

@@ -1671,6 +1671,15 @@ tbody tr:hover td { background: var(--brand-soft); }
 .scheduling-package-form label { display: grid; gap: 6px; color: var(--muted); font-size: 12px; font-weight: 700; }
 .scheduling-package-form select.input { min-height: 44px; }
 
+/* The read-only stand-in for the form on an order that is already shipped,
+   cancelled or booked. Shown only when measurements actually exist - an order
+   Amazon fulfilled before this tool ever saw it has none, and three em dashes
+   would be noise. */
+.scheduling-package-readout { display: grid; grid-template-columns: repeat(auto-fit, minmax(130px, 1fr)); gap: 12px; margin: 12px 0 0; }
+.scheduling-package-readout > div { display: grid; gap: 3px; padding: 10px 12px; border: 1px solid var(--border); border-radius: 9px; background: var(--surface); }
+.scheduling-package-readout dt { color: var(--muted); font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: .04em; }
+.scheduling-package-readout dd { margin: 0; font-size: 14px; font-weight: 600; }
+
 /* These two are shared with Order Payments and were written before the dark
    theme existed, so both hardcode a light surface and neither is reachable
    through the neutral tokens the dark section overrides. Scheduling leans on
