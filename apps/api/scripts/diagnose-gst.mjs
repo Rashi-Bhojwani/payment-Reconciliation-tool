@@ -117,7 +117,13 @@ try {
     }
 
     // --- the verdict -------------------------------------------------------
-    const refused = jobs.find(job => job.status === 'failed' && /403|role|Tax Invoicing|access|unauthorized/i.test(job.error_message ?? ''));
+    // Deliberately NOT filtered on status === 'failed'. Until this was fixed,
+    // a GST report Amazon refused outright was recorded as 'completed' with
+    // the 403 sitting in error_message - so keying off status would have
+    // reported "Amazon returned an empty report" for the exact case this
+    // script exists to identify. Historic rows written before that fix still
+    // say 'completed', so the message is what to trust here, not the status.
+    const refused = jobs.find(job => /403|forbidden|unauthorized|Tax Invoicing|role/i.test(job.error_message ?? ''));
     console.log('\nVERDICT');
     if (stored.rows > 0) {
       console.log('  Invoices ARE stored. If the page still says "No invoices yet", the date range');
@@ -127,9 +133,19 @@ try {
       console.log('  No GST sync has ever run for this tenant. Reports page -> sync');
       console.log('  GET_GST_MTR_B2B_CUSTOM and GET_GST_MTR_B2C_CUSTOM.');
     } else if (refused) {
-      console.log('  Amazon REFUSED the sync (see the error above). Granting the role in Developer');
-      console.log('  Central is not enough on its own: re-authorize in Settings -> Amazon');
-      console.log('  Connection so a new refresh token is issued carrying it, THEN sync again.');
+      const tokenAge = seller.connected_at ? new Date(seller.connected_at).toISOString().replace('T', ' ').slice(0, 16) : 'unknown';
+      const refusedAt = refused.started_at ? new Date(refused.started_at).toISOString().replace('T', ' ').slice(0, 16) : 'unknown';
+      console.log('  Amazon REFUSED the sync (see the error above). This is a permissions answer,');
+      console.log('  not a data answer - the report was never produced.');
+      console.log(`\n  Token in use was issued : ${tokenAge}`);
+      console.log(`  Amazon refused at       : ${refusedAt}`);
+      console.log('\n  If you granted Tax Invoicing in Developer Central BEFORE the token date above,');
+      console.log('  and it is still refusing, then the role is not actually attached to the');
+      console.log('  application Amazon sees - check Developer Central shows it as approved, not');
+      console.log('  merely requested, and that this app is the one it was approved for.');
+      console.log('  Otherwise: re-authorize (Settings -> Amazon Connection) to reissue the token');
+      console.log('  with the role, then sync again. A token only ever carries the roles the');
+      console.log('  application held at the moment it was issued.');
     } else if (jobs.some(job => job.status === 'completed')) {
       console.log('  A GST sync completed but stored nothing, so Amazon returned an empty report');
       console.log('  for the period requested. Amazon India generates the MTR after a month closes -');

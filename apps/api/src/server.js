@@ -8,7 +8,7 @@ import { assertActiveTenant, databaseUrlConfigured, pool, withTenant } from '@re
 import { getSpApiEndpoint, MARKETPLACES, REPORT_TYPES, SpApiClient } from '@recon/sp-api-client';
 import { secrets } from './config/secrets.js';
 import { decryptSecret, encryptSecret } from './config/crypto.js';
-import { buildGstInvoicesFromOrderItems, runInitialSellerBackfill, saveStructuredRows, startScheduler, syncRecentApiDataForTenant, syncReportForTenant } from './jobs/sync.js';
+import { buildGstInvoicesFromOrderItems, isPermissionRefusal, runInitialSellerBackfill, saveStructuredRows, startScheduler, syncRecentApiDataForTenant, syncReportForTenant } from './jobs/sync.js';
 import { buildRestoreStatements, createSyncQueue } from './jobs/sync-queue.js';
 import { calendarDay, calendarDays } from './jobs/reporting-calendar.js';
 import { categorizeFinanceLabel } from './jobs/finance-components.js';
@@ -526,8 +526,28 @@ async function syncReportForSellerRequest(params, range) {
     if (params.reportType === 'GET_GST_MTR_B2B_CUSTOM' || params.reportType === 'GET_GST_MTR_B2C_CUSTOM') {
       const invoiceType = params.reportType === 'GET_GST_MTR_B2B_CUSTOM' ? 'b2b' : 'b2c';
       const rowsImported = await buildGstInvoicesFromOrderItems(params.tenantId, invoiceType).catch(() => 0);
-      await recordSyntheticReportSync(params.tenantId, params.reportType, rowsImported > 0 ? 'fallback://order-items-gst-estimate' : 'fallback://gst-report-unavailable', message, range);
-      return { reportType: params.reportType, status: 'completed', fallback: rowsImported > 0 ? 'ORDER_ITEMS_GST_ESTIMATE' : 'GST_REPORT_UNAVAILABLE', rowsImported, warning: message };
+      // Nothing was saved: Amazon refused the report AND the order-items
+      // estimate produced nothing either. Recording a synthetic 'completed'
+      // row here was a real, costly lie - observed live, where a seller saw a
+      // green COMPLETED pill next to Amazon's own 403 saying the Tax Invoicing
+      // role was missing, and reasonably concluded the sync had worked and the
+      // data simply did not exist. It also suppressed the fix: a 'completed'
+      // row makes findMissingReportTypes consider this range covered, so the
+      // automatic sync would not retry the real report even after the seller
+      // re-authorized and it would have succeeded.
+      //
+      // syncReportForTenant already wrote the honest 'failed' row with this
+      // message before throwing, so returning failed here simply leaves it
+      // standing. Exactly the rule the settlement branch below already
+      // follows, and this is the same mistake it was written to avoid.
+      if (rowsImported === 0) {
+        return { reportType: params.reportType, status: 'failed', error: message };
+      }
+      // The estimate did produce rows, so there is real (if lower-fidelity)
+      // data to show. That is a genuine partial success, and the warning
+      // travels with it so the ledger says where the numbers came from.
+      await recordSyntheticReportSync(params.tenantId, params.reportType, 'fallback://order-items-gst-estimate', message, range);
+      return { reportType: params.reportType, status: 'completed', fallback: 'ORDER_ITEMS_GST_ESTIMATE', rowsImported, warning: message };
     }
     // Amazon generates the settlement report on its own payout schedule, so
     // "no completed report yet for this range" is a routine, expected state
@@ -571,6 +591,14 @@ async function syncReportForSellerRequest(params, range) {
       }
     }
     if (params.reportType === 'GET_FBA_FULFILLMENT_CUSTOMER_RETURNS_DATA' && /cancelled|no data|403|fatal/i.test(message)) {
+      // "No returns in this period" is a real, correct, empty answer and
+      // deserves a green pill. A 403 is not that - it means this app was never
+      // allowed to ask, which is a permission problem with a fix, and calling
+      // it completed hides both the problem and the fix. Same distinction the
+      // GST branch above now makes.
+      if (isPermissionRefusal(message)) {
+        return { reportType: params.reportType, status: 'failed', error: message };
+      }
       await recordSyntheticReportSync(params.tenantId, params.reportType, 'fallback://returns-report-unavailable', message, range);
       return { reportType: params.reportType, status: 'completed', fallback: 'RETURNS_REPORT_UNAVAILABLE', rowsImported: 0, warning: message };
     }

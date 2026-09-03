@@ -487,6 +487,43 @@ async function saveSettlementRows(tenantId, content) {
 // database row now too (see 024_gst_invoices_source_key.sql), so this must
 // generate one for every row and use it as the real upsert identity, the
 // same fix already proven for those other tables.
+/**
+ * True when Amazon refused a report because this application was not allowed
+ * to ask for it, as opposed to any other reason a report can fail.
+ *
+ * The distinction decides what the sync ledger shows, and getting it wrong is
+ * expensive in a specific way. "Amazon has no data for this period" is a
+ * correct, finished answer and deserves a green COMPLETED pill. A permission
+ * refusal is not an answer at all - it means the request never happened, there
+ * is a concrete fix (grant the role, then RE-AUTHORIZE so a new refresh token
+ * carries it), and marking it completed hides both the problem and the fix.
+ *
+ * It also stops the fix working: findMissingReportTypes treats a completed row
+ * as coverage, so the automatic sync would not retry the real report even
+ * after the seller re-authorized and it would finally have succeeded. Observed
+ * live on GST B2B/B2C, where a seller saw a green COMPLETED pill sitting
+ * directly above Amazon's own 403 naming the missing Tax Invoicing role, and
+ * reasonably concluded the sync had worked and the invoices did not exist.
+ *
+ * @param {unknown} message
+ */
+export function isPermissionRefusal(message) {
+  const text = String(message ?? '');
+  // The digit guards are not decoration. `\b403\b` matches the "403" in
+  // 403-2036854-8535523 - a perfectly ordinary Amazon India order id, since a
+  // hyphen is a word boundary - and in "4030 rows" it does not, but only by
+  // luck of which side you look at. Any message quoting an order id would have
+  // been read as a permission refusal and shown as a hard failure. Requiring
+  // the code to be bounded by neither a digit nor a hyphen keeps "403 -",
+  // "403:" and "status code 401" while excluding both.
+  //
+  // The role phrasing is matched explicitly because the SP-API client wraps a
+  // 403 with its own guidance ('requires the "Tax Invoicing" role...'), and a
+  // future wording change there should not silently turn a refusal back into
+  // a success.
+  return /(?<![\d-])(?:401|403)(?![\d-])|forbidden|unauthorized|access to the resource is denied|requires the "[^"]+" role/i.test(text);
+}
+
 const GSTID_FIELD_NAMES = ['customer-bill-to-gstid', 'customer bill to gstid', 'customerbilltogstid', 'customer-ship-to-gstid', 'customer ship to gstid', 'customershiptogstid'];
 // Catches uploading a B2C file to the B2B button or vice versa - a real
 // mistake to worry about, since the upload endpoint has no other way to

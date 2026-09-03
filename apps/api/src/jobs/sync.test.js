@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { assertGstInvoiceTypeMatchesContent, batchUpsert, dropRepeatedSettlements, ordinalsWithinGroup, parseDelimited, settlementBalanceErrors, withTenantSyncMutex } from './sync.js';
+import { assertGstInvoiceTypeMatchesContent, batchUpsert, dropRepeatedSettlements, isPermissionRefusal, ordinalsWithinGroup, parseDelimited, settlementBalanceErrors, withTenantSyncMutex } from './sync.js';
 
 function fakeClient() {
   const calls = [];
@@ -289,4 +289,50 @@ test('assertGstInvoiceTypeMatchesContent never fires when the file has no GSTID 
   const rows = [{ 'Order Id': '1', Sku: 'ABC' }];
   assert.doesNotThrow(() => assertGstInvoiceTypeMatchesContent(rows, 'b2b'));
   assert.doesNotThrow(() => assertGstInvoiceTypeMatchesContent(rows, 'b2c'));
+});
+
+// The rule these lock in: a report Amazon refused is never reported as a
+// success. A seller looking at a green COMPLETED pill above Amazon's own 403
+// concluded the sync had worked and the data did not exist - it cost real time
+// to unpick, and a completed row also stops the automatic sync retrying the
+// report after the permission is actually fixed.
+test('a permission refusal is recognised however Amazon and the client word it', () => {
+  const refusals = [
+    // The exact string a live account saw, wrapped by this repo's SP-API client.
+    'Create report failed: 403 - Amazon says: Unauthorized: Access to the resource is forbidden - GET_GST_MTR_B2B_CUSTOM requires the "Tax Invoicing" role on the SP-API application (granted in Developer Central, not in Seller Central).',
+    'SP-API 403: Access to requested resource is denied',
+    'Unauthorized',
+    'Request failed with status code 401',
+    'Access to the resource is denied'
+  ];
+  for (const message of refusals) {
+    assert.equal(isPermissionRefusal(message), true, `should be treated as a refusal: ${message.slice(0, 60)}`);
+  }
+});
+
+test('an ordinary empty or failed report is NOT treated as a permission refusal', () => {
+  // These must keep their existing behaviour. "No data" in particular is a
+  // correct, finished answer and has always earned a green pill; misreading it
+  // as a refusal would turn every quiet period into a false alarm.
+  const notRefusals = [
+    'No completed GET_V2_SETTLEMENT_REPORT_DATA_FLAT_FILE_V2 report is available for this range yet',
+    'Report CANCELLED by Amazon',
+    'no data',
+    'Rate limit exceeded: 429',
+    'fetch failed',
+    'Report processing FATAL',
+    '',
+    null,
+    undefined
+  ];
+  for (const message of notRefusals) {
+    assert.equal(isPermissionRefusal(message), false, `should NOT be treated as a refusal: ${String(message).slice(0, 60)}`);
+  }
+});
+
+test('a 403 inside an unrelated number does not read as a refusal', () => {
+  // Word-bounded on purpose: an order id or a row count containing 403 is not
+  // a status code.
+  assert.equal(isPermissionRefusal('Imported 4030 rows for order 403-2036854-8535523'), false);
+  assert.equal(isPermissionRefusal('HTTP 403'), true);
 });
