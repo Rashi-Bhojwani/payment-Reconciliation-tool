@@ -130,13 +130,18 @@ async function resetSettlementData(tenantId, range) {
 // see the matching UPLOADABLE_REPORT_TYPES comment in server.js for exactly
 // why these five and not the other three.
 const UPLOADABLE_REPORT_TYPES = new Set(['GET_V2_SETTLEMENT_REPORT_DATA_FLAT_FILE_V2', 'GET_GST_MTR_B2B_CUSTOM', 'GET_GST_MTR_B2C_CUSTOM', 'GET_FBA_FULFILLMENT_CUSTOMER_RETURNS_DATA', 'GET_FBA_REIMBURSEMENTS_DATA']);
-// GST B2B/B2C need the "Tax Invoicing" role and Sales & Traffic needs
-// "Brand Analytics" - neither is visible in Developer Central for this app
-// yet, so every live pull of these three fails with the same 403. Rather
-// than let a hosted end user hit that error, the ledger shows them as a
-// paused feature instead of a broken one. Remove a type here the moment
-// Amazon grants the role - nothing else about the sync path changes.
-const PAUSED_REPORT_TYPES = new Set(['GET_SALES_AND_TRAFFIC_REPORT', 'GET_GST_MTR_B2B_CUSTOM', 'GET_GST_MTR_B2C_CUSTOM']);
+// Sales & Traffic needs the "Brand Analytics" role, which is still not
+// granted to this app - a live pull fails with a 403, so the ledger shows it
+// as a paused feature rather than a broken one. Remove a type here the moment
+// Amazon grants the role; nothing else about the sync path changes.
+//
+// GST B2B/B2C came off this list when Amazon approved "Tax Invoicing". Worth
+// recording why removing them was the whole change: the API side never gated
+// on the role at all - REPORT_TYPE_REQUIRED_ROLES in the SP-API client only
+// makes a 403 readable, it does not refuse to try - so these reports were
+// always being requested and always allowed to succeed. Only the UI was
+// holding them back.
+const PAUSED_REPORT_TYPES = new Set(['GET_SALES_AND_TRAFFIC_REPORT']);
 async function uploadReportFile(tenantId, reportType, content, range) {
   const payload = { method: 'POST', body: JSON.stringify({ content, range: { start: formatDateParam(range.start), end: endOfRangeParam(range.end) } }) };
   return api(`/api/tenants/${tenantId}/reports/${reportType}/upload`, payload);
@@ -828,7 +833,7 @@ function SellerDashboard({ onDataChange, session, setSession, theme, setTheme })
     {view === 'feeAudit' && <FeeLeakAudit tenantId={tenantId} />}
     {view === 'returns' && <TableCard title="Return Details" rows={data?.returns ?? []} columns={['order_id', 'return_reason', 'disposition', 'status', 'return_date']} downloadFilename="returns.csv" />}
     {view === 'reimbursements' && <TableCard title="Reimbursement Details" rows={data?.reimbursements ?? []} columns={['sku', 'amount', 'reason', 'reimbursement_date']} downloadFilename="reimbursements.csv" />}
-    {view === 'tax' && <><ComingSoonNotice text="GST B2B and B2C invoice reports are paused until Amazon approves the Tax Invoicing role - new invoices won't sync until then." /><TableCard title="GST Invoice Details" rows={data?.invoices ?? []} columns={['invoice_type', 'order_id', 'taxable_value', 'cgst', 'sgst', 'igst', 'invoice_date']} downloadFilename="gst-invoices.csv" /></>}
+    {view === 'tax' && <TableCard title="GST Invoice Details" rows={data?.invoices ?? []} columns={['invoice_type', 'order_id', 'taxable_value', 'cgst', 'sgst', 'igst', 'invoice_date']} downloadFilename="gst-invoices.csv" totals={{ taxable_value: formatCurrency(sumColumn(data?.invoices, 'taxable_value')), cgst: formatCurrency(sumColumn(data?.invoices, 'cgst')), sgst: formatCurrency(sumColumn(data?.invoices, 'sgst')), igst: formatCurrency(sumColumn(data?.invoices, 'igst')) }} />}
     {view === 'reports' && <>
       <ReportsExplorer tenantId={tenantId} data={data} />
       {/* Also on Payouts, but this is the page people look for raw exports on.
@@ -1307,18 +1312,21 @@ function KpiDelta({ value }) {
   return <span className={`kpi-delta ${dir}`}>{arrow} {Math.abs(value).toLocaleString('en-IN', { maximumFractionDigits: 1 })}%<span className="kpi-delta-note">vs prior period</span></span>;
 }
 
-// GST invoice value has its own dependency note rather than the generic
-// "Unavailable" the other three cards use: it is not a transient sync gap,
-// it is paused pending Amazon's approval of the Tax Invoicing role - see
-// PAUSED_REPORT_TYPES. Telling a seller "coming soon" is honest; telling
-// them "Unavailable" alongside three genuinely-transient gaps is not.
+// GST invoice value keeps its own dependency note rather than the generic
+// "Unavailable" the other three cards use, but the reason changed: with the
+// Tax Invoicing role granted, a null here is no longer "this feature is
+// switched off", it is "Amazon has issued no GST invoice for this range
+// yet". Those want different words - the first is permanent and needs no
+// action, the second clears on its own once invoices arrive. Saying "coming
+// soon" for a report that now syncs would send a seller looking for a
+// setting that isn't there.
 function ExplanationGrid({ summary, tenantId }) {
-  const gstPaused = summary.gstValue == null;
+  const gstMissing = summary.gstValue == null;
   const cards = [
     ['Fee impact', summary.feeImpact==null?'Unavailable':`${Number(summary.feeImpact).toLocaleString('en-IN',{maximumFractionDigits:2})}%`, 'Net Amazon fees excluding TCS/TDS as a percentage of gross product sales.', 'feeImpact'],
     ['Return rate', summary.returnRate==null?'Unavailable / source mismatch':`${Number(summary.returnRate).toLocaleString('en-IN',{maximumFractionDigits:2})}%`, 'Physically returned units divided by shipped units.', 'returnRate'],
     ['Refund value rate', summary.refundValueRate==null?'Unavailable':`${Number(summary.refundValueRate).toLocaleString('en-IN',{maximumFractionDigits:2})}%`, 'Product refund value divided by gross product sales; separate from unit return rate.', 'refundValueRate'],
-    ['GST invoice value', gstPaused?'Coming soon':formatCurrency(summary.gstValue), gstPaused?'Requires GST B2B/B2C invoice data - paused until Amazon approves the Tax Invoicing role.':'Sales-invoice taxable value minus credit-note/refund taxable value.', 'gstValue']
+    ['GST invoice value', gstMissing?'No invoices yet':formatCurrency(summary.gstValue), gstMissing?'No GST B2B/B2C invoice has been synced for this range yet. Run the GST syncs on the Reports page, or pick a range Amazon has already invoiced.':'Sales-invoice taxable value minus credit-note/refund taxable value.', 'gstValue']
   ];
   return <div className="explain-grid">{cards.map(([title, value, copy, target]) => <Link key={title} to={`/seller?tenantId=${tenantId}&view=metric-detail&metric=${target}`} className="explain-card"><b>{title}</b><strong>{value}</strong><p>{copy}</p><span>Open calculation →</span></Link>)}</div>;
 }
