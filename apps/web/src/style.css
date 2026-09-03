@@ -1651,3 +1651,33 @@ tbody tr:hover td { background: var(--brand-soft); }
 :root[data-theme="dark"] .excel-report,
 :root[data-theme="dark"] .excel-table,
 :root[data-theme="dark"] .excel-table td { background: #1b1830; color: #dcdaee; }
+
+/* ---------- Order scheduling ----------
+   Deliberately thin. The scheduling pages are built out of the same Card /
+   PanelHeader / pill / table-wrap / pager / reconciliation-summary vocabulary
+   as Order Payments, so almost nothing new is needed - only the two places
+   where scheduling's shape genuinely differs from a reconciliation table. */
+
+/* Six status filters, not the four .reconciliation-summary is laid out for.
+   auto-fit rather than repeat(6) so they reflow instead of being squeezed to
+   an unreadable width on a narrow window. */
+.reconciliation-summary.scheduling-filters { grid-template-columns: repeat(auto-fit, minmax(148px, 1fr)); }
+
+/* Two actions here (sync, and schedule-selected) where every other table card
+   has one, so the shared rule's justify-content alone leaves them touching. */
+.table-card-actions { gap: 10px; }
+
+.scheduling-package-form { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 12px; align-items: end; margin: 12px 0 16px; }
+.scheduling-package-form label { display: grid; gap: 6px; color: var(--muted); font-size: 12px; font-weight: 700; }
+.scheduling-package-form select.input { min-height: 44px; }
+
+/* These two are shared with Order Payments and were written before the dark
+   theme existed, so both hardcode a light surface and neither is reachable
+   through the neutral tokens the dark section overrides. Scheduling leans on
+   them far more heavily (every row expands into an .order-detail-row, and the
+   status filters are the primary navigation), which is what made the gap worth
+   closing rather than matching. */
+:root[data-theme="dark"] .order-detail-row > td { background: var(--paper); }
+:root[data-theme="dark"] .reconciliation-summary > button { background: var(--paper); }
+:root[data-theme="dark"] .reconciliation-summary > button:hover,
+:root[data-theme="dark"] .reconciliation-summary > button.active { background: var(--violet-soft); border-color: var(--violet); box-shadow: inset 3px 0 var(--violet); }

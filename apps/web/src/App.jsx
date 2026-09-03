@@ -45,6 +45,11 @@ function codeClass(code) { return `code-${CODE_COLOR_KEY[code] ?? code.toLowerCa
 const NAV_ITEMS = [
   { view: 'dashboard', label: 'Dashboard', icon: '▦' },
   { view: 'orderPayments', label: 'Order Payments', icon: '₹' },
+  // Scheduling sits directly under the money pages because it is the other
+  // half of the same order: Order Payments answers "what did this order pay",
+  // Order Scheduling answers "get this order out the door".
+  { view: 'scheduling', label: 'Order Scheduling', icon: '⧗' },
+  { view: 'shipments', label: 'Scheduled Pickups', icon: '➤' },
   { view: 'sales', label: 'Sales Analytics', icon: '↗' },
   { view: 'businessPerformance', label: 'Business Performance', icon: '▤' },
   { view: 'productPerformance', label: 'Product Performance', icon: '◈' },
@@ -811,9 +816,18 @@ function SellerDashboard({ onDataChange, session, setSession, theme, setTheme })
     {blockedByBackfill && <InitialBackfillGate seller={data.seller} />}
     {!blockedByBackfill && <>
     {settlementRepairCount > 0 && view !== 'settings' && <SettlementRepairNotice count={settlementRepairCount} />}
-    {view !== 'dashboard' && view !== 'settings' && !detailView && <SyncLedger tenantId={tenantId} jobs={data?.jobs ?? []} onSynced={load} reportTypes={reportTypes} title={ledgerCopy?.title} subtitle={ledgerCopy?.subtitle} disabled={!connected} />}
+    {/* Scheduling pages are excluded on purpose. SyncLedger lists the SP-API
+        report types a page's figures come from, and order scheduling consumes
+        none of them - it reads the Orders API live. Left in, it would render
+        all eight report rows (reportTypes undefined means "show every one"),
+        implying the page depends on reports it never touches, next to a Sync
+        button that does something entirely different from the one that page
+        already has. */}
+    {view !== 'dashboard' && view !== 'settings' && !SCHEDULING_VIEWS.has(view) && !detailView && <SyncLedger tenantId={tenantId} jobs={data?.jobs ?? []} onSynced={load} reportTypes={reportTypes} title={ledgerCopy?.title} subtitle={ledgerCopy?.subtitle} disabled={!connected} />}
 
     {view === 'orderPayments' && <OrderReconciliation tenantId={tenantId} />}
+    {view === 'scheduling' && <OrderScheduling tenantId={tenantId} />}
+    {view === 'shipments' && <SchedulingShipments tenantId={tenantId} />}
     {view === 'dashboard' && <DashboardOverview data={data} channelData={channelData} tenantId={tenantId} />}
     {view === 'sales' && <><ComingSoonNotice text="Sales & Traffic report is paused until Amazon approves the Brand Analytics role - the figures below may be incomplete until then." /><SalesAnalytics data={data} channelData={channelData} /></>}
     {view === 'businessPerformance' && <><ComingSoonNotice text="Some of this report's figures come from Sales & Traffic, which is paused until Amazon approves the Brand Analytics role - Orders-based figures are unaffected." /><BusinessPerformanceReport data={data} /></>}
@@ -850,8 +864,8 @@ function SellerDashboard({ onDataChange, session, setSession, theme, setTheme })
   </div>;
 }
 
-function viewTitle(view) { return ({ orderPayments: 'Order Payment Reconciliation', dashboard: 'Dashboard', sales: 'Sales Analytics', businessPerformance: 'Business Performance', productPerformance: 'Product Performance', inventory: 'Inventory', payouts: 'Payout Reconciliation', brand: 'Brand Analytics', feeAudit: 'Fee Leak Audit', returns: 'Returns', reimbursements: 'Reimbursements', tax: 'GST & Tax', reports: 'Reports', rawData: 'Raw API Data', 'report-detail': 'Report Detail', 'metric-detail': 'Calculation Detail', settings: 'Settings' })[view] ?? 'Dashboard'; }
-function viewDescription(view) { return ({ orderPayments: 'See every rupee from customer order value, through Amazon deductions, to the final FBA or FBM seller receivable.', dashboard: 'Amazon-only reconciliation KPIs with explainable drill-downs.', sales: 'Revenue, order value, units and product sales trends from Amazon reports.', businessPerformance: 'Excel-style quarterly business performance report with analysed KPIs and matching graphs.', productPerformance: 'Excel-style product performance analysis with top products and written insights.', inventory: 'FBA inventory snapshots imported from SP-API inventory reports.', payouts: 'Settlement rows and payout reconciliation from Amazon settlement reports.', brand: 'ASIN-level product performance from synced Amazon order items, with Sales & Traffic metrics when available.', returns: 'Customer return reasons, status and disposition.', reimbursements: 'Amazon reimbursement credits for lost, damaged or adjusted inventory.', tax: 'GST B2B and B2C invoice rows in readable form.', reports: 'Open each fetched report and view human-readable data.', rawData: 'Inspect raw fields returned from each imported API/report source before finalizing calculations.', 'report-detail': 'Human-readable rows from the selected SP-API report.', settings: 'Appearance, account and Amazon connection settings.' })[view] ?? 'Live seller KPIs populated from synced SP-API orders and reports.'; }
+function viewTitle(view) { return ({ orderPayments: 'Order Payment Reconciliation', scheduling: 'Order Scheduling', shipments: 'Scheduled Pickups', dashboard: 'Dashboard', sales: 'Sales Analytics', businessPerformance: 'Business Performance', productPerformance: 'Product Performance', inventory: 'Inventory', payouts: 'Payout Reconciliation', brand: 'Brand Analytics', feeAudit: 'Fee Leak Audit', returns: 'Returns', reimbursements: 'Reimbursements', tax: 'GST & Tax', reports: 'Reports', rawData: 'Raw API Data', 'report-detail': 'Report Detail', 'metric-detail': 'Calculation Detail', settings: 'Settings' })[view] ?? 'Dashboard'; }
+function viewDescription(view) { return ({ orderPayments: 'See every rupee from customer order value, through Amazon deductions, to the final FBA or FBM seller receivable.', scheduling: 'Enter each package once, then book Amazon Easy Ship pickups here instead of in Seller Central.', shipments: 'Every Easy Ship pickup booked from this tool, with tracking IDs and labels.', dashboard: 'Amazon-only reconciliation KPIs with explainable drill-downs.', sales: 'Revenue, order value, units and product sales trends from Amazon reports.', businessPerformance: 'Excel-style quarterly business performance report with analysed KPIs and matching graphs.', productPerformance: 'Excel-style product performance analysis with top products and written insights.', inventory: 'FBA inventory snapshots imported from SP-API inventory reports.', payouts: 'Settlement rows and payout reconciliation from Amazon settlement reports.', brand: 'ASIN-level product performance from synced Amazon order items, with Sales & Traffic metrics when available.', returns: 'Customer return reasons, status and disposition.', reimbursements: 'Amazon reimbursement credits for lost, damaged or adjusted inventory.', tax: 'GST B2B and B2C invoice rows in readable form.', reports: 'Open each fetched report and view human-readable data.', rawData: 'Inspect raw fields returned from each imported API/report source before finalizing calculations.', 'report-detail': 'Human-readable rows from the selected SP-API report.', settings: 'Appearance, account and Amazon connection settings.' })[view] ?? 'Live seller KPIs populated from synced SP-API orders and reports.'; }
 
 function OrderPayments({ data }) {
   const rows = data?.orderPayments ?? [];
@@ -1074,6 +1088,408 @@ function StatementsView({ tenantId }) {
         {openId === statement.settlement_id && <tr className="order-detail-row"><td colSpan="9"><StatementDetail tenantId={tenantId} settlementId={statement.settlement_id} /></td></tr>}
       </React.Fragment>)}
     </tbody></table></div> : <Empty text="No settlement statements synced yet. Run the Settlements sync on the Reports page." />}
+  </Card>;
+}
+
+// ---------------------------------------------------------------------------
+// Order Scheduling
+//
+// Ported from the standalone order scheduling tool, which was server-rendered
+// EJS with its own stylesheet. Nothing of that presentation survives on
+// purpose: these use this app's Card / PanelHeader / Button / Input / pill /
+// table-wrap / pager vocabulary and nothing else, so the section reads as part
+// of the same product rather than a second one bolted on. The one genuinely
+// new visual element is the ship-by countdown, which has no equivalent here -
+// and it reuses the existing status-pill colours rather than inventing a
+// palette.
+// ---------------------------------------------------------------------------
+
+// orders.internal_status and shipments.status, in the order an order actually
+// moves through them. The label is what a seller is shown; the raw value never
+// reaches the screen, because "READY_FOR_REVIEW" tells them nothing about what
+// to do and "Needs package info" tells them exactly what to do.
+const SCHEDULING_STATUS = {
+  NEW: { label: 'New', pill: 'status-idle' },
+  SYNCED: { label: 'Synced', pill: 'status-idle' },
+  READY_FOR_REVIEW: { label: 'Needs package info', pill: 'status-running' },
+  READY_TO_SCHEDULE: { label: 'Ready to schedule', pill: 'status-running' },
+  SCHEDULING: { label: 'Scheduling…', pill: 'status-running' },
+  SCHEDULED: { label: 'Scheduled', pill: 'status-completed' },
+  SHIPPED: { label: 'Shipped', pill: 'status-completed' },
+  DELIVERED: { label: 'Delivered', pill: 'status-completed' },
+  PENDING: { label: 'Pending', pill: 'status-idle' },
+  FAILED: { label: 'Failed', pill: 'status-failed' },
+  CANCELLED: { label: 'Cancelled', pill: 'status-idle' }
+};
+const SCHEDULING_STATUS_ORDER = ['READY_FOR_REVIEW', 'READY_TO_SCHEDULE', 'SCHEDULING', 'FAILED', 'SCHEDULED', 'SHIPPED', 'CANCELLED', 'NEW', 'SYNCED'];
+// Views driven by the Orders API rather than by a synced report, so the
+// report-oriented chrome (SyncLedger, the date range) does not apply to them.
+const SCHEDULING_VIEWS = new Set(['scheduling', 'shipments']);
+const PACKAGE_TYPES = ['BOX', 'POLY_BAG', 'ENVELOPE', 'PALLET'];
+
+function SchedulingStatus({ status }) {
+  const meta = SCHEDULING_STATUS[status] ?? { label: status ?? '—', pill: 'status-idle' };
+  return <span className={`pill ${meta.pill}`}>{meta.label}</span>;
+}
+
+// Amazon's ship-by date is a hard deadline: miss it and the order counts
+// against the seller's late-shipment rate. So this is deliberately loud as it
+// approaches, and states hours rather than a date, because "12 Sep" does not
+// convey "in four hours" at a glance.
+function shipByUrgency(shipByDate) {
+  if (!shipByDate) return { level: 'none', label: 'No deadline' };
+  const hours = (new Date(shipByDate).getTime() - Date.now()) / 3_600_000;
+  if (Number.isNaN(hours)) return { level: 'none', label: '—' };
+  if (hours < 0) return { level: 'overdue', label: `Overdue by ${Math.abs(Math.round(hours))}h` };
+  if (hours < 6) return { level: 'critical', label: `${Math.round(hours)}h left` };
+  if (hours < 12) return { level: 'warning', label: `${Math.round(hours)}h left` };
+  if (hours < 48) return { level: 'ok', label: `${Math.round(hours)}h left` };
+  return { level: 'ok', label: `${Math.round(hours / 24)}d left` };
+}
+const URGENCY_PILL = { overdue: 'status-failed', critical: 'status-failed', warning: 'status-running', ok: 'status-completed', none: 'status-idle' };
+function ShipBy({ date }) {
+  const urgency = shipByUrgency(date);
+  return <span className={`pill ${URGENCY_PILL[urgency.level]}`} title={date ? new Date(date).toLocaleString('en-IN') : 'No ship-by date from Amazon'}>{urgency.label}</span>;
+}
+
+function formatGrams(grams) {
+  if (grams == null || grams === '') return '—';
+  const value = Number(grams);
+  return value >= 1000 ? `${(value / 1000).toFixed(2)} kg` : `${formatNumber(value)} g`;
+}
+function formatDimensions(length, width, height) {
+  if ([length, width, height].some(v => v == null || v === '')) return '—';
+  const trim = v => String(Number(v));
+  return `${trim(length)} × ${trim(width)} × ${trim(height)} cm`;
+}
+function formatDateTime(value) {
+  if (!value) return '—';
+  const date = new Date(value);
+  return Number.isNaN(date.getTime()) ? '—' : date.toLocaleString('en-IN', { day: '2-digit', month: 'short', year: 'numeric', hour: '2-digit', minute: '2-digit' });
+}
+
+function OrderScheduling({ tenantId }) {
+  const [overview, setOverview] = useState(null);
+  const [orders, setOrders] = useState(null);
+  const [page, setPage] = useState(1);
+  const [search, setSearch] = useState('');
+  // '' means "All statuses" and undefined means "not chosen", which the API
+  // treats differently: unchosen hides the terminal statuses so the first
+  // thing a seller sees is the work that still needs doing.
+  const [status, setStatus] = useState(undefined);
+  const [selected, setSelected] = useState(() => new Set());
+  const [openOrderId, setOpenOrderId] = useState('');
+  const [busy, setBusy] = useState('');
+  const [error, setError] = useState('');
+  const [notice, setNotice] = useState('');
+
+  async function loadOverview() {
+    try { setOverview(await api(`/api/tenants/${tenantId}/scheduling/overview`)); }
+    catch (e) { setError(e.message); }
+  }
+  async function loadOrders() {
+    setError('');
+    const query = new URLSearchParams({ page: String(page) });
+    if (search) query.set('q', search);
+    if (status !== undefined) query.set('status', status);
+    try {
+      const result = await api(`/api/tenants/${tenantId}/scheduling/orders?${query}`);
+      setOrders(result);
+      // Drop selections for orders that are no longer on screen, so a
+      // "Schedule selected" click can never act on a row the seller can't see.
+      setSelected(previous => new Set(result.orders.filter(o => previous.has(o.id)).map(o => o.id)));
+    } catch (e) { setError(e.message); setOrders({ orders: [], total: 0, pageCount: 1 }); }
+  }
+  useEffect(() => { loadOverview(); }, [tenantId]);
+  useEffect(() => { loadOrders(); }, [tenantId, page, status]);
+
+  async function runSync() {
+    setBusy('sync'); setError(''); setNotice('');
+    try {
+      const result = await api(`/api/tenants/${tenantId}/scheduling/sync`, { method: 'POST' });
+      const failed = result.results.filter(r => !r.ok);
+      setNotice(failed.length
+        ? `Pulled ${formatNumber(result.synced)} order(s). ${failed.length} account(s) failed: ${failed.map(f => f.reason).join('; ')}`
+        : `Pulled ${formatNumber(result.synced)} order${result.synced === 1 ? '' : 's'} from Amazon.`);
+      await Promise.all([loadOverview(), loadOrders()]);
+    } catch (e) { setError(e.message); }
+    finally { setBusy(''); }
+  }
+
+  async function scheduleSelected() {
+    if (!selected.size) return;
+    setBusy('bulk'); setError(''); setNotice('');
+    try {
+      const result = await api(`/api/tenants/${tenantId}/scheduling/orders/bulk-schedule`, {
+        method: 'POST', body: JSON.stringify({ orderIds: [...selected] })
+      });
+      const failures = result.results.filter(r => !r.ok);
+      // Named, not counted: "3 of 5 scheduled" leaves the seller hunting for
+      // which two, and the reason is usually one they can act on immediately.
+      setNotice(failures.length
+        ? `${formatNumber(result.succeeded)} of ${formatNumber(result.attempted)} scheduled. Not scheduled: ${failures.map(f => f.reason).join('; ')}`
+        : `All ${formatNumber(result.succeeded)} selected order${result.succeeded === 1 ? '' : 's'} scheduled.`);
+      setSelected(new Set());
+      await Promise.all([loadOverview(), loadOrders()]);
+    } catch (e) { setError(e.message); }
+    finally { setBusy(''); }
+  }
+
+  function toggle(orderId) {
+    setSelected(previous => {
+      const next = new Set(previous);
+      if (next.has(orderId)) next.delete(orderId); else next.add(orderId);
+      return next;
+    });
+  }
+
+  const rows = orders?.orders ?? [];
+  const schedulable = rows.filter(order => order.internal_status === 'READY_TO_SCHEDULE');
+  const allSelected = schedulable.length > 0 && schedulable.every(order => selected.has(order.id));
+  const counts = overview?.counts ?? {};
+
+  if (overview && !overview.connected) {
+    return <Card className="table-card">
+      <PanelHeader title="Order Scheduling" subtitle="book Amazon Easy Ship pickups for the orders you have to ship" />
+      <p className="alert warning">Connect your Amazon account in Settings → Amazon Connection first. Order scheduling uses the same connection as your reports — there is no second Amazon login to do.</p>
+    </Card>;
+  }
+
+  return <>
+    <Card className="table-card">
+      <PanelHeader title="Orders to ship" subtitle="pulled from Amazon automatically every hour" />
+      <p className="reconciliation-note">These are your Amazon Easy Ship orders. Enter the real weight and box size once — Amazon needs both to quote a pickup slot — then schedule the pickup here instead of in Seller Central. Orders arrive on their own; the Sync button is only for when you want them right now.</p>
+      <div className="table-card-actions">
+        <Button variant="secondary" disabled={busy === 'sync'} onClick={runSync}>{busy === 'sync' ? 'Pulling from Amazon…' : 'Sync orders now'}</Button>
+        <Button disabled={!selected.size || busy === 'bulk'} onClick={scheduleSelected}>
+          {busy === 'bulk' ? 'Scheduling…' : `Schedule selected${selected.size ? ` (${selected.size})` : ''}`}
+        </Button>
+      </div>
+      {notice && <p className="alert success">{notice}</p>}
+      {error && <p className="alert error">{error}</p>}
+
+      <div className="reconciliation-summary scheduling-filters">
+        <button type="button" className={status === undefined ? 'active' : ''} onClick={() => { setStatus(undefined); setPage(1); }}>
+          <strong>{formatNumber(SCHEDULING_STATUS_ORDER.filter(s => !(overview?.doneStatuses ?? []).includes(s)).reduce((sum, s) => sum + (counts[s] ?? 0), 0))}</strong>
+          <span>Still need action</span>
+        </button>
+        {['READY_FOR_REVIEW', 'READY_TO_SCHEDULE', 'SCHEDULED', 'FAILED'].map(key =>
+          <button type="button" key={key} className={status === key ? 'active' : ''} onClick={() => { setStatus(key); setPage(1); }}>
+            <strong>{formatNumber(counts[key] ?? 0)}</strong>
+            <span>{SCHEDULING_STATUS[key].label}</span>
+          </button>
+        )}
+        <button type="button" className={status === '' ? 'active' : ''} onClick={() => { setStatus(''); setPage(1); }}>
+          <strong>{formatNumber(Object.values(counts).reduce((sum, n) => sum + n, 0))}</strong>
+          <span>All orders</span>
+        </button>
+      </div>
+
+      <div className="order-search">
+        <Input value={search} onChange={event => setSearch(event.target.value)} onKeyDown={event => { if (event.key === 'Enter') { setPage(1); loadOrders(); } }} placeholder="Search order ID, SKU or ASIN…" />
+        <Button variant="ghost" onClick={() => { setPage(1); loadOrders(); }}>Search</Button>
+        <span>{formatNumber(orders?.total ?? 0)} matching orders</span>
+      </div>
+
+      {!orders ? <Empty text="Loading your Amazon orders…" /> : rows.length ? <>
+        <div className="table-wrap"><table>
+          <thead><tr>
+            <th><input type="checkbox" aria-label="Select every schedulable order on this page" checked={allSelected} disabled={!schedulable.length}
+              onChange={() => setSelected(allSelected ? new Set() : new Set(schedulable.map(o => o.id)))} /></th>
+            {['Order', 'Ordered', 'Ship by', 'Status', 'Weight', 'Dimensions', ''].map(label => <th key={label}>{label}</th>)}
+          </tr></thead>
+          <tbody>{rows.map(order => <React.Fragment key={order.id}>
+            <tr>
+              <td>{order.internal_status === 'READY_TO_SCHEDULE'
+                ? <input type="checkbox" aria-label={`Select order ${order.external_order_id}`} checked={selected.has(order.id)} onChange={() => toggle(order.id)} />
+                : null}</td>
+              <td><b>{order.external_order_id}</b>{order.is_prime ? <> <span className="pill status-idle">Prime</span></> : null}<br /><small className="muted">{order.marketplace_name ?? order.marketplace_code} · {formatNumber(order.item_count ?? 0)} item{order.item_count === 1 ? '' : 's'}</small></td>
+              <td>{String(order.order_date ?? '').slice(0, 10)}</td>
+              <td><ShipBy date={order.ship_by_date} /></td>
+              <td><SchedulingStatus status={order.internal_status} /></td>
+              <td>{formatGrams(order.package?.weight_grams)}</td>
+              <td>{formatDimensions(order.package?.length_cm, order.package?.width_cm, order.package?.height_cm)}</td>
+              <td><Button variant="ghost" onClick={() => setOpenOrderId(openOrderId === order.id ? '' : order.id)}>{openOrderId === order.id ? 'Hide' : 'Open'}</Button></td>
+            </tr>
+            {openOrderId === order.id && <tr className="order-detail-row"><td colSpan="8">
+              <SchedulingOrderDetail tenantId={tenantId} orderId={order.id} onChanged={() => { loadOrders(); loadOverview(); }} />
+            </td></tr>}
+          </React.Fragment>)}</tbody>
+        </table></div>
+        {orders.pageCount > 1 && <div className="pager">
+          <Button variant="ghost" disabled={page <= 1} onClick={() => setPage(p => Math.max(1, p - 1))}>← Previous</Button>
+          <span>Page {orders.page} of {orders.pageCount} · {formatNumber(orders.total)} orders</span>
+          <Button variant="ghost" disabled={page >= orders.pageCount} onClick={() => setPage(p => p + 1)}>Next →</Button>
+        </div>}
+      </> : <Empty text={status === undefined
+        ? 'Nothing needs action right now — every synced order is scheduled, shipped or cancelled.'
+        : 'No orders match this filter.'} />}
+    </Card>
+  </>;
+}
+
+// The package form and the schedule button, opened inline from a row. Inline
+// rather than a separate page because the whole job is "read the label, type
+// four numbers, click schedule", and losing your place in the list between
+// each order makes that job worse.
+function SchedulingOrderDetail({ tenantId, orderId, onChanged }) {
+  const [detail, setDetail] = useState(null);
+  const [form, setForm] = useState(null);
+  const [busy, setBusy] = useState('');
+  const [error, setError] = useState('');
+  const [notice, setNotice] = useState('');
+
+  async function load() {
+    setError('');
+    try {
+      const result = await api(`/api/tenants/${tenantId}/scheduling/orders/${orderId}`);
+      setDetail(result);
+      setForm({
+        weightGrams: result.package?.weight_grams ?? '',
+        lengthCm: result.package?.length_cm ?? '',
+        widthCm: result.package?.width_cm ?? '',
+        heightCm: result.package?.height_cm ?? '',
+        packageType: result.package?.package_type ?? ''
+      });
+    } catch (e) { setError(e.message); }
+  }
+  useEffect(() => { load(); }, [tenantId, orderId]);
+
+  async function savePackage(event) {
+    event.preventDefault();
+    setBusy('save'); setError(''); setNotice('');
+    try {
+      const result = await api(`/api/tenants/${tenantId}/scheduling/orders/${orderId}/package`, { method: 'PUT', body: JSON.stringify(form) });
+      setDetail(previous => ({ ...previous, ...result }));
+      setNotice('Package saved.');
+      onChanged?.();
+    } catch (e) { setError(e.message); }
+    finally { setBusy(''); }
+  }
+
+  async function schedule() {
+    setBusy('schedule'); setError(''); setNotice('');
+    try {
+      const result = await api(`/api/tenants/${tenantId}/scheduling/orders/${orderId}/schedule`, { method: 'POST' });
+      // A refused schedule comes back 200 with ok:false and a reason - the
+      // request was understood, Amazon or a pre-flight check just said no.
+      // Showing that reason is the entire point; a generic failure would send
+      // the seller to Seller Central to find out why.
+      if (result.ok) setNotice('Pickup scheduled with Amazon.');
+      else setError(result.reason ?? 'This order could not be scheduled.');
+      await load();
+      onChanged?.();
+    } catch (e) { setError(e.message); }
+    finally { setBusy(''); }
+  }
+
+  if (error && !detail) return <p className="alert error">{error}</p>;
+  if (!detail) return <Empty text="Loading order…" />;
+
+  const terminal = { SCHEDULED: 'Already scheduled', CANCELLED: 'Order cancelled', SHIPPED: 'Already shipped' }[detail.order.internal_status];
+  const set = (key, value) => setForm(previous => ({ ...previous, [key]: value }));
+
+  return <div className="order-detail-grid">
+    <div>
+      <h4>Order</h4>
+      <p>
+        <b>{detail.order.external_order_id}</b><br />
+        Ordered {formatDateTime(detail.order.order_date)}<br />
+        Ship by {formatDateTime(detail.order.ship_by_date)}<br />
+        Deliver by {formatDateTime(detail.order.delivery_by_date)}<br />
+        Amazon status: {detail.order.marketplace_status ?? '—'}
+      </p>
+      <h4>Items</h4>
+      {detail.items.length ? detail.items.map(item => <p key={item.id}>
+        <b>{formatNumber(item.quantity_ordered)}× {item.title || item.external_product_id}</b><br />
+        <small className="muted">{item.external_product_id}{item.sku ? ` · SKU ${item.sku}` : ''}</small>
+      </p>) : <p className="muted">Amazon has not returned the items for this order yet.</p>}
+
+      <h4>Shipments</h4>
+      {detail.shipments.length ? <div className="table-wrap"><table>
+        <thead><tr><th>Status</th><th>Tracking</th><th>Pickup</th><th>Label</th></tr></thead>
+        <tbody>{detail.shipments.map(shipment => <tr key={shipment.id}>
+          <td><SchedulingStatus status={shipment.status} /></td>
+          <td>{shipment.tracking_id || '—'}</td>
+          <td>{formatDateTime(shipment.scheduled_pickup_start)}</td>
+          <td>{shipment.label_url ? <a href={shipment.label_url} target="_blank" rel="noopener noreferrer">Open label</a> : '—'}</td>
+        </tr>)}</tbody>
+      </table></div> : <p className="muted">Nothing scheduled yet.</p>}
+    </div>
+
+    <div>
+      <h4>Package</h4>
+      <p className="muted">Amazon quotes a pickup slot from the real weight and box size, so these have to be measured, not estimated. They are saved against this order and reused if you reschedule.</p>
+      {notice && <p className="alert success">{notice}</p>}
+      {error && <p className="alert error">{error}</p>}
+      <form className="scheduling-package-form" onSubmit={savePackage}>
+        <label>Weight (grams)<Input type="number" step="1" min="1" value={form.weightGrams} onChange={e => set('weightGrams', e.target.value)} /></label>
+        <label>Length (cm)<Input type="number" step="0.1" min="0.1" value={form.lengthCm} onChange={e => set('lengthCm', e.target.value)} /></label>
+        <label>Width (cm)<Input type="number" step="0.1" min="0.1" value={form.widthCm} onChange={e => set('widthCm', e.target.value)} /></label>
+        <label>Height (cm)<Input type="number" step="0.1" min="0.1" value={form.heightCm} onChange={e => set('heightCm', e.target.value)} /></label>
+        <label>Package type
+          <select className="input" value={form.packageType} onChange={e => set('packageType', e.target.value)}>
+            <option value="">Select…</option>
+            {PACKAGE_TYPES.map(type => <option key={type} value={type}>{type.replace('_', ' ')}</option>)}
+          </select>
+        </label>
+        <Button type="submit" variant="secondary" disabled={busy === 'save'}>{busy === 'save' ? 'Saving…' : 'Save package'}</Button>
+      </form>
+
+      {detail.isComplete
+        ? <Button disabled={Boolean(terminal) || busy === 'schedule'} onClick={schedule}>{terminal ?? (busy === 'schedule' ? 'Asking Amazon…' : 'Schedule pickup')}</Button>
+        // Disabled here purely to avoid a dead-end click; the API refuses the
+        // same thing independently (schedulingService's preflight), so this is
+        // a courtesy, not the guard.
+        : <><p className="muted"><b>Fill in every field above before scheduling.</b> Still missing: {detail.missingFields.join(', ')}.</p>
+          <Button disabled title="Fill in every field above first">Schedule pickup</Button></>}
+    </div>
+  </div>;
+}
+
+function SchedulingShipments({ tenantId }) {
+  const [data, setData] = useState(null);
+  const [page, setPage] = useState(1);
+  const [search, setSearch] = useState('');
+  const [error, setError] = useState('');
+
+  async function load() {
+    setError('');
+    const query = new URLSearchParams({ page: String(page) });
+    if (search) query.set('q', search);
+    try { setData(await api(`/api/tenants/${tenantId}/scheduling/shipments?${query}`)); }
+    catch (e) { setError(e.message); setData({ shipments: [], total: 0, pageCount: 1 }); }
+  }
+  useEffect(() => { load(); }, [tenantId, page]);
+
+  return <Card className="table-card">
+    <PanelHeader title="Scheduled pickups" subtitle="every Easy Ship booking made from this tool" />
+    <p className="reconciliation-note">One row per pickup Amazon accepted. The tracking ID and label appear as soon as Amazon issues them — print the label and hand the package over in the pickup window.</p>
+    <div className="order-search">
+      <Input value={search} onChange={event => setSearch(event.target.value)} onKeyDown={event => { if (event.key === 'Enter') { setPage(1); load(); } }} placeholder="Search tracking ID or order ID…" />
+      <Button variant="ghost" onClick={() => { setPage(1); load(); }}>Search</Button>
+      <span>{formatNumber(data?.total ?? 0)} shipments</span>
+    </div>
+    {error && <p className="alert error">{error}</p>}
+    {!data ? <Empty text="Loading your scheduled pickups…" /> : data.shipments.length ? <>
+      <div className="table-wrap"><table>
+        <thead><tr>{['Order', 'Status', 'Tracking', 'Carrier', 'Pickup window', 'Booked', 'Label'].map(label => <th key={label}>{label}</th>)}</tr></thead>
+        <tbody>{data.shipments.map(shipment => <tr key={shipment.id}>
+          <td><b>{shipment.external_order_id}</b><br /><small className="muted">{shipment.marketplace_code}</small></td>
+          <td><SchedulingStatus status={shipment.status} />{shipment.status === 'FAILED' && shipment.failure_reason ? <><br /><small className="muted">{shipment.failure_reason}</small></> : null}</td>
+          <td>{shipment.tracking_id || '—'}</td>
+          <td>{shipment.carrier_name || '—'}</td>
+          <td>{shipment.scheduled_pickup_start ? `${formatDateTime(shipment.scheduled_pickup_start)} → ${formatDateTime(shipment.scheduled_pickup_end)}` : '—'}</td>
+          <td>{formatDateTime(shipment.created_at)}</td>
+          <td>{shipment.label_url ? <a href={shipment.label_url} target="_blank" rel="noopener noreferrer">Open label</a> : '—'}</td>
+        </tr>)}</tbody>
+      </table></div>
+      {data.pageCount > 1 && <div className="pager">
+        <Button variant="ghost" disabled={page <= 1} onClick={() => setPage(p => Math.max(1, p - 1))}>← Previous</Button>
+        <span>Page {data.page} of {data.pageCount} · {formatNumber(data.total)} shipments</span>
+        <Button variant="ghost" disabled={page >= data.pageCount} onClick={() => setPage(p => p + 1)}>Next →</Button>
+      </div>}
+    </> : <Empty text="No pickups scheduled yet. Schedule one from Order Scheduling." />}
   </Card>;
 }
 
