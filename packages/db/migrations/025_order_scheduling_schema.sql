@@ -258,6 +258,19 @@ CREATE INDEX IF NOT EXISTS idx_audit_logs_user ON scheduling.audit_logs (user_id
 -- an audit row must survive the seller it describes being deleted), and a
 -- policy comparing NULL to the current tenant would silently discard exactly
 -- the platform-level entries an audit trail exists to keep.
+--
+-- The comparison is `seller_id::text = <setting>`, casting the COLUMN to text
+-- rather than the setting to uuid, and that direction is deliberate. A
+-- connection is handed back to the pool with the setting cleared, and the only
+-- way to clear a GUC on a live connection is to set it to the empty string -
+-- so the next query on that pooled connection evaluates this expression with
+-- ''. `''::uuid` is not NULL, it is a hard error ("invalid input syntax for
+-- type uuid"), which would turn a perfectly ordinary pooled-connection reuse
+-- into a 500 on a random later request - the kind of failure that reproduces
+-- once a day and never in a test. Casting the column instead makes the empty
+-- string an ordinary non-match: the query returns no rows, which is the
+-- correct and safe answer for a connection with no tenant bound. It is also
+-- exactly the form the reconciliation tables have used since 001_init.sql.
 DO $$
 DECLARE t text;
 BEGIN
@@ -268,8 +281,10 @@ BEGIN
     EXECUTE format('ALTER TABLE scheduling.%I ENABLE ROW LEVEL SECURITY', t);
     EXECUTE format('ALTER TABLE scheduling.%I FORCE ROW LEVEL SECURITY', t);
     EXECUTE format('DROP POLICY IF EXISTS tenant_isolation ON scheduling.%I', t);
+    -- No explicit WITH CHECK: Postgres reuses the USING expression for it,
+    -- which is what blocks a tenant from INSERTing a row owned by another.
     EXECUTE format(
-      'CREATE POLICY tenant_isolation ON scheduling.%I USING (seller_id = current_setting(''app.current_tenant_id'', true)::uuid)',
+      'CREATE POLICY tenant_isolation ON scheduling.%I USING (seller_id::text = current_setting(''app.current_tenant_id'', true))',
       t
     );
   END LOOP;

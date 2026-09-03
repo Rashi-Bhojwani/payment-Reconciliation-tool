@@ -45,9 +45,15 @@ test.before(async () => {
 });
 
 test.after(async () => {
-  // The nightly cron timer and the listening socket would otherwise keep this
-  // process alive long after the assertions are done.
+  // Every cron timer and the listening socket would otherwise keep this
+  // process alive long after the assertions are done. Note the plural: the
+  // server starts two schedulers (the nightly reconciliation sync and the
+  // hourly order-scheduling sweep), and missing either one hangs this file
+  // forever rather than failing it - which is exactly what happened when the
+  // second was added. Anything else that starts a timer in server.js has to
+  // be stopped here too.
   server?.scheduler?.stop?.();
+  server?.schedulingScheduler?.stop?.();
   await server?.app?.close?.();
 });
 

@@ -78,11 +78,11 @@ export async function setSubscription(marketplaceAccountId, { subscriptionId, de
 /** Admin view: which accounts are falling behind, and why. */
 export async function listAtRisk({ lagMinutes = 120 } = {}, client) {
   const { rows } = await query(
-    `SELECT ma.id AS marketplace_account_id, ma.seller_id, s.seller_name,
+    `SELECT ma.id AS marketplace_account_id, ma.seller_id, t.company_name AS seller_name,
             m.code AS marketplace_code, ma.status AS connection_status,
             st.last_synced_at, st.consecutive_failures, st.circuit_open_until
        FROM marketplace_accounts ma
-       JOIN sellers s ON s.id = ma.seller_id
+       JOIN public.tenants t ON t.id = ma.seller_id
        JOIN marketplaces m ON m.id = ma.marketplace_id
        LEFT JOIN marketplace_account_sync_state st ON st.marketplace_account_id = ma.id
       WHERE ma.status <> 'PENDING'

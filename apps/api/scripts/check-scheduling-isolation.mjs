@@ -78,17 +78,27 @@ try {
   }
   await admin.query('commit');
 
-  // The probe's user has to be rewritten INTO the URL, not passed alongside
-  // it. node-postgres lets a connectionString win over a sibling `user`
-  // option, so the obvious spelling silently connects as whoever the URL
-  // names - here, the superuser - and every isolation check then passes for
-  // the wrong reason: superusers bypass row-level security entirely. Caught
-  // exactly that way while writing this: the leak it reported was real
-  // superuser access, not a broken policy.
-  const probeUrl = new URL(url);
-  probeUrl.username = 'scheduling_isolation_probe';
-  probeUrl.password = '';
-  const probe = new pg.Client({ connectionString: probeUrl.toString() });
+  // The probe must connect as the unprivileged role, and getting that wrong
+  // is the whole ballgame: node-postgres lets a connectionString win over a
+  // sibling `user` option, so `new pg.Client({ connectionString: url, user:
+  // 'probe' })` - the obvious spelling - silently connects as whoever the URL
+  // names. Here that is the superuser, and every check below then passes for
+  // the wrong reason, because superusers bypass row-level security entirely.
+  // Caught exactly that way while writing this: the "leak" it reported was
+  // real superuser access, not a broken policy.
+  //
+  // So no connectionString at all. The admin client has already resolved the
+  // URL into discrete parameters; reusing those with `user` replaced leaves
+  // nothing for a precedence rule to override. It also handles connection
+  // strings that are not valid WHATWG URLs - a unix-socket DSN like
+  // `postgres://postgres@/db?host=/tmp` has an empty host and makes `new
+  // URL()` throw, which an earlier version of this did.
+  const { host, port, database, ssl } = admin.connectionParameters;
+  const probe = new pg.Client({
+    host, port, database, ssl,
+    user: 'scheduling_isolation_probe',
+    password: undefined,
+  });
   await probe.connect();
   try {
     await probe.query('select set_config($1,$2,false)', ['app.current_tenant_id', TENANT_A]);
@@ -125,6 +135,34 @@ try {
       insertBlocked = true;
     }
     check(insertBlocked, 'a tenant cannot insert a scheduling order against another tenant');
+
+    // Releasing a pooled connection means clearing the setting, and the only
+    // way to clear a GUC is to set it to ''. So the very next borrower of that
+    // connection evaluates the policy with an empty string - and if the policy
+    // casts that to uuid, the query does not return zero rows, it raises
+    // "invalid input syntax for type uuid". That is a 500 on an unrelated
+    // later request, on a connection that happens to be reused: intermittent,
+    // unattributable, and effectively impossible to reproduce on demand.
+    // Whether the policy compares as text is therefore not a style question,
+    // and this asserts it against the running database rather than the SQL
+    // file.
+    await probe.query("select set_config('app.current_tenant_id','',false)");
+    let clearedIsUsable = false;
+    let clearedRows = -1;
+    try {
+      const cleared = await probe.query('select count(*)::int as n from scheduling.orders');
+      clearedIsUsable = true;
+      clearedRows = cleared.rows[0].n;
+    } catch (error) {
+      clearedIsUsable = false;
+      clearedRows = error.message;
+    }
+    check(
+      clearedIsUsable && clearedRows === 0,
+      'a connection whose tenant was cleared returns no rows instead of erroring',
+      clearedIsUsable ? `saw ${clearedRows} row(s)` : `raised: ${clearedRows}`
+    );
+    await probe.query('select set_config($1,$2,false)', ['app.current_tenant_id', TENANT_A]);
 
     for (const table of ['marketplace_accounts', 'order_items', 'packages', 'package_items', 'shipments', 'marketplace_connection_requests']) {
       const { rows: [policy] } = await admin.query(

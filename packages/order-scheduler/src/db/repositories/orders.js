@@ -76,17 +76,17 @@ export async function listForMarketplace(
   }
   if (search) {
     params.push(`%${search}%`);
-    where.push(`(o.external_order_id ILIKE $${params.length} OR s.seller_name ILIKE $${params.length})`);
+    where.push(`(o.external_order_id ILIKE $${params.length} OR t.company_name ILIKE $${params.length})`);
   }
   params.push(Math.min(limit, 200), offset);
 
   const { rows } = await query(
     `SELECT ${COLUMNS.split(',').map((c) => `o.${c.trim()}`).join(', ')},
-            s.seller_name,
+            t.company_name AS seller_name,
             COUNT(*) OVER () AS total_count,
             (SELECT COUNT(*) FROM order_items i WHERE i.order_id = o.id)::int AS item_count
        FROM orders o
-       JOIN sellers s ON s.id = o.seller_id
+       JOIN public.tenants t ON t.id = o.seller_id
       WHERE ${where.join(' AND ')}
       ORDER BY o.order_date DESC
       LIMIT $${params.length - 1} OFFSET $${params.length}`,

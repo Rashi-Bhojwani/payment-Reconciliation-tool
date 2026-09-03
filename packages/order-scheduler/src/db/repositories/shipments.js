@@ -50,14 +50,24 @@ export async function list(sellerIds, { status, search, limit = 50, offset = 0 }
   }
   params.push(Math.min(limit, 200), offset);
 
+  // public.tenants is spelled out in the join below. Unqualified `sellers`
+  // resolves through search_path to reconciliation's own sellers table, whose
+  // id is a seller row id and never a tenant id — the join would match
+  // nothing and this list would silently come back empty.
+  //
+  // The standalone tool's sellers table also carried a per-seller `timezone`,
+  // which this query used to select. tenants has no such column; every caller
+  // formats against config.marketplace.defaultTimezone anyway, so it is
+  // dropped rather than faked with a plausible default.
   const { rows } = await query(
     `SELECT ${COLUMNS.split(',').map((c) => `sh.${c.trim()}`).join(', ')},
             COUNT(*) OVER () AS total_count,
-            o.external_order_id, o.ship_by_date, s.seller_name, s.timezone,
+            o.external_order_id, o.ship_by_date,
+            t.company_name AS seller_name,
             m.code AS marketplace_code
        FROM shipments sh
        JOIN orders  o ON o.id = sh.order_id AND o.seller_id = sh.seller_id
-       JOIN sellers s ON s.id = sh.seller_id
+       JOIN public.tenants t ON t.id = sh.seller_id
        JOIN marketplaces m ON m.id = o.marketplace_id
       WHERE ${where.join(' AND ')}
       ORDER BY sh.created_at DESC

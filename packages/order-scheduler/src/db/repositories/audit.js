@@ -53,10 +53,10 @@ export async function list({ sellerId = null, userId = null, accessedPii = null,
   const { rows } = await query(
     `SELECT a.id, a.user_id, a.seller_id, a.action, a.entity_type, a.entity_id,
             a.changes, a.accessed_pii, a.ip_address, a.created_at,
-            u.email AS user_email, s.seller_name
+            u.email AS user_email, t.company_name AS seller_name
        FROM audit_logs a
-       LEFT JOIN users u   ON u.id = a.user_id
-       LEFT JOIN sellers s ON s.id = a.seller_id
+       LEFT JOIN public.users u   ON u.id = a.user_id
+       LEFT JOIN public.tenants t ON t.id = a.seller_id
       ${where.length ? `WHERE ${where.join(' AND ')}` : ''}
       ORDER BY a.created_at DESC
       LIMIT $${params.length - 1} OFFSET $${params.length}`,

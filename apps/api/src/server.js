@@ -15,6 +15,8 @@ import { categorizeFinanceLabel } from './jobs/finance-components.js';
 import { CALCULATION_REVISION, calculateDashboardMetrics } from './jobs/dashboard-calculations.js';
 import { matchesAmazonTotal, round2, statementBucket, statementPeriod, summariseStatementRows } from './jobs/settlement-statements.js';
 import { runFeeAuditForTenant } from './jobs/fee-audit.js';
+import { startSchedulingScheduler } from './jobs/scheduling-sync.js';
+import schedulingRoutes from './routes/scheduling.js';
 
 // Default 1 MiB body limit is fine for every other route, but a manually
 // uploaded settlement or GST MTR flat file (see /reports/:reportType/upload)
@@ -1783,8 +1785,14 @@ if (!databaseUrlConfigured) {
     .catch(error => app.log.warn({ err: normalizeDatabaseError(error) }, 'Admin seed skipped; run migrations before first login'));
 }
 
+// Registered last so it cannot shadow any existing route, and given
+// requireTenantUser rather than reimplementing it - the scheduling routes are
+// behind exactly the same tenant check as every other /api/tenants route.
+await app.register(schedulingRoutes, { requireTenantUser });
+
 const scheduler = startScheduler();
+const schedulingScheduler = startSchedulingScheduler();
 // PORT is what every hosting platform hands a process; 4000 stays the default
 // so `npm run dev` and the web app's VITE_API_URL are unchanged.
 await app.listen({ port: Number(process.env.PORT ?? 4000), host: '0.0.0.0' });
-export { app, scheduler };
+export { app, scheduler, schedulingScheduler };

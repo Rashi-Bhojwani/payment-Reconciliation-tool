@@ -39,11 +39,15 @@ export async function listBySeller(sellerId, client) {
 export async function listByMarketplaceForSellers(marketplaceId, sellerIds, client) {
   if (!sellerIds?.length) return [];
   const { rows } = await query(
-    `SELECT ma.*, s.seller_name
+    // public.tenants, spelled out. Unqualified `sellers` would resolve
+    // through search_path to public.sellers - reconciliation's Amazon
+    // connection table - whose id is a seller row id, never a tenant id, so
+    // the join would match nothing and this would quietly return [].
+    `SELECT ma.*, t.company_name AS seller_name
        FROM marketplace_accounts ma
-       JOIN sellers s ON s.id = ma.seller_id
+       JOIN public.tenants t ON t.id = ma.seller_id
       WHERE ma.marketplace_id = $1 AND ma.seller_id = ANY($2::uuid[])
-      ORDER BY (ma.status = 'AUTHORIZED') DESC, s.seller_name`,
+      ORDER BY (ma.status = 'AUTHORIZED') DESC, t.company_name`,
     [marketplaceId, sellerIds],
     client,
   );
@@ -120,14 +124,24 @@ export async function setStatus(sellerId, marketplaceAccountId, status, client) 
   return rows[0] ?? null;
 }
 
-/** Every AUTHORIZED account, for the order-sync scheduler — no seller in scope by nature. */
-export async function listAllAuthorized(client) {
+/**
+ * Every AUTHORIZED account for ONE seller, for the order-sync scheduler.
+ *
+ * In the standalone tool this was listAllAuthorized() — no seller argument,
+ * every account in the database, because the sweep is by nature cross-seller.
+ * That signature cannot survive the merge: `marketplace_accounts` is now
+ * behind FORCE row-level security, so the same query on a connection with no
+ * tenant bound returns an empty list and the sweep silently decides there is
+ * nothing to sync. The sweep enumerates tenants itself now and calls this
+ * once per tenant inside withSchedulingTenant — see jobs/reconcileAccounts.js.
+ */
+export async function listAuthorizedBySeller(sellerId, client) {
   const { rows } = await query(
     `SELECT ma.*, m.code AS marketplace_code
        FROM marketplace_accounts ma
        JOIN marketplaces m ON m.id = ma.marketplace_id
-      WHERE ma.status = 'AUTHORIZED'`,
-    [],
+      WHERE ma.seller_id = $1 AND ma.status = 'AUTHORIZED'`,
+    [sellerId],
     client,
   );
   return rows;
