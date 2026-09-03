@@ -127,6 +127,20 @@ export function query(text, params, client) {
 export async function withTransaction(fn) {
   const scope = tenantScope.getStore();
   if (scope) {
+    // One connection means one transaction at a time. Two overlapping
+    // withTransaction calls on the same scope would issue BEGIN inside an open
+    // transaction (Postgres warns and ignores it) and then the first COMMIT
+    // would commit BOTH - so a rollback in the second would silently roll back
+    // nothing. Nothing in the ported services does this: every one of them
+    // walks its work with a sequential `for ... of await` loop. This is here so
+    // that if that ever changes, it changes with an error rather than with
+    // occasional half-written data.
+    if (scope.inTransaction) {
+      throw new Error(
+        'A scheduling transaction is already open on this tenant scope. Two overlapping transactions cannot share one connection - run them sequentially, or give the second its own scope.',
+      );
+    }
+    scope.inTransaction = true;
     await scope.client.query('BEGIN');
     try {
       const result = await fn(scope.client);
@@ -135,6 +149,8 @@ export async function withTransaction(fn) {
     } catch (error) {
       await scope.client.query('ROLLBACK').catch(() => {});
       throw error;
+    } finally {
+      scope.inTransaction = false;
     }
   }
 
@@ -203,7 +219,7 @@ export async function withSchedulingTenant(tenantId, fn) {
   client.on('error', onError);
   try {
     await client.query('select set_config($1,$2,false)', ['app.current_tenant_id', tenantId]);
-    return await tenantScope.run({ tenantId, client }, () => fn(client));
+    return await tenantScope.run({ tenantId, client, inTransaction: false }, () => fn(client));
   } finally {
     // Clearing a GUC on a live connection means setting it to the empty
     // string; there is no "unset". The policies in migration 025 compare
