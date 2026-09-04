@@ -630,9 +630,30 @@ function InitialBackfillGate({ seller }) {
           </div>;
         })}
       </div>
-      {stalled && <p className="alert warning">This is taking longer than usual - if it doesn't move for a while, refresh the page. Nothing is lost either way; it will pick back up.</p>}
+      {/* The old copy here said "refresh the page ... it will pick back up",
+          which was not true and cost a seller a day of waiting on it. If the
+          API process stopped mid-backfill there is nothing left to pick back
+          up, and refreshing cannot start it. The server releases the block
+          itself once the backfill has gone half an hour without progress
+          (backfill_heartbeat_at), so the honest thing to say is how long that
+          takes and what happens next. */}
+      {stalled && <p className="alert warning">This has not moved for a while. If the sync stopped, this page unblocks on its own within about 30 minutes and everything already pulled is kept - you can then finish the remaining sources from the Reports page. Nothing you do here speeds it up, so there is no need to wait on this screen.</p>}
     </Card>
   );
+}
+
+// Shown after the server gives up on a stalled backfill (see the stale sweep
+// in the dashboard handler). Deliberately not a blocking screen: the whole
+// point of releasing the block is that the seller gets their dashboard back,
+// with an honest note about which sources are thin rather than a spinner that
+// never resolves.
+function BackfillIncompleteNotice({ seller }) {
+  const progress = seller.backfillProgress ?? {};
+  const unfinished = REPORTS.filter(report => (progress[report.type] ?? 'pending') !== 'completed');
+  return <p className="alert warning">
+    The one-time 90-day sync stopped before it finished{unfinished.length ? <> — {unfinished.map(r => r.label).join(', ')} {unfinished.length === 1 ? 'has' : 'have'} no history yet</> : null}.
+    Everything it did pull is saved and the figures below are built from it. Run the missing sources from the <b>Reports</b> page when you want the rest; day-to-day data keeps syncing automatically either way.
+  </p>;
 }
 
 // A settlement whose stored rows do not add up to the total Amazon stamped
@@ -788,6 +809,10 @@ function SellerDashboard({ onDataChange, session, setSession, theme, setTheme })
   // itself), since none of that depends on the range being complete.
   const backfillRunning = connected && data.seller.backfillStatus === 'running';
   const blockedByBackfill = backfillRunning && view !== 'settings';
+  // The server timed a stalled backfill out rather than leaving the seller
+  // blocked on it forever. They get their dashboard back; this is the note
+  // saying what is thin.
+  const backfillIncomplete = connected && data.seller.backfillStatus === 'failed';
   // Corrupt settlements are repaired in the background and reported inline
   // (SettlementRepairNotice), never by hiding the dashboard. Only the
   // one-time backfill blocks the page - see the comment on
@@ -814,6 +839,7 @@ function SellerDashboard({ onDataChange, session, setSession, theme, setTheme })
     {error && <p className="alert warning">{error}</p>}
     {(view === 'dashboard' || view === 'orderPayments') && !connected && data && <p className="alert warning">Connect your Amazon account in Settings → Amazon Connection to start pulling real payment data — nothing syncs until then.</p>}
     {blockedByBackfill && <InitialBackfillGate seller={data.seller} />}
+    {!blockedByBackfill && backfillIncomplete && view !== 'settings' && <BackfillIncompleteNotice seller={data.seller} />}
     {!blockedByBackfill && <>
     {settlementRepairCount > 0 && view !== 'settings' && <SettlementRepairNotice count={settlementRepairCount} />}
     {/* Scheduling pages are excluded on purpose. SyncLedger lists the SP-API

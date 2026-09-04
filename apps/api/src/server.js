@@ -1478,6 +1478,29 @@ app.get('/api/tenants/:tenantId/dashboard', async request => {
   const range = DashboardQuerySchema.parse(request.query);
   const start = range.start ? new Date(range.start) : new Date(Date.now() - 30 * 864e5);
   const end = range.end ? new Date(range.end) : new Date();
+  // A backfill whose process is gone must not block this tenant forever.
+  // backfill_status='running' hides every page in the app, and nothing except
+  // the backfill's own completion ever cleared it - so a redeploy, a restart
+  // or a crash mid-backfill left the seller staring at a progress screen that
+  // could never advance, with the app telling them to refresh a page that no
+  // amount of refreshing could help. Confirmed live: a seller was locked out
+  // for a full day this way.
+  //
+  // The heartbeat is what makes this decidable rather than a guess (see
+  // 026_seller_backfill_heartbeat.sql): a real backfill can legitimately run a
+  // long time, so elapsed time alone cannot separate "still working" from
+  // "died an hour ago". A stale heartbeat can. The window is generous because
+  // the cost of releasing too early - showing figures from a partial range -
+  // is worse than waiting a bit longer.
+  //
+  // Same reasoning, and the same shape, as the sync_jobs timeout further down
+  // this handler; this table simply never got it.
+  await pool.query(
+    `update sellers set backfill_status='failed'
+      where tenant_id=$1 and backfill_status='running'
+        and coalesce(backfill_heartbeat_at, backfill_started_at) < now() - interval '30 minutes'`,
+    [tenantId]
+  ).catch(error => app.log.warn({ err: normalizeDatabaseError(error), tenantId }, 'Stale backfill sweep skipped'));
   const sellerRow = (await pool.query(`select seller_name, amazon_seller_id, marketplace_id, auth_status, connected_at, last_token_refresh_at,
       backfill_status, backfill_started_at, backfill_completed_at, backfill_progress, data_floor_date from sellers
     where tenant_id=$1 and auth_status='authorized' order by connected_at desc limit 1`, [tenantId])).rows[0] ?? null;

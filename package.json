@@ -21,6 +21,7 @@
     "check:scheduling-isolation": "node apps/api/scripts/check-scheduling-isolation.mjs",
     "check:scheduling-runtime": "node apps/api/scripts/check-scheduling-runtime.mjs",
     "check:scheduling-api": "node apps/api/scripts/check-scheduling-api.mjs",
+    "check:backfill-recovery": "node apps/api/scripts/check-backfill-recovery.mjs",
     "diagnose:gst": "node apps/api/scripts/diagnose-gst.mjs",
     "repair:settlements": "node apps/api/scripts/repair-duplicated-settlements.mjs"
   },

@@ -1171,25 +1171,68 @@ export async function runInitialSellerBackfill(tenantId) {
     // Scoped to the CURRENT authorized seller row, not the tenant generally -
     // if the tenant reconnects a different Amazon account before this finishes,
     // progress must not be attributed to a seller row it no longer describes.
-    const active = await pool.query("select id from sellers where tenant_id=$1 and auth_status='authorized' order by connected_at desc limit 1", [parsedTenantId]);
+    const active = await pool.query("select id, backfill_completed_at, data_floor_date from sellers where tenant_id=$1 and auth_status='authorized' order by connected_at desc limit 1", [parsedTenantId]);
     if (!active.rowCount) { console.warn(`${label} skipped - no authorized seller found`); return; }
-    const sellerId = active.rows[0].id;
-    // COALESCE, not a plain overwrite: a later re-backfill (e.g. after
-    // reconnecting to pick up a newly granted SP-API role) computes a range
-    // that starts LATER than the original one, because Amazon's 90-day
-    // retention is measured from "now" - so only the first-ever backfill may
-    // set this floor. See 020_seller_data_floor.sql.
+    const seller = active.rows[0];
+    const sellerId = seller.id;
+
+    // A RE-AUTHORIZATION IS NOT A FIRST CONNECTION, and treating it as one is
+    // what made "re-authorize to pick up the Tax Invoicing role" cost a seller
+    // their whole dashboard for a day. Re-authorizing ran this entire
+    // eight-source, ninety-day pass again - re-fetching six sources that were
+    // already stored and complete - and blocked every page in the app while it
+    // did, for data the tenant already had.
+    //
+    // A top-up only fetches what has never successfully arrived, which is
+    // exactly the set a re-authorization can newly unlock: a report Amazon was
+    // refusing for a missing role has no successful sync, and every source
+    // that was already working has one. If nothing qualifies, there is nothing
+    // to do at all.
+    const firstEver = !seller.backfill_completed_at && !seller.data_floor_date;
+    let reportTypes = INITIAL_BACKFILL_REPORT_TYPES;
+    if (!firstEver) {
+      const succeeded = await pool.query(
+        `select distinct report_type from sync_jobs
+          where tenant_id=$1 and status='completed' and report_type = any($2)`,
+        [parsedTenantId, INITIAL_BACKFILL_REPORT_TYPES]
+      );
+      const have = new Set(succeeded.rows.map(row => row.report_type));
+      reportTypes = INITIAL_BACKFILL_REPORT_TYPES.filter(type => !have.has(type));
+      if (!reportTypes.length) {
+        console.log(`${label} skipped - every source already has data; a re-authorization does not re-fetch it`);
+        return;
+      }
+      console.log(`${label} top-up after re-authorization - ${reportTypes.length} of ${INITIAL_BACKFILL_REPORT_TYPES.length} source(s) have never synced: ${reportTypes.join(', ')}`);
+    }
+
+    // Only a genuine first backfill sets 'running', because only that one has
+    // grounds to block the dashboard: there is no data yet, so any figure
+    // shown would be built from a partial range. A top-up runs against a
+    // tenant that already has a full dataset, so it stays out of the way and
+    // the seller keeps working while it fills the gaps in the background.
+    //
+    // COALESCE on data_floor_date, not a plain overwrite: a later re-backfill
+    // computes a range that starts LATER than the original one, because
+    // Amazon's 90-day retention is measured from "now" - so only the
+    // first-ever backfill may set this floor. See 020_seller_data_floor.sql.
     await pool.query(
-      "update sellers set backfill_status='running', backfill_started_at=now(), backfill_progress='{}'::jsonb, data_floor_date=coalesce(data_floor_date, $2::date) where id=$1",
+      firstEver
+        ? "update sellers set backfill_status='running', backfill_started_at=now(), backfill_heartbeat_at=now(), backfill_progress='{}'::jsonb, data_floor_date=coalesce(data_floor_date, $2::date) where id=$1"
+        : "update sellers set backfill_heartbeat_at=now(), data_floor_date=coalesce(data_floor_date, $2::date) where id=$1",
       [sellerId, range.start]
     );
-    console.log(`${label} starting - ${INITIAL_BACKFILL_REPORT_TYPES.length} source(s), ${INITIAL_BACKFILL_DAYS} day window`);
+    console.log(`${label} starting - ${reportTypes.length} source(s), ${INITIAL_BACKFILL_DAYS} day window`);
     const progress = {};
+    // Every write here also beats the heartbeat. That is what lets a later
+    // dashboard load tell "still working" from "the process died an hour ago"
+    // - see 026_seller_backfill_heartbeat.sql. Without it the only signal is
+    // the start time, which says nothing about whether anything is still alive.
     async function setProgress(reportType, state) {
       progress[reportType] = state;
-      await pool.query('update sellers set backfill_progress=$2 where id=$1', [sellerId, JSON.stringify(progress)]);
+      await pool.query('update sellers set backfill_progress=$2, backfill_heartbeat_at=now() where id=$1', [sellerId, JSON.stringify(progress)]);
     }
-    for (const reportType of INITIAL_BACKFILL_REPORT_TYPES) {
+    const beat = () => pool.query('update sellers set backfill_heartbeat_at=now() where id=$1', [sellerId]).catch(() => undefined);
+    for (const reportType of reportTypes) {
       const startedAt = Date.now();
       await setProgress(reportType, 'running');
       try {
@@ -1198,6 +1241,11 @@ export async function runInitialSellerBackfill(tenantId) {
         } else {
           for (let attempt = 0; attempt < INITIAL_BACKFILL_MAX_ATTEMPTS_PER_SOURCE; attempt += 1) {
             const result = await syncReportForTenant({ tenantId: parsedTenantId, reportType, range });
+            // Beat between attempts, not just between sources: settlements can
+            // legitimately spend a long time here working through a long
+            // history one throttled batch at a time, and a source that never
+            // beats looks identical to a dead process.
+            await beat();
             if (!result?.outstandingDocuments) break;
           }
         }
@@ -1208,7 +1256,11 @@ export async function runInitialSellerBackfill(tenantId) {
         console.error(`${label} ${reportType} failed after ${Date.now() - startedAt}ms:`, error instanceof Error ? error.message : error);
       }
     }
-    await pool.query("update sellers set backfill_status='completed', backfill_completed_at=now() where id=$1", [sellerId]);
+    if (firstEver) {
+      await pool.query("update sellers set backfill_status='completed', backfill_completed_at=now(), backfill_heartbeat_at=now() where id=$1", [sellerId]);
+    } else {
+      await pool.query('update sellers set backfill_heartbeat_at=now() where id=$1', [sellerId]);
+    }
     console.log(`${label} finished`);
   } finally {
     backfillInFlight.delete(parsedTenantId);
