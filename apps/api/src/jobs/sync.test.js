@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { assertGstInvoiceTypeMatchesContent, batchUpsert, dropRepeatedSettlements, isPermissionRefusal, ordinalsWithinGroup, parseDelimited, settlementBalanceErrors, withTenantSyncMutex } from './sync.js';
+import { assertGstInvoiceTypeMatchesContent, batchUpsert, dropRepeatedSettlements, gstInvoiceDate, isPermissionRefusal, ordinalsWithinGroup, parseDelimited, settlementBalanceErrors, withTenantSyncMutex } from './sync.js';
 
 function fakeClient() {
   const calls = [];
@@ -335,4 +335,40 @@ test('a 403 inside an unrelated number does not read as a refusal', () => {
   // a status code.
   assert.equal(isPermissionRefusal('Imported 4030 rows for order 403-2036854-8535523'), false);
   assert.equal(isPermissionRefusal('HTTP 403'), true);
+});
+
+// A live account imported 1,274 GST rows and the dashboard still said "No
+// invoices yet" - both true at once, because every page that shows GST filters
+// by date and these rows had none Postgres could place correctly.
+test('an Indian DD-MM-YYYY invoice date is normalised, not handed to Postgres raw', () => {
+  // 04-08-2026 is 4 August. Passed through as-is, Postgres reads it as 8 April
+  // under the default MDY DateStyle - four months from where it belongs, and
+  // invisible on every range that should contain it.
+  assert.equal(gstInvoiceDate({ 'invoice-date': '04-08-2026' }), '2026-08-04');
+  // And this one is not a date at all under MDY: month 14. It fails the whole
+  // import rather than one row.
+  assert.equal(gstInvoiceDate({ 'invoice-date': '14-07-2026' }), '2026-07-14');
+  assert.equal(gstInvoiceDate({ 'Invoice Date': '9.8.2026' }), '2026-08-09');
+});
+
+test('an ISO date is left exactly as it is', () => {
+  // Amazon's own API may well send ISO. Normalising must not damage it.
+  assert.equal(gstInvoiceDate({ 'invoice-date': '2026-08-04' }), '2026-08-04');
+  assert.equal(gstInvoiceDate({ 'invoice-date': '2026-08-04T10:30:00Z' }), '2026-08-04T10:30:00Z');
+});
+
+test('column naming variants all resolve to the same date', () => {
+  // pick() normalises case and punctuation, so these are the same column.
+  for (const name of ['invoice-date', 'invoice date', 'Invoice Date', 'invoiceDate', 'transaction-date', 'Transaction Date']) {
+    assert.equal(gstInvoiceDate({ [name]: '2026-08-04' }), '2026-08-04', `${name} must resolve`);
+  }
+});
+
+test('a row whose date column is unrecognised yields null rather than a wrong date', () => {
+  // Null is the honest answer, and saveGstInvoices refuses the import outright
+  // when it is null for every row - storing them would mean rows that exist
+  // and can never be seen.
+  assert.equal(gstInvoiceDate({ 'Some Other Column': '2026-08-04' }), null);
+  assert.equal(gstInvoiceDate({ 'invoice-date': '' }), null);
+  assert.equal(gstInvoiceDate({}), null);
 });

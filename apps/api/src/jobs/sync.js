@@ -544,6 +544,22 @@ export function assertGstInvoiceTypeMatchesContent(rows, invoiceType) {
     throw new Error(`This looks like a B2B file, not B2C - every one of the ${rows.length} row(s) has a buyer GSTIN, which a B2C (consumer) invoice never has. Check you picked the right file/button.`);
   }
 }
+/**
+ * The invoice date for one GST row, normalised.
+ *
+ * reportDate(), not text(). Settlement's posted-date has always gone through
+ * it; this one did not, and it is the same family of Indian Amazon report with
+ * the same DD-MM-YYYY dates. Handed to Postgres raw, "04-08-2026" (4 August)
+ * is read as 8 April under the default MDY DateStyle - a row silently filed
+ * four months from where it belongs, and therefore invisible on every date
+ * range that should contain it - while "14-07-2026" is not a date at all under
+ * MDY and fails the whole import. reportDate() leaves an ISO date untouched,
+ * so this is safe whichever format Amazon's API actually sends.
+ */
+export function gstInvoiceDate(row) {
+  return reportDate(pick(row, ['invoice-date', 'invoice date', 'invoiceDate', 'transaction-date', 'transaction date']));
+}
+
 async function saveGstInvoices(tenantId, content, invoiceType) {
   const rows = z.array(ReportRowSchema).parse(parseReportRows(invoiceType === 'b2b' ? 'GET_GST_MTR_B2B_CUSTOM' : 'GET_GST_MTR_B2C_CUSTOM', content));
   assertGstInvoiceTypeMatchesContent(rows, invoiceType);
@@ -558,9 +574,16 @@ async function saveGstInvoices(tenantId, content, invoiceType) {
     // rather than replacing them, in case the API's own report (never yet
     // seen live for this tenant - Tax Invoicing role still pending) uses
     // different naming.
+    //
+    // Collected alongside the batch so the "did anything get a date?" check
+    // below reads a named list instead of counting columns into a positional
+    // array - the kind of index that silently means something else the next
+    // time a column is added.
+    const invoiceDates = [];
     const batch = rows.map((row, rowIndex) => {
       const orderId = text(pick(row, ['order-id', 'order id', 'amazon-order-id', 'amazonOrderId']));
-      const invoiceDate = text(pick(row, ['invoice-date', 'invoice date', 'invoiceDate', 'transaction-date', 'transaction date'])) ?? null;
+      const invoiceDate = gstInvoiceDate(row);
+      invoiceDates.push(invoiceDate);
       const taxableValue = number(pick(row, ['taxable-value', 'taxable value', 'taxableValue', 'taxable amount', 'tax exclusive gross']));
       return [tenantId, invoiceType, orderId, number(pick(row, ['cgst', 'cgst tax', 'cgst amount'])), number(pick(row, ['sgst', 'sgst tax', 'sgst amount'])), number(pick(row, ['igst', 'igst tax', 'igst amount'])), taxableValue, invoiceDate, row, sourceKey(row, [
         orderId, invoiceDate, taxableValue,
@@ -584,6 +607,27 @@ async function saveGstInvoices(tenantId, content, invoiceType) {
     const distinctKeys = new Set(batch.map(row => row[row.length - 1])).size;
     if (distinctKeys !== rows.length) {
       throw new Error(`GST invoice import would lose rows: ${rows.length} parsed but only ${distinctKeys} distinct source_key values`);
+    }
+    // A row with no invoice_date is stored and then invisible: every page that
+    // shows GST filters by date, so it can never appear on any range. That is
+    // the worst shape a failure can take here - the ledger says "1,274 rows
+    // imported" and the dashboard says "No invoices yet", and both are telling
+    // the truth about different things. It happened exactly that way on a live
+    // account the first time Amazon's own MTR document was ever seen, because
+    // its date column is named something this importer does not recognise.
+    //
+    // Thrown, not logged: rows that cannot be read are not an import, and
+    // recording it as a success is what made this take days to find. The
+    // message names the columns Amazon actually sent so the fix is one edit.
+    const undated = invoiceDates.filter(date => !date).length;
+    if (undated === rows.length) {
+      throw new Error(
+        `GST ${invoiceType.toUpperCase()} import read ${rows.length} row(s) but not one had a usable invoice date, so none of them could ever appear on a dated page. ` +
+        `The date column is named something this importer does not know. Columns Amazon sent: ${Object.keys(rows[0]).join(' | ')}`
+      );
+    }
+    if (undated) {
+      console.warn(`[gst ${invoiceType}] ${undated} of ${rows.length} row(s) have no invoice date and will not appear on any date range`);
     }
   });
   return rows.length;
