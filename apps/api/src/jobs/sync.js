@@ -560,6 +560,39 @@ export function gstInvoiceDate(row) {
   return reportDate(pick(row, ['invoice-date', 'invoice date', 'invoiceDate', 'transaction-date', 'transaction date']));
 }
 
+/**
+ * One tax component (cgst / sgst / igst) for a GST invoice row, summed across
+ * every place Amazon splits it.
+ *
+ * Confirmed against a real Merchant Tax Report: each row carries the tax three
+ * times over - once on the item, once on the shipping charge and once on the
+ * gift wrap ("Cgst Tax", "Shipping Cgst Tax", "Gift Wrap Cgst Tax") - and the
+ * file's own "Total Tax Amount" is their sum. Reading only the item column, as
+ * this did, silently under-reports GST on any order that carried a shipping
+ * charge. It happened to be exactly right on the July file because every
+ * shipping and gift-wrap tax there was zero, which is precisely the kind of
+ * sample that makes a wrong rule look correct.
+ *
+ * UTGST folds into SGST deliberately. Union territories levy CGST + UTGST
+ * where states levy CGST + SGST; the two occupy the same half of the split and
+ * this table has no fourth column for it. Dropping it would lose real tax and
+ * leave the components short of Total Tax Amount.
+ *
+ * Falls back to the single-column names if none of the component columns are
+ * present, so a file shaped differently from the MTR still reads.
+ */
+export function gstTaxComponent(row, base) {
+  const components = base === 'sgst'
+    ? ['sgst tax', 'shipping sgst tax', 'gift wrap sgst tax', 'utgst tax', 'shipping utgst tax', 'gift wrap utgst tax']
+    : [`${base} tax`, `shipping ${base} tax`, `gift wrap ${base} tax`];
+  if (components.some(name => hasColumn(row, [name]))) {
+    return round2(components.reduce((sum, name) => sum + number(pick(row, [name])), 0));
+  }
+  return number(pick(row, [base, `${base} tax`, `${base} amount`]));
+}
+
+function round2(value) { return Math.round(value * 100) / 100; }
+
 async function saveGstInvoices(tenantId, content, invoiceType) {
   const rows = z.array(ReportRowSchema).parse(parseReportRows(invoiceType === 'b2b' ? 'GET_GST_MTR_B2B_CUSTOM' : 'GET_GST_MTR_B2C_CUSTOM', content));
   assertGstInvoiceTypeMatchesContent(rows, invoiceType);
@@ -585,7 +618,7 @@ async function saveGstInvoices(tenantId, content, invoiceType) {
       const invoiceDate = gstInvoiceDate(row);
       invoiceDates.push(invoiceDate);
       const taxableValue = number(pick(row, ['taxable-value', 'taxable value', 'taxableValue', 'taxable amount', 'tax exclusive gross']));
-      return [tenantId, invoiceType, orderId, number(pick(row, ['cgst', 'cgst tax', 'cgst amount'])), number(pick(row, ['sgst', 'sgst tax', 'sgst amount'])), number(pick(row, ['igst', 'igst tax', 'igst amount'])), taxableValue, invoiceDate, row, sourceKey(row, [
+      return [tenantId, invoiceType, orderId, gstTaxComponent(row, 'cgst'), gstTaxComponent(row, 'sgst'), gstTaxComponent(row, 'igst'), taxableValue, invoiceDate, row, sourceKey(row, [
         orderId, invoiceDate, taxableValue,
         pick(row, ['invoice-number', 'invoice number', 'invoiceNumber']),
         pick(row, ['shipment-item-id', 'shipment item id', 'shipmentItemId']),
@@ -628,6 +661,28 @@ async function saveGstInvoices(tenantId, content, invoiceType) {
     }
     if (undated) {
       console.warn(`[gst ${invoiceType}] ${undated} of ${rows.length} row(s) have no invoice date and will not appear on any date range`);
+    }
+    // The MTR carries its own checksum and it is worth using, for the same
+    // reason the settlement importer uses Amazon's stamped total: cgst + sgst
+    // + igst must equal "Total Tax Amount" on every row, so a tax column this
+    // code does not know about shows up as a discrepancy instead of as a
+    // quietly smaller GST figure. Verified against a real file: the two rows
+    // with real values balance to the paisa.
+    //
+    // Reported, not thrown. A mismatch means the stored tax is short, which is
+    // wrong and worth saying loudly - but refusing the whole import would also
+    // deny the seller the taxable values and dates in the same file, which are
+    // independently correct. The settlement importer throws because a dropped
+    // settlement line is unrecoverable; a GST row can simply be re-imported
+    // once the column is mapped.
+    const taxMismatches = rows.reduce((count, row, index) => {
+      const stated = pick(row, ['total tax amount', 'total-tax-amount']);
+      if (stated == null) return count;
+      const components = batch[index][3] + batch[index][4] + batch[index][5];
+      return Math.abs(round2(components - number(stated))) > 0.01 ? count + 1 : count;
+    }, 0);
+    if (taxMismatches) {
+      console.warn(`[gst ${invoiceType}] ${taxMismatches} of ${rows.length} row(s) have cgst+sgst+igst not matching the file's own Total Tax Amount - a tax column is being missed, so stored GST is short for those rows`);
     }
   });
   return rows.length;

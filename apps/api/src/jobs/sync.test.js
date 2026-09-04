@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { assertGstInvoiceTypeMatchesContent, batchUpsert, dropRepeatedSettlements, gstInvoiceDate, isPermissionRefusal, ordinalsWithinGroup, parseDelimited, settlementBalanceErrors, withTenantSyncMutex } from './sync.js';
+import { assertGstInvoiceTypeMatchesContent, batchUpsert, dropRepeatedSettlements, gstInvoiceDate, gstTaxComponent, isPermissionRefusal, ordinalsWithinGroup, parseDelimited, settlementBalanceErrors, withTenantSyncMutex } from './sync.js';
 
 function fakeClient() {
   const calls = [];
@@ -371,4 +371,63 @@ test('a row whose date column is unrecognised yields null rather than a wrong da
   assert.equal(gstInvoiceDate({ 'Some Other Column': '2026-08-04' }), null);
   assert.equal(gstInvoiceDate({ 'invoice-date': '' }), null);
   assert.equal(gstInvoiceDate({}), null);
+});
+
+// Column names and values below are taken from a real Merchant Tax Report
+// (MTR_B2B, July 2026) downloaded from Seller Central - the first one this
+// project has ever seen, since the API refused the report until now.
+const MTR_SHIPMENT_ROW = {
+  'Invoice Date': '2026-07-24 12:53:52', 'Transaction Type': 'Shipment',
+  'Invoice Amount': '799', 'Tax Exclusive Gross': '677.12', 'Total Tax Amount': '121.88',
+  'Cgst Tax': '60.94', 'Sgst Tax': '60.94', 'Igst Tax': '0', 'Utgst Tax': '0',
+  'Shipping Cgst Tax': '0', 'Shipping Sgst Tax': '0', 'Shipping Igst Tax': '0',
+  'Gift Wrap Cgst Tax': '0', 'Gift Wrap Sgst Tax': '0', 'Gift Wrap Igst Tax': '0'
+};
+
+test('the real MTR balances: cgst + sgst + igst equals the file\'s own Total Tax Amount', () => {
+  const total = gstTaxComponent(MTR_SHIPMENT_ROW, 'cgst') + gstTaxComponent(MTR_SHIPMENT_ROW, 'sgst') + gstTaxComponent(MTR_SHIPMENT_ROW, 'igst');
+  assert.equal(Math.round(total * 100) / 100, 121.88);
+  // And the other identity the file asserts: taxable + tax = invoice amount.
+  assert.equal(677.12 + 121.88, 799);
+});
+
+test('tax split across item, shipping and gift wrap is summed, not just the item', () => {
+  // The July file had zero shipping and gift-wrap tax on every row, which is
+  // exactly the sample that makes reading only the item column look correct.
+  // This is the same row with a shipping charge and gift wrap added.
+  const withExtras = { ...MTR_SHIPMENT_ROW, 'Shipping Cgst Tax': '5.40', 'Gift Wrap Cgst Tax': '1.10', 'Total Tax Amount': '128.38' };
+  assert.equal(gstTaxComponent(withExtras, 'cgst'), 67.44, 'item + shipping + gift wrap');
+  const total = gstTaxComponent(withExtras, 'cgst') + gstTaxComponent(withExtras, 'sgst') + gstTaxComponent(withExtras, 'igst');
+  assert.equal(Math.round(total * 100) / 100, 128.38, 'still balances to Total Tax Amount');
+});
+
+test('UTGST is folded into SGST rather than dropped', () => {
+  // Union territories levy CGST + UTGST where states levy CGST + SGST. There
+  // is no fourth column to put it in, and dropping it would lose real tax.
+  const unionTerritory = { ...MTR_SHIPMENT_ROW, 'Sgst Tax': '0', 'Utgst Tax': '60.94' };
+  assert.equal(gstTaxComponent(unionTerritory, 'sgst'), 60.94);
+  const total = gstTaxComponent(unionTerritory, 'cgst') + gstTaxComponent(unionTerritory, 'sgst') + gstTaxComponent(unionTerritory, 'igst');
+  assert.equal(Math.round(total * 100) / 100, 121.88);
+});
+
+test('a file with none of the component columns falls back to the single-column names', () => {
+  assert.equal(gstTaxComponent({ cgst: '12.50' }, 'cgst'), 12.5);
+  assert.equal(gstTaxComponent({ 'Cgst Amount': '12.50' }, 'cgst'), 12.5);
+  assert.equal(gstTaxComponent({}, 'cgst'), 0);
+});
+
+test('the real MTR\'s ISO invoice date passes through untouched', () => {
+  // This file uses "2026-07-24 12:53:52", not the DD-MM-YYYY the settlement
+  // reports use - normalisation must leave it exactly alone.
+  assert.equal(gstInvoiceDate(MTR_SHIPMENT_ROW), '2026-07-24 12:53:52');
+});
+
+test('a real MTR B2B file is recognised as B2B and not rejected as B2C', () => {
+  // Only the Shipment rows carry a buyer GSTIN; the Cancel rows are blank.
+  // The guard must pass on that mix, or a legitimate upload is refused.
+  const rows = [
+    { 'Transaction Type': 'Cancel', 'Customer Bill To Gstid': '' },
+    { 'Transaction Type': 'Shipment', 'Customer Bill To Gstid': '09AAACX0000A1Z0' }
+  ];
+  assert.doesNotThrow(() => assertGstInvoiceTypeMatchesContent(rows, 'b2b'));
 });
