@@ -443,6 +443,23 @@ async function autoSyncBackoffRemainingMs(tenantId, reportType) {
   const wait = Math.min(SYNC_RETRY_MAX_MS, SYNC_RETRY_BASE_MS * 2 ** (consecutiveFailures - 1));
   return Math.max(0, wait - (Date.now() - new Date(rows[0].at_time).getTime()));
 }
+/**
+ * True when this report type's most recent attempt was refused by Amazon on
+ * permission grounds. Only the LATEST attempt is consulted: one successful
+ * sync after the role is granted clears it, with nothing to remember to undo.
+ */
+async function lastSyncWasPermissionRefusal(tenantId, reportType) {
+  const { rows } = await pool.query(
+    `select status, error_message from sync_jobs
+      where tenant_id=$1 and report_type=$2
+      order by started_at desc nulls last limit 1`,
+    [tenantId, reportType]
+  );
+  const last = rows[0];
+  if (!last || last.status === 'completed') return false;
+  return isPermissionRefusal(last.error_message);
+}
+
 async function findMissingReportTypes(tenantId, range) {
   if (!range?.start || !range?.end) return [];
   const missing = [];
@@ -456,6 +473,24 @@ async function findMissingReportTypes(tenantId, range) {
     );
     if (running.rowCount) continue;
     if (syncQueue.isBusy(`${tenantId}:${reportType}`)) continue;
+    // A report Amazon refuses on permission grounds will be refused again in
+    // five minutes and in five hours; only granting the role and
+    // re-authorizing changes the answer, and neither of those is something an
+    // automatic retry can bring about. Retrying it anyway spends rate-limit
+    // budget that a tenant with an incomplete settlement history badly needs -
+    // observed live, where settlement documents were pacing at 45 seconds
+    // apiece while Sales & Traffic kept being re-attempted against a role
+    // Amazon has not granted.
+    //
+    // Not a hardcoded list of "paused" report types, deliberately: that is
+    // what the frontend has, and it needs a human to remember to edit it when
+    // Amazon grants a role. This reads the last attempt's own error, so it
+    // starts including a report again the moment a manual sync succeeds -
+    // which is exactly what happened with GST today.
+    if (await lastSyncWasPermissionRefusal(tenantId, reportType)) {
+      console.log(`[sync ${tenantId.slice(0, 8)}:${reportType}] skipped - Amazon refused this on permissions; use Sync on the Reports page after granting the role and re-authorizing`);
+      continue;
+    }
     const backoffMs = await autoSyncBackoffRemainingMs(tenantId, reportType);
     if (backoffMs > 0) {
       console.log(`[sync ${tenantId.slice(0, 8)}:${reportType}] skipped - backing off after repeated failures, next auto-retry in ${Math.ceil(backoffMs / 60000)} min`);
@@ -873,7 +908,24 @@ app.post('/api/tenants/:tenantId/sync/:reportType', async request => {
   await requireTenantUser(request, params.tenantId);
   await assertActiveTenant(params.tenantId);
   await assertNoBackfillRunning(params.tenantId, 'Manual sync');
-  return syncReportForSellerRequest(params, body.range);
+
+  // Starts the sync and answers immediately. It used to await the whole
+  // Amazon round trip inside this request, which cannot work: creating a
+  // report and polling it to DONE is up to 20 polls at 15s (five minutes)
+  // before the document download even begins, and that download is paced by
+  // Amazon's own rate limit - observed live at 45 seconds per request with
+  // 37-second waits. No browser holds a fetch open that long, so a seller
+  // clicking Sync got "Failed to fetch" while the server was still working
+  // perfectly well, and the report they were told had failed then quietly
+  // succeeded with nothing on screen to say so.
+  //
+  // runExclusiveSync is the same guard the automatic path uses, so a second
+  // click while one is running joins rather than starting a duplicate. The
+  // real outcome lands in sync_jobs, which is where the ledger reads status
+  // from anyway - the next dashboard poll shows it.
+  const task = runExclusiveSync(params.tenantId, params.reportType, () => syncReportForSellerRequest(params, body.range));
+  task.catch(error => app.log.warn({ err: error, tenantId: params.tenantId, reportType: params.reportType }, 'Manual sync failed'));
+  return { reportType: params.reportType, status: 'started', message: 'Amazon is preparing this report. The ledger updates on its own when it finishes - you can leave this page.' };
 });
 
 app.post('/api/tenants/:tenantId/sync', async request => {

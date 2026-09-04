@@ -434,6 +434,17 @@ function SyncLedger({ tenantId, jobs = [], onSynced, reportTypes, title, subtitl
       if (result?.status === 'failed') throw new Error(result.error ?? 'Sync failed');
       const failedDirectSync = result?.results?.find?.(row => row.status === 'failed');
       if (failedDirectSync) throw new Error(failedDirectSync.error ?? 'Sync failed');
+      // The server now starts the sync and answers straight away, because
+      // waiting for Amazon inside the request took longer than any browser
+      // will hold a fetch open. Clear this row's local state and let the
+      // ledger show the real status from sync_jobs on the next refresh -
+      // holding a stale "syncing" here would be a second source of truth
+      // that disagrees with the row underneath it.
+      if (result?.status === 'started') {
+        setRowState(s => ({ ...s, [reportType]: undefined }));
+        await onSynced?.();
+        return;
+      }
       const syncResult = result?.results?.[0] ?? result;
       const summary = reportType === 'DIRECT_SP_API_SYNC' ? `${formatNumber(syncResult?.ordersImported)} orders · ${formatNumber(syncResult?.transactionsImported)} finance transactions` : `${formatNumber(syncResult?.rowsImported)} report rows imported`;
       setRowState(s => ({ ...s, [reportType]: { loading: false, justSynced: true, summary } }));
