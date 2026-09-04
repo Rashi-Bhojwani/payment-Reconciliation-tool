@@ -18,8 +18,11 @@
 //   DATABASE_URL="postgres://..." node apps/api/scripts/diagnose-gst.mjs [tenantId]
 //
 // With no tenant id it reports on every active tenant.
+import { readdir, readFile, stat } from 'node:fs/promises';
+import path from 'node:path';
 import pg from 'pg';
 import { envFileLoadedFrom } from '@recon/db/env.js';
+import { parseDelimited } from '../src/jobs/sync.js';
 
 const url = process.env.DATABASE_URL;
 if (!url) {
@@ -114,6 +117,68 @@ try {
         [tenant.id],
       );
       console.log('By month         : ' + months.map(m => `${m.month}=${m.rows}`).join('  '));
+    }
+
+    // --- 4. what did Amazon actually SEND? ---------------------------------
+    // The distinction this settles: "Amazon returned an empty report" and "we
+    // could not read the report Amazon returned" both surface as 0 rows
+    // imported and are indistinguishable from the screen, but one is fixed by
+    // changing the date range and the other by fixing the parser. Every sync
+    // writes the raw document to disk (or S3), so the answer is on the
+    // filesystem - this reads the newest one rather than guessing.
+    //
+    // It matters more than usual for GST specifically: the Tax Invoicing role
+    // was refused until now, so the API's own MTR document has never once been
+    // seen for this tenant. Its column names are, at this point, genuinely
+    // unverified.
+    const rawDir = path.resolve(process.cwd(), process.env.LOCAL_REPORT_DIR ?? 'storage/raw-reports', tenant.id);
+    for (const reportType of GST_TYPES) {
+      const dir = path.join(rawDir, reportType);
+      const files = await readdir(dir).catch(() => []);
+      if (!files.length) {
+        console.log(`\n${reportType}: no raw document saved locally${process.env.S3_BUCKET ? ' (this deployment stores them in S3 - fetch the newest key from sync_jobs.s3_key)' : ''}`);
+        continue;
+      }
+      const newest = (await Promise.all(files.map(async name => {
+        const full = path.join(dir, name);
+        return { full, at: (await stat(full)).mtimeMs };
+      }))).sort((a, b) => b.at - a.at)[0];
+      const content = await readFile(newest.full, 'utf8');
+      const lines = content.split(/\r?\n/).filter(line => line.trim());
+      console.log(`\n${reportType}`);
+      console.log(`  saved at   : ${path.relative(process.cwd(), newest.full)}`);
+      console.log(`  size       : ${content.length} bytes, ${lines.length} non-empty line(s)`);
+      if (!lines.length) {
+        console.log('  VERDICT    : Amazon sent an EMPTY document. Nothing to parse - this is a date-range');
+        console.log('               or "Amazon has not invoiced this period yet" answer, not a parsing bug.');
+        continue;
+      }
+      console.log(`  header     : ${lines[0].slice(0, 300)}`);
+      const parsed = parseDelimited(content.trim());
+      console.log(`  parsed rows: ${parsed.length}`);
+      if (parsed.length) {
+        const columns = Object.keys(parsed[0]);
+        console.log(`  columns    : ${columns.join(' | ')}`);
+        // The four fields saveGstInvoices needs. A name it does not recognise
+        // arrives as null and the row stores as zeroes, which is the quiet
+        // version of this failure rather than the loud one.
+        const NEEDED = {
+          'order id': ['order-id', 'order id', 'amazon-order-id', 'amazonorderid'],
+          'invoice date': ['invoice-date', 'invoice date', 'invoicedate', 'transaction-date', 'transaction date'],
+          'taxable value': ['taxable-value', 'taxable value', 'taxablevalue', 'taxable amount', 'tax exclusive gross'],
+          'cgst/sgst/igst': ['cgst', 'cgst tax', 'cgst amount', 'sgst', 'igst']
+        };
+        const normalized = columns.map(column => column.toLowerCase().trim());
+        const missing = Object.entries(NEEDED)
+          .filter(([, names]) => !names.some(name => normalized.includes(name)))
+          .map(([label]) => label);
+        console.log(missing.length
+          ? `  VERDICT    : PARSER MISMATCH - ${parsed.length} row(s) read, but no column matches: ${missing.join(', ')}.\n               Send me the "columns" line above and I will map them.`
+          : `  VERDICT    : ${parsed.length} row(s) with all required columns present. If nothing stored, the\n               import failed after parsing - check the sync error above.`);
+      } else {
+        console.log('  VERDICT    : the document has content but parsed to 0 rows - a delimiter or header');
+        console.log('               problem. Send me the "header" line above.');
+      }
     }
 
     // --- the verdict -------------------------------------------------------

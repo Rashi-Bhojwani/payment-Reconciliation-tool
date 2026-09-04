@@ -1795,7 +1795,17 @@ app.get('/api/tenants/:tenantId/dashboard', async request => {
         const excluded=mergeSummary.pendingExcludedTotals[bucket] ?? 0;
         if (baseline || excluded) console.log(`${label}   ${bucket.padEnd(8)} reported=${money(baseline).padStart(12)}   (deferred, not counted: ${money(excluded).padStart(12)})`);
       }
-      for (const row of pendingDetail) console.log(`${label}   [excluded] order=${row.order_id} status=${row.transaction_status} category=${row.category} amount_desc=${row.amount_description ?? ''} amount=${row.amount} -> would be ${row.bucket}`);
+      // One line per excluded row, on EVERY dashboard load. On a real account
+      // that is several hundred lines per request - it buried the one thing
+      // anyone actually needed to read in the log (a GST 403), and printing it
+      // is not free either. The summary above says everything the day-to-day
+      // case needs; the per-row detail is for when someone is chasing a
+      // specific figure, so it is opt-in now.
+      if (process.env.LOG_DEFERRED_ROWS === '1' || process.env.LOG_DEFERRED_ROWS === 'true') {
+        for (const row of pendingDetail) console.log(`${label}   [excluded] order=${row.order_id} status=${row.transaction_status} category=${row.category} amount_desc=${row.amount_description ?? ''} amount=${row.amount} -> would be ${row.bucket}`);
+      } else {
+        console.log(`${label}   (${pendingDetail.length} excluded row(s) not listed - set LOG_DEFERRED_ROWS=1 to see each one)`);
+      }
     }
     const hasImportedData = Number(orders.orders ?? 0) > 0 || Number(kpis.net_settled ?? 0) !== 0 || products.length > 0 || payments.length > 0 || inventory.length > 0;
     return { seller, amazonAuth, hasImportedData, kpis, orders, orderRows, orderPayments, paymentComponents, paymentSummary, dashboardCalculations, businessReportRows, products, trend, payments, settlementLines, financeLines, financialComponents, financialSummary, jobs, inventory, returns, reimbursements, invoices, orderItems, financeTransactions, autoSyncing: autoSyncReportTypes, settlementDataCorrupt };
