@@ -446,7 +446,17 @@ function SyncLedger({ tenantId, jobs = [], onSynced, reportTypes, title, subtitl
         return;
       }
       const syncResult = result?.results?.[0] ?? result;
-      const summary = reportType === 'DIRECT_SP_API_SYNC' ? `${formatNumber(syncResult?.ordersImported)} orders · ${formatNumber(syncResult?.transactionsImported)} finance transactions` : `${formatNumber(syncResult?.rowsImported)} report rows imported`;
+      // A `fallback` means Amazon's own report never arrived and these rows
+      // were derived from data already held - for GST, estimated from order
+      // items. Calling that "report rows imported" is how 1,274 estimates got
+      // read as 1,274 GST invoices from Amazon, on an account where Amazon was
+      // refusing the report outright the entire time.
+      const estimated = Boolean(syncResult?.fallback);
+      const summary = reportType === 'DIRECT_SP_API_SYNC'
+        ? `${formatNumber(syncResult?.ordersImported)} orders · ${formatNumber(syncResult?.transactionsImported)} finance transactions`
+        : estimated
+          ? `${formatNumber(syncResult?.rowsImported)} rows estimated from existing data — Amazon's own report did not arrive`
+          : `${formatNumber(syncResult?.rowsImported)} report rows imported`;
       setRowState(s => ({ ...s, [reportType]: { loading: false, justSynced: true, summary } }));
       await onSynced?.();
     } catch (e) {
@@ -511,7 +521,16 @@ function SyncLedger({ tenantId, jobs = [], onSynced, reportTypes, title, subtitl
                 <div className="ledger-meta">
                   <b>{report.label}</b>
                   <small>{paused ? 'Paused until Amazon approves the SP-API role this report needs.' : (local?.error ?? local?.summary ?? (job?.completed_at ? `Last synced ${timeAgo(job.completed_at)}${job.source === 'manual_upload' ? ' - uploaded file' : ''}` : report.hint))}</small>
-                  {!paused && !local && job?.error_message && <small className={job.status === 'failed' ? 'ledger-note-error' : 'ledger-note-warning'}>{job.error_message}</small>}
+                  {/* The `!local` here used to hide this line for the whole
+                      session after you clicked Sync, because clicking sets
+                      local state. So a report Amazon had refused with a 403
+                      showed a cheerful "1,274 report rows imported" and
+                      nothing else - the refusal only reappeared on a page
+                      refresh, by which time it read as a new problem. That is
+                      how a GST permission failure survived several days of
+                      being looked straight at. What Amazon said outranks what
+                      this session happens to remember. */}
+                  {!paused && job?.error_message && <small className={job.status === 'failed' ? 'ledger-note-error' : 'ledger-note-warning'}>{job.error_message}</small>}
                 </div>
                 <div className="ledger-row-actions">
                   <span className={`pill status-${statusLabel}`}>{paused ? 'Coming soon' : statusLabel}</span>
