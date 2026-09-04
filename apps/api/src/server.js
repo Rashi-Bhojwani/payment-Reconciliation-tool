@@ -444,20 +444,39 @@ async function autoSyncBackoffRemainingMs(tenantId, reportType) {
   return Math.max(0, wait - (Date.now() - new Date(rows[0].at_time).getTime()));
 }
 /**
- * True when this report type's most recent attempt was refused by Amazon on
- * permission grounds. Only the LATEST attempt is consulted: one successful
- * sync after the role is granted clears it, with nothing to remember to undo.
+ * How long to wait before automatically retrying a report Amazon refused on
+ * permission grounds, or 0 if it is due.
+ *
+ * This is a long backoff, NOT a stop, and the difference matters. A first
+ * version of this skipped such a report entirely until someone clicked Sync by
+ * hand - which quietly made the product manual exactly where it promises not
+ * to be: a seller who gets the role granted should see their data appear on
+ * its own, not have to know to come back and press a button. It also traded
+ * that away for nothing, because the existing exponential backoff already
+ * capped retries at six hours; the rate-limit waste it was meant to stop was
+ * not happening.
+ *
+ * What it does buy is skipping the early rungs of that exponential ladder.
+ * Fifteen minutes, then thirty, then an hour are sensible for a transient
+ * failure and pointless for a permission one: only granting the role and
+ * re-authorizing changes the answer, and neither happens in fifteen minutes.
+ * So a refusal goes straight to the six-hour cap.
+ *
+ * Only the LATEST attempt is consulted, so one successful sync clears it with
+ * nothing to remember to undo.
  */
-async function lastSyncWasPermissionRefusal(tenantId, reportType) {
+const PERMISSION_REFUSAL_RETRY_MS = SYNC_RETRY_MAX_MS;
+async function permissionRefusalWaitMs(tenantId, reportType) {
   const { rows } = await pool.query(
-    `select status, error_message from sync_jobs
+    `select status, error_message, coalesce(completed_at, started_at) as at_time from sync_jobs
       where tenant_id=$1 and report_type=$2
       order by started_at desc nulls last limit 1`,
     [tenantId, reportType]
   );
   const last = rows[0];
-  if (!last || last.status === 'completed') return false;
-  return isPermissionRefusal(last.error_message);
+  if (!last || last.status === 'completed' || !isPermissionRefusal(last.error_message)) return 0;
+  if (!last.at_time) return 0;
+  return Math.max(0, PERMISSION_REFUSAL_RETRY_MS - (Date.now() - new Date(last.at_time).getTime()));
 }
 
 async function findMissingReportTypes(tenantId, range) {
@@ -473,22 +492,18 @@ async function findMissingReportTypes(tenantId, range) {
     );
     if (running.rowCount) continue;
     if (syncQueue.isBusy(`${tenantId}:${reportType}`)) continue;
-    // A report Amazon refuses on permission grounds will be refused again in
-    // five minutes and in five hours; only granting the role and
-    // re-authorizing changes the answer, and neither of those is something an
-    // automatic retry can bring about. Retrying it anyway spends rate-limit
-    // budget that a tenant with an incomplete settlement history badly needs -
-    // observed live, where settlement documents were pacing at 45 seconds
-    // apiece while Sales & Traffic kept being re-attempted against a role
-    // Amazon has not granted.
+    // A report Amazon refuses on permission grounds gets a long wait rather
+    // than the usual escalating one - see permissionRefusalWaitMs. It still
+    // retries on its own, so a seller who gets the role granted has their data
+    // appear without knowing to come back and press anything.
     //
     // Not a hardcoded list of "paused" report types, deliberately: that is
     // what the frontend has, and it needs a human to remember to edit it when
     // Amazon grants a role. This reads the last attempt's own error, so it
-    // starts including a report again the moment a manual sync succeeds -
-    // which is exactly what happened with GST today.
-    if (await lastSyncWasPermissionRefusal(tenantId, reportType)) {
-      console.log(`[sync ${tenantId.slice(0, 8)}:${reportType}] skipped - Amazon refused this on permissions; use Sync on the Reports page after granting the role and re-authorizing`);
+    // resumes on its own - which is exactly what the GST rows need.
+    const refusalWaitMs = await permissionRefusalWaitMs(tenantId, reportType);
+    if (refusalWaitMs > 0) {
+      console.log(`[sync ${tenantId.slice(0, 8)}:${reportType}] skipped - Amazon refused this on permissions; retrying automatically in ${Math.ceil(refusalWaitMs / 60000)} min, or use Sync now if the role has just been granted`);
       continue;
     }
     const backoffMs = await autoSyncBackoffRemainingMs(tenantId, reportType);
