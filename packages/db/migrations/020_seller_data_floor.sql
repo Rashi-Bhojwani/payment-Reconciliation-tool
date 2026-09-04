@@ -1,0 +1,15 @@
+-- The earliest calendar date this tenant's data can ever reach back to -
+-- fixed permanently the first time the initial backfill runs, and never
+-- moved after that.
+--
+-- Amazon's 90-day report retention is a ROLLING window measured from "now",
+-- not from any fixed point - so re-authorizing a seller months later and
+-- re-running the backfill would compute a NEWER, more recent 90-day window,
+-- not reach further into the past. The oldest data this tool will ever hold
+-- is therefore whatever the FIRST backfill's window reached, forever - the
+-- nightly scheduler only ever extends the ceiling forward (today, and every
+-- day after), it can never extend the floor backward. Application code sets
+-- this with a COALESCE (only fills it if still null) specifically so a later
+-- re-backfill can never overwrite an earlier, further-back floor with a
+-- later, closer-in one.
+ALTER TABLE sellers ADD COLUMN IF NOT EXISTS data_floor_date date;

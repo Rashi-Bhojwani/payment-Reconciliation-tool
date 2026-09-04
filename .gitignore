@@ -11,3 +11,9 @@ coverage
 /storage/*
 /api/storage
 apps/api/storage/
+# ad-hoc probes against real seller exports - never commit seller data
+.merge_probe.mjs
+.probe*.mjs
+*.settlement.txt
+.seed_buggy.mjs
+.seed_messy.mjs

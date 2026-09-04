@@ -1,6 +1,6 @@
-import React, { createContext, useContext, useEffect, useMemo, useRef, useState } from 'react';
+import React, { createContext, Fragment, useContext, useEffect, useMemo, useRef, useState } from 'react';
 import { createRoot } from 'react-dom/client';
-import { BrowserRouter, Navigate, NavLink, Route, Routes, useLocation, useNavigate, useSearchParams } from 'react-router-dom';
+import { BrowserRouter, Link, Navigate, Route, Routes, useLocation, useNavigate, useSearchParams } from 'react-router-dom';
 import { Bar, BarChart, CartesianGrid, Cell, Line, LineChart, Pie, PieChart, ResponsiveContainer, Tooltip, XAxis, YAxis } from 'recharts';
 import './style.css';
 
@@ -45,6 +45,11 @@ function codeClass(code) { return `code-${CODE_COLOR_KEY[code] ?? code.toLowerCa
 const NAV_ITEMS = [
   { view: 'dashboard', label: 'Dashboard', icon: '▦' },
   { view: 'orderPayments', label: 'Order Payments', icon: '₹' },
+  // Scheduling sits directly under the money pages because it is the other
+  // half of the same order: Order Payments answers "what did this order pay",
+  // Order Scheduling answers "get this order out the door".
+  { view: 'scheduling', label: 'Order Scheduling', icon: '⧗' },
+  { view: 'shipments', label: 'Scheduled Pickups', icon: '➤' },
   { view: 'sales', label: 'Sales Analytics', icon: '↗' },
   { view: 'businessPerformance', label: 'Business Performance', icon: '▤' },
   { view: 'productPerformance', label: 'Product Performance', icon: '◈' },
@@ -58,6 +63,10 @@ const NAV_ITEMS = [
   { view: 'reports', label: 'Reports', icon: '◎' },
   { view: 'rawData', label: 'Raw API Data', icon: '{}' }
 ];
+// Settings is deliberately not in NAV_ITEMS (and so not in the sidebar list
+// or GlobalSearch's results, which both iterate NAV_ITEMS) - it's reached
+// from the account menu in the topbar, same as most SaaS dashboards, not
+// from the primary section list.
 
 const VIEW_REPORT_TYPES = {
   orderPayments: ['DIRECT_SP_API_SYNC', 'GET_V2_SETTLEMENT_REPORT_DATA_FLAT_FILE_V2'],
@@ -108,7 +117,7 @@ function readAmazonTokenCache(tenantId) { const cached = JSON.parse(localStorage
 async function getAmazonAccessToken(tenantId) { const cached = readAmazonTokenCache(tenantId); if (cached) return cached; const fresh = await api(`/api/tenants/${tenantId}/amazon/access-token`); localStorage.setItem(`${ACCESS_TOKEN_CACHE_PREFIX}${tenantId}`, JSON.stringify(fresh)); return fresh; }
 async function beginAmazonAuthorization(tenantId) { const { url } = await api(`/api/auth/amazon/start?tenantId=${tenantId}&json=1`); window.location.assign(url); }
 async function syncAmazonSource(tenantId, reportType, range) {
-  const payload = { method: 'POST', body: JSON.stringify({ range: { start: formatDateParam(range.start), end: formatDateParam(addDays(range.end, 1)) } }) };
+  const payload = { method: 'POST', body: JSON.stringify({ range: { start: formatDateParam(range.start), end: endOfRangeParam(range.end) } }) };
   return api(`/api/tenants/${tenantId}/sync/${reportType}`, payload);
 }
 // Deletes stored settlement rows for the visible range and re-fetches them
@@ -118,16 +127,44 @@ async function syncAmazonSource(tenantId, reportType, range) {
 // immutable, so nothing is permanently lost; this only exists as an
 // explicit, confirmed action because it does delete stored rows first.
 async function resetSettlementData(tenantId, range) {
-  const payload = { method: 'POST', body: JSON.stringify({ range: { start: formatDateParam(range.start), end: formatDateParam(addDays(range.end, 1)) }, confirm: true }) };
+  const payload = { method: 'POST', body: JSON.stringify({ range: { start: formatDateParam(range.start), end: endOfRangeParam(range.end) }, confirm: true }) };
   return api(`/api/tenants/${tenantId}/settlement-data/reset`, payload);
+}
+// Report types Seller Central lets a person download much further back than
+// SP-API's 90-day report retention allows an app to fetch automatically -
+// see the matching UPLOADABLE_REPORT_TYPES comment in server.js for exactly
+// why these five and not the other three.
+const UPLOADABLE_REPORT_TYPES = new Set(['GET_V2_SETTLEMENT_REPORT_DATA_FLAT_FILE_V2', 'GET_GST_MTR_B2B_CUSTOM', 'GET_GST_MTR_B2C_CUSTOM', 'GET_FBA_FULFILLMENT_CUSTOMER_RETURNS_DATA', 'GET_FBA_REIMBURSEMENTS_DATA']);
+// Sales & Traffic needs the "Brand Analytics" role, which is still not
+// granted to this app - a live pull fails with a 403, so the ledger shows it
+// as a paused feature rather than a broken one. Remove a type here the moment
+// Amazon grants the role; nothing else about the sync path changes.
+//
+// GST B2B/B2C came off this list when Amazon approved "Tax Invoicing". Worth
+// recording why removing them was the whole change: the API side never gated
+// on the role at all - REPORT_TYPE_REQUIRED_ROLES in the SP-API client only
+// makes a 403 readable, it does not refuse to try - so these reports were
+// always being requested and always allowed to succeed. Only the UI was
+// holding them back.
+const PAUSED_REPORT_TYPES = new Set(['GET_SALES_AND_TRAFFIC_REPORT']);
+async function uploadReportFile(tenantId, reportType, content, range) {
+  const payload = { method: 'POST', body: JSON.stringify({ content, range: { start: formatDateParam(range.start), end: endOfRangeParam(range.end) } }) };
+  return api(`/api/tenants/${tenantId}/reports/${reportType}/upload`, payload);
 }
 
 function Button({ className = '', variant = 'primary', icon, children, ...props }) { return <button {...props} className={`btn btn-${variant} ${className}`}>{icon && <span className="btn-icon" aria-hidden="true">{icon}</span>}{children}</button>; }
 function Input(props) { return <input {...props} className="input" />; }
 function Card({ children, className = '' }) { return <section className={`card ${className}`}>{children}</section>; }
 function Empty({ text }) { return <div className="empty-state">{text}</div>; }
+// Shown on pages/cards fed entirely or partly by a PAUSED_REPORT_TYPES
+// report, so a seller sees an honest reason instead of an empty or
+// suspiciously-wrong number with no explanation.
+function ComingSoonNotice({ text }) { return <p className="alert coming-soon">🕒 {text}</p>; }
 function formatCurrency(value) { return `₹${Number(value ?? 0).toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`; }
 function formatNumber(value) { return Number(value ?? 0).toLocaleString('en-IN'); }
+// Adding a money column by hand across hundreds of rows is exactly the work
+// this tool exists to remove, so any table with one gets its own total.
+function sumColumn(rows, key) { return (rows ?? []).reduce((sum, row) => sum + Number(row?.[key] ?? 0), 0); }
 function csvEscape(value) {
   const text = String(value ?? '').replaceAll('₹', '').replaceAll('—', '').replaceAll('â€”', '').trim();
   return /[",\n]/.test(text) ? `"${text.replaceAll('"', '""')}"` : text;
@@ -157,6 +194,28 @@ function timeAgo(iso) {
   return `${Math.round(hrs / 24)}d ago`;
 }
 
+// Two fake links, not one - the real files get dropped into apps/web/public/
+// at exactly these two names, one for each theme (a light-sidebar logo and a
+// dark-sidebar logo, however those actually differ - background, outline,
+// whatever the seller's own brand assets need). Which one is visible is
+// decided in CSS off data-theme (see .logo-mark-light/.logo-mark-dark in
+// style.css), not a theme prop threaded through every caller, so this
+// renders correctly even on the login/boot screens where no component
+// carries theme state at all.
+//
+// Sized by HEIGHT ONLY. The logo is a full lockup - ring mark, WELLSURE
+// wordmark, tagline - not a square icon, so forcing width equal to height
+// (an earlier version of this component did exactly that) squashed it into
+// an illegible box. Width is left to the file's own aspect ratio.
+function LogoMark({ height = 40 }) {
+  return (
+    <>
+      <img className="logo-mark logo-mark-light" src="/logo-light.png" alt="WELLSURE" style={{ height, width: 'auto' }} />
+      <img className="logo-mark logo-mark-dark" src="/logo-dark.png" alt="WELLSURE" style={{ height, width: 'auto' }} />
+    </>
+  );
+}
+
 // Login only — account creation is admin-only now (see AdminDashboard's
 // "Create seller account" card), so there is no self-serve signup here.
 function Login({ setSession }) {
@@ -173,7 +232,7 @@ function Login({ setSession }) {
   }
   return <main className="login-shell">
     <section className="login-hero">
-      <div className="brand-mark">W</div>
+      <div className="brand-mark"><LogoMark height={76} /></div>
       <p className="eyebrow">Ledger 01 — Seller Reconciliation</p>
       <h1>Every rupee Amazon touches, reconciled in one command center.</h1>
       <p>Connect Seller Central, pull SP-API orders and reports on your own schedule, and track payouts, sales, inventory and account health from a single secure cockpit.</p>
@@ -221,7 +280,22 @@ function startOfDay(d) { const { year, month, date } = istParts(d); return new D
 function addDays(d, n) { return new Date(new Date(d).getTime() + n * 864e5); }
 function formatShort(d) { return d.toLocaleDateString('en-IN', { month: 'short', day: 'numeric', timeZone: IST_TIME_ZONE }); }
 function formatDateParam(date) { return startOfDay(date).toISOString(); }
-function rangeQuery(range) { return `start=${encodeURIComponent(formatDateParam(range.start))}&end=${encodeURIComponent(formatDateParam(addDays(range.end, 1)))}`; }
+// Amazon's Custom Unified Summary runs IST midnight to IST midnight. Its own
+// PDF header states both ends in the same zone:
+//   "Account activity from Jul 1, 2026 00:00 GMT+5:30
+//                   through Jul 25, 2026 23:59 GMT+5:30"
+//
+// An earlier version of this ended the window at 23:59 GMT instead, on the
+// strength of a screenshot in which the trailing "+5:30" was cut off. Reading
+// the PDF file itself settled it: both ends are GMT+5:30, the window is
+// symmetric, and there is no blind spot to compensate for. Extracting the
+// text rather than trusting a rendered image is the only reason this was
+// caught, and it is why the boundary is quoted here verbatim.
+function endOfRangeParam(lastDay) {
+  const { year, month, date } = istParts(lastDay);
+  return new Date(Date.UTC(year, month, date + 1) - IST_OFFSET_MS).toISOString();
+}
+function rangeQuery(range) { return `start=${encodeURIComponent(formatDateParam(range.start))}&end=${encodeURIComponent(endOfRangeParam(range.end))}`; }
 function formatRangeLabel(start, end) {
   const startStr = formatShort(start);
   const endStr = istParts(start).year === istParts(end).year ? formatShort(end) : end.toLocaleDateString('en-IN', { month: 'short', day: 'numeric', year: 'numeric', timeZone: IST_TIME_ZONE });
@@ -241,7 +315,18 @@ function fromDateInputValue(value) {
   const [year, month, day] = value.split('-').map(Number);
   return new Date(Date.UTC(year, month - 1, day) - IST_OFFSET_MS);
 }
-function DateRangePicker({ value, onChange }) {
+// minDate (a "YYYY-MM-DD" string, or null/undefined) is seller.dataFloorDate
+// from the dashboard payload - the earliest date the FIRST 90-day backfill
+// ever reached, fixed permanently at that moment (see
+// 020_seller_data_floor.sql). It only ever moves forward as an account ages
+// (today's ceiling moves every day; the floor never does), so it is honest
+// to enforce it in the picker itself: a date before it is not "not synced
+// yet", it is "will never exist", because Amazon's 90-day report retention
+// is measured from now and can't be asked to reach further into the past
+// than it could the day this seller first connected. Null (a seller
+// connected before this feature existed, so no real floor was ever
+// recorded) leaves the picker exactly as unrestricted as before.
+function DateRangePicker({ value, onChange, disabled, minDate }) {
   const [open, setOpen] = useState(false);
   const [draft, setDraft] = useState(() => ({ start: toDateInputValue(value.start), end: toDateInputValue(value.end) }));
   const rootRef = useRef(null);
@@ -258,7 +343,11 @@ function DateRangePicker({ value, onChange }) {
   }, [open]);
 
   function applyRange() {
-    const start = fromDateInputValue(draft.start);
+    // The <input min> attribute stops normal use, but is only ever a browser
+    // UI hint - it does not stop a value already sitting in the field (e.g.
+    // pasted, or left over from before minDate applied) from being submitted.
+    const clampedStart = minDate && draft.start < minDate ? minDate : draft.start;
+    const start = fromDateInputValue(clampedStart);
     const end = fromDateInputValue(draft.end);
     const ordered = start <= end ? { start, end } : { start: end, end: start };
     onChange({ label: formatRangeLabel(ordered.start, ordered.end), ...ordered });
@@ -267,19 +356,26 @@ function DateRangePicker({ value, onChange }) {
 
   return (
     <div className="date-range-picker" ref={rootRef}>
-      <button type="button" className="date-range-trigger" onClick={() => setOpen(o => !o)}>
+      <button
+        type="button"
+        className="date-range-trigger"
+        disabled={disabled}
+        title={disabled ? 'Unavailable while your first 90 days of data are syncing' : undefined}
+        onClick={() => !disabled && setOpen(o => !o)}
+      >
         <span className="date-range-icon">📅</span>{value.label}
       </button>
-      {open && (
+      {!disabled && open && (
         <div className="date-range-panel date-range-panel-simple">
           <div className="date-field-group">
             <label>Start date</label>
-            <input className="input" type="date" value={draft.start} max={draft.end || toDateInputValue(new Date())} onChange={e => setDraft(d => ({ ...d, start: e.target.value }))} />
+            <input className="input" type="date" value={draft.start} min={minDate || undefined} max={draft.end || toDateInputValue(new Date())} onChange={e => setDraft(d => ({ ...d, start: e.target.value }))} />
           </div>
           <div className="date-field-group">
             <label>End date</label>
             <input className="input" type="date" value={draft.end} min={draft.start} max={toDateInputValue(new Date())} onChange={e => setDraft(d => ({ ...d, end: e.target.value }))} />
           </div>
+          {minDate && <p className="muted small">Data is available from {minDate} onward - Amazon's report history only reaches back 90 days from when you first connected.</p>}
           <div className="calendar-footer range-apply-row">
             <span className="muted small">Applied only after clicking Apply</span>
             <Button type="button" onClick={applyRange}>Apply</Button>
@@ -300,7 +396,35 @@ function StatCard({ title, value, hint }) { return <Card className="stat-card"><
 function SyncLedger({ tenantId, jobs = [], onSynced, reportTypes, title, subtitle, disabled }) {
   const { range } = useContext(DateRangeContext);
   const [rowState, setRowState] = useState({});
+  const [uploadOpen, setUploadOpen] = useState(null);
+  const [uploadDraft, setUploadDraft] = useState({ start: '', end: '', file: null });
   const reports = reportTypes ? REPORTS.filter(r => reportTypes.includes(r.type)) : REPORTS;
+
+  function openUpload(reportType) {
+    setUploadOpen(reportType);
+    setUploadDraft({ start: toDateInputValue(range.start), end: toDateInputValue(range.end), file: null });
+  }
+
+  // Reads the file in the browser and sends it as JSON, same as every other
+  // write in this app - no multipart dependency needed for what is, in the
+  // end, just text. The seller states which period the file covers rather
+  // than the server guessing it from row contents: unambiguous, and it's
+  // exactly what they'd already know from the statement/report they just
+  // downloaded (e.g. "Q1 2026 settlement").
+  async function uploadOne(reportType) {
+    if (disabled || !uploadDraft.file) return;
+    setRowState(s => ({ ...s, [reportType]: { loading: true } }));
+    try {
+      const content = await uploadDraft.file.text();
+      const uploadRange = { start: fromDateInputValue(uploadDraft.start), end: fromDateInputValue(uploadDraft.end) };
+      const result = await uploadReportFile(tenantId, reportType, content, uploadRange);
+      setRowState(s => ({ ...s, [reportType]: { loading: false, justSynced: true, summary: `${formatNumber(result.rowsImported)} report rows imported from uploaded file` } }));
+      setUploadOpen(null);
+      await onSynced?.();
+    } catch (e) {
+      setRowState(s => ({ ...s, [reportType]: { loading: false, error: e.message } }));
+    }
+  }
 
   async function syncOne(reportType) {
     if (disabled) return;
@@ -310,8 +434,29 @@ function SyncLedger({ tenantId, jobs = [], onSynced, reportTypes, title, subtitl
       if (result?.status === 'failed') throw new Error(result.error ?? 'Sync failed');
       const failedDirectSync = result?.results?.find?.(row => row.status === 'failed');
       if (failedDirectSync) throw new Error(failedDirectSync.error ?? 'Sync failed');
+      // The server now starts the sync and answers straight away, because
+      // waiting for Amazon inside the request took longer than any browser
+      // will hold a fetch open. Clear this row's local state and let the
+      // ledger show the real status from sync_jobs on the next refresh -
+      // holding a stale "syncing" here would be a second source of truth
+      // that disagrees with the row underneath it.
+      if (result?.status === 'started') {
+        setRowState(s => ({ ...s, [reportType]: undefined }));
+        await onSynced?.();
+        return;
+      }
       const syncResult = result?.results?.[0] ?? result;
-      const summary = reportType === 'DIRECT_SP_API_SYNC' ? `${formatNumber(syncResult?.ordersImported)} orders · ${formatNumber(syncResult?.transactionsImported)} finance transactions` : `${formatNumber(syncResult?.rowsImported)} report rows imported`;
+      // A `fallback` means Amazon's own report never arrived and these rows
+      // were derived from data already held - for GST, estimated from order
+      // items. Calling that "report rows imported" is how 1,274 estimates got
+      // read as 1,274 GST invoices from Amazon, on an account where Amazon was
+      // refusing the report outright the entire time.
+      const estimated = Boolean(syncResult?.fallback);
+      const summary = reportType === 'DIRECT_SP_API_SYNC'
+        ? `${formatNumber(syncResult?.ordersImported)} orders · ${formatNumber(syncResult?.transactionsImported)} finance transactions`
+        : estimated
+          ? `${formatNumber(syncResult?.rowsImported)} rows estimated from existing data — Amazon's own report did not arrive`
+          : `${formatNumber(syncResult?.rowsImported)} report rows imported`;
       setRowState(s => ({ ...s, [reportType]: { loading: false, justSynced: true, summary } }));
       await onSynced?.();
     } catch (e) {
@@ -328,7 +473,13 @@ function SyncLedger({ tenantId, jobs = [], onSynced, reportTypes, title, subtitl
     try {
       const result = await resetSettlementData(tenantId, range);
       const syncResult = result?.resync;
-      if (syncResult?.status === 'failed') throw new Error(syncResult.error ?? 'Resync failed');
+      // A reset that could not re-download everything puts the deleted rows
+      // back rather than leaving the ledger short, so it is neither a plain
+      // success nor a plain failure - say exactly which of the two happened
+      // instead of reporting "re-imported 0 fresh rows" as if it worked.
+      if (result?.warning || syncResult?.status === 'failed') {
+        throw new Error(result?.warning ?? `${syncResult?.error ?? 'Resync failed'}${result?.restoredSettlementRows ? ` (${formatNumber(result.restoredSettlementRows)} deleted rows were restored)` : ''}`);
+      }
       const summary = `Cleared ${formatNumber(result.deletedSettlementRows)} stored rows, re-imported ${formatNumber(syncResult?.rowsImported)} fresh rows`;
       setRowState(s => ({ ...s, [reportType]: { loading: false, justSynced: true, summary } }));
       await onSynced?.();
@@ -359,22 +510,58 @@ function SyncLedger({ tenantId, jobs = [], onSynced, reportTypes, title, subtitl
           // leave this control disabled after the page is refreshed.
           const busy = local?.loading;
           const failed = local?.error || job?.status === 'failed';
-          const statusLabel = disabled ? 'locked' : busy ? 'syncing' : failed ? 'failed' : job?.status ?? 'idle';
+          const paused = PAUSED_REPORT_TYPES.has(report.type);
+          const statusLabel = paused ? 'coming-soon' : disabled ? 'locked' : busy ? 'syncing' : failed ? 'failed' : job?.status ?? 'idle';
+          const uploadable = !paused && UPLOADABLE_REPORT_TYPES.has(report.type);
           return (
-            <div className={`ledger-row ${codeClass(report.code)}`} key={report.type}>
-              <span className="ledger-index">{String(i + 1).padStart(2, '0')}</span>
-              <span className={`ledger-code ${codeClass(report.code)}`}>{report.code}</span>
-              <div className="ledger-meta">
-                <b>{report.label}</b>
-                <small>{local?.error ?? local?.summary ?? (job?.completed_at ? `Last synced ${timeAgo(job.completed_at)}` : report.hint)}</small>
-                {!local && job?.error_message && <small className={job.status === 'failed' ? 'ledger-note-error' : 'ledger-note-warning'}>{job.error_message}</small>}
+            <Fragment key={report.type}>
+              <div className={`ledger-row ${codeClass(report.code)}${paused ? ' is-paused' : ''}`}>
+                <span className="ledger-index">{String(i + 1).padStart(2, '0')}</span>
+                <span className={`ledger-code ${codeClass(report.code)}`}>{report.code}</span>
+                <div className="ledger-meta">
+                  <b>{report.label}</b>
+                  <small>{paused ? 'Paused until Amazon approves the SP-API role this report needs.' : (local?.error ?? local?.summary ?? (job?.completed_at ? `Last synced ${timeAgo(job.completed_at)}${job.source === 'manual_upload' ? ' - uploaded file' : ''}` : report.hint))}</small>
+                  {/* The `!local` here used to hide this line for the whole
+                      session after you clicked Sync, because clicking sets
+                      local state. So a report Amazon had refused with a 403
+                      showed a cheerful "1,274 report rows imported" and
+                      nothing else - the refusal only reappeared on a page
+                      refresh, by which time it read as a new problem. That is
+                      how a GST permission failure survived several days of
+                      being looked straight at. What Amazon said outranks what
+                      this session happens to remember. */}
+                  {!paused && job?.error_message && <small className={job.status === 'failed' ? 'ledger-note-error' : 'ledger-note-warning'}>{job.error_message}</small>}
+                </div>
+                <div className="ledger-row-actions">
+                  <span className={`pill status-${statusLabel}`}>{paused ? 'Coming soon' : statusLabel}</span>
+                  {!paused && report.type === 'GET_V2_SETTLEMENT_REPORT_DATA_FLAT_FILE_V2' && (
+                    <Button variant="secondary" disabled={disabled || busy} title="Deletes stored settlement rows for this range and re-downloads them from Amazon - use only if figures look wrong" onClick={() => resetSettlements()}>{busy ? '…' : 'Reset & Resync'}</Button>
+                  )}
+                  {uploadable && (
+                    <Button variant="secondary" disabled={disabled || busy} title="Import a report file you downloaded directly from Seller Central - the only way to get data older than Amazon's 90-day API limit" onClick={() => uploadOpen === report.type ? setUploadOpen(null) : openUpload(report.type)}>Upload</Button>
+                  )}
+                  {!paused && <Button variant="secondary" disabled={disabled || busy} onClick={() => syncOne(report.type)}>{busy ? 'Syncing…' : 'Sync'}</Button>}
+                </div>
               </div>
-              <span className={`pill status-${statusLabel}`}>{statusLabel}</span>
-              {report.type === 'GET_V2_SETTLEMENT_REPORT_DATA_FLAT_FILE_V2' && (
-                <Button variant="secondary" disabled={disabled || busy} title="Deletes stored settlement rows for this range and re-downloads them from Amazon - use only if figures look wrong" onClick={() => resetSettlements()}>{busy ? '…' : 'Reset & Resync'}</Button>
+              {uploadOpen === report.type && (
+                <div className="ledger-upload-panel">
+                  <p className="muted small">Upload a {report.label} file downloaded directly from Seller Central - this reaches further back than Amazon's API allows this app to fetch automatically. State the period this file actually covers below; it must be correct for the data to land in the right place.</p>
+                  <div className="date-field-group">
+                    <label>Period start</label>
+                    <input className="input" type="date" value={uploadDraft.start} max={uploadDraft.end || undefined} onChange={e => setUploadDraft(d => ({ ...d, start: e.target.value }))} />
+                  </div>
+                  <div className="date-field-group">
+                    <label>Period end</label>
+                    <input className="input" type="date" value={uploadDraft.end} min={uploadDraft.start} max={toDateInputValue(new Date())} onChange={e => setUploadDraft(d => ({ ...d, end: e.target.value }))} />
+                  </div>
+                  <input className="input" type="file" accept=".txt,.csv,.tsv" onChange={e => setUploadDraft(d => ({ ...d, file: e.target.files?.[0] ?? null }))} />
+                  <div className="calendar-footer range-apply-row">
+                    <Button variant="ghost" type="button" onClick={() => setUploadOpen(null)}>Cancel</Button>
+                    <Button type="button" disabled={busy || !uploadDraft.file || !uploadDraft.start || !uploadDraft.end} onClick={() => uploadOne(report.type)}>{busy ? 'Uploading…' : 'Upload'}</Button>
+                  </div>
+                </div>
               )}
-              <Button variant="secondary" disabled={disabled || busy} onClick={() => syncOne(report.type)}>{busy ? 'Syncing…' : 'Sync'}</Button>
-            </div>
+            </Fragment>
           );
         })}
       </div>
@@ -409,6 +596,14 @@ function AmazonConnectionPanel({ tenantId, seller, onChange, setError }) {
       <div className="amazon-chip is-connected">
         <span className="dot" />
         <div className="chip-copy"><b>{seller.sellerId}</b><small>{seller.marketplaceId}</small></div>
+        {/* Re-authorizing doesn't require disconnecting first - it's the
+            same Amazon consent redirect either way, and re-authorizing is
+            exactly what's needed after enabling a new SP-API role (e.g.
+            Brand Analytics) in Developer Central, since a refresh token only
+            ever carries the roles that were granted at the moment it was
+            issued. The callback's upsert (see /oauth/callback) already
+            handles landing on an existing connected seller safely. */}
+        <Button variant="secondary" disabled={busy} onClick={connect} title="Re-run Amazon's authorization - use this after enabling a new role (e.g. Brand Analytics) in Developer Central so the account picks it up">{busy ? 'Redirecting…' : 'Re-authorize'}</Button>
         <Button variant="ghost" disabled={busy} onClick={disconnect}>{busy ? 'Disconnecting…' : 'Disconnect'}</Button>
       </div>
     );
@@ -422,7 +617,101 @@ function AmazonConnectionPanel({ tenantId, seller, onChange, setError }) {
   );
 }
 
-function SellerDashboard() {
+// Shown for every page except Settings while runInitialSellerBackfill (the
+// API job that runs once, right after authorization) is still working
+// through this seller's last 90 days - the only window that data is ever
+// reachable in, so it has to complete before any range-based figure on this
+// dashboard can be trusted. REPORTS already lists all eight sources in the
+// exact order the backend backfills them in, so it doubles as this
+// checklist; seller.backfillProgress is the real, live per-source status
+// the backend records as it goes, not a simulated progress bar.
+const BACKFILL_STATE_META = {
+  completed: { icon: '✓', tone: 'emerald', label: 'Synced' },
+  running: { icon: '⟳', tone: 'marigold', label: 'Syncing…' },
+  failed: { icon: '✕', tone: 'danger', label: 'Amazon declined this source' },
+  pending: { icon: '·', tone: '', label: 'Queued' }
+};
+function InitialBackfillGate({ seller }) {
+  const progress = seller.backfillProgress ?? {};
+  const completedCount = REPORTS.filter(r => progress[r.type] === 'completed' || progress[r.type] === 'failed').length;
+  const startedAt = seller.backfillStartedAt ? new Date(seller.backfillStartedAt) : null;
+  const stalled = startedAt && Date.now() - startedAt.getTime() > 30 * 60_000;
+  return (
+    <Card className="panel backfill-gate">
+      <div className="backfill-gate-hero">
+        <span className="spinner-dot" />
+        <div>
+          <h2>Syncing your last 90 days</h2>
+          <p>This runs once, automatically, right after connecting Amazon - it's the one chance to pull this much history, since Amazon only keeps report documents for 90 days. Nothing else is available to look at until it finishes; this page updates on its own.</p>
+        </div>
+      </div>
+      <div className="backfill-gate-progress">
+        <div className="backfill-gate-progress-bar"><div style={{ width: `${Math.round(completedCount / REPORTS.length * 100)}%` }} /></div>
+        <span>{completedCount} of {REPORTS.length} sources</span>
+      </div>
+      <div className="backfill-gate-list">
+        {REPORTS.map(report => {
+          const state = progress[report.type] ?? 'pending';
+          const meta = BACKFILL_STATE_META[state] ?? BACKFILL_STATE_META.pending;
+          return <div className="backfill-gate-row" key={report.type}>
+            <span className={`activity-icon tone-${meta.tone || 'violet'}`} aria-hidden="true">{meta.icon}</span>
+            <div><b>{report.label}</b><small>{report.hint}</small></div>
+            <span className={`pill status-${state === 'completed' ? 'completed' : state === 'failed' ? 'failed' : state === 'running' ? 'running' : 'idle'}`}>{meta.label}</span>
+          </div>;
+        })}
+      </div>
+      {/* The old copy here said "refresh the page ... it will pick back up",
+          which was not true and cost a seller a day of waiting on it. If the
+          API process stopped mid-backfill there is nothing left to pick back
+          up, and refreshing cannot start it. The server releases the block
+          itself once the backfill has gone half an hour without progress
+          (backfill_heartbeat_at), so the honest thing to say is how long that
+          takes and what happens next. */}
+      {stalled && <p className="alert warning">This has not moved for a while. If the sync stopped, this page unblocks on its own within about 30 minutes and everything already pulled is kept - you can then finish the remaining sources from the Reports page. Nothing you do here speeds it up, so there is no need to wait on this screen.</p>}
+    </Card>
+  );
+}
+
+// Shown after the server gives up on a stalled backfill (see the stale sweep
+// in the dashboard handler). Deliberately not a blocking screen: the whole
+// point of releasing the block is that the seller gets their dashboard back,
+// with an honest note about which sources are thin rather than a spinner that
+// never resolves.
+function BackfillIncompleteNotice({ seller }) {
+  const progress = seller.backfillProgress ?? {};
+  const unfinished = REPORTS.filter(report => (progress[report.type] ?? 'pending') !== 'completed');
+  return <p className="alert warning">
+    The one-time 90-day sync stopped before it finished{unfinished.length ? <> — {unfinished.map(r => r.label).join(', ')} {unfinished.length === 1 ? 'has' : 'have'} no history yet</> : null}.
+    Everything it did pull is saved and the figures below are built from it. Run the missing sources from the <b>Reports</b> page when you want the rest; day-to-day data keeps syncing automatically either way.
+  </p>;
+}
+
+// A settlement whose stored rows do not add up to the total Amazon stamped
+// on the document is corrupt, and the server is already re-downloading it
+// automatically (see settlementDataCorrupt on the API). This says so inline
+// and keeps the figures visible.
+//
+// It deliberately does NOT replace the whole page the way
+// InitialBackfillGate does. Blocking everything was tried and was wrong:
+// most "incomplete" reasons a dashboard reports are normal and permanent -
+// a range ending today always runs past the last settlement Amazon has
+// issued, deferred activity is always live - so a full-page block on them
+// never cleared and hid a working dashboard behind a spinner forever. The
+// one-time backfill is a genuinely empty state with nothing to show; this
+// is not.
+function SettlementRepairNotice({ count }) {
+  return (
+    <p className="alert warning settlement-repair-notice">
+      <span className="spinner-dot" />
+      <span>
+        <b>Re-checking {count} settlement{count === 1 ? '' : 's'} with Amazon.</b>{' '}
+        {count === 1 ? 'It does' : 'They do'} not add up to the total Amazon stamped on {count === 1 ? 'it' : 'them'}, so some figures below may shift once the corrected copy arrives. This is being fixed automatically - nothing to click.
+      </span>
+    </p>
+  );
+}
+
+function SellerDashboard({ onDataChange, session, setSession, theme, setTheme }) {
   const [params] = useSearchParams();
   const tenantId = params.get('tenantId') ?? '';
   const view = params.get('view') ?? 'orderPayments';
@@ -432,6 +721,7 @@ function SellerDashboard() {
   const [data, setData] = useState(null);
   const [error, setError] = useState('');
   const [loading, setLoading] = useState(false);
+  const [awaitingAmazon, setAwaitingAmazon] = useState(null);
   const rangeSyncRef = useRef({ key: '', requestId: 0 });
   // The server auto-syncs whatever a date range is missing in the background
   // and reports back which report types it kicked off (data.autoSyncing).
@@ -439,7 +729,13 @@ function SellerDashboard() {
   // while that's non-empty so the dashboard fills in on its own - capped so
   // a permanently-failing source (e.g. a real Amazon permission issue)
   // can't poll forever.
-  const AUTO_POLL_MAX_ATTEMPTS = 5;
+  // 30 x 20s = 10 minutes - deliberately longer than the /dashboard handler's
+  // own 6-minute stale-job sweep (see server.js), so this loop always ends in
+  // a state that is actually true: either a real 'completed'/'failed' row, or
+  // the sweep itself flipping an abandoned 'running' row to 'failed'. It is
+  // not bounding how long a sync is allowed to take - only how long the UI
+  // keeps checking back in on one that's still going.
+  const AUTO_POLL_MAX_ATTEMPTS = 30;
   const AUTO_POLL_DELAY_MS = 20_000;
   const autoPollRef = useRef({ key: '', attempts: 0 });
   async function load(targetRange = range, requestId = rangeSyncRef.current.requestId) {
@@ -449,16 +745,44 @@ function SellerDashboard() {
       const dashboard = await api(`/api/tenants/${tenantId}/dashboard?${rangeQuery(targetRange)}`);
       if (requestId !== rangeSyncRef.current.requestId) return;
       setData(dashboard);
+      onDataChange?.(dashboard);
       const rangeKey = `${targetRange.start}|${targetRange.end}`;
       if (autoPollRef.current.key !== rangeKey) autoPollRef.current = { key: rangeKey, attempts: 0 };
-      if (dashboard.autoSyncing?.length && autoPollRef.current.attempts < AUTO_POLL_MAX_ATTEMPTS) {
+      // The fetch is done, so the fetch spinner stops here - always. It used to
+      // stay lit for the whole polling window, which for a seller who had just
+      // connected Amazon meant a spinner that appeared to run forever while the
+      // page sat there. Waiting on Amazon is a different state from loading the
+      // page, and it says so, with its own copy and a visible attempt count.
+      setLoading(false);
+      // dashboard.autoSyncing only lists what THIS request just kicked off -
+      // once a source is actually running, findMissingReportTypes correctly
+      // stops offering it up as "missing" (it's already in flight, no need
+      // to trigger it again), so it silently drops out of autoSyncing on the
+      // very next poll even though it is nowhere near done. Relying on
+      // autoSyncing alone made the poll loop declare victory the moment a
+      // slower source (Orders & finance runs paginated Orders + Finance +
+      // Inventory + Catalog calls, not a single report file - it can
+      // legitimately take minutes) got past its own trigger, leaving the
+      // sync ledger frozen on a stale "running" row with nothing left to
+      // refresh it. Checking data.jobs directly for any row still actually
+      // 'running' is what keeps the loop honest.
+      const runningReportTypes = (dashboard.jobs ?? []).filter(job => job.status === 'running').map(job => job.report_type);
+      const sources = Array.from(new Set([...(dashboard.autoSyncing ?? []), ...runningReportTypes]));
+      // Deliberately keyed on work actually in flight, NOT on "the data is
+      // not perfect yet". A settlement repair that is running shows up in
+      // sources like any other sync and polls normally; one waiting out its
+      // cooldown does not, and must not, or a dashboard left open would
+      // re-poll every 20s indefinitely against conditions that are often
+      // permanent and normal (a range ending today always outruns Amazon's
+      // last settlement). The repair notice stays visible either way.
+      const stillSyncing = Boolean(sources.length) && autoPollRef.current.attempts < AUTO_POLL_MAX_ATTEMPTS;
+      setAwaitingAmazon(stillSyncing ? { sources, attempt: autoPollRef.current.attempts + 1, of: AUTO_POLL_MAX_ATTEMPTS } : null);
+      if (stillSyncing) {
         autoPollRef.current.attempts += 1;
         setTimeout(() => { if (requestId === rangeSyncRef.current.requestId) void load(targetRange, requestId); }, AUTO_POLL_DELAY_MS);
-      } else {
-        setLoading(false);
       }
     } catch (e) {
-      if (requestId === rangeSyncRef.current.requestId) { setError(e.message); setLoading(false); }
+      if (requestId === rangeSyncRef.current.requestId) { setError(e.message); setLoading(false); setAwaitingAmazon(null); }
     }
   }
   useEffect(() => {
@@ -466,6 +790,31 @@ function SellerDashboard() {
     rangeSyncRef.current.requestId += 1;
     void load(range, rangeSyncRef.current.requestId);
   }, [tenantId, range.start, range.end]);
+
+  // Self-terminating: re-checks every 5s for as long as the LAST response
+  // said the backfill was still running, and simply stops scheduling once one
+  // says otherwise - no attempt cap needed for the normal case, because
+  // runInitialSellerBackfill (the API job) always reaches a terminal
+  // 'completed' state itself, source by source, even when some of the eight
+  // fail outright. BACKFILL_POLL_MAX_MINUTES only guards the one scenario
+  // that job can't self-recover from - the API process restarting mid-run -
+  // by giving up and telling the seller to refresh rather than polling
+  // forever against a status that will now never change.
+  const BACKFILL_POLL_MS = 5_000;
+  const BACKFILL_POLL_MAX_MINUTES = 30;
+  const backfillPollRef = useRef({ key: '', attempts: 0 });
+  useEffect(() => {
+    if (data?.seller?.backfillStatus !== 'running') return;
+    const rangeKey = `${range.start}|${range.end}`;
+    if (backfillPollRef.current.key !== rangeKey) backfillPollRef.current = { key: rangeKey, attempts: 0 };
+    if (backfillPollRef.current.attempts * BACKFILL_POLL_MS >= BACKFILL_POLL_MAX_MINUTES * 60_000) return;
+    const requestId = rangeSyncRef.current.requestId;
+    const timer = setTimeout(() => {
+      backfillPollRef.current.attempts += 1;
+      if (requestId === rangeSyncRef.current.requestId) void load(range, requestId);
+    }, BACKFILL_POLL_MS);
+    return () => clearTimeout(timer);
+  }, [data, range.start, range.end]);
 
   // Pulled from the same calculateDashboardMetrics engine that powers every
   // other KPI on this dashboard, so this chart can never disagree with the
@@ -482,45 +831,97 @@ function SellerDashboard() {
   const ledgerCopy = VIEW_LEDGER_COPY[view];
   const detailView = view === 'report-detail' || view === 'metric-detail';
   const connected = !!data?.seller?.connected;
+  // The one-time 90-day catch-up (see runInitialSellerBackfill on the API).
+  // Every other page is replaced with InitialBackfillGate while this runs -
+  // not just the date picker disabled - because any figure shown from a
+  // partially-backfilled range could be read as final when it isn't yet.
+  // Settings stays reachable (theme, logout, checking the Amazon connection
+  // itself), since none of that depends on the range being complete.
+  const backfillRunning = connected && data.seller.backfillStatus === 'running';
+  const blockedByBackfill = backfillRunning && view !== 'settings';
+  // The server timed a stalled backfill out rather than leaving the seller
+  // blocked on it forever. They get their dashboard back; this is the note
+  // saying what is thin.
+  const backfillIncomplete = connected && data.seller.backfillStatus === 'failed';
+  // Corrupt settlements are repaired in the background and reported inline
+  // (SettlementRepairNotice), never by hiding the dashboard. Only the
+  // one-time backfill blocks the page - see the comment on
+  // SettlementRepairNotice for why the two are not the same case.
+  const settlementRepairCount = connected && !backfillRunning
+    ? (data?.dashboardCalculations?.diagnostics?.settlementIntegrity?.length ?? 0)
+    : 0;
 
   return <div className="page-stack">
     <div className="section-title">
       <div><h1>{viewTitle(view)}</h1><p>{viewDescription(view)}</p></div>
       <div className="actions">
         {loading && <span className="pill status-running range-loading-pill"><span className="spinner-dot" />Refreshing…</span>}
-        <AmazonConnectionPanel tenantId={tenantId} seller={data?.seller} onChange={load} setError={setError} />
+        {!loading && awaitingAmazon && <span className="pill status-idle range-loading-pill"><span className="spinner-dot" />Amazon is preparing {awaitingAmazon.sources.length} report{awaitingAmazon.sources.length === 1 ? '' : 's'} · check {awaitingAmazon.attempt}/{awaitingAmazon.of}</span>}
+        {/* Connecting/re-authorizing/disconnecting Amazon lives in
+            Settings → Amazon Connection now, not exposed on every page - a
+            hosted end user doesn't need "Disconnect" one click away from
+            their dashboard. The banner below still tells an unconnected
+            seller what to do; it just doesn't put the button in their face. */}
       </div>
     </div>
-    {freshAmazonAuth && connected && <p className="alert success">Amazon account connected. Select a date range or use Sync on this page to pull limited data.</p>}
+    {freshAmazonAuth && connected && !backfillRunning && <p className="alert success">Amazon account connected. Select a date range or use Sync on this page to pull limited data.</p>}
     {amazonError && <p className="alert warning">Amazon connection issue: {amazonError}</p>}
     {error && <p className="alert warning">{error}</p>}
-    {(view === 'dashboard' || view === 'orderPayments') && !connected && data && <p className="alert warning">Connect your Amazon account to start pulling real payment data — nothing syncs until then.</p>}
-    {view !== 'dashboard' && !detailView && <SyncLedger tenantId={tenantId} jobs={data?.jobs ?? []} onSynced={load} reportTypes={reportTypes} title={ledgerCopy?.title} subtitle={ledgerCopy?.subtitle} disabled={!connected} />}
+    {(view === 'dashboard' || view === 'orderPayments') && !connected && data && <p className="alert warning">Connect your Amazon account in Settings → Amazon Connection to start pulling real payment data — nothing syncs until then.</p>}
+    {blockedByBackfill && <InitialBackfillGate seller={data.seller} />}
+    {!blockedByBackfill && backfillIncomplete && view !== 'settings' && <BackfillIncompleteNotice seller={data.seller} />}
+    {!blockedByBackfill && <>
+    {settlementRepairCount > 0 && view !== 'settings' && <SettlementRepairNotice count={settlementRepairCount} />}
+    {/* Scheduling pages are excluded on purpose. SyncLedger lists the SP-API
+        report types a page's figures come from, and order scheduling consumes
+        none of them - it reads the Orders API live. Left in, it would render
+        all eight report rows (reportTypes undefined means "show every one"),
+        implying the page depends on reports it never touches, next to a Sync
+        button that does something entirely different from the one that page
+        already has. */}
+    {view !== 'dashboard' && view !== 'settings' && !SCHEDULING_VIEWS.has(view) && !detailView && <SyncLedger tenantId={tenantId} jobs={data?.jobs ?? []} onSynced={load} reportTypes={reportTypes} title={ledgerCopy?.title} subtitle={ledgerCopy?.subtitle} disabled={!connected} />}
 
     {view === 'orderPayments' && <OrderReconciliation tenantId={tenantId} />}
+    {view === 'scheduling' && <OrderScheduling tenantId={tenantId} />}
+    {view === 'shipments' && <SchedulingShipments tenantId={tenantId} />}
     {view === 'dashboard' && <DashboardOverview data={data} channelData={channelData} tenantId={tenantId} />}
-    {view === 'sales' && <SalesAnalytics data={data} channelData={channelData} />}
-    {view === 'businessPerformance' && <BusinessPerformanceReport data={data} />}
-    {view === 'productPerformance' && <ProductPerformanceReport data={data} />}
+    {view === 'sales' && <><ComingSoonNotice text="Sales & Traffic report is paused until Amazon approves the Brand Analytics role - the figures below may be incomplete until then." /><SalesAnalytics data={data} channelData={channelData} /></>}
+    {view === 'businessPerformance' && <><ComingSoonNotice text="Some of this report's figures come from Sales & Traffic, which is paused until Amazon approves the Brand Analytics role - Orders-based figures are unaffected." /><BusinessPerformanceReport data={data} /></>}
+    {view === 'productPerformance' && <><ComingSoonNotice text="Product Performance requires Amazon's Sales & Traffic report, paused until Amazon approves the Brand Analytics role." /><ProductPerformanceReport data={data} /></>}
     {view === 'inventory' && <TableCard title="Inventory" rows={data?.inventory ?? []} columns={['sku', 'fulfillable_quantity', 'snapshot_date']} downloadFilename="inventory.csv" />}
     {view === 'payouts' && <>
-      <TableCard title="Payout Activity" rows={data?.payments ?? []} columns={['posted_date', 'settlement_id', 'net_amount', 'lines']} downloadFilename="payout-activity.csv" />
-      <TableCard title="Settlement Lines (itemized)" rows={data?.settlementLines ?? []} columns={['source_row_id', 'posted_date', 'posted_date_time', 'settlement_id', 'order_id', 'transaction_type', 'order_item_code', 'merchant_order_item_id', 'adjustment_id', 'sku', 'quantity_purchased', 'amount_type', 'amount_description', 'amount', 'source_key']} pageSize={10} downloadFilename="settlement-lines.csv" />
+      <StatementsView tenantId={tenantId} />
+      <TableCard title="Payout Activity" rows={data?.payments ?? []} columns={['posted_date', 'settlement_id', 'net_amount', 'lines']} downloadFilename="payout-activity.csv" totals={{ net_amount: formatCurrency(sumColumn(data?.payments, 'net_amount')) }} />
+      <TableCard title="Settlement Lines (itemized)" rows={data?.settlementLines ?? []} columns={['source_row_id', 'posted_date', 'posted_date_time', 'settlement_id', 'order_id', 'transaction_type', 'order_item_code', 'merchant_order_item_id', 'adjustment_id', 'sku', 'quantity_purchased', 'amount_type', 'amount_description', 'amount', 'source_key']} pageSize={10} downloadFilename="settlement-lines.csv" totals={{ amount: formatCurrency(sumColumn(data?.settlementLines, 'amount')) }} />
+      {/* The other half of the ledger. Settlement documents carry only Released
+          activity and lag the posted date Amazon builds its own statement on,
+          so when a section does not match Amazon these are the rows that say
+          why - they are the only place Deferred activity exists. */}
+      <TableCard title="Finance API Lines (itemized)" rows={data?.financeLines ?? []} columns={['posted_date', 'maturity_dates', 'transaction_status', 'transaction_type', 'transaction_id', 'order_id', 'sku', 'fulfillment_networks', 'category', 'amount_description', 'amount', 'deferral_reasons', 'context_types']} pageSize={10} downloadFilename="finance-lines.csv" totals={{ amount: formatCurrency(sumColumn(data?.financeLines, 'amount')) }} />
     </>}
     {view === 'brand' && <TableCard title="Product Performance" rows={data?.products ?? []} columns={['asin', 'units', 'sales', 'buy_box']} downloadFilename="product-performance.csv" />}
     {view === 'feeAudit' && <FeeLeakAudit tenantId={tenantId} />}
     {view === 'returns' && <TableCard title="Return Details" rows={data?.returns ?? []} columns={['order_id', 'return_reason', 'disposition', 'status', 'return_date']} downloadFilename="returns.csv" />}
     {view === 'reimbursements' && <TableCard title="Reimbursement Details" rows={data?.reimbursements ?? []} columns={['sku', 'amount', 'reason', 'reimbursement_date']} downloadFilename="reimbursements.csv" />}
-    {view === 'tax' && <TableCard title="GST Invoice Details" rows={data?.invoices ?? []} columns={['invoice_type', 'order_id', 'taxable_value', 'cgst', 'sgst', 'igst', 'invoice_date']} downloadFilename="gst-invoices.csv" />}
-    {view === 'reports' && <ReportsExplorer tenantId={tenantId} data={data} />}
+    {view === 'tax' && <TableCard title="GST Invoice Details" rows={data?.invoices ?? []} columns={['invoice_type', 'order_id', 'taxable_value', 'cgst', 'sgst', 'igst', 'invoice_date']} downloadFilename="gst-invoices.csv" totals={{ taxable_value: formatCurrency(sumColumn(data?.invoices, 'taxable_value')), cgst: formatCurrency(sumColumn(data?.invoices, 'cgst')), sgst: formatCurrency(sumColumn(data?.invoices, 'sgst')), igst: formatCurrency(sumColumn(data?.invoices, 'igst')) }} />}
+    {view === 'reports' && <>
+      <ReportsExplorer tenantId={tenantId} data={data} />
+      {/* Also on Payouts, but this is the page people look for raw exports on.
+          It is the only view of the Finances API half of the ledger - the half
+          that carries deferred activity and that Amazon builds its own
+          statement from - so when a section disagrees, this is what says why. */}
+      <TableCard title="Finance API Lines (itemized)" rows={data?.financeLines ?? []} columns={['posted_date', 'maturity_dates', 'transaction_status', 'transaction_type', 'transaction_id', 'order_id', 'sku', 'fulfillment_networks', 'category', 'amount_description', 'amount', 'deferral_reasons', 'context_types']} pageSize={10} downloadFilename="finance-lines.csv" totals={{ amount: formatCurrency(sumColumn(data?.financeLines, 'amount')) }} />
+    </>}
     {view === 'rawData' && <RawApiDataExplorer data={data} />}
     {view === 'report-detail' && <ReportDetail data={data} reportType={params.get('reportType')} />}
     {view === 'metric-detail' && <MetricDetail metric={params.get('metric')} tenantId={tenantId} />}
+    {view === 'settings' && <SettingsPage session={session} setSession={setSession} tenantId={tenantId} seller={data?.seller} onChange={load} theme={theme} setTheme={setTheme} />}
+    </>}
   </div>;
 }
 
-function viewTitle(view) { return ({ orderPayments: 'Order Payment Reconciliation', dashboard: 'Dashboard', sales: 'Sales Analytics', businessPerformance: 'Business Performance', productPerformance: 'Product Performance', inventory: 'Inventory', payouts: 'Payout Reconciliation', brand: 'Brand Analytics', feeAudit: 'Fee Leak Audit', returns: 'Returns', reimbursements: 'Reimbursements', tax: 'GST & Tax', reports: 'Reports', rawData: 'Raw API Data', 'report-detail': 'Report Detail', 'metric-detail': 'Calculation Detail' })[view] ?? 'Dashboard'; }
-function viewDescription(view) { return ({ orderPayments: 'See every rupee from customer order value, through Amazon deductions, to the final FBA or FBM seller receivable.', dashboard: 'Amazon-only reconciliation KPIs with explainable drill-downs.', sales: 'Revenue, order value, units and product sales trends from Amazon reports.', businessPerformance: 'Excel-style quarterly business performance report with analysed KPIs and matching graphs.', productPerformance: 'Excel-style product performance analysis with top products and written insights.', inventory: 'FBA inventory snapshots imported from SP-API inventory reports.', payouts: 'Settlement rows and payout reconciliation from Amazon settlement reports.', brand: 'ASIN-level product performance from synced Amazon order items, with Sales & Traffic metrics when available.', returns: 'Customer return reasons, status and disposition.', reimbursements: 'Amazon reimbursement credits for lost, damaged or adjusted inventory.', tax: 'GST B2B and B2C invoice rows in readable form.', reports: 'Open each fetched report and view human-readable data.', rawData: 'Inspect raw fields returned from each imported API/report source before finalizing calculations.', 'report-detail': 'Human-readable rows from the selected SP-API report.' })[view] ?? 'Live seller KPIs populated from synced SP-API orders and reports.'; }
+function viewTitle(view) { return ({ orderPayments: 'Order Payment Reconciliation', scheduling: 'Order Scheduling', shipments: 'Scheduled Pickups', dashboard: 'Dashboard', sales: 'Sales Analytics', businessPerformance: 'Business Performance', productPerformance: 'Product Performance', inventory: 'Inventory', payouts: 'Payout Reconciliation', brand: 'Brand Analytics', feeAudit: 'Fee Leak Audit', returns: 'Returns', reimbursements: 'Reimbursements', tax: 'GST & Tax', reports: 'Reports', rawData: 'Raw API Data', 'report-detail': 'Report Detail', 'metric-detail': 'Calculation Detail', settings: 'Settings' })[view] ?? 'Dashboard'; }
+function viewDescription(view) { return ({ orderPayments: 'See every rupee from customer order value, through Amazon deductions, to the final FBA or FBM seller receivable.', scheduling: 'Enter each package once, then book Amazon Easy Ship pickups here instead of in Seller Central.', shipments: 'Every Easy Ship pickup booked from this tool, with tracking IDs and labels.', dashboard: 'Amazon-only reconciliation KPIs with explainable drill-downs.', sales: 'Revenue, order value, units and product sales trends from Amazon reports.', businessPerformance: 'Excel-style quarterly business performance report with analysed KPIs and matching graphs.', productPerformance: 'Excel-style product performance analysis with top products and written insights.', inventory: 'FBA inventory snapshots imported from SP-API inventory reports.', payouts: 'Settlement rows and payout reconciliation from Amazon settlement reports.', brand: 'ASIN-level product performance from synced Amazon order items, with Sales & Traffic metrics when available.', returns: 'Customer return reasons, status and disposition.', reimbursements: 'Amazon reimbursement credits for lost, damaged or adjusted inventory.', tax: 'GST B2B and B2C invoice rows in readable form.', reports: 'Open each fetched report and view human-readable data.', rawData: 'Inspect raw fields returned from each imported API/report source before finalizing calculations.', 'report-detail': 'Human-readable rows from the selected SP-API report.', settings: 'Appearance, account and Amazon connection settings.' })[view] ?? 'Live seller KPIs populated from synced SP-API orders and reports.'; }
 
 function OrderPayments({ data }) {
   const rows = data?.orderPayments ?? [];
@@ -578,7 +979,60 @@ function OrderReconciliation({ tenantId }) {
   async function toggle(orderId) { if(openId===orderId){setOpenId('');return;} setOpenId(orderId); if(!details[orderId]) { try { const detail=await api(`/api/tenants/${tenantId}/orders-reconciliation/${encodeURIComponent(orderId)}`); setDetails(value=>({...value,[orderId]:detail})); } catch(e){setError(e.message);} } }
   const flagByOrder=new Map(flags.map(flag=>[flag.order_id,flag]));
   const counts = { reconciled: orders.filter(order=>order.hasFeeData).length, awaiting: orders.filter(order=>!order.hasFeeData&&!/cancel/i.test(order.status??'')).length, cancelled: orders.filter(order=>/cancel/i.test(order.status??'')).length };
-  const filteredOrders=orders.filter(order=>(orderView==='all'||(orderView==='matched'&&order.hasFeeData)||(orderView==='awaiting'&&!order.hasFeeData&&!/cancel/i.test(order.status??''))||(orderView==='cancelled'&&/cancel/i.test(order.status??'')))&&String(order.amazon_order_id).toLowerCase().includes(orderSearch.trim().toLowerCase()));
+  // Searches order ID and settlement ID together rather than making the
+  // seller pick a field first: the two never collide (Amazon's order IDs are
+  // NNN-NNNNNNN-NNNNNNN, settlement IDs are plain digits), so one box can
+  // serve both - paste either and the rows for it come back.
+  const orderQuery=orderSearch.trim().toLowerCase();
+  const matchesQuery=order=>!orderQuery
+    ||String(order.amazon_order_id??'').toLowerCase().includes(orderQuery)
+    ||String(order.settlement_id??'').toLowerCase().includes(orderQuery);
+  const filteredOrders=orders.filter(order=>(orderView==='all'||(orderView==='matched'&&order.hasFeeData)||(orderView==='awaiting'&&!order.hasFeeData&&!/cancel/i.test(order.status??''))||(orderView==='cancelled'&&/cancel/i.test(order.status??'')))&&matchesQuery(order));
+  // Totals for whatever the seller is currently looking at, not for the page
+  // they happen to be on - a per-page total would change every time they
+  // clicked Next and would answer no useful question. Money columns sum only
+  // rows Amazon has actually posted fees for (hasFeeData); the rest render
+  // as "—" in the table and must not be counted as zero here either.
+  const sumBy=(rows,key)=>rows.reduce((sum,row)=>sum+Number(row[key]??0),0);
+  const settledOrders=filteredOrders.filter(order=>order.hasFeeData);
+  const orderTotals={
+    orders:filteredOrders.length,
+    settled:settledOrders.length,
+    gross:sumBy(filteredOrders,'gross_item_price'),
+    promotion:sumBy(settledOrders,'promotion'),
+    referral:sumBy(settledOrders,'referral_commission'),
+    fulfillment:sumBy(settledOrders,'fulfillment_fee'),
+    fees:sumBy(settledOrders,'total_deductions'),
+    other:sumBy(settledOrders,'other_amount'),
+    netPayout:sumBy(settledOrders,'net_payout')
+  };
+  // "₹0.00" and "not known yet" are completely different answers, and the
+  // first version printed the former for the latter: on the awaiting tab,
+  // where by definition NO order has fees posted, every fee column totalled
+  // ₹0.00 - which reads as "Amazon charged you nothing", the single most
+  // misleading thing this table could say. The rows themselves already show
+  // "—" for exactly this reason; the totals row now agrees with them.
+  const feeTotal=value=>orderTotals.settled===0?'—':formatCurrency(value);
+  // ORDER money only, and the label has to say so. Called "Money released by
+  // Amazon" this read as "what landed in my bank" and was compared against
+  // the dashboard's Settled Amount, which is a different figure entirely:
+  // Settled Amount is Amazon's own deposit total and carries EVERYTHING in
+  // the settlement - service fees, storage, advertising, refunds,
+  // reimbursements, adjustments - while this sums net_payout across the
+  // orders in the table below and nothing else. On a real account they sat
+  // 1,856.06 apart for the same range with neither being wrong.
+  //
+  // Settled Amount stays the answer to "how much money did I get". This
+  // answers a narrower question the order table could otherwise only answer
+  // by hand: of the orders listed here, how much has Amazon released.
+  const releasedOrders=orders.filter(order=>order.hasFeeData&&order.payment_received);
+  const awaitingOrders=orders.filter(order=>!order.payment_received&&!/cancel/i.test(order.status??''));
+  const payoutSummary={
+    receivedOrders:releasedOrders.length,
+    received:sumBy(releasedOrders,'net_payout'),
+    awaitingOrders:awaitingOrders.length,
+    awaitingGross:sumBy(awaitingOrders,'gross_item_price')
+  };
   const orderPageSize=10; const orderTotalPages=Math.max(1,Math.ceil(filteredOrders.length/orderPageSize)); const safeOrderPage=Math.min(orderPage,orderTotalPages-1); const visibleOrders=filteredOrders.slice(safeOrderPage*orderPageSize,safeOrderPage*orderPageSize+orderPageSize);
   useEffect(()=>setOrderPage(0),[orderView,orderSearch,range.start,range.end]);
   const uniqueValues=key=>[...new Set(transactions.map(row=>row[key]).filter(Boolean))].sort();
@@ -598,68 +1052,787 @@ function OrderReconciliation({ tenantId }) {
       day:'2-digit',month:'short',year:'numeric',hour:'2-digit',minute:'2-digit',second:'2-digit',hourCycle:'h23',timeZone:'UTC',timeZoneName:'short'
     }).format(parsed);
   };
-  const reconciliationTable = <Card className="table-card"><PanelHeader title="Order-wise gross → fees → payout" subtitle={source||'Loading Amazon money lines'} /><div className="reconciliation-summary"><button type="button" className={orderView==='matched'?'active':''} onClick={()=>setOrderView('matched')}><strong>{formatNumber(counts.reconciled)}</strong><span>Payments posted in this period</span></button><button type="button" className={orderView==='awaiting'?'active':''} onClick={()=>setOrderView('awaiting')}><strong>{formatNumber(counts.awaiting)}</strong><span>Recent orders awaiting Amazon</span></button><button type="button" className={orderView==='cancelled'?'active':''} onClick={()=>setOrderView('cancelled')}><strong>{formatNumber(counts.cancelled)}</strong><span>Cancelled — no payout expected</span></button><button type="button" className={orderView==='all'?'active':''} onClick={()=>setOrderView('all')}><strong>{formatNumber(orders.length)}</strong><span>All orders</span></button></div><p className="reconciliation-note">The payout columns use the Finances API transaction status and posted timestamp. Settlement ID and deposit-date data come from Amazon's settlement report. “Yes” means Amazon released or initiated the payout; SP-API cannot confirm when the seller's bank actually credited it.</p><div className="order-search"><Input value={orderSearch} onChange={event=>setOrderSearch(event.target.value)} placeholder="Search order ID…"/><span>{formatNumber(filteredOrders.length)} matching orders</span></div>{error&&<p className="alert error">{error}</p>}{filteredOrders.length?<><div className="table-wrap"><table><thead><tr>{['Order','Settlement ID','Amazon status','Transaction date','Product charges','Promotions','Referral','Fulfillment','Amazon fees','Other','Net payout','Money released?','Released / deposit time','Payout status','Reconciliation',''].map(label=><th key={label}>{label}</th>)}</tr></thead><tbody>{visibleOrders.map(order=>{const flag=flagByOrder.get(order.amazon_order_id);const detail=details[order.amazon_order_id];return <React.Fragment key={order.amazon_order_id}><tr><td>{order.amazon_order_id}</td><td>{order.settlement_id??'—'}</td><td>{order.status??'—'}</td><td>{String(order.transaction_date??order.order_date??'').slice(0,10)}</td><td>{Number(order.gross_item_price)?formatCurrency(order.gross_item_price):'Items pending'}</td><td>{order.hasFeeData?formatCurrency(order.promotion):'—'}</td><td>{order.hasFeeData?formatCurrency(order.referral_commission):'—'}</td><td>{order.hasFeeData?formatCurrency(order.fulfillment_fee):'—'}</td><td>{order.hasFeeData?formatCurrency(order.total_deductions):'—'}</td><td>{order.hasFeeData?formatCurrency(order.other_amount):'—'}</td><td><b>{order.hasFeeData?formatCurrency(order.net_payout):'—'}</b></td><td><span className={`pill ${order.payment_received?'status-completed':'status-idle'}`}>{order.payment_received?'Yes':'No'}</span></td><td>{payoutTime(order)}</td><td>{order.payout_status??'Awaiting payment data'}</td><td>{statusBadge(order,flag)}</td><td><Button variant="ghost" onClick={()=>toggle(order.amazon_order_id)}>{openId===order.amazon_order_id?'Hide':'Details'}</Button></td></tr>{openId===order.amazon_order_id&&<tr className="order-detail-row"><td colSpan="16">{detail?<div className="order-detail-grid"><div><h4>Items</h4>{detail.items.length?detail.items.map((item,index)=><p key={index}><b>{item.title}</b><br/>{item.sku} · {formatNumber(item.quantity_ordered)} × {formatCurrency(item.item_price)}{item.package_weight?` · ${item.package_weight} ${item.weight_unit??''}`:''}</p>):<p className="muted">Order items have not been returned by Amazon yet. Run Orders & finance sync again after the order is confirmed.</p>}</div><OrderMoneyDetails order={order} detail={detail} /></div>:<Empty text="Loading order details…" />}</td></tr>}</React.Fragment>})}</tbody></table></div>{orderTotalPages>1&&<div className="pager"><Button variant="ghost" disabled={safeOrderPage===0} onClick={()=>setOrderPage(page=>Math.max(0,page-1))}>← Previous</Button><span>Page {safeOrderPage+1} of {orderTotalPages} · {formatNumber(filteredOrders.length)} orders</span><Button variant="ghost" disabled={safeOrderPage>=orderTotalPages-1} onClick={()=>setOrderPage(page=>Math.min(orderTotalPages-1,page+1))}>Next →</Button></div>}</>:<Empty text="No synced orders in this period."/>}</Card>;
+  const reconciliationTable = <Card className="table-card"><PanelHeader title="Order-wise gross → fees → payout" subtitle={source||'Loading Amazon money lines'} /><div className="reconciliation-summary"><button type="button" className={orderView==='matched'?'active':''} onClick={()=>setOrderView('matched')}><strong>{formatNumber(counts.reconciled)}</strong><span>Payments posted in this period</span></button><button type="button" className={orderView==='awaiting'?'active':''} onClick={()=>setOrderView('awaiting')}><strong>{formatNumber(counts.awaiting)}</strong><span>Recent orders awaiting Amazon</span></button><button type="button" className={orderView==='cancelled'?'active':''} onClick={()=>setOrderView('cancelled')}><strong>{formatNumber(counts.cancelled)}</strong><span>Cancelled — no payout expected</span></button><button type="button" className={orderView==='all'?'active':''} onClick={()=>setOrderView('all')}><strong>{formatNumber(orders.length)}</strong><span>All orders</span></button></div><p className="reconciliation-note">The payout columns use the Finances API transaction status and posted timestamp. Settlement ID and deposit-date data come from Amazon's settlement report. “Yes” means Amazon released or initiated the payout; SP-API cannot confirm when the seller's bank actually credited it.</p><div className="payout-summary"><div><span>Released for these orders</span><strong>{formatCurrency(payoutSummary.received)}</strong><small>{formatNumber(payoutSummary.receivedOrders)} order{payoutSummary.receivedOrders===1?'':'s'} · order payouts only — service fees, refunds and adjustments are not counted here</small></div><div><span>Still awaiting payout</span><strong>{formatCurrency(payoutSummary.awaitingGross)}</strong><small>{formatNumber(payoutSummary.awaitingOrders)} order{payoutSummary.awaitingOrders===1?'':'s'} · order value, before Amazon's fees</small></div></div><p className="payout-summary-note">These two cover the orders in this table only. For the money Amazon actually deposited to your bank — every settlement line, not just order payouts — see <b>Settled Amount</b> on the Dashboard.</p><div className="order-search"><Input value={orderSearch} onChange={event=>setOrderSearch(event.target.value)} placeholder="Search order ID or settlement ID…"/><span>{formatNumber(filteredOrders.length)} matching orders</span></div>{error&&<p className="alert error">{error}</p>}{filteredOrders.length?<><div className="table-wrap"><table><thead><tr>{['Order','Settlement ID','Amazon status','Transaction date','Product charges','Promotions','Referral','Fulfillment','Amazon fees','Other','Net payout','Money released?','Released / deposit time','Payout status','Reconciliation',''].map(label=><th key={label}>{label}</th>)}</tr></thead><tbody>{visibleOrders.map(order=>{const flag=flagByOrder.get(order.amazon_order_id);const detail=details[order.amazon_order_id];return <React.Fragment key={order.amazon_order_id}><tr><td>{order.amazon_order_id}</td><td>{order.settlement_id??'—'}</td><td>{order.status??'—'}</td><td>{String(order.transaction_date??order.order_date??'').slice(0,10)}</td><td>{Number(order.gross_item_price)?formatCurrency(order.gross_item_price):'Items pending'}</td><td>{order.hasFeeData?formatCurrency(order.promotion):'—'}</td><td>{order.hasFeeData?formatCurrency(order.referral_commission):'—'}</td><td>{order.hasFeeData?formatCurrency(order.fulfillment_fee):'—'}</td><td>{order.hasFeeData?formatCurrency(order.total_deductions):'—'}</td><td>{order.hasFeeData?formatCurrency(order.other_amount):'—'}</td><td><b>{order.hasFeeData?formatCurrency(order.net_payout):'—'}</b></td><td><span className={`pill ${order.payment_received?'status-completed':'status-idle'}`}>{order.payment_received?'Yes':'No'}</span></td><td>{payoutTime(order)}</td><td>{order.payout_status??'Awaiting payment data'}</td><td>{statusBadge(order,flag)}</td><td><Button variant="ghost" onClick={()=>toggle(order.amazon_order_id)}>{openId===order.amazon_order_id?'Hide':'Details'}</Button></td></tr>{openId===order.amazon_order_id&&<tr className="order-detail-row"><td colSpan="16">{detail?<div className="order-detail-grid"><div><h4>Items</h4>{detail.items.length?detail.items.map((item,index)=><p key={index}><b>{item.title}</b><br/>{item.sku} · {formatNumber(item.quantity_ordered)} × {formatCurrency(item.item_price)}{item.package_weight?` · ${item.package_weight} ${item.weight_unit??''}`:''}</p>):<p className="muted">Order items have not been returned by Amazon yet. Run Orders & finance sync again after the order is confirmed.</p>}</div><OrderMoneyDetails order={order} detail={detail} /></div>:<Empty text="Loading order details…" />}</td></tr>}</React.Fragment>})}</tbody><tfoot><tr className="table-totals"><td colSpan="4">Totals · {formatNumber(orderTotals.orders)} order{orderTotals.orders===1?'':'s'}{orderTotals.settled===0?' · Amazon has not posted fees for any of them yet':orderTotals.settled<orderTotals.orders?` · fee columns cover the ${formatNumber(orderTotals.settled)} Amazon has posted fees for`:''}</td><td>{formatCurrency(orderTotals.gross)}</td><td>{feeTotal(orderTotals.promotion)}</td><td>{feeTotal(orderTotals.referral)}</td><td>{feeTotal(orderTotals.fulfillment)}</td><td>{feeTotal(orderTotals.fees)}</td><td>{feeTotal(orderTotals.other)}</td><td><b>{feeTotal(orderTotals.netPayout)}</b></td><td colSpan="5"></td></tr></tfoot></table></div>{orderTotalPages>1&&<div className="pager"><Button variant="ghost" disabled={safeOrderPage===0} onClick={()=>setOrderPage(page=>Math.max(0,page-1))}>← Previous</Button><span>Page {safeOrderPage+1} of {orderTotalPages} · {formatNumber(filteredOrders.length)} orders</span><Button variant="ghost" disabled={safeOrderPage>=orderTotalPages-1} onClick={()=>setOrderPage(page=>Math.min(orderTotalPages-1,page+1))}>Next →</Button></div>}</>:<Empty text="No synced orders in this period."/>}</Card>;
   const ledgerColumns=['posted_date','transaction_status','account_type','transaction_type','order_id','product_details','product_charges','promotional_rebates','amazon_fees','other','total'];
   const ledgerRows=filteredTransactions.map(row=>({...row,posted_date:String(row.posted_date??'').slice(0,10),product_charges:formatCurrency(row.product_charges),promotional_rebates:formatCurrency(row.promotional_rebates),amazon_fees:formatCurrency(row.amazon_fees),other:formatCurrency(row.other),total:formatCurrency(row.total)}));
-  return <>{reconciliationTable}<Card className="transaction-ledger-intro"><div><span className="live-source">MATCHES SELLER CENTRAL TRANSACTION VIEW</span><h2>All Amazon transactions</h2><p>This includes Order Payments, refunds, Easy Ship charges, service fees, tax withheld, and standalone transactions—not only orders that have a payout.</p></div><div className="transaction-ledger-actions"><strong>{formatNumber(filteredTransactions.length)} of {formatNumber(transactions.length)} transactions</strong><Button variant="secondary" disabled={!ledgerRows.length} onClick={()=>downloadCsv('amazon-transactions.csv',ledgerRows,ledgerColumns)}>Download filtered CSV</Button></div></Card><Card className="transaction-filters"><div><label>Account type<select className="input" value={ledgerFilters.account} onChange={event=>setLedgerFilters(value=>({...value,account:event.target.value}))}><option value="">All account types</option>{uniqueValues('account_type').map(value=><option key={value}>{value}</option>)}</select></label><label>Transaction type<select className="input" value={ledgerFilters.type} onChange={event=>setLedgerFilters(value=>({...value,type:event.target.value}))}><option value="">All transaction types</option>{uniqueValues('transaction_type').map(value=><option key={value}>{value}</option>)}</select></label><label>Transaction status<select className="input" value={ledgerFilters.status} onChange={event=>setLedgerFilters(value=>({...value,status:event.target.value}))}><option value="">All statuses</option>{uniqueValues('transaction_status').map(value=><option key={value}>{value}</option>)}</select></label><label>Order ID<Input value={ledgerFilters.orderId} onChange={event=>setLedgerFilters(value=>({...value,orderId:event.target.value}))} placeholder="Enter order ID…"/></label></div><Button variant="ghost" onClick={()=>setLedgerFilters({account:'',type:'',status:'',orderId:''})}>Clear filters</Button></Card><TableCard title="Complete Amazon transaction ledger" rows={ledgerRows} columns={ledgerColumns} pageSize={10}/></>;
+  // Summed from filteredTransactions (raw numbers), not from ledgerRows -
+  // those have already been through formatCurrency. Follows the current
+  // filters, so narrowing to one account type or status re-totals to match.
+  const ledgerTotals={product_charges:formatCurrency(sumBy(filteredTransactions,'product_charges')),promotional_rebates:formatCurrency(sumBy(filteredTransactions,'promotional_rebates')),amazon_fees:formatCurrency(sumBy(filteredTransactions,'amazon_fees')),other:formatCurrency(sumBy(filteredTransactions,'other')),total:formatCurrency(sumBy(filteredTransactions,'total'))};
+  return <>{reconciliationTable}<Card className="transaction-ledger-intro"><div><span className="live-source">MATCHES SELLER CENTRAL TRANSACTION VIEW</span><h2>All Amazon transactions</h2><p>This includes Order Payments, refunds, Easy Ship charges, service fees, tax withheld, and standalone transactions—not only orders that have a payout.</p></div><div className="transaction-ledger-actions"><strong>{formatNumber(filteredTransactions.length)} of {formatNumber(transactions.length)} transactions</strong><Button variant="secondary" disabled={!ledgerRows.length} onClick={()=>downloadCsv('amazon-transactions.csv',ledgerRows,ledgerColumns)}>Download filtered CSV</Button></div></Card><Card className="transaction-filters"><div><label>Account type<select className="input" value={ledgerFilters.account} onChange={event=>setLedgerFilters(value=>({...value,account:event.target.value}))}><option value="">All account types</option>{uniqueValues('account_type').map(value=><option key={value}>{value}</option>)}</select></label><label>Transaction type<select className="input" value={ledgerFilters.type} onChange={event=>setLedgerFilters(value=>({...value,type:event.target.value}))}><option value="">All transaction types</option>{uniqueValues('transaction_type').map(value=><option key={value}>{value}</option>)}</select></label><label>Transaction status<select className="input" value={ledgerFilters.status} onChange={event=>setLedgerFilters(value=>({...value,status:event.target.value}))}><option value="">All statuses</option>{uniqueValues('transaction_status').map(value=><option key={value}>{value}</option>)}</select></label><label>Order ID<Input value={ledgerFilters.orderId} onChange={event=>setLedgerFilters(value=>({...value,orderId:event.target.value}))} placeholder="Enter order ID…"/></label></div><Button variant="ghost" onClick={()=>setLedgerFilters({account:'',type:'',status:'',orderId:''})}>Clear filters</Button></Card><TableCard title="Complete Amazon transaction ledger" rows={ledgerRows} columns={ledgerColumns} pageSize={10} totals={ledgerTotals} totalsLabel="Totals (all filtered rows)"/></>;
+}
+
+// Amazon's own "All Statements" page, rebuilt from the settlement rows this
+// tool holds - same columns, same periods, same payout figures - so a seller
+// can compare the two side by side without translating between them. Expand a
+// row and it answers the question the Amazon page cannot: not just what the
+// payout was, but every line that made it that number.
+//
+// Deliberately NOT date-range filtered. A settlement is Amazon's own period,
+// and cutting one in half at the edge of whatever range the picker happens to
+// hold would produce a payout that matches nothing - the whole point here is
+// that each row foots to the total Amazon stamped on that document.
+const STATEMENT_BUCKETS = [
+  { key: 'sales', label: 'Sales', hint: 'Money the buyer paid: product price, GST on it, shipping, gift wrap, and promotional rebates' },
+  { key: 'refunds', label: 'Refunds', hint: 'Money returned to buyers, including the fees Amazon gave back with them' },
+  { key: 'expenses', label: 'Expenses', hint: "Amazon's charges: commission, fulfilment, closing, storage, advertising, TCS/TDS withheld" },
+  { key: 'others', label: 'Others', hint: 'Anything Amazon labelled in a way no rule here recognised - normally zero' }
+];
+function StatementDetail({ tenantId, settlementId }) {
+  const [detail, setDetail] = useState(null);
+  const [error, setError] = useState('');
+  useEffect(() => {
+    let active = true; setDetail(null); setError('');
+    api(`/api/tenants/${tenantId}/statements/${encodeURIComponent(settlementId)}`)
+      .then(result => { if (active) setDetail(result); })
+      .catch(e => { if (active) setError(e.message); });
+    return () => { active = false; };
+  }, [tenantId, settlementId]);
+  if (error) return <p className="alert error">{error}</p>;
+  if (!detail) return <Empty text="Loading every line behind this payout…" />;
+  return <div className="statement-detail">
+    <div className="statement-detail-formula">
+      {STATEMENT_BUCKETS.map(bucket => <div key={bucket.key} title={bucket.hint}><span>{bucket.label}</span><strong>{formatCurrency(detail[bucket.key])}</strong></div>)}
+      <div className="statement-detail-payout"><span>Payout</span><strong>{formatCurrency(detail.payout)}</strong></div>
+    </div>
+    {detail.matches_amazon === false && <p className="alert warning">These lines add up to {formatCurrency(detail.payout)}, but Amazon stamped {formatCurrency(detail.amazon_total)} on this document — a difference of {formatCurrency(detail.payout - detail.amazon_total)}. The stored rows for this statement are incomplete or duplicated, so treat this breakdown as unreliable until it re-syncs.</p>}
+    <h4>Where the money went, by Amazon's own label</h4>
+    <div className="table-wrap"><table><thead><tr><th>Section</th><th>Amazon's label</th><th>Lines</th><th>Amount</th></tr></thead><tbody>
+      {detail.groups.map(group => <tr key={`${group.bucket}|${group.label}`}><td><span className={`pill statement-pill-${group.bucket}`}>{STATEMENT_BUCKETS.find(b => b.key === group.bucket)?.label ?? group.bucket}</span></td><td>{group.label}</td><td>{formatNumber(group.lines)}</td><td>{formatCurrency(group.amount)}</td></tr>)}
+    </tbody><tfoot><tr className="table-totals"><td colSpan="3">Total · {formatNumber(detail.lines)} line{detail.lines === 1 ? '' : 's'}</td><td>{formatCurrency(detail.payout)}</td></tr></tfoot></table></div>
+    <h4>Order by order</h4>
+    <p className="muted small">{detail.nonOrderLines > 0 ? `${formatNumber(detail.nonOrderLines)} line${detail.nonOrderLines === 1 ? '' : 's'} in this statement belong to no order — subscription, storage, advertising and similar account-level charges. That is usually why a payout is smaller than the orders alone suggest.` : 'Every line in this statement belongs to an order.'}</p>
+    {detail.orders.length ? <div className="table-wrap"><table><thead><tr><th>Order</th><th>Sales</th><th>Refunds</th><th>Expenses</th><th>Others</th><th>Net for this order</th></tr></thead><tbody>
+      {detail.orders.map(order => <tr key={order.order_id}><td>{order.order_id}</td><td>{formatCurrency(order.sales)}</td><td>{formatCurrency(order.refunds)}</td><td>{formatCurrency(order.expenses)}</td><td>{formatCurrency(order.others)}</td><td><b>{formatCurrency(order.net)}</b></td></tr>)}
+    </tbody></table></div> : <Empty text="No order-level lines in this statement." />}
+  </div>;
+}
+function StatementsView({ tenantId }) {
+  const [statements, setStatements] = useState(null);
+  const [error, setError] = useState('');
+  const [openId, setOpenId] = useState('');
+  useEffect(() => {
+    let active = true; setError('');
+    api(`/api/tenants/${tenantId}/statements`)
+      .then(result => { if (active) setStatements(result.statements); })
+      .catch(e => { if (active) setError(e.message); });
+    return () => { active = false; };
+  }, [tenantId]);
+  if (error) return <Card className="table-card"><PanelHeader title="All Statements" /><p className="alert error">{error}</p></Card>;
+  if (!statements) return <Card className="table-card"><PanelHeader title="All Statements" /><Empty text="Loading your settlement statements…" /></Card>;
+  const period = statement => {
+    const start = statement.period_start ? String(statement.period_start).slice(0, 10) : null;
+    const end = statement.period_end ? String(statement.period_end).slice(0, 10) : null;
+    return start && end ? `${start} → ${end}` : start ?? end ?? statement.settlement_id;
+  };
+  return <Card className="table-card">
+    <PanelHeader title="All Statements" subtitle="every settlement Amazon has issued, and exactly what made up each payout" />
+    <p className="reconciliation-note">These are Amazon's own statement periods, rebuilt from the settlement documents already synced — the same figures its “All Statements” page shows. Open any row to see every line behind that payout: what was earned, what Amazon deducted, and which orders it came from. Sales + Refunds + Expenses + Others always equals Payout exactly, because every line lands in one of those four.</p>
+    {statements.length ? <div className="table-wrap"><table><thead><tr><th>Statement period</th><th>Deposited</th><th>Sales</th><th>Refunds</th><th>Expenses</th><th>Others</th><th>Payout</th><th>Amazon agrees?</th><th></th></tr></thead><tbody>
+      {statements.map(statement => <React.Fragment key={statement.settlement_id}>
+        <tr>
+          <td><b>{period(statement)}</b><br /><small className="muted">{statement.settlement_id} · {formatNumber(statement.lines)} lines</small></td>
+          <td>{statement.deposit_date ? String(statement.deposit_date).slice(0, 10) : <span className="pill status-idle">Not yet paid out</span>}</td>
+          <td>{formatCurrency(statement.sales)}</td>
+          <td>{formatCurrency(statement.refunds)}</td>
+          <td>{formatCurrency(statement.expenses)}</td>
+          <td>{formatCurrency(statement.others)}</td>
+          <td><b>{formatCurrency(statement.payout)}</b></td>
+          <td>{statement.matches_amazon === true ? <span className="pill status-completed">Matches</span> : statement.matches_amazon === false ? <span className="pill status-failed">Off by {formatCurrency(Math.abs(statement.payout - statement.amazon_total))}</span> : <span className="pill status-idle">No total stated</span>}</td>
+          <td><Button variant="ghost" onClick={() => setOpenId(openId === statement.settlement_id ? '' : statement.settlement_id)}>{openId === statement.settlement_id ? 'Hide' : 'Breakdown'}</Button></td>
+        </tr>
+        {openId === statement.settlement_id && <tr className="order-detail-row"><td colSpan="9"><StatementDetail tenantId={tenantId} settlementId={statement.settlement_id} /></td></tr>}
+      </React.Fragment>)}
+    </tbody></table></div> : <Empty text="No settlement statements synced yet. Run the Settlements sync on the Reports page." />}
+  </Card>;
+}
+
+// ---------------------------------------------------------------------------
+// Order Scheduling
+//
+// Ported from the standalone order scheduling tool, which was server-rendered
+// EJS with its own stylesheet. Nothing of that presentation survives on
+// purpose: these use this app's Card / PanelHeader / Button / Input / pill /
+// table-wrap / pager vocabulary and nothing else, so the section reads as part
+// of the same product rather than a second one bolted on. The one genuinely
+// new visual element is the ship-by countdown, which has no equivalent here -
+// and it reuses the existing status-pill colours rather than inventing a
+// palette.
+// ---------------------------------------------------------------------------
+
+// orders.internal_status and shipments.status, in the order an order actually
+// moves through them. The label is what a seller is shown; the raw value never
+// reaches the screen, because "READY_FOR_REVIEW" tells them nothing about what
+// to do and "Needs package info" tells them exactly what to do.
+const SCHEDULING_STATUS = {
+  NEW: { label: 'New', pill: 'status-idle' },
+  SYNCED: { label: 'Synced', pill: 'status-idle' },
+  READY_FOR_REVIEW: { label: 'Needs package info', pill: 'status-running' },
+  READY_TO_SCHEDULE: { label: 'Ready to schedule', pill: 'status-running' },
+  SCHEDULING: { label: 'Scheduling…', pill: 'status-running' },
+  SCHEDULED: { label: 'Scheduled', pill: 'status-completed' },
+  SHIPPED: { label: 'Shipped', pill: 'status-completed' },
+  DELIVERED: { label: 'Delivered', pill: 'status-completed' },
+  PENDING: { label: 'Pending', pill: 'status-idle' },
+  FAILED: { label: 'Failed', pill: 'status-failed' },
+  CANCELLED: { label: 'Cancelled', pill: 'status-idle' }
+};
+const SCHEDULING_STATUS_ORDER = ['READY_FOR_REVIEW', 'READY_TO_SCHEDULE', 'SCHEDULING', 'FAILED', 'SCHEDULED', 'SHIPPED', 'CANCELLED', 'NEW', 'SYNCED'];
+// Statuses where this tool has nothing left to do with the order, and what to
+// say instead of a form. SHIPPED is the one that matters in practice: Amazon
+// reports it for anything fulfilled directly in Seller Central, which is every
+// order an account placed before it started using this tool.
+const SETTLED_SCHEDULING_STATUS = {
+  SHIPPED: 'Amazon reports this order as already shipped — fulfilled directly in Seller Central, outside this tool. There is nothing left to schedule, so there is nothing to measure.',
+  CANCELLED: 'This order was cancelled, so there is nothing to ship.',
+  SCHEDULED: 'The pickup is already booked with Amazon — the shipment is listed on the left. These are the measurements it was booked with.'
+};
+const packageHasMeasurements = pkg =>
+  Boolean(pkg) && [pkg.weight_grams, pkg.length_cm, pkg.width_cm, pkg.height_cm].some(v => v != null && v !== '');
+// Views driven by the Orders API rather than by a synced report, so the
+// report-oriented chrome (SyncLedger, the date range) does not apply to them.
+const SCHEDULING_VIEWS = new Set(['scheduling', 'shipments']);
+const PACKAGE_TYPES = ['BOX', 'POLY_BAG', 'ENVELOPE', 'PALLET'];
+
+function SchedulingStatus({ status }) {
+  const meta = SCHEDULING_STATUS[status] ?? { label: status ?? '—', pill: 'status-idle' };
+  return <span className={`pill ${meta.pill}`}>{meta.label}</span>;
+}
+
+// Amazon's ship-by date is a hard deadline: miss it and the order counts
+// against the seller's late-shipment rate. So this is deliberately loud as it
+// approaches, and states hours rather than a date, because "12 Sep" does not
+// convey "in four hours" at a glance.
+function shipByUrgency(shipByDate) {
+  if (!shipByDate) return { level: 'none', label: 'No deadline' };
+  const hours = (new Date(shipByDate).getTime() - Date.now()) / 3_600_000;
+  if (Number.isNaN(hours)) return { level: 'none', label: '—' };
+  if (hours < 0) return { level: 'overdue', label: `Overdue by ${Math.abs(Math.round(hours))}h` };
+  if (hours < 6) return { level: 'critical', label: `${Math.round(hours)}h left` };
+  if (hours < 12) return { level: 'warning', label: `${Math.round(hours)}h left` };
+  if (hours < 48) return { level: 'ok', label: `${Math.round(hours)}h left` };
+  return { level: 'ok', label: `${Math.round(hours / 24)}d left` };
+}
+const URGENCY_PILL = { overdue: 'status-failed', critical: 'status-failed', warning: 'status-running', ok: 'status-completed', none: 'status-idle' };
+function ShipBy({ date }) {
+  const urgency = shipByUrgency(date);
+  return <span className={`pill ${URGENCY_PILL[urgency.level]}`} title={date ? new Date(date).toLocaleString('en-IN') : 'No ship-by date from Amazon'}>{urgency.label}</span>;
+}
+
+function formatGrams(grams) {
+  if (grams == null || grams === '') return '—';
+  const value = Number(grams);
+  return value >= 1000 ? `${(value / 1000).toFixed(2)} kg` : `${formatNumber(value)} g`;
+}
+function formatDimensions(length, width, height) {
+  if ([length, width, height].some(v => v == null || v === '')) return '—';
+  const trim = v => String(Number(v));
+  return `${trim(length)} × ${trim(width)} × ${trim(height)} cm`;
+}
+function formatDateTime(value) {
+  if (!value) return '—';
+  const date = new Date(value);
+  return Number.isNaN(date.getTime()) ? '—' : date.toLocaleString('en-IN', { day: '2-digit', month: 'short', year: 'numeric', hour: '2-digit', minute: '2-digit' });
+}
+
+function OrderScheduling({ tenantId }) {
+  const [overview, setOverview] = useState(null);
+  const [orders, setOrders] = useState(null);
+  const [page, setPage] = useState(1);
+  const [search, setSearch] = useState('');
+  // '' means "All statuses" and undefined means "not chosen", which the API
+  // treats differently: unchosen hides the terminal statuses so the first
+  // thing a seller sees is the work that still needs doing.
+  const [status, setStatus] = useState(undefined);
+  const [selected, setSelected] = useState(() => new Set());
+  const [openOrderId, setOpenOrderId] = useState('');
+  const [busy, setBusy] = useState('');
+  const [error, setError] = useState('');
+  const [notice, setNotice] = useState('');
+
+  async function loadOverview() {
+    try { setOverview(await api(`/api/tenants/${tenantId}/scheduling/overview`)); }
+    catch (e) { setError(e.message); }
+  }
+  async function loadOrders() {
+    setError('');
+    const query = new URLSearchParams({ page: String(page) });
+    if (search) query.set('q', search);
+    if (status !== undefined) query.set('status', status);
+    try {
+      const result = await api(`/api/tenants/${tenantId}/scheduling/orders?${query}`);
+      setOrders(result);
+      // Drop selections for orders that are no longer on screen, so a
+      // "Schedule selected" click can never act on a row the seller can't see.
+      setSelected(previous => new Set(result.orders.filter(o => previous.has(o.id)).map(o => o.id)));
+    } catch (e) { setError(e.message); setOrders({ orders: [], total: 0, pageCount: 1 }); }
+  }
+  useEffect(() => { loadOverview(); }, [tenantId]);
+  useEffect(() => { loadOrders(); }, [tenantId, page, status]);
+
+  async function runSync() {
+    setBusy('sync'); setError(''); setNotice('');
+    try {
+      const result = await api(`/api/tenants/${tenantId}/scheduling/sync`, { method: 'POST' });
+      const failed = result.results.filter(r => !r.ok);
+      setNotice(failed.length
+        ? `Pulled ${formatNumber(result.synced)} order(s). ${failed.length} account(s) failed: ${failed.map(f => f.reason).join('; ')}`
+        : `Pulled ${formatNumber(result.synced)} order${result.synced === 1 ? '' : 's'} from Amazon.`);
+      await Promise.all([loadOverview(), loadOrders()]);
+    } catch (e) { setError(e.message); }
+    finally { setBusy(''); }
+  }
+
+  async function scheduleSelected() {
+    if (!selected.size) return;
+    setBusy('bulk'); setError(''); setNotice('');
+    try {
+      const result = await api(`/api/tenants/${tenantId}/scheduling/orders/bulk-schedule`, {
+        method: 'POST', body: JSON.stringify({ orderIds: [...selected] })
+      });
+      const failures = result.results.filter(r => !r.ok);
+      // Named, not counted: "3 of 5 scheduled" leaves the seller hunting for
+      // which two, and the reason is usually one they can act on immediately.
+      setNotice(failures.length
+        ? `${formatNumber(result.succeeded)} of ${formatNumber(result.attempted)} scheduled. Not scheduled: ${failures.map(f => f.reason).join('; ')}`
+        : `All ${formatNumber(result.succeeded)} selected order${result.succeeded === 1 ? '' : 's'} scheduled.`);
+      setSelected(new Set());
+      await Promise.all([loadOverview(), loadOrders()]);
+    } catch (e) { setError(e.message); }
+    finally { setBusy(''); }
+  }
+
+  function toggle(orderId) {
+    setSelected(previous => {
+      const next = new Set(previous);
+      if (next.has(orderId)) next.delete(orderId); else next.add(orderId);
+      return next;
+    });
+  }
+
+  const rows = orders?.orders ?? [];
+  const schedulable = rows.filter(order => order.internal_status === 'READY_TO_SCHEDULE');
+  const allSelected = schedulable.length > 0 && schedulable.every(order => selected.has(order.id));
+  const counts = overview?.counts ?? {};
+
+  if (overview && !overview.connected) {
+    return <Card className="table-card">
+      <PanelHeader title="Order Scheduling" subtitle="book Amazon Easy Ship pickups for the orders you have to ship" />
+      <p className="alert warning">Connect your Amazon account in Settings → Amazon Connection first. Order scheduling uses the same connection as your reports — there is no second Amazon login to do.</p>
+    </Card>;
+  }
+
+  return <>
+    <Card className="table-card">
+      <PanelHeader title="Orders to ship" subtitle="pulled from Amazon automatically every hour" />
+      <p className="reconciliation-note">These are your Amazon Easy Ship orders. Enter the real weight and box size once — Amazon needs both to quote a pickup slot — then schedule the pickup here instead of in Seller Central. Orders arrive on their own; the Sync button is only for when you want them right now.</p>
+      <div className="table-card-actions">
+        <Button variant="secondary" disabled={busy === 'sync'} onClick={runSync}>{busy === 'sync' ? 'Pulling from Amazon…' : 'Sync orders now'}</Button>
+        <Button disabled={!selected.size || busy === 'bulk'} onClick={scheduleSelected}>
+          {busy === 'bulk' ? 'Scheduling…' : `Schedule selected${selected.size ? ` (${selected.size})` : ''}`}
+        </Button>
+      </div>
+      {notice && <p className="alert success">{notice}</p>}
+      {error && <p className="alert error">{error}</p>}
+
+      <div className="reconciliation-summary scheduling-filters">
+        <button type="button" className={status === undefined ? 'active' : ''} onClick={() => { setStatus(undefined); setPage(1); }}>
+          <strong>{formatNumber(SCHEDULING_STATUS_ORDER.filter(s => !(overview?.doneStatuses ?? []).includes(s)).reduce((sum, s) => sum + (counts[s] ?? 0), 0))}</strong>
+          <span>Still need action</span>
+        </button>
+        {['READY_FOR_REVIEW', 'READY_TO_SCHEDULE', 'SCHEDULED', 'FAILED'].map(key =>
+          <button type="button" key={key} className={status === key ? 'active' : ''} onClick={() => { setStatus(key); setPage(1); }}>
+            <strong>{formatNumber(counts[key] ?? 0)}</strong>
+            <span>{SCHEDULING_STATUS[key].label}</span>
+          </button>
+        )}
+        <button type="button" className={status === '' ? 'active' : ''} onClick={() => { setStatus(''); setPage(1); }}>
+          <strong>{formatNumber(Object.values(counts).reduce((sum, n) => sum + n, 0))}</strong>
+          <span>All orders</span>
+        </button>
+      </div>
+
+      <div className="order-search">
+        <Input value={search} onChange={event => setSearch(event.target.value)} onKeyDown={event => { if (event.key === 'Enter') { setPage(1); loadOrders(); } }} placeholder="Search order ID, SKU or ASIN…" />
+        <Button variant="ghost" onClick={() => { setPage(1); loadOrders(); }}>Search</Button>
+        <span>{formatNumber(orders?.total ?? 0)} matching orders</span>
+      </div>
+
+      {!orders ? <Empty text="Loading your Amazon orders…" /> : rows.length ? <>
+        <div className="table-wrap"><table>
+          <thead><tr>
+            <th><input type="checkbox" aria-label="Select every schedulable order on this page" checked={allSelected} disabled={!schedulable.length}
+              onChange={() => setSelected(allSelected ? new Set() : new Set(schedulable.map(o => o.id)))} /></th>
+            {['Order', 'Ordered', 'Ship by', 'Status', 'Weight', 'Dimensions', ''].map(label => <th key={label}>{label}</th>)}
+          </tr></thead>
+          <tbody>{rows.map(order => <React.Fragment key={order.id}>
+            <tr>
+              <td>{order.internal_status === 'READY_TO_SCHEDULE'
+                ? <input type="checkbox" aria-label={`Select order ${order.external_order_id}`} checked={selected.has(order.id)} onChange={() => toggle(order.id)} />
+                : null}</td>
+              <td><b>{order.external_order_id}</b>{order.is_prime ? <> <span className="pill status-idle">Prime</span></> : null}<br /><small className="muted">{order.marketplace_name ?? order.marketplace_code} · {formatNumber(order.item_count ?? 0)} item{order.item_count === 1 ? '' : 's'}</small></td>
+              <td>{String(order.order_date ?? '').slice(0, 10)}</td>
+              <td><ShipBy date={order.ship_by_date} /></td>
+              <td><SchedulingStatus status={order.internal_status} /></td>
+              <td>{formatGrams(order.package?.weight_grams)}</td>
+              <td>{formatDimensions(order.package?.length_cm, order.package?.width_cm, order.package?.height_cm)}</td>
+              <td><Button variant="ghost" onClick={() => setOpenOrderId(openOrderId === order.id ? '' : order.id)}>{openOrderId === order.id ? 'Hide' : 'Open'}</Button></td>
+            </tr>
+            {openOrderId === order.id && <tr className="order-detail-row"><td colSpan="8">
+              <SchedulingOrderDetail tenantId={tenantId} orderId={order.id} onChanged={() => { loadOrders(); loadOverview(); }} />
+            </td></tr>}
+          </React.Fragment>)}</tbody>
+        </table></div>
+        {orders.pageCount > 1 && <div className="pager">
+          <Button variant="ghost" disabled={page <= 1} onClick={() => setPage(p => Math.max(1, p - 1))}>← Previous</Button>
+          <span>Page {orders.page} of {orders.pageCount} · {formatNumber(orders.total)} orders</span>
+          <Button variant="ghost" disabled={page >= orders.pageCount} onClick={() => setPage(p => p + 1)}>Next →</Button>
+        </div>}
+      </> : <Empty text={status === undefined
+        ? 'Nothing needs action right now — every synced order is scheduled, shipped or cancelled.'
+        : 'No orders match this filter.'} />}
+    </Card>
+  </>;
+}
+
+// The package form and the schedule button, opened inline from a row. Inline
+// rather than a separate page because the whole job is "read the label, type
+// four numbers, click schedule", and losing your place in the list between
+// each order makes that job worse.
+function SchedulingOrderDetail({ tenantId, orderId, onChanged }) {
+  const [detail, setDetail] = useState(null);
+  const [form, setForm] = useState(null);
+  const [busy, setBusy] = useState('');
+  const [error, setError] = useState('');
+  const [notice, setNotice] = useState('');
+
+  async function load() {
+    setError('');
+    try {
+      const result = await api(`/api/tenants/${tenantId}/scheduling/orders/${orderId}`);
+      setDetail(result);
+      setForm({
+        weightGrams: result.package?.weight_grams ?? '',
+        lengthCm: result.package?.length_cm ?? '',
+        widthCm: result.package?.width_cm ?? '',
+        heightCm: result.package?.height_cm ?? '',
+        packageType: result.package?.package_type ?? ''
+      });
+    } catch (e) { setError(e.message); }
+  }
+  useEffect(() => { load(); }, [tenantId, orderId]);
+
+  async function savePackage(event) {
+    event.preventDefault();
+    setBusy('save'); setError(''); setNotice('');
+    try {
+      const result = await api(`/api/tenants/${tenantId}/scheduling/orders/${orderId}/package`, { method: 'PUT', body: JSON.stringify(form) });
+      setDetail(previous => ({ ...previous, ...result }));
+      setNotice('Package saved.');
+      onChanged?.();
+    } catch (e) { setError(e.message); }
+    finally { setBusy(''); }
+  }
+
+  async function schedule() {
+    setBusy('schedule'); setError(''); setNotice('');
+    try {
+      const result = await api(`/api/tenants/${tenantId}/scheduling/orders/${orderId}/schedule`, { method: 'POST' });
+      // A refused schedule comes back 200 with ok:false and a reason - the
+      // request was understood, Amazon or a pre-flight check just said no.
+      // Showing that reason is the entire point; a generic failure would send
+      // the seller to Seller Central to find out why.
+      if (result.ok) setNotice('Pickup scheduled with Amazon.');
+      else setError(result.reason ?? 'This order could not be scheduled.');
+      await load();
+      onChanged?.();
+    } catch (e) { setError(e.message); }
+    finally { setBusy(''); }
+  }
+
+  if (error && !detail) return <p className="alert error">{error}</p>;
+  if (!detail) return <Empty text="Loading order…" />;
+
+  // An order in one of these is finished as far as this tool is concerned, and
+  // the package form has no job to do on it. Getting this wrong is worse than
+  // it sounds: an account whose whole history predates this tool is ALL
+  // shipped orders, so the very first screen a seller sees would be a hundred
+  // rows each demanding four measurements for a parcel that left weeks ago.
+  const settled = SETTLED_SCHEDULING_STATUS[detail.order.internal_status];
+  const savedPackage = detail.package && packageHasMeasurements(detail.package);
+  const set = (key, value) => setForm(previous => ({ ...previous, [key]: value }));
+
+  return <div className="order-detail-grid">
+    <div>
+      <h4>Order</h4>
+      <p>
+        <b>{detail.order.external_order_id}</b><br />
+        Ordered {formatDateTime(detail.order.order_date)}<br />
+        Ship by {formatDateTime(detail.order.ship_by_date)}<br />
+        Deliver by {formatDateTime(detail.order.delivery_by_date)}<br />
+        Amazon status: {detail.order.marketplace_status ?? '—'}
+      </p>
+      <h4>Items</h4>
+      {detail.items.length ? detail.items.map(item => <p key={item.id}>
+        <b>{formatNumber(item.quantity_ordered)}× {item.title || item.external_product_id}</b><br />
+        <small className="muted">{item.external_product_id}{item.sku ? ` · SKU ${item.sku}` : ''}</small>
+      </p>) : <p className="muted">Amazon has not returned the items for this order yet.</p>}
+
+      <h4>Shipments</h4>
+      {detail.shipments.length ? <div className="table-wrap"><table>
+        <thead><tr><th>Status</th><th>Tracking</th><th>Pickup</th><th>Label</th></tr></thead>
+        <tbody>{detail.shipments.map(shipment => <tr key={shipment.id}>
+          <td><SchedulingStatus status={shipment.status} /></td>
+          <td>{shipment.tracking_id || '—'}</td>
+          <td>{formatDateTime(shipment.scheduled_pickup_start)}</td>
+          <td>{shipment.label_url ? <a href={shipment.label_url} target="_blank" rel="noopener noreferrer">Open label</a> : '—'}</td>
+        </tr>)}</tbody>
+      </table></div> : <p className="muted">Nothing scheduled yet.</p>}
+    </div>
+
+    <div>
+      <h4>Package</h4>
+      {/* The settled check comes FIRST, before the package-completeness one.
+          The other order round-trips through "you still have to fill this in"
+          for an order that shipped a month ago, because an unmeasured parcel
+          and a parcel that needs measuring look identical from the data. */}
+      {settled ? <>
+        <p className="muted">{settled}</p>
+        {savedPackage
+          ? <dl className="scheduling-package-readout">
+            <div><dt>Weight</dt><dd>{formatGrams(detail.package.weight_grams)}</dd></div>
+            <div><dt>Size</dt><dd>{formatDimensions(detail.package.length_cm, detail.package.width_cm, detail.package.height_cm)}</dd></div>
+            <div><dt>Type</dt><dd>{(detail.package.package_type ?? '—').replace('_', ' ')}</dd></div>
+          </dl>
+          : null}
+      </> : <>
+        <p className="muted">Amazon quotes a pickup slot from the real weight and box size, so these have to be measured, not estimated. They are saved against this order and reused if you reschedule.</p>
+        {notice && <p className="alert success">{notice}</p>}
+        {error && <p className="alert error">{error}</p>}
+        <form className="scheduling-package-form" onSubmit={savePackage}>
+          <label>Weight (grams)<Input type="number" step="1" min="1" value={form.weightGrams} onChange={e => set('weightGrams', e.target.value)} /></label>
+          <label>Length (cm)<Input type="number" step="0.1" min="0.1" value={form.lengthCm} onChange={e => set('lengthCm', e.target.value)} /></label>
+          <label>Width (cm)<Input type="number" step="0.1" min="0.1" value={form.widthCm} onChange={e => set('widthCm', e.target.value)} /></label>
+          <label>Height (cm)<Input type="number" step="0.1" min="0.1" value={form.heightCm} onChange={e => set('heightCm', e.target.value)} /></label>
+          <label>Package type
+            <select className="input" value={form.packageType} onChange={e => set('packageType', e.target.value)}>
+              <option value="">Select…</option>
+              {PACKAGE_TYPES.map(type => <option key={type} value={type}>{type.replace('_', ' ')}</option>)}
+            </select>
+          </label>
+          <Button type="submit" variant="secondary" disabled={busy === 'save'}>{busy === 'save' ? 'Saving…' : 'Save package'}</Button>
+        </form>
+
+        {detail.isComplete
+          // Disabled here purely to avoid a dead-end click; the API refuses the
+          // same thing independently (schedulingService's preflight), so this is
+          // a courtesy, not the guard.
+          ? <Button disabled={busy === 'schedule'} onClick={schedule}>{busy === 'schedule' ? 'Asking Amazon…' : 'Schedule pickup'}</Button>
+          : <><p className="muted"><b>Fill in every field above before scheduling.</b> Still missing: {detail.missingFields.join(', ')}.</p>
+            <Button disabled title="Fill in every field above first">Schedule pickup</Button></>}
+      </>}
+    </div>
+  </div>;
+}
+
+function SchedulingShipments({ tenantId }) {
+  const [data, setData] = useState(null);
+  const [page, setPage] = useState(1);
+  const [search, setSearch] = useState('');
+  const [error, setError] = useState('');
+
+  async function load() {
+    setError('');
+    const query = new URLSearchParams({ page: String(page) });
+    if (search) query.set('q', search);
+    try { setData(await api(`/api/tenants/${tenantId}/scheduling/shipments?${query}`)); }
+    catch (e) { setError(e.message); setData({ shipments: [], total: 0, pageCount: 1 }); }
+  }
+  useEffect(() => { load(); }, [tenantId, page]);
+
+  return <Card className="table-card">
+    <PanelHeader title="Scheduled pickups" subtitle="every Easy Ship booking made from this tool" />
+    <p className="reconciliation-note">One row per pickup Amazon accepted. The tracking ID and label appear as soon as Amazon issues them — print the label and hand the package over in the pickup window.</p>
+    <div className="order-search">
+      <Input value={search} onChange={event => setSearch(event.target.value)} onKeyDown={event => { if (event.key === 'Enter') { setPage(1); load(); } }} placeholder="Search tracking ID or order ID…" />
+      <Button variant="ghost" onClick={() => { setPage(1); load(); }}>Search</Button>
+      <span>{formatNumber(data?.total ?? 0)} shipments</span>
+    </div>
+    {error && <p className="alert error">{error}</p>}
+    {!data ? <Empty text="Loading your scheduled pickups…" /> : data.shipments.length ? <>
+      <div className="table-wrap"><table>
+        <thead><tr>{['Order', 'Status', 'Tracking', 'Carrier', 'Pickup window', 'Booked', 'Label'].map(label => <th key={label}>{label}</th>)}</tr></thead>
+        <tbody>{data.shipments.map(shipment => <tr key={shipment.id}>
+          <td><b>{shipment.external_order_id}</b><br /><small className="muted">{shipment.marketplace_code}</small></td>
+          <td><SchedulingStatus status={shipment.status} />{shipment.status === 'FAILED' && shipment.failure_reason ? <><br /><small className="muted">{shipment.failure_reason}</small></> : null}</td>
+          <td>{shipment.tracking_id || '—'}</td>
+          <td>{shipment.carrier_name || '—'}</td>
+          <td>{shipment.scheduled_pickup_start ? `${formatDateTime(shipment.scheduled_pickup_start)} → ${formatDateTime(shipment.scheduled_pickup_end)}` : '—'}</td>
+          <td>{formatDateTime(shipment.created_at)}</td>
+          <td>{shipment.label_url ? <a href={shipment.label_url} target="_blank" rel="noopener noreferrer">Open label</a> : '—'}</td>
+        </tr>)}</tbody>
+      </table></div>
+      {data.pageCount > 1 && <div className="pager">
+        <Button variant="ghost" disabled={page <= 1} onClick={() => setPage(p => Math.max(1, p - 1))}>← Previous</Button>
+        <span>Page {data.page} of {data.pageCount} · {formatNumber(data.total)} shipments</span>
+        <Button variant="ghost" disabled={page >= data.pageCount} onClick={() => setPage(p => p + 1)}>Next →</Button>
+      </div>}
+    </> : <Empty text="No pickups scheduled yet. Schedule one from Order Scheduling." />}
+  </Card>;
 }
 
 function FeeLeakAudit({tenantId}) {
   const {range}=useContext(DateRangeContext); const [result,setResult]=useState({flags:[],totalOvercharged:0}); const [busy,setBusy]=useState(false); const [error,setError]=useState('');
   async function load(){setResult(await api(`/api/tenants/${tenantId}/fee-leaks?${rangeQuery(range)}`));}
   useEffect(()=>{load().catch(e=>setError(e.message));},[tenantId,range.start,range.end]);
-  async function audit(){setBusy(true);setError('');try{await api(`/api/tenants/${tenantId}/fee-audit`,{method:'POST',body:JSON.stringify({range:{start:formatDateParam(range.start),end:formatDateParam(addDays(range.end,1))},varianceThreshold:5})});await load();}catch(e){setError(e.message)}finally{setBusy(false)}}
+  async function audit(){setBusy(true);setError('');try{await api(`/api/tenants/${tenantId}/fee-audit`,{method:'POST',body:JSON.stringify({range:{start:formatDateParam(range.start),end:endOfRangeParam(range.end)},varianceThreshold:5})});await load();}catch(e){setError(e.message)}finally{setBusy(false)}}
   return <><Card className="fee-audit-hero"><div><span className="live-source">AMAZON FEES ESTIMATE API</span><h2>{formatCurrency(result.totalOvercharged)} potential overcharge</h2><p>Expected Amazon fees compared with itemized fees actually deducted. Slab fallback is clearly identified when used.</p></div><Button onClick={audit} disabled={busy}>{busy?'Auditing…':'Run fee audit'}</Button></Card>{error&&<p className="alert error">{error}</p>}<TableCard title="Flagged fee discrepancies" rows={result.flags} columns={['order_id','sku','source','expected_fee','actual_fee','variance','flagged_at','resolved']} pageSize={15}/></>;
+}
+
+// Every settlement document already in the ledger, most recent first. There
+// is no real "processing" state to show here - a row only exists in
+// data.payments because Amazon already settled it, so "Settled" is what
+// every row honestly is. Nothing here is inferred.
+function SettlementTimeline({ payments, tenantId }) {
+  const rows = [...(payments ?? [])].sort((a, b) => new Date(b.posted_date) - new Date(a.posted_date)).slice(0, 6);
+  return <Card className="panel">
+    <PanelHeader title="Settlement Timeline" subtitle="Most recent first" />
+    {rows.length ? <>
+      <div className="settlement-timeline">{rows.map((row, i) => <div className="timeline-row" key={row.settlement_id ?? i}>
+        <span className="timeline-dot" />
+        <div><b>{row.settlement_id ?? 'Settlement'}</b><small>{String(row.posted_date ?? '').slice(0, 10)} · {formatNumber(row.lines ?? 0)} lines</small></div>
+        <span className="timeline-amount">{formatCurrency(row.net_amount)}</span>
+        <span className="pill status-completed">Settled</span>
+      </div>)}</div>
+      <div className="timeline-footer"><Link className="panel-link" to={`/seller?tenantId=${tenantId}&view=payouts`}>View all settlements →</Link></div>
+    </> : <Empty text="No settlements imported for this period yet." />}
+  </Card>;
+}
+
+// Expense Breakdown, straight from the same expense-line groups the Expenses
+// statement section is built from (dashboard-calculations.js's group() over
+// expenseRows) - Amazon's own fee labels, not invented category names. Top 5
+// by size, the rest folded into one honest "Other fees" slice.
+const EXPENSE_SLICE_COLORS = ['#7c3aed', '#1668e8', '#22a65a', '#ea7b24', '#d94380', '#94a3b8'];
+function ExpenseBreakdown({ components, tenantId }) {
+  const ranked = [...(components ?? [])].map(c => ({ ...c, amount: Math.abs(Number(c.amount ?? 0)) })).filter(c => c.amount > 0).sort((a, b) => b.amount - a.amount);
+  const top = ranked.slice(0, 5);
+  const otherTotal = ranked.slice(5).reduce((sum, c) => sum + c.amount, 0);
+  const slices = otherTotal > 0 ? [...top, { label: 'Other fees', amount: otherTotal }] : top;
+  const total = slices.reduce((sum, s) => sum + s.amount, 0);
+  const chartData = slices.map(s => ({ name: s.label, value: s.amount }));
+  return <Card className="panel">
+    <PanelHeader title="Expense Breakdown" subtitle="By Amazon fee label" />
+    {slices.length ? <div className="expense-breakdown">
+      <ResponsiveContainer width="100%" height={190}>
+        <PieChart><Pie data={chartData} innerRadius={56} outerRadius={80} dataKey="value" paddingAngle={2}>{chartData.map((_, i) => <Cell key={i} fill={EXPENSE_SLICE_COLORS[i % EXPENSE_SLICE_COLORS.length]} />)}</Pie><Tooltip formatter={value => formatCurrency(value)} /></PieChart>
+      </ResponsiveContainer>
+      <div className="expense-breakdown-total"><span>Total</span><strong>{formatCurrency(total)}</strong></div>
+      <div className="expense-legend">{slices.map((s, i) => <div className="expense-legend-row" key={s.label}><span className="dot" style={{ background: EXPENSE_SLICE_COLORS[i % EXPENSE_SLICE_COLORS.length] }} /><b>{s.label}</b><span>{formatCurrency(s.amount)} ({total ? Math.round(s.amount / total * 100) : 0}%)</span></div>)}</div>
+      <div className="timeline-footer"><Link className="panel-link" to={`/seller?tenantId=${tenantId}&view=metric-detail&metric=deductions`}>Open full calculation →</Link></div>
+    </div> : <Empty text="No classified expense lines for this period yet." />}
+  </Card>;
+}
+
+// The single source of truth for "what needs attention", shown in the
+// topbar notification bell. Deliberately narrow: only a sync job Amazon
+// itself reported as failed, in plain language ("X sync failed: reason").
+// The dashboard-calculation's own internal completeness/coverage reasoning
+// (which rows were excluded and why, dedup counts, etc.) used to feed this
+// too, but that is diagnostic detail for whoever built the reconciliation,
+// not something an end user hosting this tool needs surfaced as an "alert" -
+// it lives in the calculation detail pages for whoever wants it.
+function buildAlerts(data) {
+  const alerts = [];
+  for (const job of data?.jobs ?? []) {
+    if (job.status !== 'failed') continue;
+    const label = REPORTS.find(r => r.type === job.report_type)?.label ?? job.report_type;
+    alerts.push({ severity: 'high', text: `${label} sync failed: ${job.error_message ?? 'no error detail returned'}`, at: job.completed_at ?? job.started_at });
+  }
+  return alerts;
+}
+
+// Fetches the immediately preceding period of the same length, purely to
+// compute the "vs prior period" deltas on the KPI strip - reuses the exact
+// same /dashboard endpoint and calculation engine the main view already
+// calls, just with a shifted range, so a delta can never disagree with how
+// either figure was itself computed.
+function usePriorPeriod(tenantId, range) {
+  const [prevData, setPrevData] = useState(null);
+  useEffect(() => {
+    if (!tenantId) return;
+    let active = true;
+    const days = Math.max(1, Math.round((startOfDay(range.end) - startOfDay(range.start)) / 864e5) + 1);
+    const prevEnd = addDays(range.start, -1);
+    const prevStart = addDays(prevEnd, -(days - 1));
+    api(`/api/tenants/${tenantId}/dashboard?${rangeQuery({ start: prevStart, end: prevEnd })}`)
+      .then(d => { if (active) setPrevData(d); })
+      .catch(() => { if (active) setPrevData(null); });
+    return () => { active = false; };
+  }, [tenantId, range.start, range.end]);
+  return prevData;
+}
+
+// Amazon's own Sales Dashboard totals for the range, computed the same way
+// Amazon computes them: sum businessReportRows (already deduplicated
+// per-day - server.js prefers each day's asin='ALL' rollup row and only
+// falls back to summing per-ASIN rows when Amazon didn't send one, so this
+// never double-counts). Deliberately separate from Net Qty / Orders Synced
+// above: those are reconciliation-adjusted (net of actual returns, cancelled
+// and pending/unshipped orders excluded, missing item quantities backfilled
+// from settlement data) - genuinely different, both-correct numbers for
+// different questions, not two attempts at the same one. Comparing this card
+// against Seller Central's Sales Dashboard is the direct apples-to-apples
+// check; Net Qty/Orders Synced are not meant to equal it.
+function sumBusinessReportTotals(rows) {
+  return (rows ?? []).reduce((acc, row) => ({
+    totalOrderItems: acc.totalOrderItems + Number(row.total_order_items ?? 0),
+    unitsOrdered: acc.unitsOrdered + Number(row.units_ordered ?? 0),
+    orderedProductSales: acc.orderedProductSales + Number(row.ordered_product_sales ?? 0)
+  }), { totalOrderItems: 0, unitsOrdered: 0, orderedProductSales: 0 });
+}
+// Amazon's own "Avg. units/order item" and "Avg. sales/order item" are
+// ratios over the RANGE TOTAL, not an average of each day's own average -
+// confirmed against a live Seller Central screenshot: 623 units ordered /
+// 590 total order items = 1.0559 -> displayed as 1.06, and
+// ₹83,42,382.00 / 590 = ₹14,139.63 exactly. Averaging the per-day
+// average_sales_per_order_item / average_units_per_order_item fields
+// instead (which businessReportRows also carries) would give a different,
+// non-matching number on any range where daily volume varies - so these two
+// are deliberately derived from the same totals as the other three, not
+// pulled from those columns.
+function formatRatio(value) { return Number(value ?? 0).toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 }); }
+function AmazonBusinessReportCard({ rows }) {
+  const hasRows = Boolean(rows?.length);
+  const totals = useMemo(() => sumBusinessReportTotals(rows), [rows]);
+  const avgUnitsPerOrderItem = totals.totalOrderItems ? totals.unitsOrdered / totals.totalOrderItems : null;
+  const avgSalesPerOrderItem = totals.totalOrderItems ? totals.orderedProductSales / totals.totalOrderItems : null;
+  return <Card className="profit-control-card">
+    <PanelHeader title="Amazon Business Report" subtitle="Matches Seller Central's Sales Dashboard for this range" />
+    {hasRows
+      ? <div className="profit-kpi-grid amazon-business-report-grid">
+          <div className="mini-metric"><span>Total Order Items</span><strong>{formatNumber(totals.totalOrderItems)}</strong></div>
+          <div className="mini-metric"><span>Units Ordered</span><strong>{formatNumber(totals.unitsOrdered)}</strong></div>
+          <div className="mini-metric"><span>Ordered Product Sales</span><strong>{formatCurrency(totals.orderedProductSales)}</strong></div>
+          <div className="mini-metric"><span>Avg. Units/Order Item</span><strong>{avgUnitsPerOrderItem==null?'—':formatRatio(avgUnitsPerOrderItem)}</strong></div>
+          <div className="mini-metric"><span>Avg. Sales/Order Item</span><strong>{avgSalesPerOrderItem==null?'—':formatCurrency(avgSalesPerOrderItem)}</strong></div>
+        </div>
+      : <Empty text="Coming soon - requires Amazon's Sales & Traffic report, paused until Amazon approves the Brand Analytics role. Once enabled, these five numbers will match Seller Central's Sales Dashboard exactly." />}
+  </Card>;
+}
+// Amazon's own five statement sections - Income, Expenses, Tax, GST,
+// Transfers. This is the core reconciliation claim of the tool, so it stays
+// on the dashboard regardless of anything else there. These five are
+// settlement/finance-derived (not blocked on the paused GST B2B/B2C or
+// Sales & Traffic reports), unlike the GST invoice value tile elsewhere,
+// which is why they're not gated behind a "Coming soon" notice. This used
+// to also show a "Provisional - not yet reconciled" debug banner and a
+// calculation-build revision line for whoever was building the tool - that
+// diagnostic language was dropped for a hosted end user; the five cards
+// themselves (each a link to its own source rows and formula) were not.
+function AmazonStatementSummary({ data, tenantId }) {
+  return (
+    <Card className="profit-control-card">
+      <PanelHeader title="Amazon Statement Summary" subtitle="Income, Expenses, Tax, GST & Transfers" />
+      <div className="profit-kpi-grid account-activity-grid">
+        {['income', 'expenses', 'tax', 'transfers', 'gst'].map(metric => (
+          <DrillMetric
+            key={metric}
+            to={`/seller?tenantId=${tenantId}&view=metric-detail&metric=${metric}`}
+            title={metric === 'gst' ? 'Goods and Services Tax' : metric[0].toUpperCase() + metric.slice(1)}
+            value={formatCurrency(data?.dashboardCalculations?.statement?.[metric]?.value)}
+            hint="Open Amazon source rows and formula"
+          />
+        ))}
+      </div>
+    </Card>
+  );
 }
 function DashboardOverview({ data, channelData, tenantId }) {
   const { range } = useContext(DateRangeContext);
   const summary = useMemo(() => buildDashboardSummary(data, range), [data, range]);
+  const prevData = usePriorPeriod(tenantId, range);
+  const prevSummary = useMemo(() => prevData ? buildDashboardSummary(prevData) : null, [prevData]);
   return <>
     <div className="metrics-strip">
-      <DrillMetric to={`/seller?tenantId=${tenantId}&view=metric-detail&metric=netSales`} title="Net Sales" value={formatCurrency(summary.netSales)} hint="Click to see order-value formula" />
-      <DrillMetric to={`/seller?tenantId=${tenantId}&view=metric-detail&metric=netQty`} title="Net Qty" value={summary.netQty==null?'Unavailable':formatNumber(summary.netQty)} hint="Click to see units source" />
-      <DrillMetric to={`/seller?tenantId=${tenantId}&view=metric-detail&metric=orders`} title="Orders Synced" value={formatNumber(summary.ordersCount)} hint="Distinct eligible Amazon order IDs" />
-      <DrillMetric to={`/seller?tenantId=${tenantId}&view=metric-detail&metric=returns`} title="Returns" value={formatNumber(summary.returnQty)} hint="Total returned quantity" />
+      <DrillMetric to={`/seller?tenantId=${tenantId}&view=metric-detail&metric=netSales`} title="Net Sales" value={formatCurrency(summary.netSales)} icon="₹" tone="violet" delta={prevSummary && pctDelta(summary.netSales, prevSummary.netSales)} />
+      <DrillMetric to={`/seller?tenantId=${tenantId}&view=metric-detail&metric=netQty`} title="Net Qty" value={summary.netQty==null?'Unavailable':formatNumber(summary.netQty)} icon="◧" tone="blue" delta={prevSummary && pctDelta(summary.netQty, prevSummary.netQty)} />
+      <DrillMetric to={`/seller?tenantId=${tenantId}&view=metric-detail&metric=orders`} title="Orders Synced" value={formatNumber(summary.ordersCount)} icon="⇄" tone="emerald" delta={prevSummary && pctDelta(summary.ordersCount, prevSummary.ordersCount)} />
+      <DrillMetric to={`/seller?tenantId=${tenantId}&view=metric-detail&metric=returns`} title="Returns" value={formatNumber(summary.returnQty)} icon="↩" tone="marigold" delta={prevSummary && pctDelta(summary.returnQty, prevSummary.returnQty)} />
     </div>
+
+    <AmazonBusinessReportCard rows={data?.businessReportRows} />
 
     <Card className="profit-control-card">
       <PanelHeader title="Profit Analysis" subtitle="Clean overview" />
       <div className="profit-kpi-grid">
-        <DrillMetric to={`/seller?tenantId=${tenantId}&view=metric-detail&metric=settled`} title="Settled Amount" value={formatCurrency(summary.settledAmount)} hint="From settlements / finance" />
-        <DrillMetric to={`/seller?tenantId=${tenantId}&view=metric-detail&metric=deductions`} title="Deductions" value={formatCurrency(summary.deductions)} hint="Fees, refunds, charges" />
-        <DrillMetric to={`/seller?tenantId=${tenantId}&view=metric-detail&metric=reimbursements`} title="Reimbursements" value={formatCurrency(summary.reimbursements)} hint="Credits imported" />
-        <DrillMetric to={`/seller?tenantId=${tenantId}&view=metric-detail&metric=drr`} title="DRR" value={formatCurrency(summary.drr)} hint="Daily run rate" />
+        <DrillMetric to={`/seller?tenantId=${tenantId}&view=metric-detail&metric=settled`} title="Settled Amount" value={formatCurrency(summary.settledAmount)} icon="🧾" tone="violet" hint="From settlements / finance" />
+        <DrillMetric to={`/seller?tenantId=${tenantId}&view=metric-detail&metric=deductions`} title="Deductions" value={formatCurrency(summary.deductions)} icon="✂" tone="danger" hint="Fees, refunds, charges" />
+        <DrillMetric to={`/seller?tenantId=${tenantId}&view=metric-detail&metric=reimbursements`} title="Reimbursements" value={formatCurrency(summary.reimbursements)} icon="↺" tone="emerald" hint="Credits imported" />
+        <DrillMetric to={`/seller?tenantId=${tenantId}&view=metric-detail&metric=drr`} title="DRR" value={formatCurrency(summary.drr)} icon="⏱" tone="marigold" hint="Daily run rate" />
       </div>
     </Card>
+
+    <div className="dashboard-grid three">
+      <SettlementTimeline payments={data?.payments} tenantId={tenantId} />
+      <ExpenseBreakdown components={data?.dashboardCalculations?.statement?.expenses?.components} tenantId={tenantId} />
+    </div>
+
+    <AmazonStatementSummary data={data} tenantId={tenantId} />
 
     <ExplanationGrid summary={summary} tenantId={tenantId} />
 
-    <Card className="profit-control-card">
-      <PanelHeader title="Amazon Account Activity" subtitle="Matches Amazon statement sections" />
-      <div className="profit-kpi-grid account-activity-grid">
-        {['income','expenses','tax','transfers','gst'].map(metric=><DrillMetric key={metric} to={`/seller?tenantId=${tenantId}&view=metric-detail&metric=${metric}`} title={metric==='gst'?'Goods and Services Tax':metric[0].toUpperCase()+metric.slice(1)} value={formatCurrency(data?.dashboardCalculations?.statement?.[metric]?.value)} hint="Open Amazon source rows and formula" />)}
-      </div>
-    </Card>
-
     <SalesAnalytics data={data} channelData={channelData} />
 
-    <div className="dashboard-grid two">
-      <TableCard title="Reconciliation Snapshot" rows={summary.reconcileRows} columns={['area', 'count', 'amount', 'status']} />
-      <TableCard title="Recent Sync Jobs" rows={data?.jobs ?? []} columns={['report_type', 'status', 'completed_at', 'error_message']} />
-    </div>
+    <TableCard title="Reconciliation Snapshot" rows={summary.reconcileRows} columns={['area', 'count', 'amount', 'status']} />
   </>;
 }
 
 
-function DrillMetric({ to, title, value, hint }) { return <NavLink to={to} className="mini-metric drill-metric"><span>{title}</span><strong>{value}</strong>{trendHint(hint)}<em>View calculation →</em></NavLink>; }
+// icon/tone/delta are all optional so every existing caller (which only
+// passes to/title/value/hint) renders exactly as before; the dashboard's own
+// KPI strip is the only caller that supplies them.
+function DrillMetric({ to, title, value, hint, icon, tone, delta }) {
+  return <Link to={to} className="mini-metric drill-metric">
+    {icon && <span className={`kpi-icon tone-${tone ?? 'violet'}`} aria-hidden="true">{icon}</span>}
+    <span>{title}</span><strong>{value}</strong>
+    {delta !== undefined ? <KpiDelta value={delta} /> : trendHint(hint)}
+    <em>View calculation →</em>
+  </Link>;
+}
+// Percentage change vs a prior period. null means "not expressible" (no prior
+// value, or the prior value was itself zero and the current one isn't - a
+// true percentage there is undefined, not 0% or some arbitrarily large
+// number), and the caller shows nothing rather than a misleading figure.
+function pctDelta(curr, prev) {
+  if (curr == null || prev == null) return null;
+  if (prev === 0) return curr === 0 ? 0 : null;
+  return ((curr - prev) / Math.abs(prev)) * 100;
+}
+function KpiDelta({ value }) {
+  if (value == null) return null;
+  const dir = value > 0.05 ? 'up' : value < -0.05 ? 'down' : 'flat';
+  const arrow = dir === 'up' ? '↑' : dir === 'down' ? '↓' : '→';
+  return <span className={`kpi-delta ${dir}`}>{arrow} {Math.abs(value).toLocaleString('en-IN', { maximumFractionDigits: 1 })}%<span className="kpi-delta-note">vs prior period</span></span>;
+}
+
+// GST invoice value keeps its own dependency note rather than the generic
+// "Unavailable" the other three cards use, but the reason changed: with the
+// Tax Invoicing role granted, a null here is no longer "this feature is
+// switched off", it is "Amazon has issued no GST invoice for this range
+// yet". Those want different words - the first is permanent and needs no
+// action, the second clears on its own once invoices arrive. Saying "coming
+// soon" for a report that now syncs would send a seller looking for a
+// setting that isn't there.
 function ExplanationGrid({ summary, tenantId }) {
+  const gstMissing = summary.gstValue == null;
   const cards = [
     ['Fee impact', summary.feeImpact==null?'Unavailable':`${Number(summary.feeImpact).toLocaleString('en-IN',{maximumFractionDigits:2})}%`, 'Net Amazon fees excluding TCS/TDS as a percentage of gross product sales.', 'feeImpact'],
     ['Return rate', summary.returnRate==null?'Unavailable / source mismatch':`${Number(summary.returnRate).toLocaleString('en-IN',{maximumFractionDigits:2})}%`, 'Physically returned units divided by shipped units.', 'returnRate'],
     ['Refund value rate', summary.refundValueRate==null?'Unavailable':`${Number(summary.refundValueRate).toLocaleString('en-IN',{maximumFractionDigits:2})}%`, 'Product refund value divided by gross product sales; separate from unit return rate.', 'refundValueRate'],
-    ['GST invoice value', summary.gstValue==null?'Unavailable':formatCurrency(summary.gstValue), 'Sales-invoice taxable value minus credit-note/refund taxable value.', 'gstValue']
+    ['GST invoice value', gstMissing?'No invoices yet':formatCurrency(summary.gstValue), gstMissing?'No GST B2B/B2C invoice has been synced for this range yet. Run the GST syncs on the Reports page, or pick a range Amazon has already invoiced.':'Sales-invoice taxable value minus credit-note/refund taxable value.', 'gstValue']
   ];
-  return <div className="explain-grid">{cards.map(([title, value, copy, target]) => <NavLink key={title} to={`/seller?tenantId=${tenantId}&view=metric-detail&metric=${target}`} className="explain-card"><b>{title}</b><strong>{value}</strong><p>{copy}</p><span>Open calculation →</span></NavLink>)}</div>;
+  return <div className="explain-grid">{cards.map(([title, value, copy, target]) => <Link key={title} to={`/seller?tenantId=${tenantId}&view=metric-detail&metric=${target}`} className="explain-card"><b>{title}</b><strong>{value}</strong><p>{copy}</p><span>Open calculation →</span></Link>)}</div>;
 }
 function InsightCards({ title, cards }) { return <Card><PanelHeader title={title} /><div className="explain-grid compact">{cards.map(([label, value]) => <div className="explain-card" key={label}><b>{label}</b><strong>{value}</strong></div>)}</div></Card>; }
 
@@ -675,9 +1848,9 @@ function ReportsExplorer({ tenantId, data }) {
   return <div className="reports-grid">{REPORTS.map(report => {
     const detail = REPORT_DETAIL_MAP[report.type];
     const job = data?.jobs?.find(j => j.report_type === report.type);
-    return <NavLink className={`report-tile ${codeClass(report.code)}`} key={report.type} to={`/seller?tenantId=${tenantId}&view=report-detail&reportType=${report.type}`}>
+    return <Link className={`report-tile ${codeClass(report.code)}`} key={report.type} to={`/seller?tenantId=${tenantId}&view=report-detail&reportType=${report.type}`}>
       <span className={`ledger-code ${codeClass(report.code)}`}>{report.code}</span><div><b>{report.label}</b><p>{detail.explanation}</p></div><small>{job?.completed_at ? `Last synced ${timeAgo(job.completed_at)}` : report.hint}</small>
-    </NavLink>;
+    </Link>;
   })}</div>;
 }
 function reportFieldCount(rows) { return Array.from(new Set(rows.flatMap(row => Object.keys(row ?? {})))).length; }
@@ -959,19 +2132,82 @@ function ReportChart({ title, data, type, dataKey, keys }) {
 
 function PanelHeader({ title, subtitle }) { const { range } = useContext(DateRangeContext); return <div className="panel-header"><h2>{title}</h2><span>{subtitle ?? range.label}</span></div>; }
 function Legend({ items }) { return <div className="legend-list">{items.map((item, i) => <div key={item.name}><span style={{ background: COLORS[i % COLORS.length] }} />{item.name}<b>{formatCurrency(item.value)}</b></div>)}</div>; }
-function TableCard({ title, rows = [], columns, pageSize = 6, downloadFilename }) {
+// totals is supplied by the caller as {column: 'formatted value'}, never
+// derived here: by the time rows reach this component their money columns are
+// display strings ("₹1,234.00"), and adding those up means parsing a currency
+// symbol and thousands separators back into numbers - fragile, and wrong the
+// first time a locale or currency changes. The caller still holds the raw
+// numeric rows, so it sums those and hands over the finished text.
+function TableCard({ title, rows = [], columns, pageSize = 6, downloadFilename, totals, totalsLabel = 'Totals' }) {
   const [page, setPage] = useState(0);
   const totalPages = Math.max(1, Math.ceil(rows.length / pageSize));
   useEffect(() => { setPage(0); }, [rows, pageSize]);
   const safePage = Math.min(page, totalPages - 1);
   const visibleRows = rows.slice(safePage * pageSize, safePage * pageSize + pageSize);
+  const totalsFirstColumn = totals ? columns.findIndex(c => totals[c] != null) : -1;
   return <Card className="table-card">
     <PanelHeader title={title} />
     {downloadFilename && <div className="table-card-actions"><Button variant="secondary" disabled={!rows.length} onClick={() => downloadCsv(downloadFilename, rows, columns)}>Download CSV ({formatNumber(rows.length)} rows)</Button></div>}
     {rows.length ? <>
-      <div className="table-wrap"><table><thead><tr>{columns.map(c => <th key={c}>{c.replaceAll('_', ' ')}</th>)}</tr></thead><tbody>{visibleRows.map((row, i) => <tr key={i}>{columns.map(c => <td key={c}>{row[c] ?? '—'}</td>)}</tr>)}</tbody></table></div>
+      <div className="table-wrap"><table><thead><tr>{columns.map(c => <th key={c}>{c.replaceAll('_', ' ')}</th>)}</tr></thead><tbody>{visibleRows.map((row, i) => <tr key={i}>{columns.map(c => <td key={c}>{row[c] ?? '—'}</td>)}</tr>)}</tbody>
+        {totalsFirstColumn >= 0 && <tfoot><tr className="table-totals">
+          {totalsFirstColumn > 0 && <td colSpan={totalsFirstColumn}>{totalsLabel} · {formatNumber(rows.length)} row{rows.length === 1 ? '' : 's'}</td>}
+          {columns.slice(Math.max(totalsFirstColumn, 0)).map(c => <td key={c}>{totals[c] ?? ''}</td>)}
+        </tr></tfoot>}
+      </table></div>
       {rows.length > pageSize && <div className="pager"><Button variant="ghost" disabled={safePage === 0} onClick={() => setPage(p => Math.max(0, p - 1))}>← Previous</Button><span>Page {safePage + 1} of {totalPages} · {formatNumber(rows.length)} rows</span><Button variant="ghost" disabled={safePage >= totalPages - 1} onClick={() => setPage(p => Math.min(totalPages - 1, p + 1))}>Next →</Button></div>}
     </> : <Empty text="No data imported yet." />}
+  </Card>;
+}
+
+// Everything here is either real session data already held by the app
+// (email, role, tenant id) or an existing, already-working control
+// (AmazonConnectionPanel, logout) - nothing new is invented just to fill out
+// a settings page.
+const SETTINGS_TABS = [
+  { key: 'appearance', label: 'Appearance' },
+  { key: 'profile', label: 'Profile' },
+  { key: 'amazon', label: 'Amazon Connection' },
+  { key: 'account', label: 'Account' }
+];
+function SettingsPage({ session, setSession, tenantId, seller, onChange, theme, setTheme }) {
+  const [tab, setTab] = useState('appearance');
+  const [error, setError] = useState('');
+  function logout() { localStorage.removeItem('token'); setSession(null); }
+  return <Card className="panel">
+    <div className="settings-grid">
+      <nav className="settings-nav">{SETTINGS_TABS.map(t => <button type="button" key={t.key} className={tab === t.key ? 'active' : ''} onClick={() => setTab(t.key)}>{t.label}</button>)}</nav>
+      <div className="settings-section">
+        {error && <p className="alert warning">{error}</p>}
+        {tab === 'appearance' && <>
+          <div className="settings-row">
+            <div className="settings-row-copy"><b>Theme</b><p>Applies immediately and is remembered on this device.</p></div>
+            <div className="theme-switch">
+              <button type="button" className={theme === 'light' ? 'active' : ''} onClick={() => setTheme('light')}>☀ Light</button>
+              <button type="button" className={theme === 'dark' ? 'active' : ''} onClick={() => setTheme('dark')}>☾ Dark</button>
+            </div>
+          </div>
+        </>}
+        {tab === 'profile' && <div className="settings-row">
+          <div className="settings-row-copy" style={{ maxWidth: 'none', width: '100%' }}>
+            <b>Signed in as</b>
+            <div className="settings-profile-grid">
+              <div><span>Email</span><b>{session?.email ?? '—'}</b></div>
+              <div><span>Role</span><b style={{ textTransform: 'capitalize' }}>{session?.role ?? '—'}</b></div>
+              <div><span>Tenant ID</span><b>{tenantId || '—'}</b></div>
+            </div>
+          </div>
+        </div>}
+        {tab === 'amazon' && <div className="settings-row">
+          <div className="settings-row-copy"><b>Amazon Seller Central</b><p>Connect or disconnect the Amazon account this tenant syncs from.</p></div>
+          <AmazonConnectionPanel tenantId={tenantId} seller={seller} onChange={onChange} setError={setError} />
+        </div>}
+        {tab === 'account' && <div className="settings-row">
+          <div className="settings-row-copy"><b>Log out</b><p>Ends this session on this device. You'll need to sign in again to return.</p></div>
+          <Button variant="dark" onClick={logout}>⏻ Logout</Button>
+        </div>}
+      </div>
+    </div>
   </Card>;
 }
 
@@ -983,7 +2219,11 @@ function AdminDashboard() {
   const [creating, setCreating] = useState(false);
   const [createMsg, setCreateMsg] = useState('');
   async function load() { try { setTenants((await api('/api/admin/tenants')).tenants); } catch (e) { setError(e.message); } }
-  async function action(path) { await api(path, { method: 'POST' }); await load(); }
+  async function action(path) { try { await api(path, { method: 'POST' }); await load(); } catch (e) { setError(e.message); } }
+  async function deleteTenant(t) {
+    if (!window.confirm(`Delete ${t.company_name}? This permanently removes their login and every synced record - orders, settlements, GST invoices, everything. This cannot be undone.`)) return;
+    try { await api(`/api/admin/tenants/${t.id}`, { method: 'DELETE' }); await load(); } catch (e) { setError(e.message); }
+  }
   useEffect(() => { void load(); }, []);
   const stats = useMemo(() => ({ total: tenants.length, pending: tenants.filter(t => !t.amazon_connected).length, active: tenants.filter(t => t.status === 'active').length }), [tenants]);
 
@@ -1005,23 +2245,100 @@ function AdminDashboard() {
     <Card className="create-seller-card">
       <PanelHeader title="Create seller account" subtitle="Admin only" />
       <form onSubmit={createSeller} className="form-row">
-        <Input placeholder="Company name" value={newSeller.companyName} onChange={e => setNewSeller({ ...newSeller, companyName: e.target.value })} required />
+        <Input placeholder="Seller name" value={newSeller.companyName} onChange={e => setNewSeller({ ...newSeller, companyName: e.target.value })} required />
         <Input placeholder="Owner email" type="email" value={newSeller.ownerEmail} onChange={e => setNewSeller({ ...newSeller, ownerEmail: e.target.value })} required />
         <Input placeholder="Temporary password" type="password" value={newSeller.password} onChange={e => setNewSeller({ ...newSeller, password: e.target.value })} required minLength={8} />
         <Button disabled={creating}>{creating ? 'Creating…' : 'Create seller'}</Button>
       </form>
       {createMsg && <p className="alert success">{createMsg}</p>}
     </Card>
-    <Card className="table-card"><PanelHeader title="Seller Authorization Control" /><div className="table-wrap"><table><thead><tr><th>Seller</th><th>Status</th><th>Login</th><th>Amazon auth</th><th>Connected</th><th>Last sync</th><th>Actions</th></tr></thead><tbody>{tenants.map(t => <tr key={t.id}><td><b>{t.company_name}</b><small>{t.id}</small></td><td><span className={`pill status-${t.status}`}>{t.status}</span></td><td>{t.login_email ?? t.owner_email ?? '—'}</td><td>{t.amazon_connected ? `${t.seller_name ?? t.company_name} · ${t.amazon_seller_id} · ${t.auth_status}` : 'Not connected'}</td><td>{t.amazon_connected_at ? new Date(t.amazon_connected_at).toLocaleString() : '—'}</td><td>{t.last_successful_sync ?? '—'}</td><td><div className="row-actions">{t.status === 'pending' && <><Button onClick={() => action(`/api/admin/tenants/${t.id}/grant-access`)}>Grant</Button><Button variant="secondary" onClick={() => action(`/api/admin/tenants/${t.id}/reject`)}>Reject</Button></>}{t.status === 'active' && <>{REPORTS.map(r => <Button variant="secondary" key={r.type} onClick={() => action(`/api/admin/tenants/${t.id}/sync/${r.type}`)}>{r.code}</Button>)}<Button variant="danger" onClick={() => action(`/api/admin/tenants/${t.id}/revoke-access`)}>Revoke</Button></>}</div></td></tr>)}</tbody></table></div></Card>
+    <Card className="table-card"><PanelHeader title="Seller Authorization Control" /><div className="table-wrap"><table><thead><tr><th>Seller</th><th>Status</th><th>Login</th><th>Amazon auth</th><th>Connected</th><th>Last sync</th><th>Actions</th></tr></thead><tbody>{tenants.map(t => <tr key={t.id}><td><b>{t.company_name}</b><small>{t.id}</small></td><td><span className={`pill status-${t.status}`}>{t.status}</span></td><td>{t.login_email ?? t.owner_email ?? '—'}</td><td>{t.amazon_connected ? `${t.seller_name ?? t.company_name} · ${t.amazon_seller_id} · ${t.auth_status}` : 'Not connected'}</td><td>{t.amazon_connected_at ? new Date(t.amazon_connected_at).toLocaleString() : '—'}</td><td>{t.last_successful_sync ?? '—'}</td><td><div className="row-actions">{t.status === 'pending' && <><Button onClick={() => action(`/api/admin/tenants/${t.id}/grant-access`)}>Grant</Button><Button variant="secondary" onClick={() => action(`/api/admin/tenants/${t.id}/reject`)}>Reject</Button></>}{t.status === 'active' && <Button variant="danger" onClick={() => action(`/api/admin/tenants/${t.id}/revoke-access`)}>Revoke</Button>}{t.status === 'suspended' && <><Button onClick={() => action(`/api/admin/tenants/${t.id}/grant-access`)}>Activate</Button><Button variant="danger" onClick={() => deleteTenant(t)}>Delete</Button></>}</div></td></tr>)}</tbody></table></div></Card>
   </div>;
+}
+
+// A minimal, click-outside-closes dropdown shell shared by the notifications
+// bell and the account menu, so both open/close the same way and only one is
+// ever open at a time.
+function useDropdown() {
+  const [open, setOpen] = useState(false);
+  const rootRef = useRef(null);
+  useEffect(() => {
+    if (!open) return;
+    function onClickOutside(e) { if (rootRef.current && !rootRef.current.contains(e.target)) setOpen(false); }
+    document.addEventListener('mousedown', onClickOutside);
+    return () => document.removeEventListener('mousedown', onClickOutside);
+  }, [open]);
+  return [open, setOpen, rootRef];
+}
+
+function NotificationsBell({ alerts }) {
+  const [open, setOpen, rootRef] = useDropdown();
+  return <div className="topbar-menu-root" ref={rootRef}>
+    <button type="button" className="icon-btn" aria-label="Notifications" title="Notifications" onClick={() => setOpen(o => !o)}>
+      🔔{alerts.length > 0 && <span className="badge-count">{alerts.length > 9 ? '9+' : alerts.length}</span>}
+    </button>
+    {open && <div className="topbar-menu">
+      <div className="topbar-menu-heading">{alerts.length ? `${alerts.length} open item${alerts.length === 1 ? '' : 's'}` : 'Notifications'}</div>
+      {alerts.length ? alerts.map((alert, i) => <div className={`alert-row severity-${alert.severity}`} key={i}><span className="alert-dot" /><div><p>{alert.text}</p>{alert.at && <small>{timeAgo(alert.at)}</small>}</div></div>)
+        : <div className="topbar-menu-empty">Nothing needs attention right now.</div>}
+    </div>}
+  </div>;
+}
+
+function AccountMenu({ session, onLogout, tenantId }) {
+  const [open, setOpen, rootRef] = useDropdown();
+  const label = session?.email?.split('@')[0] ?? session?.email ?? 'Account';
+  return <div className="topbar-menu-root" ref={rootRef}>
+    <button type="button" className="avatar-btn" onClick={() => setOpen(o => !o)}>
+      <span className="avatar">{session?.email?.[0]?.toUpperCase()}</span>
+      <span className="avatar-btn-copy"><b>{label}</b><small>{session?.role}</small></span>
+    </button>
+    {open && <div className="topbar-menu account-menu">
+      <div className="account-menu-header"><span className="avatar">{session?.email?.[0]?.toUpperCase()}</span><div><b>{session?.email}</b><small>{session?.role}</small></div></div>
+      <Link className="account-menu-item" to={`/seller?tenantId=${tenantId ?? ''}&view=settings`} onClick={() => setOpen(false)}>⚙ Settings</Link>
+      <button type="button" className="account-menu-item danger" onClick={onLogout}>⏻ Logout</button>
+    </div>}
+  </div>;
+}
+
+// One CSV, meaningful on every page because dashboardCalculations is fetched
+// on every view regardless of which report you're looking at - the KPIs and
+// Amazon's five statement sections for whatever range is currently selected.
+function exportDashboardSnapshot(data, range) {
+  const m = data?.dashboardCalculations?.metrics ?? {};
+  const s = data?.dashboardCalculations?.statement ?? {};
+  const rows = [
+    { metric: 'Net Sales', value: m.netSales?.value },
+    { metric: 'Net Qty', value: m.netQty?.value },
+    { metric: 'Orders Synced', value: m.orders?.value },
+    { metric: 'Returns', value: m.returns?.value },
+    { metric: 'Settled Amount', value: m.settled?.value },
+    { metric: 'Deductions', value: m.deductions?.value },
+    { metric: 'Reimbursements', value: m.reimbursements?.value },
+    { metric: 'DRR', value: m.drr?.value },
+    { metric: 'Income', value: s.income?.value },
+    { metric: 'Expenses', value: s.expenses?.value },
+    { metric: 'Tax', value: s.tax?.value },
+    { metric: 'Goods and Services Tax', value: s.gst?.value },
+    { metric: 'Transfers', value: s.transfers?.value }
+  ];
+  downloadCsv(`wellsure-snapshot-${toDateInputValue(range.start)}-to-${toDateInputValue(range.end)}.csv`, rows, ['metric', 'value']);
 }
 
 function SidebarLink({ to, icon, children, onClick }) {
   const location = useLocation();
   const target = new URL(to, 'http://local');
   const current = new URL(`${location.pathname}${location.search}`, 'http://local');
+  // Plain Link, deliberately not react-router's NavLink: NavLink computes its
+  // own "active" class from the pathname alone, ignoring the ?view= query
+  // string every sidebar entry actually differs by - since all fourteen
+  // share the pathname /seller, NavLink marked all fourteen active
+  // simultaneously. Confirmed live: every link in the DOM carried class
+  // "active" regardless of which one this component's own (correct) match
+  // computed. A plain Link never adds a class on its own, so this component's
+  // own computed `active` is the only thing that can set it.
   const active = current.pathname === target.pathname && current.searchParams.get('view') === target.searchParams.get('view');
-  return <NavLink className={active ? 'active' : ''} to={to} onClick={onClick}><span className="nav-icon" aria-hidden="true">{icon}</span><span>{children}</span></NavLink>;
+  return <Link className={active ? 'active' : ''} to={to} onClick={onClick}><span className="nav-icon" aria-hidden="true">{icon}</span><span className="nav-label">{children}</span></Link>;
 }
 
 const SEARCH_KEYWORDS = {
@@ -1099,30 +2416,125 @@ function GlobalSearch({ tenantId }) {
 }
 
 // Seller-facing shell: sidebar + topbar. Admins never render this component.
+// The sidebar can be closed on any screen size, not just on a phone, and the
+// choice is remembered - someone who wants the full width for a wide
+// settlement table should not have to re-close it on every page. The topbar
+// toggle is always rendered, so the sidebar can never be closed with no way
+// back.
+const NAV_OPEN_KEY = 'wellsure_sidebar_open';
+function useSidebarOpen() {
+  const [open, setOpen] = useState(() => {
+    const stored = localStorage.getItem(NAV_OPEN_KEY);
+    if (stored === 'open') return true;
+    if (stored === 'closed') return false;
+    return typeof window === 'undefined' ? true : window.innerWidth > 980;
+  });
+  useEffect(() => { localStorage.setItem(NAV_OPEN_KEY, open ? 'open' : 'closed'); }, [open]);
+  return [open, setOpen];
+}
+
+// Real light/dark toggle, not a cosmetic one - it drives data-theme on <html>,
+// which every existing card/table/input already reads its colors through
+// (see the dark-theme block in style.css), and persists across visits.
+const THEME_KEY = 'wellsure_theme';
+// Deliberately does NOT fall back to prefers-color-scheme for a first-time
+// visitor. It used to, and that is exactly what broke the hosted login page:
+// a device set to system dark mode landed a brand-new seller in dark theme
+// before they ever touched the toggle, and .login-shell/.login-hero's
+// background is a hardcoded light gradient (not a token), so text colors
+// flipped to their dark-mode values (near-white) while the background
+// stayed light - unreadable white-on-cream. WELLSURE's light gold/black
+// look is the intended default brand identity, not one of two equally-
+// supported options, so every new visitor starts there; dark mode is still
+// one click away and remembered via THEME_KEY once a seller actually picks it.
+function resolveStoredTheme() {
+  const stored = localStorage.getItem(THEME_KEY);
+  return stored === 'dark' ? 'dark' : 'light';
+}
+// useTheme() only mounts inside SellerShell, i.e. after login - so without
+// this, data-theme was never set on <html> for the login/boot screens, and
+// anything keyed off it there (the light/dark logo swap - see LogoMark)
+// would always render as if light mode, even for a seller whose device or
+// saved preference is dark. Runs once at module load, before the first
+// render, so there is no flash of the wrong logo either.
+if (typeof document !== 'undefined') document.documentElement.dataset.theme = resolveStoredTheme();
+function useTheme() {
+  const [theme, setTheme] = useState(resolveStoredTheme);
+  useEffect(() => {
+    document.documentElement.dataset.theme = theme;
+    localStorage.setItem(THEME_KEY, theme);
+  }, [theme]);
+  return [theme, setTheme];
+}
+
 function SellerShell({ session, setSession }) {
   function logout() { localStorage.removeItem('token'); setSession(null); }
   const [range, setRange] = useState(defaultDateRange);
-  const [mobileNavOpen, setMobileNavOpen] = useState(false);
-  return <div className="app-shell">
-    {mobileNavOpen && <div className="sidebar-overlay" onClick={() => setMobileNavOpen(false)} />}
-    <aside className={`sidebar${mobileNavOpen ? ' open' : ''}`}>
-      <div className="logo"><span>W</span><div><b>WELLSURE</b><small>Seller Intelligence</small></div></div>
+  const [navOpen, setNavOpen] = useSidebarOpen();
+  const [theme, setTheme] = useTheme();
+  // The dashboard fetch happens inside <SellerDashboard> (it needs the route's
+  // own tenantId/view), but the notifications bell and Export live in the
+  // topbar above it - lifted here via a plain callback so both read the exact
+  // same payload SellerDashboard just loaded, never a second, possibly
+  // inconsistent fetch of their own.
+  const [dashboardData, setDashboardData] = useState(null);
+  const alerts = useMemo(() => buildAlerts(dashboardData), [dashboardData]);
+  // The one-time 90-day catch-up after authorization (see
+  // runInitialSellerBackfill on the API). Selecting a different date range
+  // mid-backfill could show a range that isn't fully synced yet as if it
+  // were final, so the picker is locked for the whole app shell - not just
+  // the Dashboard page - until the backend reports it done.
+  const backfillRunning = dashboardData?.seller?.connected && dashboardData.seller.backfillStatus === 'running';
+  // On a phone the sidebar is an overlay drawer, so following a link should
+  // close it. On a desktop it sits beside the content and should stay put.
+  const closeOnNavigate = () => { if (window.innerWidth <= 980) setNavOpen(false); };
+  return <div className={`app-shell${navOpen ? '' : ' nav-closed'}`}>
+    {navOpen && <div className="sidebar-overlay" onClick={() => setNavOpen(false)} />}
+    <aside className={`sidebar${navOpen ? ' open' : ''}`} aria-hidden={!navOpen}>
+      <div className="sidebar-head">
+        <div className="logo"><LogoMark height={56} /></div>
+        {/* "Collapse", not "close" - see the .app-shell.nav-closed rewrite in
+            style.css: this now narrows the sidebar to an icon rail (logo and
+            nav icons still visible/clickable), it never fully disappears on
+            desktop. */}
+        <button type="button" className="sidebar-close" aria-label="Collapse menu" title="Collapse menu" onClick={() => setNavOpen(false)}>✕</button>
+      </div>
       <nav>
-        {NAV_ITEMS.map(item => <SidebarLink key={item.view} icon={item.icon} to={`/seller?tenantId=${session?.tenantId ?? ''}&view=${item.view}`} onClick={() => setMobileNavOpen(false)}>{item.label}</SidebarLink>)}
+        {NAV_ITEMS.map(item => <SidebarLink key={item.view} icon={item.icon} to={`/seller?tenantId=${session?.tenantId ?? ''}&view=${item.view}`} onClick={closeOnNavigate}>{item.label}</SidebarLink>)}
       </nav>
+      <div className="sidebar-help">
+        <b>Need help understanding your numbers?</b>
+        <a className="btn btn-secondary" href="mailto:support@wellsure.app?subject=WELLSURE%20support">Contact support</a>
+      </div>
     </aside>
     <main className="workspace">
       <header className="topbar">
-        <button type="button" className="hamburger-btn" aria-label="Open menu" onClick={() => setMobileNavOpen(o => !o)}>☰</button>
+        <button
+          type="button"
+          className="hamburger-btn"
+          aria-label={navOpen ? 'Collapse menu' : 'Expand menu'}
+          aria-expanded={navOpen}
+          title={navOpen ? 'Collapse menu' : 'Expand menu'}
+          onClick={() => setNavOpen(o => !o)}
+        >☰</button>
         <GlobalSearch tenantId={session?.tenantId} />
         <select><option>Amazon.in</option></select>
-        <DateRangePicker value={range} onChange={setRange} />
-        <div className="avatar">{session?.email?.[0]?.toUpperCase()}</div>
-        <Button variant="dark" onClick={logout}>Logout</Button>
+        <DateRangePicker value={range} onChange={setRange} disabled={backfillRunning} minDate={dashboardData?.seller?.dataFloorDate} />
+        <div className="topbar-actions">
+          <Button
+            variant="secondary"
+            icon="⇩"
+            disabled={!dashboardData}
+            onClick={() => exportDashboardSnapshot(dashboardData, range)}
+            title="Export the current KPI and statement snapshot as CSV"
+          >Export</Button>
+          <NotificationsBell alerts={alerts} />
+          <AccountMenu session={session} onLogout={logout} tenantId={session?.tenantId} />
+        </div>
       </header>
       <DateRangeContext.Provider value={{ range, setRange }}>
         <Routes>
-          <Route path="/seller" element={<SellerDashboard />} />
+          <Route path="/seller" element={<SellerDashboard onDataChange={setDashboardData} session={session} setSession={setSession} theme={theme} setTheme={setTheme} />} />
           <Route path="*" element={<Navigate to={`/seller?tenantId=${session?.tenantId ?? ''}&view=dashboard`} replace />} />
         </Routes>
       </DateRangeContext.Provider>
@@ -1136,7 +2548,7 @@ function AdminShell({ session, setSession }) {
   function logout() { localStorage.removeItem('token'); setSession(null); }
   return <div className="admin-shell">
     <header className="admin-topbar">
-      <div className="logo"><span>W</span><div><b>WELLSURE</b><small>Admin Console</small></div></div>
+      <div className="logo"><LogoMark height={56} /></div>
       <div className="admin-topbar-right">
         <div className="avatar">{session?.email?.[0]?.toUpperCase()}</div>
         <Button variant="dark" onClick={logout}>Logout {session?.email}</Button>
@@ -1151,9 +2563,38 @@ function AdminShell({ session, setSession }) {
   </div>;
 }
 
+// If the SP-API application is registered with a Redirect URI pointing at this
+// web app instead of at the API, Amazon lands the seller here holding a
+// one-time authorization code that only the API can exchange (it needs the LWA
+// client secret, which must never reach a browser). Rather than showing an
+// empty page, hand the whole query string to the API's callback and let the
+// normal flow finish. Nothing is read or stored here - it is a forward.
+function isAmazonCallbackPath() {
+  const path = window.location.pathname.replace(/\/+$/, '');
+  return path === '/oauth/callback' || path === '/api/auth/amazon/callback';
+}
+function forwardAmazonCallbackToApi() {
+  if (!isAmazonCallbackPath()) return false;
+  window.location.replace(`${API}/oauth/callback${window.location.search}`);
+  return true;
+}
+
 function App() {
   const [session, setSession] = useState(null);
-  useEffect(() => { const token = localStorage.getItem('token'); if (token) api('/api/auth/me').then(d => setSession(d.user)).catch(() => localStorage.removeItem('token')); }, []);
+  // null = still asking the API who we are. Rendering the login form during
+  // that check made a returning seller - including one coming back from
+  // Amazon's consent page - flash a login screen they had no reason to see.
+  const [booted, setBooted] = useState(() => !localStorage.getItem('token') && !isAmazonCallbackPath());
+  useEffect(() => {
+    if (forwardAmazonCallbackToApi()) return;
+    const token = localStorage.getItem('token');
+    if (!token) { setBooted(true); return; }
+    api('/api/auth/me')
+      .then(d => setSession(d.user))
+      .catch(() => localStorage.removeItem('token'))
+      .finally(() => setBooted(true));
+  }, []);
+  if (!booted) return <div className="boot-screen"><div className="brand-mark"><LogoMark height={64} /></div><p>Signing you in…</p></div>;
   if (!session) return <BrowserRouter><Login setSession={setSession} /></BrowserRouter>;
   return <BrowserRouter>{session.role === 'admin' ? <AdminShell session={session} setSession={setSession} /> : <SellerShell session={session} setSession={setSession} />}</BrowserRouter>;
 }

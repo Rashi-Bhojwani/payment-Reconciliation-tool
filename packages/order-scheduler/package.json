@@ -1,0 +1,21 @@
+{
+  "name": "@recon/order-scheduler",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Order scheduling core - marketplace adapters, order sync and Easy Ship scheduling, merged in from the standalone order_scheduling_tool",
+  "main": "src/index.js",
+  "exports": {
+    ".": "./src/index.js",
+    "./db/pool.js": "./src/db/pool.js",
+    "./config.js": "./src/config.js"
+  },
+  "dependencies": {
+    "axios": "^1.7.9",
+    "date-fns-tz": "^3.2.0",
+    "decimal.js": "^10.4.3",
+    "pg": "^8.13.1",
+    "pino": "^9.5.0",
+    "zod": "^3.24.1"
+  }
+}

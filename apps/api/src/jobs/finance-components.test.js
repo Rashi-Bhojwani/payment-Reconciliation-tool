@@ -42,6 +42,34 @@ test('preserves Seller Central Transaction View column summaries exactly', () =>
   assert.equal(Object.values(summaries).reduce((sum,value)=>sum+value,0),569.85);
 });
 
+test('preserves the parent fee name on generic Base/Tax breakdown leaves', () => {
+  // Confirmed live against a real account's Deferred (not-yet-settled)
+  // transactions: bare "Base"/"Tax" leaves under a named fee, always at
+  // exactly an 18.00% ratio (India's GST rate) - i.e. definitely a fee's
+  // pre-tax base plus GST on it, not two independent unrelated amounts.
+  // Losing the parent's own label ("Commission" here) left both leaves
+  // indistinguishable from product tax or plain income downstream.
+  const rows = flattenFinanceTransaction({ transactionId:'tx-5', relatedIdentifiers:{orderId:'order-5'}, breakdowns:[
+    { breakdownType:'Commission', breakdowns:[
+      { breakdownType:'Base', breakdownAmount:{currencyAmount:-45} },
+      { breakdownType:'Tax', breakdownAmount:{currencyAmount:-8.1} }
+    ] }
+  ] });
+  assert.deepEqual(rows.map(row=>[row.category,row.description,row.amount]),[['referral_commission','Commission Base',-45],['referral_commission','Commission Tax',-8.1]]);
+});
+
+test('leaves an already-specific leaf label untouched even with a differing parent', () => {
+  // A leaf that already carries its own specific Amazon-provided name (not
+  // one of the generic Base/Tax/Amount/Fee/Total terms) must not get a
+  // parent label glued onto it - it is not ambiguous and needs no help.
+  const rows = flattenFinanceTransaction({ transactionId:'tx-6', relatedIdentifiers:{orderId:'order-6'}, breakdowns:[
+    { breakdownType:'AmazonFees', breakdowns:[
+      { breakdownType:'FBAPerUnitFulfillmentFee', breakdownAmount:{currencyAmount:-84} }
+    ] }
+  ] });
+  assert.equal(rows.find(row=>row.category==='fulfillment_fee_per_unit').description,'FBAPerUnitFulfillmentFee');
+});
+
 test('computes seller-provided jewellery slabs', () => {
   assert.deepEqual(computeSlabFees(FASHION_JEWELLERY_SLAB, 1200), { referralFee:270, closingFee:76 });
   assert.equal(computeWeightFee(0.5),55); assert.equal(computeWeightFee(3),146); assert.equal(computeWeightFee(6),232);

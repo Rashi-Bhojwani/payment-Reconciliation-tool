@@ -1,0 +1,12 @@
+-- Distinguishes a sync_jobs row created by calling Amazon's API from one
+-- created by a human uploading a report file they downloaded directly from
+-- Seller Central (see the new /reports/:reportType/upload endpoint). Seller
+-- Central lets a person download statements, GST MTR reports, and FBA
+-- returns/reimbursements reports much further back than SP-API's 90-day
+-- report retention allows an app to fetch automatically - so a one-time
+-- manual upload at onboarding is the only legitimate way to get older
+-- history into this tool without the seller doing Amazon's "unarchive"
+-- dance and hoping the API catches up. The ledger needs to say which one
+-- happened, honestly, rather than showing an upload as if Amazon had been
+-- called.
+ALTER TABLE sync_jobs ADD COLUMN IF NOT EXISTS source text NOT NULL DEFAULT 'api' CHECK (source IN ('api', 'manual_upload'));

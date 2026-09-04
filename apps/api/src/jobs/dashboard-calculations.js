@@ -1,14 +1,98 @@
+import { calendarDay } from './reporting-calendar.js';
 const num = value => value == null || value === '' ? null : Number(value);
 const amount = row => Number(row?.amount ?? row?.total_amount ?? 0) || 0;
-const norm = value => String(value ?? '').toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim();
+// Settlement labels are already space-separated English ("Product Tax",
+// "Fixed closing fee"), but Finance API breakdown labels are PascalCase with
+// no separators at all ("OurPriceTax", "ItemTDS"). Splitting camelCase/
+// PascalCase boundaries before the generic non-alphanumeric collapse turns
+// "OurPriceTax" into "our price tax" so a word-boundary pattern like \btax\b
+// can actually match "tax" as its own word - previously it normalized to
+// one glued token "ourpricetax", which \btax\b (and \b(tcs|tds)\b) can never
+// match in the middle of. Confirmed live: this was silently sending
+// "OurPriceTax" rows on Finance-API-sourced (Deferred/pending) transactions
+// past every specific classifier undetected. Already-space-separated
+// settlement text is unaffected - there is no lowercase-to-uppercase
+// transition inside "Product Tax" to split.
+const norm = value => String(value ?? '')
+  .replace(/([a-z0-9])([A-Z])/g, '$1 $2')
+  .replace(/([A-Z]+)([A-Z][a-z])/g, '$1 $2')
+  .toLowerCase()
+  .replace(/[^a-z0-9]+/g, ' ')
+  .trim();
 const rawField = (raw, names) => { const entries=Object.entries(raw??{}); for(const name of names){const wanted=norm(name).replaceAll(' ','');const hit=entries.find(([key])=>norm(key).replaceAll(' ','')===wanted);if(hit&&hit[1]!==''&&hit[1]!=null)return hit[1];} };
-const text = row => norm(`${row.parent_transaction_type??''} ${row.transaction_type??''} ${row.account_type??''} ${row.amount_type??''} ${row.amount_description??''} ${row.category??''}`);
+// account_type ("Cash On Delivery Transactions and Non-Transactional Fees",
+// "Electronic Transactions (Credit Card/Net Banking/GC)") is a per-
+// TRANSACTION payment-rail descriptor, not a per-line-item category signal -
+// yet it was folded into every classifier's search text. That first COD
+// label literally contains the substring "Fees", so isFee's bare "fee"
+// keyword matched on it regardless of what the actual line item was.
+// Confirmed live: the identical line type (e.g. "OurPriceTax") landed in
+// Expenses for a COD-paid order and Income for a card-paid order - the only
+// difference between the two rows was which payment rail collected the
+// money, which has nothing to do with what category that specific line
+// belongs in. Settlement rows never populate account_type at all, so this
+// was a real, pre-existing latent bug that only started affecting real
+// numbers once Finance API rows (which do populate it) started being used.
+const text = row => norm(`${row.parent_transaction_type??''} ${row.transaction_type??''} ${row.amount_type??''} ${row.amount_description??''} ${row.category??''}`);
 const keyOf = row => row.source_row_id ?? row.id ?? `${row.transaction_id??row.settlement_id??''}|${row.order_id??''}|${row.order_item_id??row.sku??''}|${row.category??row.amount_type??''}|${row.amount_description??''}|${row.posted_date??''}|${amount(row)}`;
 function dedupe(rows,key=keyOf){const seen=new Set(),included=[],duplicates=[];for(const row of rows){const keyValue=key(row);(seen.has(keyValue)?duplicates:included).push(row);seen.add(keyValue);}return{included,duplicates};}
 const isSummary=row=>String(row.category??'').startsWith('summary_');
-const isRefund=row=>/refund/.test(text(row));
-const isPrincipal=row=>/principal|item price/.test(norm(`${row.amount_type??''} ${row.amount_description??''} ${row.category??''}`));
-const isPromotion=row=>/promotion|promo rebate/.test(text(row))&&!/product tax discount|shipping tax discount|gift wrap tax discount/.test(text(row));
+export const isRefund=row=>/refund/.test(text(row));
+// amount_type is the settlement report's GROUP for a line, not the line
+// itself: Amazon stamps "ItemPrice" on Principal, Product Tax, Shipping and
+// Shipping tax alike. Including it here made every one of those count as a
+// product sale, because norm("ItemPrice Product Tax") contains "item price".
+// Confirmed against a real seller's statement: the dashboard reported Net
+// Sales of 596.00 where Amazon's product sales were 567.60 and GST was 28.40
+// - the tax was being added to the sale. Net Sales, Fee Impact, Refund Value
+// Rate and DRR all read off this. Only the line's own description (or the
+// normalized Finance API category) may decide that a row is a product sale.
+// "principal" alone is not specific enough: Amazon's Finance API names a
+// shipping charge "ShippingPrincipal" and a gift-wrap charge
+// "GiftWrapPrincipal" - both contain the literal word "principal", so the
+// bare regex counted them as a product sale. Confirmed on a real seller's
+// account: four ShippingPrincipal rows worth exactly 200.00 (which Amazon's
+// own statement lists as a separate "Shipping credits" Income line, not
+// product sales) were inflating Gross product sales, and so Net Sales,
+// Fee Impact and Refund Value Rate, by that same 200.00. Shipping/gift-wrap
+// credits already have their own classifier (isShippingOrGiftWrapCredit,
+// below) which still correctly counts them as Income - this exclusion only
+// keeps them out of PRODUCT sales specifically, same principle as the
+// ItemPrice/amount_type fix above.
+export const isPrincipal=row=>{const t=norm(`${row.amount_description??''} ${row.category??''}`);return /principal|item price/.test(t)&&!/shipping|gift wrap/.test(t);};
+// A tax discount reduces the GST collected; it is not a promotional rebate.
+// The exclusion used to be a literal list of settlement's spellings ("product
+// tax discount", "shipping tax discount", "gift wrap tax discount"), which the
+// Finances API does not use - it says "OurPriceTaxDiscount". So that row
+// matched isPromotion AND isProductGst and was counted in Income and GST both.
+// Measured against Amazon's own statement on the Deferred population: Income
+// came out 7,146.50 against 7,152.59, short by exactly the -6.09 of
+// OurPriceTaxDiscount it had double counted.
+//
+// Deferring to isProductGst instead of restating its spellings means the two
+// can no longer disagree, whatever Amazon calls the line next. "OurPriceDiscount"
+// and "ShippingDiscount" carry no tax wording, so they remain promotions.
+//
+// That claim was aspirational, not real: neither "OurPriceDiscount" nor
+// "ShippingDiscount" contains the word "promotion" or "promo rebate", so the
+// regex above never actually matched either of them by that route -
+// "OurPriceDiscount" only survived because its category is literally
+// "promotion". "ShippingDiscount" has no such category (it is
+// "shipping_charge"), so it fell through to isShippingOrGiftWrapCredit
+// instead - correct for Income's total (both land in Income) but wrong for
+// Net Sales, which subtracts promotions but not shipping credits.
+//
+// Reproduced against a real account's Net Sales export: Income already
+// matched Amazon's statement exactly (97,775.43), but Net Sales read
+// 97,094.25 against an Amazon-implied 96,974.25 - short by 120.00. Amazon's
+// own PDF nets "ShippingDiscount" into "Promotional rebates", not a
+// separate shipping line (its Income debits foot to exactly refunds +
+// promotional rebates, nothing else). The same 120.00 reappears as the gap
+// between (reimbursements + shipping/gift-wrap credits) here and on the
+// statement - proving this is a reclassification, not missing money: Income
+// stays exactly correct either way, only which section the 120.00 sits in
+// was wrong.
+export const isPromotion=row=>/promotion|promo rebate|discount/.test(text(row))&&!isProductGst(row);
 // Amazon's own Transaction/Account Activity statement puts TDS Reimbursement
 // and Chargebacks under Income - grouped with A-to-z Guarantee claims,
 // SAFE-T Reimbursements and Clawbacks as claims-related credits/debits,
@@ -18,47 +102,500 @@ const isPromotion=row=>/promotion|promo rebate/.test(text(row))&&!/product tax d
 // isReimbursement's own Reimbursements KPI - it is simply an Income line
 // with no more specific category), keeps both aligned with the real
 // statement sections without changing what counts as a "reimbursement".
-const isWithholding=row=>/\b(tcs|tds)\b/.test(text(row))&&!/reimburse/.test(text(row));
-const isReimbursement=row=>/reimburse|safe t|lost|damaged|clawback/.test(text(row));
-const isFee=row=>/itemfees|itemtcs|itemtds|other transaction|fee|commission|closing|storage|shipping label|service|advertis|adjustment|easy ship charges|postagepurchase|tcs|tds/.test(text(row))&&!isReimbursement(row)&&!isPrincipal(row)&&!isPromotion(row);
-const isProductGst=row=>/product tax|shipping tax|gift wrap tax|tax discount|\bgst collected|\bgst refund/.test(text(row))&&!/fee|commission|service|itemtcs|itemtds|tcs|tds/.test(text(row));
-const isGenericTax=row=>/\btax\b/.test(text(row))&&!isProductGst(row)&&!isWithholding(row)&&!isFee(row);
-const isTransfer=row=>/transfer|deposit|bank account|withdrawal/.test(text(row));
+// "TaxWithholding" is the Finances API's own name for the TDS Amazon deducts;
+// settlement calls the same thing "Tax Withheld". It carries neither "tcs" nor
+// "tds" as a word, so it fell past this test and past isFee into the generic
+// Tax bucket - which Amazon does not use: on both reconciled accounts every
+// line of its Tax section is 0, while TDS appears under Expenses as "TDS -
+// Section 194-O Net".
+export const isWithholding=row=>/\b(tcs|tds)\b|withholding|tax withheld/.test(text(row))&&!/reimburse/.test(text(row));
+export const isReimbursement=row=>/reimburse|safe t|lost|damaged|clawback/.test(text(row));
+// Shipping and gift wrap CREDITS are Income - they are money the buyer paid.
+// The matching charges ("shipping chargeback", "gift wrap fee", a purchased
+// shipping label) are Expenses, and isFee already claims those, so this must
+// not re-claim them. Amazon's statement keeps the two apart as separate named
+// lines: "Shipping credits" / "Gift wrap credits" under Income against
+// "Shipping label purchases" and the transaction fees under Expenses.
+// Tax on either belongs to GST, never here.
+export const isShippingOrGiftWrapCredit=row=>/shipping|gift wrap/.test(text(row))
+  &&!isFee(row)&&!isProductGst(row)&&!isWithholding(row)&&!isPromotion(row)&&!isTransfer(row);
+// "holdback"/"shipping hb" earn theirs too. Amazon defines Other transaction
+// fees as "shipping chargebacks, shipping HOLDBACKS, and sales tax collection
+// fees", but a holdback arrives as "ShippingHB" - no fee word at all - so it
+// matched the shipping-CREDIT rule and was counted as Income, with its tax
+// landing in the generic Tax section. Measured on a real account: moving it
+// raises Income by 35.40 and lowers Expenses by 35.40, which were that
+// account's only two remaining differences from its statement.
+// "cancellation" earns its place: Amazon charges an OrderCancellationCharge and
+// GST on it, and the tax leaf ("OrderCancellationCharge Tax") contains no other
+// fee word, so without this it landed in the generic Tax bucket instead of
+// Expenses alongside the charge it is tax on.
+// A leaf Amazon labels only "Base" or "Tax" is a COMPONENT of the fee above it,
+// not a line of its own. flattenFinanceTransaction prefixes the parent's name
+// when Amazon supplies one - "Commission Base" - but Amazon does not always
+// supply one, and the row then arrives as a bare "Base" or "Tax" that matches
+// no rule at all: the Base landed in no section, and the Tax in a generic Tax
+// section Amazon does not use.
+//
+// Measured on a real account, 380 such rows, every parent type fee-bearing:
+// "Promo" belongs to the same set. It arrives bare, always positive, always
+// under a fee-bearing parent (Shipment, ServiceFee), and is a DISCOUNT ON A FEE
+// rather than a promotional rebate to a buyer - settlement spells the same thing
+// "Discount on Fee". Measured on a real account it was 782.00 counted in no
+// section at all, which was that account's entire remaining Expenses gap.
+// A genuine buyer rebate says "Promotion" or "Promo rebates" and is claimed by
+// isPromotion before this rule is reached.
+//   ProductAdsPayment  Base  -9,974.35   Tax  -1,795.39   (Cost of Advertising)
+//   Shipment           Base -12,059.47   Tax  -2,170.74
+//   ServiceFee         Base  -3,150.25   Tax    -567.05
+//   Refund             Base    -428.25   Tax     -77.08
+//
+// Tax on a fee belongs with the fee - Amazon reports "Commission Tax" inside
+// Expenses, not GST - so both components are Expenses. The guards keep this
+// away from anything that is genuinely a sale, a promotion or a transfer.
+const isGenericFeeComponent=row=>/^(base|tax|amount|fee|total|promo)$/.test(norm(row.amount_description??''))
+  &&!isPrincipal(row)&&!isPromotion(row)&&!isReimbursement(row)&&!isTransfer(row);
+export const isFee=row=>/itemfees|itemtcs|itemtds|other transaction|fee|commission|closing|storage|shipping label|service|advertis|adjustment|easy ship charges|postagepurchase|cancellation|holdback|shipping hb|tcs|tds/.test(text(row))&&!isReimbursement(row)&&!isPrincipal(row)&&!isPromotion(row)||isGenericFeeComponent(row);
+// Amazon is not consistent about spacing, and norm() cannot repair it: it
+// splits camelCase, so "GiftwrapTax" becomes "giftwrap tax" - one word - while
+// settlement writes "Gift wrap tax". A pattern demanding the space missed the
+// Finance API spelling entirely, and that row then matched the gift-wrap CREDIT
+// rule as well, so a single 9.16 line was counted in Income AND in a Tax
+// section Amazon reports as 0, while GST was short by the same 9.16. "gift ?wrap"
+// accepts both spellings.
+// "our price tax" is the Finance API's own name (after camelCase splitting)
+// for what settlement calls "Product Tax" - the tax on the item's own sale
+// price, as distinct from "shipping tax"/"gift wrap tax". Without this
+// alias it does not contain the literal phrase "product tax" and falls
+// through to isGenericTax instead of GST, producing a phantom non-zero Tax
+// figure on Deferred orders even after the camelCase-splitting fix.
+export const isProductGst=row=>/product tax|our price tax|shipping tax|gift ?wrap tax|tax discount|\bgst collected|\bgst refund/.test(text(row))&&!/fee|commission|service|itemtcs|itemtds|tcs|tds/.test(text(row));
+// finance_transaction_items.category is not a raw Amazon label like
+// settlement's amount_type/amount_description - it is a normalized bucket
+// name from categorizeFinanceLabel() (finance-components.js), which
+// deliberately collapses product tax, GST, TCS and TDS into one generic
+// 'tax' string since the Finances API doesn't expose a finer split at that
+// level. text() folds category in alongside the real fields for every other
+// classifier, which is fine everywhere else, but here it means the bare
+// bucket name alone - with no "product tax"/"tcs"/"tds" wording actually
+// present - was enough to satisfy \btax\b and misclassify a merged pending
+// row as generic Tax (confirmed live: this account's real Tax is always 0,
+// yet merging in Finance API rows made it show non-zero). Only the row's
+// own amount_type/amount_description - the actual label text, not the
+// bucket it got sorted into - may trigger this specific classifier.
+export const isGenericTax=row=>/\btax\b/.test(norm(`${row.amount_type??''} ${row.amount_description??''}`))&&!isProductGst(row)&&!isWithholding(row)&&!isFee(row);
+export const isTransfer=row=>/transfer|deposit|bank account|withdrawal/.test(text(row));
 const round2=value=>Math.round((Number(value)+Number.EPSILON)*100)/100;
 const signedSum=rows=>round2(rows.reduce((sum,row)=>sum+amount(row),0));
 const component=(category,label,value,rows,operation='+')=>({category,label,amount:value,count:rows.length,operation});
+// Amazon stamps settlement dates as "02.07.2026 19:30:30 UTC", and on some
+// accounts as "29.07.2026 23:59:00 GMT+5:30". The pattern below used to stop
+// at the seconds and discard whatever followed, so *every* stamp was read as
+// UTC - a GMT+5:30 deposit was placed 5 hours 30 minutes later than it
+// actually happened. That is invisible in the middle of a month and decisive
+// at its edge: it is more than enough to push a deposit out of the window it
+// belongs to, or pull in one that does not, and the amounts involved are
+// whole payouts. The offset is now read when Amazon states one, and the
+// absence of one still means UTC.
+const ZONE_OFFSET_MINUTES=zone=>{
+  const text=String(zone??'').trim();
+  if(!text||/^(utc|gmt|z)$/i.test(text))return 0;
+  const m=text.match(/^(?:utc|gmt)?\s*([+-])(\d{1,2})(?::?(\d{2}))?$/i);
+  if(!m)return null;
+  return (m[1]==='-'?-1:1)*(Number(m[2])*60+Number(m[3]??0));
+};
 const utcDate=value=>{
   const s=String(value??'').trim();
-  const m=s.match(/^(\d{1,2})[./-](\d{1,2})[./-](\d{4})(?:\s+(\d{1,2}):(\d{2})(?::(\d{2}))?)?/);
-  if(m)return new Date(Date.UTC(+m[3],+m[2]-1,+m[1],+(m[4]??0),+(m[5]??0),+(m[6]??0)));
+  const m=s.match(/^(\d{1,2})[./-](\d{1,2})[./-](\d{4})(?:[\sT]+(\d{1,2}):(\d{2})(?::(\d{2}))?)?\s*(.*)$/);
+  if(m){
+    const offsetMinutes=ZONE_OFFSET_MINUTES(m[7]);
+    // An offset we do not recognise is not the same as no offset. Guessing UTC
+    // there is how a silent 5.5-hour shift got in; hand it to Date instead,
+    // which either understands it or reports it as invalid.
+    if(offsetMinutes==null)return new Date(s);
+    return new Date(Date.UTC(+m[3],+m[2]-1,+m[1],+(m[4]??0),+(m[5]??0),+(m[6]??0))-offsetMinutes*60000);
+  }
   return new Date(s);
 };
 const rangeDates=range=>({start:new Date(range.start),end:new Date(range.end)});
 const inRange=(value,range)=>{const d=utcDate(value);const r=rangeDates(range);return !Number.isNaN(d.getTime())&&d>=r.start&&d<r.end;};
-const overlapsRange=(start,end,range)=>{const r=rangeDates(range);const a=utcDate(start),b=utcDate(end??start);return !Number.isNaN(a.getTime())&& !Number.isNaN(b.getTime()) && a<r.end && b>=r.start;};
 const statusEligible=status=>!new Set(['cancelled','canceled','pending','unshipped','replacement']).has(norm(status).replaceAll(' ',''));
+// The 'replacement' entry above has never once matched a real order: Amazon's
+// OrderStatus enum has no such value - a free-replacement order still reports
+// OrderStatus=Shipped like any other. The one signal that does distinguish it
+// is a non-standard order id (observed live: "S02-1001563-0287843" instead
+// of the usual NNN-NNNNNNN-NNNNNNN shape every ordinary order has).
+// Reproduced against a real account's Net Qty export: of 339 shipped
+// order-item rows for 1 Jun-31 Jul, exactly one had a non-standard order id,
+// at 0.00 item price and quantity 5 - and 5 is exactly the gap between our
+// shipped-unit count (361) and Amazon's own Units Ordered business report
+// (356).
+//
+// This used to ALSO exclude any order flagged IsReplacementOrder=true, on
+// the theory that a $0 replacement is never a sale. That was wrong, proven
+// wrong by Amazon's own report: the account has four more $0-priced,
+// standard-shaped orders that carry the flag, and excluding all five (not
+// just the S02- one) dropped our count to 352 - but Amazon's Units Ordered
+// stayed at 356 even after those four synced. Amazon counts a standard-id
+// replacement as a unit ordered; it only excludes the kind that gets its own
+// non-standard order id. Matching Amazon's own line means matching its own
+// distinction, not the more sweeping one that seemed to follow from it.
+const STANDARD_ORDER_ID = /^\d{3}-\d{7}-\d{7}$/;
+const isReplacementOrder=row=>row.amazon_order_id!=null&&!STANDARD_ORDER_ID.test(row.amazon_order_id);
 const orderItemKey=row=>rawField(row.raw,['order-item-id','orderItemId','order-item-code','amazon-order-item-id'])??row.order_item_id??row.source_row_id??row.id;
 const returnKey=row=>rawField(row.raw,['return-event-id','event-id','rma-id'])??`${row.order_id??''}|${rawField(row.raw,['order-item-id','orderItemId'])??row.order_item_id??''}|${row.sku??''}|${row.return_date??''}|${row.quantity??''}`;
 const financialKey=row=>`${row.transaction_id??row.settlement_id??''}|${row.order_id??''}|${rawField(row.raw,['order-item-id','orderItemId','order-item-code'])??row.order_item_id??row.sku??''}|${row.category??row.amount_type??''}|${row.amount_description??''}|${row.posted_date??''}|${amount(row)}`;
 const gstKey=row=>`${rawField(row.raw,['invoice-number','invoice number','document-number','credit-note-number'])??row.document_number??row.source_row_id??row.id}|${rawField(row.raw,['line-item-id','invoice-line-id','order-item-id'])??row.line_id??row.sku??''}`;
 
-export function inclusiveDays(start,end){const a=new Date(start),b=new Date(end);return Math.max(1,Math.round((Date.UTC(b.getUTCFullYear(),b.getUTCMonth(),b.getUTCDate())-Date.UTC(a.getUTCFullYear(),a.getUTCMonth(),a.getUTCDate()))/864e5));}
+// Counted in the seller's own calendar, not in whatever the window's
+// boundaries happen to look like in UTC. The two are not the same: the range
+// now ends at 23:59 GMT of the last day (Amazon's convention) rather than at
+// IST midnight, which moves the end into the *next* UTC calendar day and
+// would have quietly turned a 30-day window into 31 - dividing DRR by the
+// wrong number without anything visibly changing. Reading both boundaries as
+// IST days makes this invariant to the boundary convention entirely.
+// Amazon re-posts money rather than updating it, so the same payment can reach
+// this tool under several transaction ids and be counted several times over.
+//
+// The obvious version of this rule - "drop anything marked DEFERRED_RELEASED" -
+// only works on accounts whose duplication happens to follow the deferral
+// lifecycle. Measured on two real sellers it does not generalise:
+//
+//   MINDCIRCUS         income 1.00x  (deferral re-issue only)
+//   NEERUCYCLETRADERS  income 1.797x, GST 1.797x, released half 2.25x
+//
+// Two independent sections drifting by the identical factor cannot be a
+// classification fault; it is one population counted more than once. On the
+// second account the duplicates are not all DEFERRED_RELEASED, so a rule keyed
+// on the status label cannot see them.
+//
+// So identity is economic, not lifecycle: two transactions carrying the SAME
+// ORDER and a byte-identical set of (category, description, amount) lines are
+// the same payment recorded twice, whatever status either one wears and
+// whatever dates they were posted on. Verified on the first account, where the
+// rule found the duplication without being told to look for it - 331 duplicate
+// signatures, 329 of them exactly a DEFERRED_RELEASED/RELEASED pair.
+//
+// Two deliberate limits keep it from eating real money:
+//   - a transaction with NO order id is never collapsed. Transfers, service
+//     fees and withholding legitimately repeat with identical lines, and one
+//     real account carries 51 identical order-less rows that must all count.
+//   - the whole line set must match. A partial refund, a fee reversal or any
+//     transaction that differs by a single line is a different economic event
+//     and survives.
+// When copies are found, the one furthest through the lifecycle wins, because
+// that is the record Amazon's own statement dates the money by.
+// How much history de-duplication needs before the window to be trustworthy.
+// Matches FINANCE_LOOKBACK_DAYS in server.js, which is what gets fetched;
+// this is the check that it actually arrived.
+// A build marker, surfaced in diagnostics.
+//
+// Chasing a figure the dashboard showed but no committed build reproduced cost
+// a full round trip, and the answer was simply that the API process had not been
+// restarted after a pull. Node does not hot-reload, so a stale process reports
+// stale numbers with total confidence. Bump this whenever the statement maths
+// changes, and the running build can be read off the dashboard instead of
+// inferred from the numbers it produces.
+export const CALCULATION_REVISION = 'shipping-discount-is-a-promotion-2026-08-14';
+export const MINIMUM_DEDUPE_LOOKBACK_DAYS = 30;
+// The instant a row was posted, for ordering. Never compare posted_date as a
+// string: it arrives as a Date from Postgres and as an ISO string from an
+// import, and only one of those sorts correctly that way.
+const postedAt=row=>{const t=utcDate(row?.posted_date).getTime();return Number.isNaN(t)?Infinity:t;};
+const RELEASE_RANK=Object.freeze({released:0,deferred_released:1,deferred:2});
+const releaseRank=row=>RELEASE_RANK[String(row?.transaction_status??'').trim().toLowerCase().replace(/[\s-]+/g,'_')]??9;
+// A transaction whose every line is Amazon's bare, not-yet-classified label
+// ("Base"/"Tax", category "other"/"tax" - no fee-type name attached) is not
+// yet a candidate for the per-line dedup above: that dedup requires an exact
+// (order_id, category, amount_description, amount) match, and by the time
+// Amazon later re-posts the SAME fee under its real name (a NEW transaction
+// id, category e.g. "closing_fee", description "FixedClosingFee Base"), the
+// category+description text differs, so the two are never recognised as the
+// same line and both survive.
+//
+// Found on a real seller (TGS INDIA, 1 Jun-31 Jul 2026): 127 wholly-generic
+// transactions across 68 orders whose every line amount was matched exactly
+// by a specifically-named fee transaction on the same order - 6,304.67 of
+// double-counted Expenses, against an observed gap to Amazon's own statement
+// of 6,305.85 for the same window. Net Sales, Income, Tax, Transfers and GST
+// were all within a few rupees or exact; this single mechanism was the whole
+// remaining Expenses gap.
+//
+// Matched at the TRANSACTION level, not the line level, and every line's
+// amount must be consumable from the specific side: a lone "Base: -75" with
+// no sibling "Tax" line matching just as exactly is not dropped, because a
+// partial match is exactly the "different economic event" case line-level
+// dedup above already protects. isGenericLine's TAX_LABELS check on category
+// mirrors how the rest of this file already tells "other" from "tax" apart.
+const GENERIC_ECHO_DESCRIPTIONS=Object.freeze(new Set(['Base','Tax']));
+const isGenericLine=row=>GENERIC_ECHO_DESCRIPTIONS.has(row.amount_description)&&(row.category==='other'||row.category==='tax');
+function dropGenericFeeEchoes(rows){
+  const byTransaction=new Map();
+  for(const row of rows){
+    if(!row.order_id)continue;
+    const list=byTransaction.get(row.transaction_id);
+    if(list)list.push(row);else byTransaction.set(row.transaction_id,[row]);
+  }
+  const specificAmountsByOrder=new Map();
+  for(const [,lines] of byTransaction){
+    if(lines.every(isGenericLine))continue;
+    const order=lines[0].order_id;
+    let counter=specificAmountsByOrder.get(order);
+    if(!counter){counter=new Map();specificAmountsByOrder.set(order,counter);}
+    for(const row of lines){const key=round2(amount(row));counter.set(key,(counter.get(key)??0)+1);}
+  }
+  const dropSet=new Set();
+  let dropped=0;
+  for(const [,lines] of byTransaction){
+    if(!lines.every(isGenericLine))continue;
+    const counter=specificAmountsByOrder.get(lines[0].order_id);
+    if(!counter)continue;
+    const claimed=[];
+    let fullyMatched=true;
+    for(const row of lines){
+      const key=round2(amount(row));
+      const available=counter.get(key)??0;
+      if(available<=0){fullyMatched=false;break;}
+      counter.set(key,available-1);
+      claimed.push(key);
+    }
+    if(fullyMatched){
+      for(const row of lines)dropSet.add(row);
+      dropped+=lines.length;
+    }else{
+      for(const key of claimed)counter.set(key,(counter.get(key)??0)+1);
+    }
+  }
+  return {kept:rows.filter(row=>!dropSet.has(row)),dropped};
+}
+export function dedupeRepostedTransactions(rows){
+  // Identity is the LINE, not the whole transaction.
+  //
+  // Matching entire transactions on their exact line set is too brittle: when
+  // Amazon reverses a fee between deferral and release the two records describe
+  // the same money with different compositions, so they no longer match and the
+  // copy survives. Measured on a real account, transaction-level matching left
+  // 55,516.09 of duplicates behind that line-level matching removes.
+  //
+  // A line is identified by the order it belongs to plus Amazon's own
+  // (category, description, amount). How many of a repeated line are REAL is
+  // the largest count any single status reaches - a lifecycle re-post appears
+  // once per stage, so two identical refunds show up as 2 DEFERRED_RELEASED +
+  // 2 RELEASED and two survive, while one sale re-posted shows up as 1 + 1 and
+  // one survives. A seller genuinely charged the same fee twice inside one
+  // stage keeps both, because that stage's own count is 2.
+  //
+  // A row with no order id is never collapsed: transfers, service fees and
+  // withholding legitimately repeat with identical values, and one real account
+  // carries 51 identical order-less rows that must all count.
+  const groups=new Map();
+  const kept=[];
+  for(const row of rows){
+    if(!row.order_id){kept.push(row);continue;}
+    const key=`${row.order_id}|${row.category??row.amount_type??''}|${row.amount_description??''}|${amount(row)}`;
+    (groups.get(key)??groups.set(key,[]).get(key)).push(row);
+  }
+  let dropped=0;
+  for(const copies of groups.values()){
+    const perStatus=new Map();
+    for(const copy of copies){const rank=releaseRank(copy);perStatus.set(rank,(perStatus.get(rank)??0)+1);}
+    const realEvents=Math.max(...perStatus.values());
+    // Keep the EARLIEST posting. Amazon dates money by where it first appeared
+    // in the ledger; the re-post at release time is the copy. Verified on a real
+    // account with a full month of history: keeping the original reproduces its
+    // statement exactly, keeping the released copy gives 9,50,003.27 against
+    // 5,28,614.89.
+    // Order by INSTANT, never by the string form. Postgres hands back
+    // timestamptz as a Date object, and String(date) is "Wed Jul 01 2026 ...",
+    // so a lexicographic sort orders by weekday name - Fri, Sat, Sun, Thu, Wed.
+    // "Keep the earliest" then kept an effectively random copy. It was invisible
+    // in tests, which pass ISO strings that happen to sort correctly, and cost a
+    // long hunt: on a real account it moved Income from 5,64,126.22 to
+    // 8,19,913.31 and made Tax non-zero, purely through picking the wrong copy.
+    copies.sort((a,b)=>postedAt(a)-postedAt(b));
+    kept.push(...copies.slice(0,realEvents));
+    dropped+=copies.length-realEvents;
+  }
+  const echoPass=dropGenericFeeEchoes(kept);
+  return {kept:echoPass.kept,dropped:dropped+echoPass.dropped};
+}
+
+export function inclusiveDays(start,end){
+  const a=Date.parse(`${calendarDay(start)}T00:00:00Z`);
+  const b=Date.parse(`${calendarDay(end)}T00:00:00Z`);
+  return Math.max(1,Math.round((b-a)/864e5));
+}
 
 export function calculateDashboardMetrics(input,range){
-  const orderAudit=dedupe(input.orders??[],row=>row.amazon_order_id);const eligibleOrders=orderAudit.included.filter(row=>statusEligible(row.status));const eligibleIds=new Set(eligibleOrders.map(row=>row.amazon_order_id));
+  const orderAudit=dedupe(input.orders??[],row=>row.amazon_order_id);const eligibleOrders=orderAudit.included.filter(row=>statusEligible(row.status)&&!isReplacementOrder(row));const eligibleIds=new Set(eligibleOrders.map(row=>row.amazon_order_id));
   const itemAudit=dedupe((input.orderItems??[]).filter(row=>eligibleIds.has(row.amazon_order_id)),row=>orderItemKey(row)??keyOf(row));
   const returnAudit=dedupe(input.returns??[],returnKey);
-  const shippedAvailable=itemAudit.included.length>0&&itemAudit.included.every(row=>num(row.quantity_ordered)!=null);
-  const returnsAvailable=returnAudit.included.length>0?returnAudit.included.every(row=>num(row.quantity)!=null):true;
-  const shippedUnits=shippedAvailable?itemAudit.included.reduce((s,r)=>s+num(r.quantity_ordered),0):null;
-  const returnedUnits=returnsAvailable?returnAudit.included.reduce((s,r)=>s+num(r.quantity),0):null;
-  const netQty=shippedUnits==null||returnedUnits==null?null:shippedUnits-returnedUnits;
 
   const financeAudit=dedupe((input.financeItems??[]).filter(row=>!isSummary(row)),financialKey);const settlementAudit=dedupe(input.settlementRows??[],financialKey);
+
+  // Shipped units. order_items (Orders API) is the primary source, but Amazon
+  // meters listOrderItems at one order per 2200ms, so on a large or freshly
+  // connected account it lags the orders themselves by minutes. The previous
+  // rule - EVERY item row must carry a quantity or the entire KPI reports
+  // "Unavailable" - meant one order whose items had not arrived yet blanked
+  // Net Qty, Return Rate and everything derived from them, on an account where
+  // Amazon had already stated the quantity in the settlement report.
+  //
+  // Settlement lines carry Amazon's own quantity-purchased per order item, so
+  // an eligible order that order_items has not reached yet is counted from
+  // that instead of being discarded. Nothing is estimated or inferred: an
+  // order contributes units only where Amazon itself stated a quantity, each
+  // order is counted from exactly one source, and orders Amazon has given no
+  // quantity for anywhere are reported as a coverage shortfall rather than
+  // silently treated as zero.
+  const settlementQuantity=row=>num(rawField(row.raw,['quantity-purchased','quantity purchased','quantityPurchased']));
+  const unitsByOrder=new Map();
+  for(const row of itemAudit.included){
+    const quantity=num(row.quantity_ordered);
+    if(quantity==null)continue;
+    unitsByOrder.set(row.amazon_order_id,(unitsByOrder.get(row.amazon_order_id)??0)+quantity);
+  }
+  const settlementUnitsByOrder=new Map();
+  for(const row of settlementAudit.included){
+    const quantity=settlementQuantity(row);
+    if(quantity==null||quantity<=0||!row.order_id||!isPrincipal(row)||isRefund(row))continue;
+    settlementUnitsByOrder.set(row.order_id,(settlementUnitsByOrder.get(row.order_id)??0)+quantity);
+  }
+  let ordersCountedFromSettlement=0;
+  for(const order of eligibleOrders){
+    if(unitsByOrder.has(order.amazon_order_id))continue;
+    const quantity=settlementUnitsByOrder.get(order.amazon_order_id);
+    if(quantity==null)continue;
+    unitsByOrder.set(order.amazon_order_id,quantity);
+    ordersCountedFromSettlement+=1;
+  }
+  const ordersWithoutQuantity=eligibleOrders.filter(order=>!unitsByOrder.has(order.amazon_order_id)).length;
+  // Returns get the same treatment as shipped units. Requiring EVERY return
+  // row to carry a quantity meant a single row Amazon had not put a quantity
+  // on blanked Net Qty and Return Rate outright - seen live with 9 return
+  // rows where 8 had quantities, and confirmed by the KPI working on a
+  // 30-day range and going Unavailable on a narrower one that happened to
+  // include the incomplete row. Sum the quantities Amazon did state, and
+  // report the rows it did not. Still no guessing: a row without a quantity
+  // contributes nothing rather than being assumed to be one unit, and if
+  // Amazon stated no quantity anywhere the figure stays honestly unavailable.
+  const returnRowsWithQuantity=returnAudit.included.filter(row=>num(row.quantity)!=null);
+  const returnRowsMissingQuantity=returnAudit.included.length-returnRowsWithQuantity.length;
+  const shippedUnits=unitsByOrder.size?[...unitsByOrder.values()].reduce((sum,units)=>sum+units,0):null;
+  const returnedUnits=!returnAudit.included.length?0
+    :returnRowsWithQuantity.length?returnRowsWithQuantity.reduce((s,r)=>s+num(r.quantity),0)
+    :null;
+  const netQty=shippedUnits==null||returnedUnits==null?null:shippedUnits-returnedUnits;
+  const unitsSource=!unitsByOrder.size?'Orders + Returns'
+    :ordersCountedFromSettlement?`Orders + Returns (${ordersCountedFromSettlement} order${ordersCountedFromSettlement===1?'':'s'} counted from Amazon settlement quantity-purchased)`
+    :'Orders + Returns';
+  // A shortfall is stated, never hidden - but it no longer destroys the KPI.
+  const unitsCoverageNote=shippedUnits==null?'Unavailable - Amazon has not returned order items or settlement quantities for this range yet'
+    :ordersWithoutQuantity?`${ordersWithoutQuantity} of ${eligibleOrders.length} orders still awaiting quantity from Amazon`
+    :null;
+  const returnsNote=returnedUnits==null?'Unavailable - Amazon has not stated a quantity on any return in this range'
+    :returnRowsMissingQuantity?`${returnRowsMissingQuantity} of ${returnAudit.included.length} returns have no quantity from Amazon yet`
+    :null;
   const settlementComplete=settlementAudit.included.some(row=>isPrincipal(row)||isProductGst(row)||isFee(row)||isTransfer(row))&&settlementAudit.included.some(row=>row.settlement_id||row.raw?.['settlement-id']||row.raw?.['settlement id']);
-  const financialRows=settlementComplete?settlementAudit.included:financeAudit.included;
-  const financialDuplicates=settlementComplete?settlementAudit.duplicates:financeAudit.duplicates;
-  const financialSource=settlementComplete?'Amazon Settlement report':'Amazon Finances API';
+  // The settlement report is the source. The Finances API is a FALLBACK ONLY,
+  // used when there is no usable settlement data at all - never as an additive
+  // supplement.
+  //
+  // The two are two views of the same ledger, so adding "unsettled" Finance
+  // rows on top of settlement rows produces an accrual/cash hybrid that
+  // matches no Amazon report. Measured on a real seller for 21-29 Jul 2026,
+  // that merge inflated Income, Expenses and GST by an identical factor of
+  // 7/3 - and 993.30 - 425.70 = 567.60, exactly the settlement figure. Three
+  // independent buckets cannot share one ratio through a classification bug;
+  // it can only be the same population counted twice.
+  //
+  // The merge was attempted because settlement's 567.60 was read as
+  // disagreeing with Amazon's Income of 425.70. It does not. Amazon's own
+  // sub-lines for that window are product sales 567.60 and product sale
+  // refunds -141.90, netting to 425.70. Settlement's 567.60 WAS Amazon's
+  // gross, to the paisa; only the refund row was missing from ingestion. A
+  // gross figure was compared against a net one and an ingestion gap was
+  // misdiagnosed as a source and date-basis error. Never compare a section
+  // total against a sub-line.
+  //
+  // Amazon's Date Range / Custom Unified Summary report is POSTED-DATE based:
+  // orders placed before the window but posted inside it appear in Amazon's
+  // own PDF for that window. Settlement rows are therefore scoped by
+  // posted_date, matching Amazon, and must not be re-dated to the order.
+  //
+  // pendingFinanceRows is computed for measurement only - it is reported in
+  // diagnostics so the size of not-yet-settled activity stays visible, and it
+  // never reaches financialRows.
+  const settledOrderIds=new Set([...(input.settledOrderIdsAllTime??[]),...settlementAudit.included.map(row=>row.order_id)].filter(Boolean));
+  const pendingFinanceRows=financeAudit.included.filter(row=>row.order_id&&!settledOrderIds.has(row.order_id)&&row.transaction_status&&!/released/i.test(row.transaction_status));
+
+  // DEFERRED_RELEASED is the SAME money as a RELEASED row, not extra money.
+  //
+  // When a deferred payment matures, Amazon does not update the transaction -
+  // it issues a second one, with a different transactionId and the release date
+  // as its posted date. Both come back from listTransactions, so counting both
+  // doubles the ledger. Proved on a real account, one order, one fee line:
+  //
+  //   RELEASED           0zLrB-4XOAs21B   posted 2026-07-25   Commission Base  -186.83
+  //   DEFERRED_RELEASED  O_vpD65He6FncA   posted 2026-07-15   Commission Base  -186.83
+  //
+  // 104 of 251 orders carried both, and with a wide enough window that every
+  // deferred origin is present, 1,967 of 3,273 released rows pair to one. Taken
+  // together the two populations totalled 228,172.22 against a statement of
+  // 113,423.84 - almost exactly twice.
+  //
+  // This is why the two earlier attempts to merge Deferred activity overshot
+  // and were reverted: the merge was right, the double count was not.
+  // De-duplication has to see OUTSIDE the window, then the window is applied.
+  //
+  // A payment posted in June and re-posted on release in July has its original
+  // outside the range being viewed. Filter first and only the July copy is
+  // visible, so it survives and is counted at a date Amazon does not use.
+  // Measured on a seller whose export carries a full month of lookback, doing
+  // it in this order reproduces the statement exactly - Income, Expenses, GST
+  // and Tax all 0.00 - while the same rule on an account with only five days of
+  // lookback over-counts Income by 63,963.29, purely because the originals were
+  // not there to match against. That is why financeItems is fetched with a
+  // lookback and narrowed here rather than in SQL.
+  const deduped=dedupeRepostedTransactions(financeAudit.included);
+  const financeStatementRows=deduped.kept.filter(row=>inRange(row.posted_date,range));
+  const duplicatedByRelease=deduped.dropped;
+
+  // Amazon's statement is built from the financial ledger by POSTED DATE and
+  // carries both released and still-deferred activity. A settlement document
+  // carries neither: it holds only released money, and it lags, because money
+  // released inside a window can belong to a settlement period that has not
+  // closed. Measured on the reconciled account for one window, settlement rows
+  // stored 101,248.49 against 107,014.34 of released activity Amazon counted -
+  // short by 5,765.85 before any classification runs. So the Finances API is
+  // the source whenever it has data, and settlement is the fallback.
+  //
+  // Against a real Custom Unified Summary this reproduces:
+  //   Tax      0.00 vs      0.00   exact
+  //   GST 23,682.67 vs 23,691.75   -9.08
+  //   Income 1,31,996.27 vs 1,32,046.97  -50.70
+  //   Expenses -46,586.46 vs -42,314.88  -4,271.58   (see completeness note)
+  // The Finances API wins whenever it carries statement lines. Settlement is
+  // the fallback for an account that has no Finance data at all, and nothing
+  // else.
+  //
+  // This used to ALSO require the Finance side to hold more rows than the
+  // settlement side. That comparison is meaningless - the two describe the same
+  // money at different granularities, so their row counts say nothing about
+  // coverage - and it was actively wrong. On a real account with 6,876 Finance
+  // rows it silently fell back to settlement and reported Income 8,73,050.23
+  // where Amazon says 5,64,126.22, while the Finance path reproduces that
+  // statement to 0.00 on every section.
+  //
+  // There is no judgement to make here. A settlement document holds only
+  // released money and lags the posted date Amazon builds its statement on, so
+  // it cannot reproduce the statement even in principle. The Finances API is
+  // the ledger the statement is drawn from.
+  const financeComplete=financeStatementRows.some(row=>isPrincipal(row)||isFee(row)||isProductGst(row)||isPromotion(row)||isReimbursement(row)||isWithholding(row));
+  const useFinanceStatement=financeComplete;
+  const financialRows=useFinanceStatement?financeStatementRows:settlementAudit.included;
+  const financialDuplicates=useFinanceStatement?financeAudit.duplicates:settlementAudit.duplicates;
+  const financialSource=useFinanceStatement?'Amazon Finances API':'Amazon Settlement report';
   const principalRows=financialRows.filter(isPrincipal);const grossRows=principalRows.filter(row=>amount(row)>0&&!isRefund(row));const refundPrincipalRows=principalRows.filter(row=>amount(row)<0&&isRefund(row));
   const promoRows=financialRows.filter(isPromotion);const promoDebits=promoRows.filter(row=>amount(row)<0);const promoRefunds=promoRows.filter(row=>amount(row)>0);
   const grossSales=signedSum(grossRows);const productRefunds=Math.abs(signedSum(refundPrincipalRows));const netPromotions=round2(Math.abs(signedSum(promoDebits))-signedSum(promoRefunds));const netSales=round2(grossSales-productRefunds-netPromotions);
@@ -69,32 +606,288 @@ export function calculateDashboardMetrics(input,range){
   const financeReimbursements=financialRows.filter(isReimbursement);const reportReimbursementAudit=dedupe(input.reimbursements??[]);
   const reimbursementRows=financeReimbursements.length?financeReimbursements:reportReimbursementAudit.included;const reimbursements=signedSum(reimbursementRows);
 
-  const headerAudit=dedupe((input.settlementHeaders??[]).filter(row=>!/failed/.test(text(row))&&((row.deposit_date&&inRange(row.deposit_date,range))||overlapsRange(row.settlement_start_date,row.settlement_end_date,range))),row=>row.settlement_id??keyOf(row));
-  const transferRows=headerAudit.included.map(row=>({...row,amount:-Math.abs(Number(row.total_amount??row.amount??0))}));const settled=Math.abs(signedSum(transferRows));
+  // Amazon's Transfers section reports the money that actually left Amazon
+  // for the seller's bank *during the statement window* - it is keyed on the
+  // deposit, not on the settlement period the deposit pays for. The `||
+  // overlapsRange(settlement_start, settlement_end)` clause that used to sit
+  // here therefore counted a second, different population: settlements whose
+  // *period* touches the window even though the deposit landed outside it.
+  // Measured over-count, both accounts, both in the same direction:
+  //   Seller A 1-25 Jul: -1,17,288.92 vs Amazon -1,07,559.21  (+9,729.71)
+  //   Seller B 21-29 Jul:    -328.84 vs Amazon      -246.63  (+   82.21)
+  // The metric's own description already said "deposit_date in the selected
+  // range"; the code did something wider. Dropping the clause must move both
+  // accounts toward zero - if it moves anything the other way, the diagnosis
+  // above is wrong and this should be reverted rather than compensated for.
+  //
+  // That over-count was only half of it. The rows feeding this filter were
+  // also picked non-deterministically (see loadDashboardCalculations), which
+  // could resolve a settlement to a line carrying no total-amount and quietly
+  // score it 0. The two defects pull in opposite directions, which is why
+  // Seller A's transfers moved -1,09,260.18 -> -1,17,288.92 across reloads
+  // with nothing about transfers having changed. Both are fixed together;
+  // neither is meaningful to measure while the other is live.
+  // Amazon's Transfers section is the Finances API's own Transfer
+  // transactions, posted in the window. Not settlement headers - and that
+  // distinction is the whole reason no rule built on them ever matched.
+  //
+  // Verified live against both accounts that have a Custom Unified Summary to
+  // check against, on windows of different lengths:
+  //   Seller A, 1-25 Jul: 14 Transfer transactions = 1,07,559.21 = Amazon
+  //   Seller C, 1-30 Jul:  9 Transfer transactions = 7,59,003.33 = Amazon
+  //
+  // The Finances API posts a transfer about a day EARLIER than the settlement
+  // file stamps its deposit-date, so the two disagree at every window edge.
+  // Seller C's last transfer posts 30 Jul 06:55 - inside a 1-30 Jul window -
+  // while its settlement says deposit-date 31 Jul 12:36, which is outside;
+  // that single settlement, worth 66,743.04, was the entire gap. Seller A had
+  // the mirror image: two settlements the deposit rule wanted to include whose
+  // transfers actually posted before the window began.
+  //
+  // Settlement headers remain the fallback for a range the Finances API has
+  // not been synced for, where an approximate figure beats none - but where
+  // real transfer transactions exist they are the answer, not a hint.
+  const financeTransfers=dedupe((input.financeTransactions??[]).filter(row=>/^transfer$/i.test(String(row.transaction_type??'').trim())&&inRange(row.posted_date,range)),row=>row.transaction_id??keyOf(row));
+  const headerAudit=dedupe((input.settlementHeaders??[]).filter(row=>!/failed/.test(text(row))&&row.deposit_date&&inRange(row.deposit_date,range)),row=>row.settlement_id??keyOf(row));
+  const transferSource=financeTransfers.included.length?'Amazon Finances API transfers':'Settlement headers';
+  const transferRows=financeTransfers.included.length
+    ?financeTransfers.included.map(row=>({...row,amount:-Math.abs(Number(row.total_amount??row.amount??0))}))
+    :headerAudit.included.map(row=>({...row,amount:-Math.abs(Number(row.total_amount??row.amount??0))}));
+  const settled=Math.abs(signedSum(transferRows));
+  // Every deposit this window did NOT count, and how far outside it fell.
+  //
+  // Twice now a Transfers gap has been chased by reasoning about which
+  // deposits *should* be in range, and twice the reasoning was wrong - first
+  // blaming missing settlement documents, then a 5.5-hour boundary that
+  // turned out to be empty. The tool holds the answer either way: it knows
+  // every deposit it has and which ones it rejected. Showing the rejected
+  // ones with their dates turns "why is Transfers short" from an argument
+  // into a lookup, and the seller can read it off the screen instead of
+  // exporting rows.
+  const dayOffsetFromRange=value=>{
+    const at=utcDate(value);const{start,end}=rangeDates(range);
+    if(Number.isNaN(at.getTime()))return null;
+    if(at<start)return -Math.ceil((start-at)/864e5);
+    if(at>=end)return Math.floor((at-end)/864e5)+1;
+    return 0;
+  };
+  const depositsOutsideRange=dedupe((input.settlementHeaders??[]).filter(row=>!/failed/.test(text(row))&&row.deposit_date&&!inRange(row.deposit_date,range)),row=>row.settlement_id??keyOf(row))
+    .included
+    .map(row=>({settlement_id:row.settlement_id,deposit_date:row.deposit_date,settlement_start_date:row.settlement_start_date,settlement_end_date:row.settlement_end_date,amount:round2(Math.abs(Number(row.total_amount??row.amount??0))),days_outside:dayOffsetFromRange(row.deposit_date)}))
+    .filter(row=>row.days_outside!=null&&Math.abs(row.days_outside)<=7&&row.amount>0)
+    .sort((a,b)=>Math.abs(a.days_outside)-Math.abs(b.days_outside));
 
   const gstImported=(input.gstInvoices??[]).filter(row=>Object.keys(row.raw??{}).length>0&&!/synthetic|order item estimate/.test(norm(`${row.source??''} ${JSON.stringify(row.raw??{})}`)));const gstAudit=dedupe(gstImported,gstKey);
   const gstAvailable=gstAudit.included.length>0;const gstInvoiceValue=gstAvailable?gstAudit.included.reduce((sum,row)=>{const kind=norm(`${rawField(row.raw,['document-type','invoice-type','transaction-type'])??row.document_type??''}`);return sum+(/credit|refund/.test(kind)?-Math.abs(Number(row.taxable_value??0)):Number(row.taxable_value??0));},0):null;
   const productGstRows=financialRows.filter(isProductGst);const genericTaxRows=financialRows.filter(isGenericTax);
-  const incomeRows=financialRows.filter(row=>!isFee(row)&&!isWithholding(row)&&!isProductGst(row)&&!isGenericTax(row)&&!isTransfer(row));
+  // Income is an ALLOW-LIST, not a residual.
+  //
+  // It used to be "everything that is not a fee, tax, GST or transfer", which
+  // silently swept every row no classifier recognised into Income. That is
+  // invisible on settlement rows, whose labels the classifiers were written
+  // against, and badly wrong on Finances API rows, whose labels differ - which
+  // is why both previous attempts to merge Deferred activity overshot. Amazon's
+  // own statement, reconciled row-by-row from a Custom Unified Transaction
+  // report, puts Deferred at +7,152.59 of Income for the window measured; the
+  // residual classifier turned that into +30,931.91.
+  //
+  // Amazon's Income section is a closed list: product sales, shipping credits,
+  // gift wrap credits, promotional rebates, and claims-type credits (SAFE-T,
+  // reimbursements, clawbacks, A-to-z, chargebacks, TDS reimbursement). Nothing
+  // else belongs there, so nothing else is allowed in by default.
+  const isIncomeLine=row=>isPrincipal(row)||isPromotion(row)||isReimbursement(row)||isShippingOrGiftWrapCredit(row);
+  const incomeRows=financialRows.filter(isIncomeLine);
+  // Money no rule claims. It is deliberately NOT folded into Income - that is
+  // the bug being fixed - but it is never dropped quietly either: it is
+  // reported so an incomplete classifier shows up as a stated discrepancy
+  // rather than as a wrong Income figure.
+  const unclassifiedRows=financialRows.filter(row=>!isIncomeLine(row)&&!isFee(row)&&!isWithholding(row)&&!isProductGst(row)&&!isGenericTax(row)&&!isTransfer(row));
   const gst=signedSum(productGstRows),tax=signedSum(genericTaxRows),income=signedSum(incomeRows),expenses=signedSum(expenseRows),transfers=signedSum(transferRows);
   const days=inclusiveDays(range.start,range.end);const unitRate=returnedUnits==null?null:shippedUnits==null||shippedUnits===0?(returnedUnits>0?null:0):returnedUnits/shippedUnits*100;const refundValueRate=grossSales?productRefunds/grossSales*100:null;
-  const diagnostics={sourcePolicy:{financial:`${financialSource} (${settlementComplete?'complete statement takes precedence':'settlement incomplete; Finances fallback'})`,reimbursements:financeReimbursements.length?financialSource:'Reimbursements report fallback',gst:'Imported GST B2B/B2C rows only',settled:'Settlement headers filtered by deposit_date'},includedRows:financialRows.length,excludedRows:(settlementComplete?financeAudit.included.length:settlementAudit.included.length),duplicateRows:financialDuplicates.length+itemAudit.duplicates.length+returnAudit.duplicates.length+gstAudit.duplicates.length,categoryTotals:{grossSales,productRefunds,netPromotions,expenseDebits,expenseCredits,tcsTds,operationalFees,gst,tax,transfers}};
+  const excludedFinanceRows=settlementComplete?financeAudit.included.length-pendingFinanceRows.length:0;
+  // Deferred activity is measured but never added (see above). Reporting it
+  // separately is what proved the merge wrong in the first place, and it is
+  // the only way to tell "Amazon counts money we do not have" apart from
+  // "we classify money we do have incorrectly" - the two failures look
+  // identical in the totals alone. Row-by-row output shows how each pending
+  // row *would* classify; the aggregates show what it *would* contribute.
+  const bucketOf=row=>isFee(row)||isWithholding(row)?'expenses':isProductGst(row)?'gst':isGenericTax(row)?'tax':isTransfer(row)?'transfer':'income';
+  const pendingFinanceRowsDetail=pendingFinanceRows.map(row=>({order_id:row.order_id,transaction_status:row.transaction_status,category:row.category,amount_type:row.amount_type,amount_description:row.amount_description,amount:amount(row),bucket:bucketOf(row)}));
+  const bucketTotals=rows=>rows.reduce((totals,row)=>{const bucket=bucketOf(row);totals[bucket]=round2((totals[bucket]??0)+amount(row));return totals;},{});
+  const pendingByOrder=new Map();
+  for(const row of pendingFinanceRows){
+    const entry=pendingByOrder.get(row.order_id)??{transactions:new Map(),total:0};
+    entry.transactions.set(row.transaction_id,round2((entry.transactions.get(row.transaction_id)??0)+amount(row)));
+    entry.total=round2(entry.total+amount(row));
+    pendingByOrder.set(row.order_id,entry);
+  }
+  const pendingMergeSummary={
+    merged:false,
+    settlementBaselineTotals:bucketTotals(settlementAudit.included),
+    pendingExcludedTotals:bucketTotals(pendingFinanceRows),
+    pendingOrders:pendingByOrder.size,
+    pendingRows:pendingFinanceRows.length,
+    financeRowsInRange:financeAudit.included.length,
+    settledOrderIdsKnown:settledOrderIds.size,
+    ordersWithMultipleTransactions:[...pendingByOrder].filter(([,entry])=>entry.transactions.size>1).map(([orderId,entry])=>({order_id:orderId,total:entry.total,transactions:[...entry.transactions].map(([transactionId,total])=>({transaction_id:transactionId,total}))}))
+  };
+  // The Account Activity panel claims to match Amazon's own statement
+  // sections. Until it demonstrably does, saying so is a lie the seller has
+  // no way to catch - they would have to open Seller Central and compare by
+  // hand, which is the work this tool exists to remove. So the claim is
+  // conditional on the data behind it being provably whole, and every reason
+  // it is not travels with the numbers instead of being buried in a log.
+  const settlementIntegrityRows=(input.settlementIntegrity??[]).map(row=>({settlement_id:row.settlement_id,row_count:Number(row.row_count),rows_total:Number(row.rows_total),header_total:Number(row.header_total),difference:round2(Number(row.rows_total)-Number(row.header_total))}));
+  const outstandingSettlementSyncs=Number(input.outstandingSettlementSyncs??0);
+  const provisionalReasons=[];
+  // De-duplication can only match a re-posted payment against an original it
+  // can see. If the stored history does not reach far enough back, originals
+  // from before the window are missing, their July re-posts survive, and the
+  // sections read HIGH - silently, because every row involved is genuine.
+  //
+  // Measured on two real accounts, same code, same day:
+  //   30 days of history  ->  2 of 166 July orders unmatched  ->  exact match
+  //    6 days of history  -> 41 of 244 July orders unmatched  ->  Income +63,022.63
+  //
+  // So this is stated rather than left to be discovered. It is a sync-coverage
+  // problem, not a calculation one, and the fix is to sync a wider range.
+  const financeHistoryStart=financeAudit.included
+    .map(row=>utcDate(row.posted_date)).filter(d=>!Number.isNaN(d.getTime()))
+    .reduce((earliest,d)=>earliest===null||d<earliest?d:earliest,null);
+  if(financeHistoryStart&&useFinanceStatement){
+    const lookbackDays=Math.floor((rangeDates(range).start-financeHistoryStart)/86400000);
+    if(lookbackDays<MINIMUM_DEDUPE_LOOKBACK_DAYS){
+      provisionalReasons.push(`Amazon re-posts a deferred payment when it matures, and matching a re-post to its original needs history from before this range. Only ${Math.max(lookbackDays,0)} day(s) are stored before it, against the ${MINIMUM_DEDUPE_LOOKBACK_DAYS} needed, so originals that fall earlier cannot be matched and their re-posts are counted here. These sections may read HIGH. Sync a wider range to fix it - it is a coverage gap, not a calculation error.`);
+    }
+  }
+  // Only a caveat when the Finances API is NOT carrying the statement. It is
+  // not "a different view" - it is the ledger Amazon builds the statement from,
+  // indexed by posted date and carrying deferred activity, which a settlement
+  // document cannot do.
+  if(!settlementComplete&&!useFinanceStatement)provisionalReasons.push('Neither a settlement document nor the Finances API covers this range yet, so these sections are built from whatever partial data has arrived.');
+  if(outstandingSettlementSyncs>0)provisionalReasons.push(`${outstandingSettlementSyncs} settlement sync(s) did not finish, so some of Amazon's documents for this range have not been read yet.`);
+  // This total is NOT comparable to a section gap, and reporting it as though
+  // it were was a mistake worth recording. The check sums every row a
+  // settlement has, on any date; the sections sum only rows posted inside the
+  // selected window. A settlement straddling the window's edge, or a duplicate
+  // row left outside it by an earlier reset, moves this number without moving
+  // Income by a paisa. Measured live on Seller A: net +20,445.84 here while
+  // Income sat 9,066.84 *short* - opposite signs, so one cannot be explaining
+  // the other. What it does say, unambiguously, is that stored rows sum to
+  // more than Amazon's own document totals, in the same direction on all of
+  // them: rows this tool holds that Amazon's documents do not account for.
+  if(settlementIntegrityRows.length){
+    const netDifference=round2(settlementIntegrityRows.reduce((sum,row)=>sum+row.difference,0));
+    const absoluteDifference=round2(settlementIntegrityRows.reduce((sum,row)=>sum+Math.abs(row.difference),0));
+    const largestGap=round2(Math.max(...settlementIntegrityRows.map(row=>Math.abs(row.difference))));
+    const direction=netDifference>0?'more than':'less than';
+    provisionalReasons.push(`${settlementIntegrityRows.length} settlement(s) do not add up to Amazon's own document total - stored rows sum to ${Math.abs(netDifference)} ${direction} Amazon says they should (${absoluteDifference} in dispute, largest single gap ${largestGap}). This counts every date in those settlements, not just this range, so it does not translate directly into a section gap.`);
+  }
+  // The single most useful thing to know about a settlement-based figure, and
+  // it was invisible: how far the settlement documents actually reach.
+  //
+  // Confirmed on a real account (1-30 Jul window): eight settlements forming
+  // an unbroken chain from 28 Jun to 25 Jul, each one starting exactly where
+  // the last ended, each paying out exactly two days after it closed. The
+  // chain is complete - nothing is missing from the middle - it simply stops
+  // five days before the window does. Everything the seller sold between 25
+  // and 30 Jul is on Amazon's statement and in no settlement document,
+  // because Amazon had not settled it yet.
+  //
+  // That is the same activity the Finances API marks Deferred, seen from the
+  // other side, and it is why the sections can be wrong in either direction:
+  // an uncovered tail heavy with sales leaves them short, one heavy with
+  // refunds leaves them high. A seller looking at a settlement-only figure
+  // for a window that runs past the last settlement is looking at a partial
+  // period without being told so.
+  const settlementCoverageEnd=(input.settlementHeaders??[])
+    .map(row=>utcDate(row.settlement_end_date))
+    .filter(date=>!Number.isNaN(date.getTime()))
+    .reduce((latest,date)=>date>latest?date:latest,null);
+  const rangeEndsAt=rangeDates(range).end;
+  if(settlementComplete&&settlementCoverageEnd&&settlementCoverageEnd<rangeEndsAt){
+    const uncoveredDays=Math.max(1,Math.round((rangeEndsAt-settlementCoverageEnd)/864e5));
+    provisionalReasons.push(`Settlement documents reach only ${settlementCoverageEnd.toISOString().slice(0,10)}, but this range runs to ${rangeEndsAt.toISOString().slice(0,10)} - the last ${uncoveredDays} day(s) are on Amazon's statement with no settlement document behind them yet, so whatever happened in them is missing from these sections.`);
+  }
+  if(depositsOutsideRange.length){
+    const nearest=depositsOutsideRange.slice(0,3)
+      .map(row=>`${row.deposit_date} ${row.amount} (${row.days_outside>0?`${row.days_outside} day(s) after this range ends`:`${Math.abs(row.days_outside)} day(s) before it starts`}${row.settlement_end_date?`, for the settlement ending ${row.settlement_end_date}`:''})`)
+      .join('; ');
+    provisionalReasons.push(`${depositsOutsideRange.length} deposit(s) sit just outside this window and are not in Transfers: ${nearest}. If Amazon's statement counts one of these, it dates transfers by something other than when the money actually landed.`);
+  }
+  // Deferred activity is deliberately excluded (see above), but "deliberate"
+  // is not the same as "certainly right": Seller B's own Amazon statement for
+  // 21-29 Jul carries a -141.90 refund that the Finances API reports as
+  // Deferred and no settlement document contains. Until that is resolved, the
+  // honest position is that these sections may be short by this much.
+  //
+  // One number for all of it cannot be checked against anything. Split by the
+  // section each row would land in and the comparison becomes direct: if the
+  // Deferred income matches how far Income sits from Amazon, and the Deferred
+  // GST matches the GST gap, then Amazon's statement *does* carry this
+  // activity and excluding it is the whole error - no classifier is at fault.
+  // If they do not match, excluding Deferred is right and the gap is
+  // elsewhere. That is the measurement that decides it, so it has to be
+  // visible rather than inferred.
+  if(pendingFinanceRows.length){
+    const pendingTotals=bucketTotals(pendingFinanceRows);
+    const bySection=['income','gst','expenses','tax','transfer']
+      .filter(bucket=>pendingTotals[bucket]!=null&&pendingTotals[bucket]!==0)
+      .map(bucket=>`${bucket} ${pendingTotals[bucket]>=0?'+':''}${pendingTotals[bucket]}`)
+      .join(', ');
+    const deferredTotal=round2(pendingFinanceRows.reduce((sum,row)=>sum+amount(row),0));
+    // Counted or excluded is decided by the source, and the wording has to
+    // follow it. Saying "excluded" while the rows are in the totals is the
+    // failure this whole exercise exists to prevent.
+    provisionalReasons.push(useFinanceStatement
+      ? `${pendingFinanceRows.length} Deferred row(s) totalling ${deferredTotal} ARE counted, because Amazon's statement carries still-deferred activity and a settlement document cannot - by section: ${bySection || 'nothing that lands in a section'}. Deferred is a live population, so this reproduces a statement generated now, not one generated earlier.`
+      : `${pendingFinanceRows.length} Deferred row(s) totalling ${deferredTotal} are excluded because no settlement document carries them - by section: ${bySection || 'nothing that lands in a section'}. If Amazon's statement for this range includes any, those sections are short by exactly those amounts.`);
+  }
+  // An incomplete classifier now shows up as a stated discrepancy instead of
+  // as an inflated Income figure. Amazon's own taxonomy is closed, so on
+  // correctly classified data this list is empty and nothing is reported.
+  if(unclassifiedRows.length){
+    const byLabel=new Map();
+    for(const row of unclassifiedRows){
+      const label=`${row.amount_type??row.category??''} ${row.amount_description??''}`.trim()||'(no label)';
+      byLabel.set(label,round2((byLabel.get(label)??0)+amount(row)));
+    }
+    const worst=[...byLabel].sort((a,b)=>Math.abs(b[1])-Math.abs(a[1])).slice(0,5).map(([label,value])=>`${label} ${value}`).join('; ');
+    provisionalReasons.push(`${unclassifiedRows.length} row(s) totalling ${signedSum(unclassifiedRows)} match no statement section and are counted in none - largest: ${worst}. Amazon's sections are a closed list, so this is a gap in this tool's classification, and every section it would have belonged to is short by its share.`);
+  }
+  // The one section still known to disagree with Amazon, and why. Stated on the
+  // dashboard rather than left for a seller to discover: Amazon reports fee
+  // charges gross and their reversals as separate credits, while a released
+  // Finances transaction restates the fee it already carried when deferred.
+  // Measured against a real statement, Expenses came out 4,271.58 too negative
+  // while Income, GST and Tax landed within 50.70, 9.08 and 0.00 - and the whole
+  // difference is on the credit side: Amazon's expense credits were 7,094.39
+  // against 1,589.46 here, with the missing reversals sitting in the
+  // DEFERRED_RELEASED rows this deliberately drops.
+  if(useFinanceStatement&&duplicatedByRelease>0){
+    provisionalReasons.push(`Expenses can read more negative than Amazon's statement. ${duplicatedByRelease} row(s) are re-issued copies of already-counted money (Amazon re-posts a deferred transaction when it matures) and are excluded to avoid double counting - but fee REVERSALS that exist only on those rows are dropped with them, and Amazon reports those as expense credits. Measured on a reconciled account the effect was 4,271.58 on Expenses, with Income, GST and Tax within 50.70, 9.08 and 0.00.`);
+  }
+  const completeness={provisional:provisionalReasons.length>0,reasons:provisionalReasons};
+  const diagnostics={completeness,calculationRevision:CALCULATION_REVISION,sourcePolicy:{financial:`${financialSource} (${useFinanceStatement?`the ledger Amazon builds its statement from; ${pendingFinanceRows.length} still-Deferred row(s) counted, ${duplicatedByRelease} re-issued copy row(s) dropped as already counted`:`settlement only; ${pendingFinanceRows.length} Deferred Finance API row(s) measured but excluded - no settlement document carries them`})`,reimbursements:financeReimbursements.length?financialSource:'Reimbursements report fallback',gst:'Imported GST B2B/B2C rows only',settled:`${transferSource} in the selected range`},includedRows:financialRows.length,excludedRows:(settlementComplete?excludedFinanceRows:settlementAudit.included.length),duplicateRows:financialDuplicates.length+itemAudit.duplicates.length+returnAudit.duplicates.length+gstAudit.duplicates.length,categoryTotals:{grossSales,productRefunds,netPromotions,expenseDebits,expenseCredits,tcsTds,operationalFees,gst,tax,transfers},pendingFinanceRowsDetail,pendingMergeSummary,outstandingSettlementSyncs,depositsOutsideRange,
+    // Settlements whose own lines do not add up to the total Amazon stamped on
+    // the document. Empty means every settlement held is provably complete.
+    settlementIntegrity:settlementIntegrityRows};
   const metric=(value,unit,formula,components,rows,source=financialSource,status=value==null?'Unavailable':null)=>({value,unit,formula,components,rows,source,status,range,diagnostics});
   const metrics={
     netSales:metric(netSales,'amount','Gross product Principal sales − Refund Principal lines − net seller-funded promotions',[component('gross_sales','Gross product sales',grossSales,grossRows),component('product_refunds','Product refunds',-productRefunds,refundPrincipalRows,'−'),component('promotions','Net seller-funded promotions',-netPromotions,promoRows,'−')],[...grossRows,...refundPrincipalRows,...promoRows]),
-    netQty:metric(netQty,'quantity','Shipped units − physically returned units; exact cancelled, pending/unshipped, and replacement statuses excluded',[component('shipped_units','Shipped units',shippedUnits,itemAudit.included),component('returned_units','Returned units',returnedUnits==null?null:-returnedUnits,returnAudit.included,'−')],[...itemAudit.included,...returnAudit.included],'Orders + Returns',netQty==null?'Unavailable / source mismatch':null),
+    netQty:metric(netQty,'quantity','Shipped units − physically returned units; exact cancelled, pending/unshipped, and replacement statuses excluded',[component('shipped_units','Shipped units',shippedUnits,itemAudit.included),component('returned_units','Returned units',returnedUnits==null?null:-returnedUnits,returnAudit.included,'−')],[...itemAudit.included,...returnAudit.included],unitsSource,unitsCoverageNote??returnsNote),
     orders:metric(eligibleOrders.length,'quantity','Distinct eligible Amazon order IDs by order_date; cancelled, pending/unshipped, and replacement statuses excluded',[component('eligible_orders','Eligible distinct orders',eligibleOrders.length,eligibleOrders)],eligibleOrders,'Orders API'),
-    returns:metric(returnedUnits,'quantity','Sum of Amazon return quantity; no missing quantity is guessed as one',[component('returned_units','Returned quantity',returnedUnits,returnAudit.included)],returnAudit.included,'Returns report',returnedUnits==null?'Unavailable':null),
-    settled:metric(settled,'amount','Absolute value of successful bank deposits with deposit_date in the selected range',[component('successful_transfers','Successful bank transfers',settled,headerAudit.included)],headerAudit.included,'Settlement headers'),
+    returns:metric(returnedUnits,'quantity','Sum of Amazon return quantity; no missing quantity is guessed as one',[component('returned_units','Returned quantity',returnedUnits,returnAudit.included)],returnAudit.included,'Returns report',returnsNote),
+    settled:metric(settled,'amount','Absolute value of the money Amazon actually transferred to the bank in the selected range',[component('successful_transfers','Successful bank transfers',settled,transferRows)],transferRows,transferSource),
     deductions:metric(deductions,'amount','Gross expense debits − expense refunds/credits (includes TCS/TDS)',[component('expense_debits','Gross expense debits',expenseDebits,expenseRows.filter(r=>amount(r)<0)),component('expense_credits','Expense refunds/credits',-expenseCredits,expenseRows.filter(r=>amount(r)>0),'−'),component('tcs_tds','TCS/TDS included',tcsTds,withholdingRows),component('operational_fees','Operational fees excluding TCS/TDS',operationalFees,expenseRows.filter(r=>!isWithholding(r)))],expenseRows),
     reimbursements:metric(reimbursements,'amount','Reimbursement credits − reimbursement reversals',[component('net_reimbursements','Net reimbursements',reimbursements,reimbursementRows)],reimbursementRows,financeReimbursements.length?financialSource:'Reimbursements report'),
     drr:metric(round2(netSales/days),'amount',`Net Sales ÷ ${days} calendar days derived from the half-open range`,[component('net_sales','Net Sales',netSales,[]),component('days','Calendar days',days,[])],[]),
     feeImpact:metric(grossSales?operationalFees/grossSales*100:null,'percentage','Operational Amazon fees excluding TCS/TDS ÷ gross product sales × 100',[component('operational_fees','Operational fees',operationalFees,expenseRows.filter(r=>!isWithholding(r))),component('gross_sales','Gross product sales',grossSales,grossRows)],expenseRows),
-    returnRate:metric(unitRate,'percentage','Physically returned units ÷ shipped units × 100',[component('returned_units','Returned units',returnedUnits,returnAudit.included),component('shipped_units','Shipped units',shippedUnits,itemAudit.included)],[...returnAudit.included,...itemAudit.included],'Orders + Returns',unitRate==null?'Unavailable / source mismatch':null),
+    returnRate:metric(unitRate,'percentage','Physically returned units ÷ shipped units × 100',[component('returned_units','Returned units',returnedUnits,returnAudit.included),component('shipped_units','Shipped units',shippedUnits,itemAudit.included)],[...returnAudit.included,...itemAudit.included],unitsSource,unitRate==null?(unitsCoverageNote??returnsNote??'Unavailable - no shipped units to divide by'):null),
     refundValueRate:metric(refundValueRate,'percentage','Product refund Principal value ÷ gross product Principal sales × 100',[component('product_refunds','Product refunds',productRefunds,refundPrincipalRows),component('gross_sales','Gross product sales',grossSales,grossRows)],[...refundPrincipalRows,...grossRows]),
-    gstValue:metric(gstInvoiceValue,'amount','Genuine GST sales-invoice taxable value − genuine credit-note/refund taxable value',[component('net_taxable_value','Net taxable invoice value',gstInvoiceValue,gstAudit.included)],gstAudit.included,'Imported GST B2B/B2C reports',gstAvailable?null:'Unavailable')
+    gstValue:metric(gstInvoiceValue,'amount','Genuine GST sales-invoice taxable value − genuine credit-note/refund taxable value',[component('net_taxable_value','Net taxable invoice value',gstInvoiceValue,gstAudit.included)],gstAudit.included,'Imported GST B2B/B2C reports',gstAvailable?null:'Unavailable - GST B2B/B2C invoice reports have not been imported for this range')
   };
   const group=rows=>{const map=new Map();for(const row of rows){const name=row.amount_description??row.category??row.transaction_type??'Other';const old=map.get(name)??{category:norm(name).replaceAll(' ','_'),label:name,amount:0,count:0};old.amount+=amount(row);old.count++;map.set(name,old);}return[...map.values()];};
-  const statement={income:metric(income,'amount','Net Amazon Income statement lines',group(incomeRows),incomeRows),expenses:metric(expenses,'amount','Expense debits plus expense refunds/credits; includes TCS/TDS',group(expenseRows),expenseRows),tax:metric(tax,'amount','Amazon generic Tax section only',group(genericTaxRows),genericTaxRows),transfers:metric(transfers,'amount','Signed successful bank transfers by deposit_date',group(transferRows),transferRows,'Settlement headers'),gst:metric(gst,'amount','Product/shipping/gift-wrap GST collected plus GST refunds',group(productGstRows),productGstRows)};
+  const statement={income:metric(income,'amount','Net Amazon Income statement lines',group(incomeRows),incomeRows),expenses:metric(expenses,'amount','Expense debits plus expense refunds/credits; includes TCS/TDS',group(expenseRows),expenseRows),tax:metric(tax,'amount','Amazon generic Tax section only',group(genericTaxRows),genericTaxRows),transfers:metric(transfers,'amount','Signed money Amazon transferred to the bank, posted in the selected range',group(transferRows),transferRows,transferSource),gst:metric(gst,'amount','Product/shipping/gift-wrap GST collected plus GST refunds',group(productGstRows),productGstRows)};
   return{metrics,statement,diagnostics};
 }
